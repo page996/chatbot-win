@@ -10,9 +10,9 @@ from app.personal_wechat_bot.conversation.context_store import DEFAULT_SESSION_I
 from app.personal_wechat_bot.domain.models import RawWeChatMessage, SendResult, utc_now_iso
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
-from app.personal_wechat_bot.tools.permissions import validate_readable_file
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.workspace.attachment_pipeline import AttachmentPipeline, IncomingAttachment
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
@@ -52,6 +52,7 @@ class BackendEventJsonlDriver:
         max_input_bytes: int,
         attachment_parser: BackendAttachmentParser | None = None,
         file_workspace: FileWorkspace | None = None,
+        attachment_pipeline: AttachmentPipeline | None = None,
         context_store: ConversationContextStore | None = None,
     ):
         self.event_path = Path(event_path)
@@ -61,6 +62,14 @@ class BackendEventJsonlDriver:
         self.max_input_bytes = max_input_bytes
         self.attachment_parser = attachment_parser or BackendAttachmentParser(RapidOcrSubprocessEngine())
         self.file_workspace = file_workspace or FileWorkspace(self.event_path.parent / "file_workspace")
+        self.attachment_pipeline = attachment_pipeline or AttachmentPipeline(
+            file_index=self.file_index,
+            file_workspace=self.file_workspace,
+            attachment_parser=self.attachment_parser,
+            allowed_input_roots=self.allowed_input_roots,
+            allowed_extensions=self.allowed_extensions,
+            max_input_bytes=self.max_input_bytes,
+        )
         self.context_store = context_store
         self._seen_raw_ids: set[str] = set()
 
@@ -144,7 +153,17 @@ class BackendEventJsonlDriver:
                 original_name=str(item.get("name", "")),
                 kind=str(item.get("kind", "file") or "file"),
             )
-            indexed.append(self._index_attachment(attachment, conversation_id=conversation_id, session_id=session_id))
+            indexed.append(
+                self.attachment_pipeline.process(
+                    IncomingAttachment(
+                        path=attachment.path,
+                        original_name=attachment.original_name,
+                        kind=attachment.kind,
+                    ),
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                )
+            )
         allowed = [item for item in indexed if item.get("status") == "indexed"]
         blocked = [item for item in indexed if item.get("status") == "blocked"]
         text = _compose_message_text(str(raw.driver_meta.get("original_text", raw.text)), allowed, blocked)
@@ -162,60 +181,6 @@ class BackendEventJsonlDriver:
             observed_at=raw.observed_at,
             driver_meta=meta,
         )
-
-    def _index_attachment(self, attachment: BackendAttachment, *, conversation_id: str, session_id: str) -> dict[str, Any]:
-        try:
-            safe_path = validate_readable_file(
-                attachment.path,
-                self.allowed_input_roots,
-                self.allowed_extensions,
-                self.max_input_bytes,
-            )
-            staged = self.file_workspace.stage_file(
-                safe_path,
-                conversation_id=conversation_id,
-                session_id=session_id,
-                original_name=attachment.original_name or safe_path.name,
-                kind=attachment.kind,
-            )
-            file_id = self.file_index.add(
-                staged.staged_path,
-                source="file_workspace",
-                original_name=attachment.original_name or safe_path.name,
-            )
-            parse_result = self.file_workspace.parse_or_get_cached(staged, self.attachment_parser)
-            return {
-                "status": "indexed",
-                "file_id": file_id,
-                "name": attachment.original_name or safe_path.name,
-                "kind": attachment.kind,
-                "suffix": safe_path.suffix.lower(),
-                "workspace": {
-                    "conversation_id": staged.conversation_id,
-                    "session_id": staged.session_id,
-                    "workspace_dir": staged.workspace_dir,
-                    "staged_path": staged.staged_path,
-                    "manifest_path": staged.manifest_path,
-                    "derived_dir": staged.derived_dir,
-                    "outputs_dir": staged.outputs_dir,
-                    "sha256": staged.sha256,
-                },
-                "parse": {
-                    "status": parse_result.status,
-                    "kind": parse_result.kind,
-                    "summary": parse_result.summary,
-                    "text": parse_result.text,
-                    "error": parse_result.error,
-                },
-            }
-        except (FileNotFoundError, PermissionError) as exc:
-            return {
-                "status": "blocked",
-                "name": attachment.original_name or Path(attachment.path).name,
-                "kind": attachment.kind,
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
-
 
 def append_backend_event(
     event_path: str | Path,
