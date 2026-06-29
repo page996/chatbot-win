@@ -386,6 +386,10 @@ def _attach_parse_artifact_refs(attachment: dict[str, Any]) -> None:
         "media_dir": artifacts.get("media_dir", str(Path(derived_dir) / "media")),
         "media_index_path": artifacts.get("media_index_path", str(Path(derived_dir) / "media" / "index.json")),
         "media_extract_count": artifacts.get("media_extract_count", 0),
+        "media_ocr_status": artifacts.get("media_ocr_status", ""),
+        "media_ocr_dir": artifacts.get("media_ocr_dir", str(Path(derived_dir) / "media" / "ocr")),
+        "media_ocr_count": artifacts.get("media_ocr_count", 0),
+        "media_ocr_error_count": artifacts.get("media_ocr_error_count", 0),
     }
 
 

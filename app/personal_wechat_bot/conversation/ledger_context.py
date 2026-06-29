@@ -278,6 +278,7 @@ def _file_lines(file_refs: list[dict[str, Any]]) -> list[str]:
             f"table_chunk_count={artifacts.get('table_chunk_count', '')} "
             f"media_index={artifacts.get('media_index_path', '')} "
             f"media_extract_count={artifacts.get('media_extract_count', '')} "
+            f"media_ocr={artifacts.get('media_ocr_status', '')}:{artifacts.get('media_ocr_count', '')} "
             f"parse_status={parse.get('status', '')} summary={_compact(str(parse.get('summary', '')), 300)}"
         )
     return lines

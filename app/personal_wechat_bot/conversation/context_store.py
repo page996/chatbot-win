@@ -84,6 +84,7 @@ class ConversationContextSnapshot:
                     f"content={artifacts.get('content_path', '')} "
                     f"table_index={artifacts.get('table_index_path', '')} "
                     f"media_index={artifacts.get('media_index_path', '')} "
+                    f"media_ocr={artifacts.get('media_ocr_status', '')}:{artifacts.get('media_ocr_count', '')} "
                     f"status={parse.get('status', item.get('status', ''))} kind={parse.get('kind', item.get('kind', ''))}"
                 )
                 lines.append(header)

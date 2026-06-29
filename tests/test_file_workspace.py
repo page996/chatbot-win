@@ -142,6 +142,34 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertIn("## Embedded Media", content)
             self.assertIn("blocked_capabilities", content)
 
+    def test_docx_embedded_image_ocr_writes_media_markdown_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "media.docx"
+            _write_docx_with_media(source)
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "docx", "summary", "正文"),
+                embedded_media_ocr=_FakeOcr("图片文字"),
+            )
+
+            derived = Path(staged.derived_dir)
+            analysis = json.loads((derived / "analysis.json").read_text(encoding="utf-8"))
+            manifest = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
+            media_index = json.loads(Path(analysis["media_index_path"]).read_text(encoding="utf-8"))
+            ocr_path = Path(analysis["media_images"][0]["ocr_path"])
+            content = (derived / "content.md").read_text(encoding="utf-8")
+
+            self.assertEqual(analysis["media_ocr_status"], "completed")
+            self.assertEqual(analysis["media_ocr_count"], 1)
+            self.assertEqual(media_index["images"][0]["ocr_text"], "图片文字")
+            self.assertEqual(manifest["parse"]["media_ocr_count"], 1)
+            self.assertTrue(ocr_path.exists())
+            self.assertIn("图片文字", ocr_path.read_text(encoding="utf-8"))
+            self.assertIn("first_image_ocr", content)
+
     def test_standalone_image_is_not_marked_as_embedded_media_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "image.png"
@@ -293,6 +321,17 @@ class _FakeLibreOffice:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("pdf", encoding="utf-8")
         return output
+
+
+class _FakeOcr:
+    def __init__(self, text: str):
+        self.text = text
+
+    def health(self):
+        return None
+
+    def read_text(self, image_path: str | Path) -> str:
+        return self.text
 
 
 def _write_docx_with_media(path: Path) -> None:

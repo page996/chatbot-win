@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from app.personal_wechat_bot.memory.file_index import FileIndex
@@ -100,6 +101,35 @@ class AttachmentPipelineTest(unittest.TestCase):
             self.assertIn('"name": "alpha"', result["parse"]["text"])
             self.assertEqual(result["parse"]["raw_text"], "name\tvalue\nalpha\t1")
 
+    def test_process_returns_embedded_media_ocr_artifacts_for_docx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inbox = root / "inbox"
+            inbox.mkdir()
+            source = inbox / "media.docx"
+            _write_docx_with_media(source)
+            pipeline = AttachmentPipeline(
+                file_index=FileIndex(root / "file_index.sqlite"),
+                file_workspace=FileWorkspace(root / "file_workspace"),
+                attachment_parser=_Parser("正文", kind="docx"),
+                allowed_input_roots=[inbox],
+                allowed_extensions=[".docx"],
+                max_input_bytes=4096,
+                embedded_media_ocr=_FakeOcr("图中文字"),
+            )
+
+            result = pipeline.process(
+                IncomingAttachment(path="media.docx", original_name="media.docx", kind="file"),
+                conversation_id="conv1",
+                session_id="session1",
+            )
+
+            self.assertEqual(result["status"], "indexed")
+            self.assertEqual(result["artifacts"]["media_extract_count"], 1)
+            self.assertEqual(result["artifacts"]["media_ocr_status"], "completed")
+            self.assertEqual(result["artifacts"]["media_ocr_count"], 1)
+            self.assertTrue(Path(result["artifacts"]["media_images"][0]["ocr_path"]).exists())
+
     def test_process_blocks_disallowed_file_without_copying(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -132,6 +162,29 @@ class _Parser:
 
     def parse(self, path: str | Path) -> AttachmentParseResult:
         return AttachmentParseResult("parsed", self.kind, "summary", self.text)
+
+
+class _FakeOcr:
+    def __init__(self, text: str):
+        self.text = text
+
+    def health(self):
+        return None
+
+    def read_text(self, image_path: str | Path) -> str:
+        return self.text
+
+
+def _write_docx_with_media(path: Path) -> None:
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body><w:p><w:r><w:t>正文</w:t></w:r></w:p></w:body>"
+        "</w:document>"
+    )
+    with zipfile.ZipFile(path, "w") as docx:
+        docx.writestr("word/document.xml", document)
+        docx.writestr("word/media/image1.png", b"fake image bytes")
 
 
 if __name__ == "__main__":

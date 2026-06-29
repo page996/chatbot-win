@@ -7,6 +7,7 @@ from typing import Any
 
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.permissions import validate_readable_file
+from app.personal_wechat_bot.vision.ocr import OcrEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
@@ -36,6 +37,7 @@ class AttachmentPipeline:
         allowed_input_roots: list[Path],
         allowed_extensions: list[str],
         max_input_bytes: int,
+        embedded_media_ocr: OcrEngine | None = None,
     ):
         self.file_index = file_index
         self.file_workspace = file_workspace
@@ -43,6 +45,7 @@ class AttachmentPipeline:
         self.allowed_input_roots = allowed_input_roots
         self.allowed_extensions = allowed_extensions
         self.max_input_bytes = max_input_bytes
+        self.embedded_media_ocr = embedded_media_ocr
 
     def process(
         self,
@@ -71,7 +74,11 @@ class AttachmentPipeline:
                 source="file_workspace",
                 original_name=attachment.original_name or safe_path.name,
             )
-            parse_result = self.file_workspace.parse_or_get_cached(staged, self.attachment_parser)
+            parse_result = self.file_workspace.parse_or_get_cached(
+                staged,
+                self.attachment_parser,
+                embedded_media_ocr=self.embedded_media_ocr,
+            )
             artifacts = _artifact_refs(staged)
             parse_text = _conversation_parse_text(parse_result.text, parse_result.kind, artifacts)
             return {
@@ -136,6 +143,10 @@ def _artifact_refs(staged) -> dict[str, Any]:
         "media_dir": str(analysis.get("media_dir", "")) if isinstance(analysis, dict) else "",
         "media_index_path": str(analysis.get("media_index_path", "")) if isinstance(analysis, dict) else "",
         "media_extract_count": int(analysis.get("media_extract_count", 0) or 0) if isinstance(analysis, dict) else 0,
+        "media_ocr_status": str(analysis.get("media_ocr_status", "")) if isinstance(analysis, dict) else "",
+        "media_ocr_dir": str(analysis.get("media_ocr_dir", "")) if isinstance(analysis, dict) else "",
+        "media_ocr_count": int(analysis.get("media_ocr_count", 0) or 0) if isinstance(analysis, dict) else 0,
+        "media_ocr_error_count": int(analysis.get("media_ocr_error_count", 0) or 0) if isinstance(analysis, dict) else 0,
         "media_images": [
             dict(item)
             for item in media_images

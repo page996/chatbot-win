@@ -11,6 +11,7 @@ from typing import Any
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
+from app.personal_wechat_bot.vision.ocr import OcrEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 from app.personal_wechat_bot.workspace.table_artifacts import SPREADSHEET_SUFFIXES, write_table_artifacts
 
@@ -145,7 +146,13 @@ class FileWorkspace:
             error=str(result.get("error", "")),
         )
 
-    def write_parse_result(self, staged: StagedFile, result: AttachmentParseResult) -> None:
+    def write_parse_result(
+        self,
+        staged: StagedFile,
+        result: AttachmentParseResult,
+        *,
+        embedded_media_ocr: OcrEngine | None = None,
+    ) -> None:
         derived_dir = Path(staged.derived_dir)
         derived_dir.mkdir(parents=True, exist_ok=True)
         content_path = derived_dir / "content.md"
@@ -153,7 +160,7 @@ class FileWorkspace:
         analysis_path = derived_dir / "analysis.json"
         chunks = _write_chunks(derived_dir / "chunks", result.text)
         table_artifacts = _write_table_artifacts(staged, result)
-        media_artifacts = _write_media_artifacts(staged)
+        media_artifacts = _write_media_artifacts(staged, embedded_media_ocr=embedded_media_ocr)
         payload = {
             "file_id": staged.file_id,
             "conversation_id": staged.conversation_id,
@@ -209,14 +216,23 @@ class FileWorkspace:
             source=str(manifest.get("source", "backend_event_attachment")),
         )
 
-    def parse_or_get_cached(self, staged: StagedFile, parser: Any) -> AttachmentParseResult:
+    def parse_or_get_cached(
+        self,
+        staged: StagedFile,
+        parser: Any,
+        *,
+        embedded_media_ocr: OcrEngine | None = None,
+    ) -> AttachmentParseResult:
         cached = self.read_parse_result(staged)
         if cached is not None:
-            if _needs_table_artifact_refresh(staged, cached):
-                self.write_parse_result(staged, cached)
+            if _needs_table_artifact_refresh(staged, cached) or _needs_media_artifact_refresh(
+                staged,
+                embedded_media_ocr=embedded_media_ocr,
+            ):
+                self.write_parse_result(staged, cached, embedded_media_ocr=embedded_media_ocr)
             return cached
         result = parser.parse(staged.staged_path)
-        self.write_parse_result(staged, result)
+        self.write_parse_result(staged, result, embedded_media_ocr=embedded_media_ocr)
         return result
 
     def file_dir(self, conversation_id: str, session_id: str, file_id: str) -> Path:
@@ -307,6 +323,10 @@ class FileWorkspace:
             "media_dir": str(media_artifacts.get("media_dir", "")),
             "media_index_path": str(media_artifacts.get("index_path", "")),
             "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
+            "media_ocr_status": str(media_artifacts.get("ocr_status", "")),
+            "media_ocr_dir": str(media_artifacts.get("ocr_dir", "")),
+            "media_ocr_count": int(media_artifacts.get("ocr_count", 0) or 0),
+            "media_ocr_error_count": int(media_artifacts.get("ocr_error_count", 0) or 0),
             "media_images": [
                 dict(item)
                 for item in media_artifacts.get("images", [])
@@ -369,6 +389,10 @@ def _analysis_payload(
         "media_dir": str(media_artifacts.get("media_dir", "")),
         "media_index_path": str(media_artifacts.get("index_path", "")),
         "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
+        "media_ocr_status": str(media_artifacts.get("ocr_status", "")),
+        "media_ocr_dir": str(media_artifacts.get("ocr_dir", "")),
+        "media_ocr_count": int(media_artifacts.get("ocr_count", 0) or 0),
+        "media_ocr_error_count": int(media_artifacts.get("ocr_error_count", 0) or 0),
         "media_images": [
             dict(item)
             for item in media_artifacts.get("images", [])
@@ -471,6 +495,9 @@ def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
         f"- extract_status: {analysis.get('media_status', '')}",
         f"- extract_count: {analysis.get('media_extract_count', 0)}",
         f"- index: {analysis.get('media_index_path', '')}",
+        f"- ocr_status: {analysis.get('media_ocr_status', '')}",
+        f"- ocr_count: {analysis.get('media_ocr_count', 0)}",
+        f"- ocr_dir: {analysis.get('media_ocr_dir', '')}",
     ]
     if error:
         lines.append(f"- error: {error}")
@@ -484,6 +511,8 @@ def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
         first = media_images[0]
         if isinstance(first, dict):
             lines.append(f"- first_image: {first.get('path', '')}")
+            if first.get("ocr_path"):
+                lines.append(f"- first_image_ocr: {first.get('ocr_path', '')}")
     media_audio = analysis.get("media_audio", [])
     if isinstance(media_audio, list) and media_audio:
         first = media_audio[0]
@@ -503,17 +532,22 @@ def _write_table_artifacts(staged: StagedFile, result: AttachmentParseResult) ->
     return write_table_artifacts(staged.staged_path, tables_dir)
 
 
-def _write_media_artifacts(staged: StagedFile) -> dict[str, Any]:
+def _write_media_artifacts(staged: StagedFile, *, embedded_media_ocr: OcrEngine | None = None) -> dict[str, Any]:
     suffix = Path(staged.staged_path).suffix.lower()
     media_dir = Path(staged.derived_dir) / "media"
     if suffix != ".docx":
         if media_dir.exists():
             shutil.rmtree(media_dir)
         return {}
-    return _extract_docx_media(Path(staged.staged_path), media_dir)
+    return _extract_docx_media(Path(staged.staged_path), media_dir, embedded_media_ocr=embedded_media_ocr)
 
 
-def _extract_docx_media(path: Path, media_dir: Path) -> dict[str, Any]:
+def _extract_docx_media(
+    path: Path,
+    media_dir: Path,
+    *,
+    embedded_media_ocr: OcrEngine | None = None,
+) -> dict[str, Any]:
     image_suffixes = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".emf", ".wmf"}
     audio_suffixes = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma"}
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -551,13 +585,18 @@ def _extract_docx_media(path: Path, media_dir: Path) -> dict[str, Any]:
         _write_json(media_dir / "index.json", payload)
         return payload
 
+    ocr_payload = _write_media_ocr_artifacts(images, media_dir / "ocr", embedded_media_ocr)
     payload = {
         "status": "completed",
         "media_dir": str(media_dir),
         "index_path": str(media_dir / "index.json"),
         "extract_count": len(images) + len(audio),
-        "images": images,
+        "images": ocr_payload["images"],
         "audio": audio,
+        "ocr_status": ocr_payload["status"],
+        "ocr_dir": ocr_payload["ocr_dir"],
+        "ocr_count": ocr_payload["ocr_count"],
+        "ocr_error_count": ocr_payload["error_count"],
         "error": "",
     }
     _write_json(media_dir / "index.json", payload)
@@ -574,6 +613,75 @@ def _media_item(source_name: str, output: Path, suffix: str) -> dict[str, Any]:
     }
 
 
+def _write_media_ocr_artifacts(
+    images: list[dict[str, Any]],
+    ocr_dir: Path,
+    embedded_media_ocr: OcrEngine | None,
+) -> dict[str, Any]:
+    if not images:
+        return {"status": "not_needed", "ocr_dir": "", "ocr_count": 0, "error_count": 0, "images": images}
+    if embedded_media_ocr is None:
+        return {"status": "skipped_no_ocr_engine", "ocr_dir": "", "ocr_count": 0, "error_count": 0, "images": images}
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    updated: list[dict[str, Any]] = []
+    ocr_count = 0
+    error_count = 0
+    for index, item in enumerate(images, start=1):
+        image_path = Path(str(item.get("path", "")))
+        output_path = ocr_dir / f"{index:04d}_{Path(str(item.get('name', 'image'))).stem}.md"
+        current = dict(item)
+        try:
+            text = embedded_media_ocr.read_text(image_path)
+            status = "parsed" if text.strip() else "empty"
+            output_path.write_text(_media_ocr_markdown(current, status, text=text), encoding="utf-8")
+            current.update(
+                {
+                    "ocr_status": status,
+                    "ocr_path": str(output_path),
+                    "ocr_text": _compact(text, 2000),
+                    "ocr_char_count": len(text),
+                }
+            )
+            ocr_count += 1
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            output_path.write_text(_media_ocr_markdown(current, "failed", error=error), encoding="utf-8")
+            current.update({"ocr_status": "failed", "ocr_path": str(output_path), "ocr_error": error})
+            error_count += 1
+        updated.append(current)
+    if error_count and ocr_count:
+        status = "partial"
+    elif error_count:
+        status = "failed"
+    else:
+        status = "completed"
+    return {
+        "status": status,
+        "ocr_dir": str(ocr_dir),
+        "ocr_count": ocr_count,
+        "error_count": error_count,
+        "images": updated,
+    }
+
+
+def _media_ocr_markdown(item: dict[str, Any], status: str, *, text: str = "", error: str = "") -> str:
+    lines = [
+        f"# Embedded Image OCR: {item.get('name', '')}",
+        "",
+        f"- source_name: {item.get('source_name', '')}",
+        f"- image_path: {item.get('path', '')}",
+        f"- status: {status}",
+        "",
+        "## Text",
+        "",
+        text,
+        "",
+    ]
+    if error:
+        lines.extend(["## Error", "", error, ""])
+    return "\n".join(lines)
+
+
 def _needs_table_artifact_refresh(staged: StagedFile, result: AttachmentParseResult) -> bool:
     suffix = Path(staged.staged_path).suffix.lower()
     if result.kind != "spreadsheet" and suffix not in SPREADSHEET_SUFFIXES:
@@ -582,6 +690,24 @@ def _needs_table_artifact_refresh(staged: StagedFile, result: AttachmentParseRes
     if not isinstance(analysis, dict):
         return True
     return not analysis.get("table_index_path") or int(analysis.get("table_chunk_count", 0) or 0) <= 0
+
+
+def _needs_media_artifact_refresh(
+    staged: StagedFile,
+    *,
+    embedded_media_ocr: OcrEngine | None = None,
+) -> bool:
+    if Path(staged.staged_path).suffix.lower() != ".docx":
+        return False
+    index = _read_json(Path(staged.derived_dir) / "media" / "index.json", None)
+    if not isinstance(index, dict):
+        return True
+    images = index.get("images", [])
+    if embedded_media_ocr is None:
+        return False
+    if not isinstance(images, list):
+        return True
+    return any(isinstance(item, dict) and not item.get("ocr_status") for item in images)
 
 
 def _document_media_analysis(path: Path, suffix: str, media_artifacts: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -783,6 +909,14 @@ def _estimate_tokens(text: str) -> int:
 
 def _extract_links(text: str) -> list[str]:
     return re.findall(r"https?://[^\s]+", text, flags=re.IGNORECASE)
+
+
+def _compact(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "..."
 
 
 def _safe_segment(value: str) -> str:

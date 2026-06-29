@@ -65,6 +65,7 @@ class BackendEventJsonlDriver:
             allowed_input_roots=self.allowed_input_roots,
             allowed_extensions=self.allowed_extensions,
             max_input_bytes=self.max_input_bytes,
+            embedded_media_ocr=self.attachment_parser.ocr_engine,
         )
         self.context_store = context_store
         self._seen_raw_ids: set[str] = set()
