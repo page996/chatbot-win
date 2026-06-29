@@ -18,6 +18,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "text")
+            self.assertEqual(result.summary, "已读取文本附件预览")
             self.assertEqual(result.text, "first line\nsecond line")
 
     def test_text_attachment_preview_is_truncated(self) -> None:
@@ -47,6 +48,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "docx")
+            self.assertEqual(result.summary, "已提取 DOCX 文本预览")
             self.assertEqual(result.text, "第一段\n第二段")
 
     def test_image_attachment_uses_injected_ocr_engine(self) -> None:
@@ -58,9 +60,10 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "image")
+            self.assertEqual(result.summary, "已完成图片 OCR 预览")
             self.assertEqual(result.text, "图片里的任务信息")
 
-    def test_pdf_is_registered_but_not_parsed_yet(self) -> None:
+    def test_pdf_is_registered_when_worker_python_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "paper.pdf"
             path.write_bytes(b"%PDF-placeholder")
@@ -69,6 +72,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "skipped")
             self.assertEqual(result.kind, "pdf")
+            self.assertIn("worker Python 不可用", result.summary)
 
     def test_csv_attachment_extracts_rows_with_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,8 +83,16 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "spreadsheet")
+            self.assertEqual(result.summary, "已提取表格文本预览")
             self.assertIn("name\tvalue", result.text)
             self.assertIn("alpha\t1", result.text)
+
+    def test_default_worker_python_prefers_project_vendor_runtime(self) -> None:
+        parser = BackendAttachmentParser()
+
+        self.assertIsNotNone(parser.worker_python)
+        self.assertIn("vendor", str(parser.worker_python))
+        self.assertTrue(str(parser.worker_python).endswith("python.exe"))
 
 
 class _FakeOcr:

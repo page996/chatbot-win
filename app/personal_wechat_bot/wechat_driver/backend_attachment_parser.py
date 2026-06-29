@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import zipfile
 import base64
 import json
 import subprocess
+import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -155,7 +156,13 @@ def _kind_for_suffix(suffix: str) -> str:
 
 
 def _default_worker_python() -> Path | None:
-    candidate = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "python" / "python.exe"
-    if candidate.exists():
-        return candidate
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates = [
+        repo_root / "vendor" / "ocr-python" / "Scripts" / "python.exe",
+        Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "python" / "python.exe",
+        Path(sys.executable),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     return None
