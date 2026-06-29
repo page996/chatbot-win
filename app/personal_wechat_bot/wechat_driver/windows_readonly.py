@@ -212,9 +212,14 @@ class SnapshotMessageParser:
         if not chat_title or not sender_name or not text:
             return None
         context_only = False
+        voice_meta: dict[str, object] = {}
         if text.startswith("[OCR_CONTEXT]"):
             context_only = True
             text = text.removeprefix("[OCR_CONTEXT]").strip()
+            if not text:
+                return None
+        elif text.startswith("[OCR_VOICE_TRANSCRIPT]"):
+            text, voice_meta = _ocr_voice_transcript(text)
             if not text:
                 return None
         raw_id = _snapshot_raw_id(line, observed_at, index)
@@ -232,6 +237,7 @@ class SnapshotMessageParser:
                 "context_only": context_only,
                 "ocr_fallback": True,
                 "attachments": _ocr_context_attachments(text) if context_only else [],
+                "voice": voice_meta,
             },
         )
 
@@ -326,3 +332,18 @@ def _ocr_context_attachments(text: str) -> list[dict[str, object]]:
             "note": "OCR saw a WeChat file card; real file path is not available from frontend OCR.",
         }
     ]
+
+
+def _ocr_voice_transcript(text: str) -> tuple[str, dict[str, object]]:
+    payload = text.removeprefix("[OCR_VOICE_TRANSCRIPT]").strip()
+    duration = ""
+    if " duration=" in payload:
+        payload, duration = payload.rsplit(" duration=", 1)
+        duration = duration.strip()
+    transcript = payload.strip()
+    return transcript, {
+        "status": "transcribed",
+        "source": "wechat_builtin_voice_to_text_ocr",
+        "text": transcript,
+        "duration": duration,
+    }

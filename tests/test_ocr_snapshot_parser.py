@@ -111,6 +111,38 @@ class OcrSnapshotParserTest(unittest.TestCase):
 
         self.assertEqual(snapshot, "[private] PAGE | PAGE |  | 如果可以接收到我的消息，回复第一行加括号")
 
+    def test_extracts_visible_wechat_voice_transcription(self) -> None:
+        text = "\n".join(
+            [
+                "搜索",
+                "PAGE",
+                "14:20",
+                "语音",
+                "12\"",
+                "转文字",
+                "这是一条微信语音转文字内容",
+            ]
+        )
+
+        result = parse_ocr_snapshot(text, preferred_chat_title="PAGE")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.message, "")
+        self.assertEqual(result.voice_transcripts[0]["text"], "这是一条微信语音转文字内容")
+        self.assertEqual(result.voice_transcripts[0]["source"], "wechat_builtin_voice_to_text_ocr")
+        self.assertEqual(
+            result.to_snapshots(),
+            [
+                "[private] PAGE | PAGE |  | [OCR_VOICE_TRANSCRIPT] 这是一条微信语音转文字内容 duration=12\"",
+            ],
+        )
+
+    def test_extracts_inline_voice_transcription(self) -> None:
+        result = parse_ocr_snapshot("PAGE\n语音转文字：请把这段语音写入上下文", preferred_chat_title="PAGE")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.voice_transcripts[0]["text"], "请把这段语音写入上下文")
+
     def test_blocks_truncated_left_list_preview_with_stale_visual_content(self) -> None:
         text = "\n".join(
             [

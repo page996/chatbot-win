@@ -13,6 +13,7 @@ class OcrSnapshotParseResult:
     raw_lines: tuple[str, ...]
     normalized_lines: tuple[str, ...]
     attachments: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    voice_transcripts: tuple[dict[str, str], ...] = field(default_factory=tuple)
     status: str = "ok"
     reason: str = ""
     evidence: tuple[str, ...] = field(default_factory=tuple)
@@ -28,6 +29,16 @@ class OcrSnapshotParseResult:
         snapshots: list[str] = []
         if self.message:
             snapshots.append(self.to_snapshot())
+        for transcript in self.voice_transcripts:
+            text = str(transcript.get("text", "")).strip()
+            if not text:
+                continue
+            duration = str(transcript.get("duration", "")).strip()
+            suffix = f" duration={duration}" if duration else ""
+            snapshots.append(
+                f"[private] {self.chat_title} | {self.sender_name} |  | "
+                f"[OCR_VOICE_TRANSCRIPT] {text}{suffix}"
+            )
         for attachment in self.attachments:
             name = str(attachment.get("name", "")).strip()
             if not name:
@@ -95,8 +106,10 @@ def parse_ocr_snapshot(
             evidence=tuple(ambiguity["evidence"]),
         )
 
+    voice_transcripts = _extract_voice_transcripts(normalized_lines, chat_title, ignored)
     message, attachments = _guess_visible_context(normalized_lines, chat_title, ignored_names=ignored_names)
-    if not message and not attachments:
+    message = _suppress_message_if_voice_transcript(message, voice_transcripts)
+    if not message and not attachments and not voice_transcripts:
         return None
 
     return OcrSnapshotParseResult(
@@ -104,6 +117,7 @@ def parse_ocr_snapshot(
         sender_name=chat_title,
         message=message,
         attachments=attachments,
+        voice_transcripts=voice_transcripts,
         raw_lines=raw_lines,
         normalized_lines=normalized_lines,
     )
@@ -144,6 +158,22 @@ _DATE_TIME_RE = re.compile(
 )
 _FILE_NAME_RE = re.compile(r"^[\w .()\-\u4e00-\u9fff]+?\.(?:pdf|docx?|xlsx?|csv|pptx?|txt|zip|rar)$", re.I)
 _FILE_SIZE_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:[KMGT]?B|[KMGT])$", re.I)
+_VOICE_DURATION_RE = re.compile(r"^\d{1,3}\s*(?:''|\"|秒|s)$", re.I)
+_VOICE_INLINE_TRANSCRIPT_RE = re.compile(
+    r"^(?:语音转文字|转文字|转换为文字|已转文字|voice transcript|transcription)\s*[:：]\s*(?P<text>.+)$",
+    re.I,
+)
+_VOICE_MARKER_EXACT = {
+    "语音",
+    "转文字",
+    "语音转文字",
+    "转换为文字",
+    "已转文字",
+    "voice",
+    "voice message",
+    "transcription",
+    "voice transcript",
+}
 
 
 def _normalize_line(value: str) -> str:
@@ -179,6 +209,98 @@ def _guess_visible_context(
 
     best = max(blocks, key=lambda block: _block_score(block))
     return _join_message_lines(best[1]), attachments
+
+
+def _extract_voice_transcripts(
+    lines: tuple[str, ...],
+    chat_title: str,
+    ignored_names: set[str],
+) -> tuple[dict[str, str], ...]:
+    transcripts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, line in enumerate(lines):
+        inline = _VOICE_INLINE_TRANSCRIPT_RE.match(line)
+        if inline:
+            _append_voice_transcript(
+                transcripts,
+                seen,
+                text=inline.group("text"),
+                duration=_nearby_voice_duration(lines, index),
+            )
+            continue
+        if not _is_voice_marker_line(line):
+            continue
+        text = _next_voice_transcript_line(lines, index, chat_title, ignored_names)
+        if not text:
+            continue
+        _append_voice_transcript(
+            transcripts,
+            seen,
+            text=text,
+            duration=_nearby_voice_duration(lines, index),
+        )
+    return tuple(transcripts)
+
+
+def _append_voice_transcript(
+    transcripts: list[dict[str, str]],
+    seen: set[str],
+    *,
+    text: str,
+    duration: str,
+) -> None:
+    cleaned = _normalize_line(text)
+    key = _compact_for_compare(cleaned)
+    if not cleaned or not key or key in seen:
+        return
+    seen.add(key)
+    payload = {
+        "text": cleaned,
+        "source": "wechat_builtin_voice_to_text_ocr",
+        "status": "transcribed",
+    }
+    if duration:
+        payload["duration"] = duration
+    transcripts.append(payload)
+
+
+def _next_voice_transcript_line(
+    lines: tuple[str, ...],
+    marker_index: int,
+    chat_title: str,
+    ignored_names: set[str],
+) -> str:
+    stop = min(len(lines), marker_index + 5)
+    for candidate in lines[marker_index + 1 : stop]:
+        if _is_voice_marker_line(candidate) or _looks_like_voice_duration(candidate):
+            continue
+        if _is_noise_line(candidate, chat_title=chat_title, ignored_names=ignored_names):
+            continue
+        if _is_attachment_card_line(candidate):
+            continue
+        if _looks_like_message_text(candidate):
+            return candidate
+    return ""
+
+
+def _nearby_voice_duration(lines: tuple[str, ...], marker_index: int) -> str:
+    start = max(0, marker_index - 2)
+    stop = min(len(lines), marker_index + 3)
+    for candidate in lines[start:stop]:
+        if _looks_like_voice_duration(candidate):
+            return candidate
+    return ""
+
+
+def _suppress_message_if_voice_transcript(message: str, voice_transcripts: tuple[dict[str, str], ...]) -> str:
+    if not message or not voice_transcripts:
+        return message
+    normalized_message = _compact_for_compare(message)
+    for transcript in voice_transcripts:
+        normalized_transcript = _compact_for_compare(str(transcript.get("text", "")))
+        if normalized_message and normalized_message == normalized_transcript:
+            return ""
+    return message
 
 
 def _guess_last_message(
@@ -345,6 +467,8 @@ def _is_noise_line(line: str, chat_title: str, ignored_names: Iterable[str]) -> 
         return True
     if _is_attachment_card_line(line):
         return True
+    if _is_voice_marker_line(line) or _looks_like_voice_duration(line):
+        return True
     if "搜索" in line and len(line) <= 4:
         return True
     if _looks_like_time(line):
@@ -358,6 +482,18 @@ def _looks_like_message_text(line: str) -> bool:
     if len(line) <= 1:
         return False
     return bool(_compact_for_compare(line))
+
+
+def _is_voice_marker_line(line: str) -> bool:
+    normalized = _normalize_line(line).lower()
+    if normalized in _VOICE_MARKER_EXACT:
+        return True
+    compact = _compact_for_compare(normalized)
+    return compact in {"语音", "转文字", "语音转文字", "转换为文字", "已转文字"}
+
+
+def _looks_like_voice_duration(line: str) -> bool:
+    return bool(_VOICE_DURATION_RE.match(_normalize_line(line)))
 
 
 def _compact_for_compare(value: str) -> str:

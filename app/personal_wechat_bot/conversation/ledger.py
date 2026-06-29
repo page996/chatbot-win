@@ -317,16 +317,37 @@ def _text_blocks_from_message(message: NormalizedMessage) -> list[dict[str, Any]
     blocks: list[dict[str, Any]] = []
     text = _primary_message_text(message).strip()
     if text:
+        voice = _voice_from_metadata(message.metadata)
         blocks.append(
             asdict(
                 LedgerTextBlock(
-                    kind="text",
+                    kind=_primary_text_kind(message),
                     text=text,
                     token_estimate=_estimate_tokens(text),
-                    metadata={"visible_in_context": True},
+                    metadata=_primary_text_metadata(voice),
                 )
             )
         )
+    else:
+        voice = _voice_from_metadata(message.metadata)
+    if voice and not _voice_duplicate_primary_text(text, voice):
+        voice_text = str(voice.get("text", "")).strip()
+        if voice_text:
+            blocks.append(
+                asdict(
+                    LedgerTextBlock(
+                        kind="voice:transcript",
+                        text=voice_text,
+                        token_estimate=_estimate_tokens(voice_text),
+                        metadata={
+                            "visible_in_context": True,
+                            "source": voice.get("source", ""),
+                            "status": voice.get("status", ""),
+                            "duration": voice.get("duration", ""),
+                        },
+                    )
+                )
+            )
     for attachment in _attachments_from_metadata(message.metadata):
         parse = attachment.get("parse") if isinstance(attachment.get("parse"), dict) else {}
         parsed_text = str(parse.get("text", "")).strip()
@@ -350,6 +371,45 @@ def _primary_message_text(message: NormalizedMessage) -> str:
     if isinstance(original, str):
         return original
     return message.text
+
+
+def _primary_text_kind(message: NormalizedMessage) -> str:
+    voice = _voice_from_metadata(message.metadata)
+    if voice and _voice_duplicate_primary_text(message.text, voice):
+        return "voice:transcript"
+    return "text"
+
+
+def _primary_text_metadata(voice: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"visible_in_context": True}
+    if voice:
+        metadata.update(
+            {
+                "source": voice.get("source", ""),
+                "status": voice.get("status", ""),
+                "duration": voice.get("duration", ""),
+            }
+        )
+    return metadata
+
+
+def _voice_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    raw = metadata.get("voice")
+    if not isinstance(raw, dict):
+        return {}
+    text = str(raw.get("text", "")).strip()
+    if not text:
+        return {}
+    return {
+        "status": str(raw.get("status") or "transcribed").strip(),
+        "source": str(raw.get("source") or "wechat_builtin_voice_to_text_ocr").strip(),
+        "text": text,
+        "duration": str(raw.get("duration", "")).strip(),
+    }
+
+
+def _voice_duplicate_primary_text(text: str, voice: dict[str, Any]) -> bool:
+    return bool(text.strip()) and _normalize_for_match(text) == _normalize_for_match(str(voice.get("text", "")))
 
 
 def _attachments_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]:

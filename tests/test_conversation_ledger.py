@@ -120,6 +120,30 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(entry.text_blocks[0]["text"], "request")
             self.assertEqual(entry.text_blocks[1]["text"], "parsed body")
 
+    def test_voice_transcript_is_marked_in_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            entry = store.append_message(
+                _message(
+                    "voice1",
+                    "请根据这条语音继续处理",
+                    metadata={
+                        "voice": {
+                            "status": "transcribed",
+                            "source": "wechat_builtin_voice_to_text_ocr",
+                            "text": "请根据这条语音继续处理",
+                            "duration": "8\"",
+                        }
+                    },
+                )
+            )
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+
+            self.assertEqual(entry.text_blocks[0]["kind"], "voice:transcript")
+            self.assertEqual(entry.text_blocks[0]["metadata"]["source"], "wechat_builtin_voice_to_text_ocr")
+            self.assertIn("[block:voice:transcript", markdown)
+            self.assertIn("请根据这条语音继续处理", markdown)
+
     def test_mark_recalled_hides_body_from_active_reads_and_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
