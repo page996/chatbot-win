@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,39 @@ class AttachmentPipelineTest(unittest.TestCase):
             self.assertGreater(result["artifacts"]["chunk_count"], 1)
             self.assertTrue(Path(result["artifacts"]["chunks"][0]["path"]).exists())
 
+    def test_process_returns_structured_table_artifacts_for_spreadsheet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inbox = root / "inbox"
+            inbox.mkdir()
+            source = inbox / "table.csv"
+            source.write_text("name,value\nalpha,1\nbeta,2\n", encoding="utf-8")
+            pipeline = AttachmentPipeline(
+                file_index=FileIndex(root / "file_index.sqlite"),
+                file_workspace=FileWorkspace(root / "file_workspace"),
+                attachment_parser=_Parser("name\tvalue\nalpha\t1", kind="spreadsheet"),
+                allowed_input_roots=[inbox],
+                allowed_extensions=[".csv"],
+                max_input_bytes=1024,
+            )
+
+            result = pipeline.process(
+                IncomingAttachment(path="table.csv", original_name="table.csv", kind="file"),
+                conversation_id="conv1",
+                session_id="session1",
+            )
+
+            table_chunk = Path(result["artifacts"]["table_chunks"][0]["path"])
+            chunk_payload = json.loads(table_chunk.read_text(encoding="utf-8"))
+
+            self.assertEqual(result["status"], "indexed")
+            self.assertEqual(result["artifacts"]["table_chunk_count"], 1)
+            self.assertTrue(Path(result["artifacts"]["table_index_path"]).exists())
+            self.assertEqual(chunk_payload["rows"][0], {"name": "alpha", "value": "1"})
+            self.assertIn("[structured_table:first_chunk]", result["parse"]["text"])
+            self.assertIn('"name": "alpha"', result["parse"]["text"])
+            self.assertEqual(result["parse"]["raw_text"], "name\tvalue\nalpha\t1")
+
     def test_process_blocks_disallowed_file_without_copying(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -92,11 +126,12 @@ class AttachmentPipelineTest(unittest.TestCase):
 
 
 class _Parser:
-    def __init__(self, text: str):
+    def __init__(self, text: str, *, kind: str = "text"):
         self.text = text
+        self.kind = kind
 
     def parse(self, path: str | Path) -> AttachmentParseResult:
-        return AttachmentParseResult("parsed", "text", "summary", self.text)
+        return AttachmentParseResult("parsed", self.kind, "summary", self.text)
 
 
 if __name__ == "__main__":

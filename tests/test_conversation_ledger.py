@@ -254,6 +254,36 @@ class LedgerContextAssemblerTest(unittest.TestCase):
             self.assertIn("chunk_count=3", rendered)
             self.assertIn("chunks_dir=derived/chunks", rendered)
 
+    def test_file_section_includes_table_artifact_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            message = _message(
+                "m1",
+                "table message",
+                metadata={
+                    "attachments": [
+                        {
+                            "file_id": "f1",
+                            "name": "table.csv",
+                            "workspace": {"manifest_path": "manifest.json", "derived_dir": "derived"},
+                            "artifacts": {
+                                "content_path": "derived/content.md",
+                                "table_index_path": "derived/tables/index.json",
+                                "table_chunk_count": 2,
+                            },
+                            "parse": {"status": "parsed", "summary": "table ok", "text": "first rows"},
+                        }
+                    ]
+                },
+            )
+            store.append_message(message)
+
+            snapshot = LedgerContextAssembler(store, max_recent_entries=5, token_budget=300).build_snapshot(message)
+            rendered = snapshot.render_for_prompt()
+
+            self.assertIn("table_index=derived/tables/index.json", rendered)
+            self.assertIn("table_chunk_count=2", rendered)
+
 
 def _message(
     message_id: str,

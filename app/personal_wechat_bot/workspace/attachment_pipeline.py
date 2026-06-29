@@ -73,6 +73,7 @@ class AttachmentPipeline:
             )
             parse_result = self.file_workspace.parse_or_get_cached(staged, self.attachment_parser)
             artifacts = _artifact_refs(staged)
+            parse_text = _conversation_parse_text(parse_result.text, parse_result.kind, artifacts)
             return {
                 "status": "indexed",
                 "file_id": file_id,
@@ -93,7 +94,8 @@ class AttachmentPipeline:
                     "status": parse_result.status,
                     "kind": parse_result.kind,
                     "summary": parse_result.summary,
-                    "text": parse_result.text,
+                    "text": parse_text,
+                    "raw_text": parse_result.text,
                     "error": parse_result.error,
                 },
                 "artifacts": artifacts,
@@ -111,6 +113,7 @@ def _artifact_refs(staged) -> dict[str, Any]:
     derived_dir = Path(staged.derived_dir)
     analysis = _read_json(derived_dir / "analysis.json", {})
     chunks = analysis.get("chunks", []) if isinstance(analysis, dict) else []
+    table_chunks = analysis.get("table_chunks", []) if isinstance(analysis, dict) else []
     return {
         "content_path": str(derived_dir / "content.md"),
         "analysis_path": str(derived_dir / "analysis.json"),
@@ -118,11 +121,57 @@ def _artifact_refs(staged) -> dict[str, Any]:
         "chunks_dir": str(derived_dir / "chunks"),
         "chunk_count": len(chunks) if isinstance(chunks, list) else 0,
         "chunks": [dict(item) for item in chunks if isinstance(item, dict)] if isinstance(chunks, list) else [],
+        "tables_dir": str(analysis.get("tables_dir", "")) if isinstance(analysis, dict) else "",
+        "table_index_path": str(analysis.get("table_index_path", "")) if isinstance(analysis, dict) else "",
+        "table_chunk_count": len(table_chunks) if isinstance(table_chunks, list) else 0,
+        "table_chunks": [
+            dict(item)
+            for item in table_chunks
+            if isinstance(item, dict)
+        ]
+        if isinstance(table_chunks, list)
+        else [],
     }
 
 
+def _conversation_parse_text(raw_text: str, kind: str, artifacts: dict[str, Any]) -> str:
+    if kind != "spreadsheet":
+        return raw_text
+    table_chunks = artifacts.get("table_chunks", [])
+    first_chunk = table_chunks[0] if isinstance(table_chunks, list) and table_chunks else {}
+    if not isinstance(first_chunk, dict):
+        return raw_text
+    chunk_path_raw = str(first_chunk.get("path", "")).strip()
+    if not chunk_path_raw:
+        return raw_text
+    chunk_path = Path(chunk_path_raw)
+    chunk_payload = _read_json(chunk_path, {})
+    rows = chunk_payload.get("rows", []) if isinstance(chunk_payload, dict) else []
+    preview_json = json.dumps(rows, ensure_ascii=False, indent=2) if isinstance(rows, list) else "[]"
+    lines = [
+        "[structured_table:first_chunk]",
+        f"table_index_path={artifacts.get('table_index_path', '')}",
+        f"tables_dir={artifacts.get('tables_dir', '')}",
+        f"table_chunk_count={artifacts.get('table_chunk_count', 0)}",
+        f"first_chunk_path={chunk_path}",
+        "rows_json=",
+        _compact(preview_json, 6000),
+    ]
+    if raw_text.strip():
+        lines.extend(["", "[spreadsheet_text_preview]", _compact(raw_text, 1200)])
+    return "\n".join(lines).strip()
+
+
+def _compact(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "..."
+
+
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
+    if not path.is_file():
         return default
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)

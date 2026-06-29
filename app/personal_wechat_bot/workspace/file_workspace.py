@@ -11,6 +11,7 @@ from typing import Any
 from app.personal_wechat_bot.domain.models import utc_now_iso
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
+from app.personal_wechat_bot.workspace.table_artifacts import SPREADSHEET_SUFFIXES, write_table_artifacts
 
 
 CHUNK_TOKEN_TARGET = 1600
@@ -150,6 +151,7 @@ class FileWorkspace:
         preview_path = derived_dir / "preview.txt"
         analysis_path = derived_dir / "analysis.json"
         chunks = _write_chunks(derived_dir / "chunks", result.text)
+        table_artifacts = _write_table_artifacts(staged, result)
         payload = {
             "file_id": staged.file_id,
             "conversation_id": staged.conversation_id,
@@ -160,16 +162,17 @@ class FileWorkspace:
             "content_path": str(content_path),
             "analysis_path": str(analysis_path),
             "chunks": chunks,
+            "table_artifacts": table_artifacts,
             "result": asdict(result),
             "updated_at": utc_now_iso(),
         }
         _write_json(derived_dir / "parse_result.json", payload)
-        analysis = _analysis_payload(staged, result, chunks)
+        analysis = _analysis_payload(staged, result, chunks, table_artifacts)
         _write_json(analysis_path, analysis)
         content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
         if result.text:
             preview_path.write_text(result.text, encoding="utf-8")
-        self._update_manifest_parse_artifacts(staged, result, content_path, analysis_path, chunks)
+        self._update_manifest_parse_artifacts(staged, result, content_path, analysis_path, chunks, table_artifacts)
 
     def staged_from_manifest(self, manifest_path: str | Path) -> StagedFile:
         safe_manifest_path = _ensure_within(Path(manifest_path).resolve(), self.root)
@@ -198,6 +201,8 @@ class FileWorkspace:
     def parse_or_get_cached(self, staged: StagedFile, parser: Any) -> AttachmentParseResult:
         cached = self.read_parse_result(staged)
         if cached is not None:
+            if _needs_table_artifact_refresh(staged, cached):
+                self.write_parse_result(staged, cached)
             return cached
         result = parser.parse(staged.staged_path)
         self.write_parse_result(staged, result)
@@ -261,11 +266,13 @@ class FileWorkspace:
         content_path: Path,
         analysis_path: Path,
         chunks: list[dict[str, Any]],
+        table_artifacts: dict[str, Any] | None = None,
     ) -> None:
         manifest_path = Path(staged.manifest_path)
         manifest = _read_json(manifest_path, {})
         if not isinstance(manifest, dict):
             return
+        table_artifacts = table_artifacts if isinstance(table_artifacts, dict) else {}
         manifest["parse"] = {
             "status": result.status,
             "kind": result.kind,
@@ -276,6 +283,14 @@ class FileWorkspace:
             "chunks_dir": str(Path(staged.derived_dir) / "chunks"),
             "chunk_count": len(chunks),
             "chunks": chunks,
+            "tables_dir": str(table_artifacts.get("tables_dir", "")),
+            "table_index_path": str(table_artifacts.get("index_path", "")),
+            "table_chunk_count": int(table_artifacts.get("chunk_count", 0) or 0),
+            "table_chunks": [
+                dict(item)
+                for item in table_artifacts.get("chunks", [])
+                if isinstance(item, dict)
+            ],
             "updated_at": utc_now_iso(),
         }
         manifest["updated_at"] = utc_now_iso()
@@ -291,9 +306,20 @@ def _safe_filename(name: str, fallback_suffix: str) -> str:
     return cleaned[:180]
 
 
-def _analysis_payload(staged: StagedFile, result: AttachmentParseResult, chunks: list[dict[str, Any]]) -> dict[str, Any]:
+def _analysis_payload(
+    staged: StagedFile,
+    result: AttachmentParseResult,
+    chunks: list[dict[str, Any]],
+    table_artifacts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     text = result.text or ""
     suffix = Path(staged.staged_path).suffix.lower()
+    table_artifacts = table_artifacts if isinstance(table_artifacts, dict) else {}
+    table_chunks = [
+        dict(item)
+        for item in table_artifacts.get("chunks", [])
+        if isinstance(item, dict)
+    ]
     return {
         "file_id": staged.file_id,
         "conversation_id": staged.conversation_id,
@@ -306,13 +332,26 @@ def _analysis_payload(staged: StagedFile, result: AttachmentParseResult, chunks:
         "char_count": len(text),
         "line_count": len(text.splitlines()) if text else 0,
         "has_images": False,
-        "has_tables": result.kind == "spreadsheet",
+        "has_tables": result.kind == "spreadsheet" or bool(table_chunks),
         "has_audio": False,
         "external_links": _extract_links(text),
         "chunked": len(chunks) > 1,
         "chunk_count": len(chunks),
         "chunks_dir": str(Path(staged.derived_dir) / "chunks") if chunks else "",
         "chunks": chunks,
+        "table_status": str(table_artifacts.get("status", "")),
+        "tables_dir": str(table_artifacts.get("tables_dir", "")),
+        "table_index_path": str(table_artifacts.get("index_path", "")),
+        "table_count": int(table_artifacts.get("table_count", 0) or 0),
+        "table_row_count": int(table_artifacts.get("row_count", 0) or 0),
+        "table_chunk_count": int(table_artifacts.get("chunk_count", 0) or 0),
+        "tables": [
+            dict(item)
+            for item in table_artifacts.get("tables", [])
+            if isinstance(item, dict)
+        ],
+        "table_chunks": table_chunks,
+        "table_error": str(table_artifacts.get("error", "")),
         "created_at": utc_now_iso(),
     }
 
@@ -331,6 +370,7 @@ def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysi
         "",
         result.summary or "",
         "",
+        *_table_content_lines(analysis),
         "## Text",
         "",
         result.text or "",
@@ -339,6 +379,51 @@ def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysi
     if result.error:
         lines.extend(["## Error", "", result.error, ""])
     return "\n".join(lines)
+
+
+def _table_content_lines(analysis: dict[str, Any]) -> list[str]:
+    if not analysis.get("has_tables"):
+        return []
+    lines = [
+        "## Tables",
+        "",
+        f"- status: {analysis.get('table_status', '')}",
+        f"- table_count: {analysis.get('table_count', 0)}",
+        f"- row_count: {analysis.get('table_row_count', 0)}",
+        f"- chunk_count: {analysis.get('table_chunk_count', 0)}",
+        f"- index: {analysis.get('table_index_path', '')}",
+        f"- chunks_dir: {analysis.get('tables_dir', '')}",
+    ]
+    error = str(analysis.get("table_error", "")).strip()
+    if error:
+        lines.append(f"- error: {error}")
+    chunks = analysis.get("table_chunks", [])
+    if isinstance(chunks, list) and chunks:
+        first = chunks[0]
+        if isinstance(first, dict):
+            lines.append(f"- first_chunk: {first.get('path', '')}")
+    lines.append("")
+    return lines
+
+
+def _write_table_artifacts(staged: StagedFile, result: AttachmentParseResult) -> dict[str, Any]:
+    suffix = Path(staged.staged_path).suffix.lower()
+    tables_dir = Path(staged.derived_dir) / "tables"
+    if result.kind != "spreadsheet" and suffix not in SPREADSHEET_SUFFIXES:
+        if tables_dir.exists():
+            shutil.rmtree(tables_dir)
+        return {}
+    return write_table_artifacts(staged.staged_path, tables_dir)
+
+
+def _needs_table_artifact_refresh(staged: StagedFile, result: AttachmentParseResult) -> bool:
+    suffix = Path(staged.staged_path).suffix.lower()
+    if result.kind != "spreadsheet" and suffix not in SPREADSHEET_SUFFIXES:
+        return False
+    analysis = _read_json(Path(staged.derived_dir) / "analysis.json", {})
+    if not isinstance(analysis, dict):
+        return True
+    return not analysis.get("table_index_path") or int(analysis.get("table_chunk_count", 0) or 0) <= 0
 
 
 def _write_chunks(chunks_dir: Path, text: str) -> list[dict[str, Any]]:

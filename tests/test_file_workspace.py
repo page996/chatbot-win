@@ -81,6 +81,41 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertEqual(manifest["parse"]["analysis_path"], str(derived / "analysis.json"))
             self.assertEqual(manifest["parse"]["chunk_count"], 1)
 
+    def test_spreadsheet_parse_result_writes_structured_table_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "table.csv"
+            rows = ["name,value"]
+            rows.extend(f"item-{index},{index}" for index in range(105))
+            source.write_text("\n".join(rows), encoding="utf-8")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "spreadsheet", "summary", "name\tvalue\nitem-0\t0"),
+            )
+
+            derived = Path(staged.derived_dir)
+            analysis = json.loads((derived / "analysis.json").read_text(encoding="utf-8"))
+            manifest = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
+            first_chunk_path = Path(analysis["table_chunks"][0]["path"])
+            second_chunk_path = Path(analysis["table_chunks"][1]["path"])
+            first_chunk = json.loads(first_chunk_path.read_text(encoding="utf-8"))
+            content = (derived / "content.md").read_text(encoding="utf-8")
+
+            self.assertTrue(analysis["has_tables"])
+            self.assertEqual(analysis["table_status"], "completed")
+            self.assertEqual(analysis["table_row_count"], 105)
+            self.assertEqual(analysis["table_chunk_count"], 2)
+            self.assertTrue(first_chunk_path.exists())
+            self.assertTrue(second_chunk_path.exists())
+            self.assertEqual(first_chunk["rows"][0], {"name": "item-0", "value": "0"})
+            self.assertEqual(first_chunk["row_count"], 100)
+            self.assertEqual(manifest["parse"]["table_chunk_count"], 2)
+            self.assertEqual(Path(manifest["parse"]["table_index_path"]), derived / "tables" / "index.json")
+            self.assertIn("## Tables", content)
+            self.assertIn("table_count: 1", content)
+
     def test_long_parse_result_is_chunked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "long.txt"
