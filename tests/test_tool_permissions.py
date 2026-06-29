@@ -54,6 +54,7 @@ class ToolPermissionTest(unittest.TestCase):
         result = self.tool.run(self.request(str(outside)))
 
         self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.summary, "文件读取被文件访问权限阻止")
         self.assertIn("outside allowed roots", result.error or "")
 
     def test_disallowed_extension_is_blocked(self) -> None:

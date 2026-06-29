@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import zipfile
 from pathlib import Path
 
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
@@ -115,6 +116,45 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertEqual(Path(manifest["parse"]["table_index_path"]), derived / "tables" / "index.json")
             self.assertIn("## Tables", content)
             self.assertIn("table_count: 1", content)
+
+    def test_docx_parse_result_marks_embedded_media_as_blocked_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "media.docx"
+            _write_docx_with_media(source)
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+
+            workspace.write_parse_result(staged, AttachmentParseResult("parsed", "docx", "summary", "正文"))
+
+            derived = Path(staged.derived_dir)
+            analysis = json.loads((derived / "analysis.json").read_text(encoding="utf-8"))
+            content = (derived / "content.md").read_text(encoding="utf-8")
+            manifest = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
+
+            self.assertTrue(analysis["has_images"])
+            self.assertEqual(analysis["media"]["image_count"], 1)
+            self.assertEqual(analysis["media_extract_count"], 1)
+            self.assertTrue(Path(analysis["media_index_path"]).exists())
+            self.assertTrue(Path(analysis["media_images"][0]["path"]).exists())
+            self.assertEqual(manifest["parse"]["media_extract_count"], 1)
+            self.assertEqual(Path(manifest["parse"]["media_index_path"]), derived / "media" / "index.json")
+            self.assertIn("embedded_image_extraction_and_ocr", analysis["blocked_capabilities"])
+            self.assertIn("## Embedded Media", content)
+            self.assertIn("blocked_capabilities", content)
+
+    def test_standalone_image_is_not_marked_as_embedded_media_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "image.png"
+            source.write_bytes(b"\x89PNG\r\n\x1a\n")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+
+            workspace.write_parse_result(staged, AttachmentParseResult("parsed", "image", "summary", "OCR text"))
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(analysis["has_images"])
+            self.assertEqual(analysis["blocked_capabilities"], [])
 
     def test_long_parse_result_is_chunked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +293,18 @@ class _FakeLibreOffice:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("pdf", encoding="utf-8")
         return output
+
+
+def _write_docx_with_media(path: Path) -> None:
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body><w:p><w:r><w:t>正文</w:t></w:r></w:p></w:body>"
+        "</w:document>"
+    )
+    with zipfile.ZipFile(path, "w") as docx:
+        docx.writestr("word/document.xml", document)
+        docx.writestr("word/media/image1.png", b"fake image bytes")
 
 
 if __name__ == "__main__":

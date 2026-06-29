@@ -42,8 +42,8 @@ class BotConfig:
     send_confirm_required: bool = True
     send_max_chars: int = 800
     send_min_interval_seconds: int = 5
-    contacts_whitelist: set[str] = field(default_factory=set)
-    groups_whitelist: set[str] = field(default_factory=set)
+    accepted_contacts: set[str] = field(default_factory=set)
+    accepted_groups: set[str] = field(default_factory=set)
     group_cooldown_seconds: int = 60
     context_window_messages: int = 20
     topics: list[str] = field(default_factory=lambda: ["日常闲聊", "学习", "AI"])
@@ -82,3 +82,19 @@ class BotConfig:
             "qq.com",
         ]
     )
+
+    @property
+    def contacts_whitelist(self) -> set[str]:
+        return self.accepted_contacts
+
+    @contacts_whitelist.setter
+    def contacts_whitelist(self, value: set[str]) -> None:
+        self.accepted_contacts = set(value)
+
+    @property
+    def groups_whitelist(self) -> set[str]:
+        return self.accepted_groups
+
+    @groups_whitelist.setter
+    def groups_whitelist(self, value: set[str]) -> None:
+        self.accepted_groups = set(value)

@@ -9,6 +9,8 @@ from pathlib import Path
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.control.commands import (
+    accept_contact_channel,
+    accept_group_channel,
     change_group_name,
     init_config,
     set_deepseek_api,
@@ -67,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init")
 
     preflight = sub.add_parser("preflight")
+    preflight.add_argument("--show-accepted", action="store_true")
     preflight.add_argument("--show-whitelist", action="store_true")
 
     sub.add_parser("send-readiness")
@@ -124,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup_artifacts = sub.add_parser("cleanup-artifacts")
     cleanup_artifacts.add_argument("--apply", action="store_true")
+
+    accept_contact = sub.add_parser("accept-contact")
+    accept_contact.add_argument("wechat_id")
+
+    accept_group = sub.add_parser("accept-group")
+    accept_group.add_argument("group_name")
 
     add_contact = sub.add_parser("add-contact")
     add_contact.add_argument("wechat_id")
@@ -249,7 +258,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "preflight":
         config = load_config(args.data_dir)
-        result = build_preflight_report(config, show_whitelist=args.show_whitelist)
+        result = build_preflight_report(config, show_accepted=args.show_accepted or args.show_whitelist)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "send-readiness":
@@ -313,13 +322,21 @@ def main(argv: list[str] | None = None) -> None:
         result = build_artifact_cleanup_report(args.data_dir, apply=args.apply)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command == "accept-contact":
+        accept_contact_channel(args.data_dir, args.wechat_id)
+        print(f"accepted contact channel {args.wechat_id}")
+        return
+    if args.command == "accept-group":
+        accept_group_channel(args.data_dir, args.group_name)
+        print(f"accepted group channel {args.group_name}")
+        return
     if args.command == "add-contact":
         whitelist_contact(args.data_dir, args.wechat_id)
-        print(f"added contact {args.wechat_id}")
+        print(f"accepted contact channel {args.wechat_id} (legacy add-contact alias)")
         return
     if args.command == "add-group":
         whitelist_group(args.data_dir, args.group_name)
-        print(f"added group {args.group_name}")
+        print(f"accepted group channel {args.group_name} (legacy add-group alias)")
         return
     if args.command == "rename-group":
         change_group_name(args.data_dir, args.old_name, args.new_name)

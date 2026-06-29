@@ -24,7 +24,7 @@ class AITopicClassifier:
                 topic="private",
                 confidence=1.0,
                 style_context="自然朋友聊天",
-        )
+            )
         recent = self._recent[message.conversation_id]
         recent.append(message)
         try:

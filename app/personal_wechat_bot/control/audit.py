@@ -92,8 +92,10 @@ _DISPOSABLE_ARTIFACTS = {
 
 _RETAINED_ARTIFACTS = {
     "config.json": "runtime configuration",
-    "contacts_whitelist.json": "whitelist state",
-    "groups_whitelist.json": "whitelist state",
+    "accepted_contacts.json": "accepted private-channel compatibility state",
+    "accepted_groups.json": "accepted group-channel compatibility state",
+    "contacts_whitelist.json": "legacy accepted-contact compatibility state",
+    "groups_whitelist.json": "legacy accepted-group compatibility state",
     "topic_rules.json": "conversation policy state",
     "search_blocklist.json": "search safety policy",
     "backend_events.jsonl": "default backend event stream; may contain replay evidence",

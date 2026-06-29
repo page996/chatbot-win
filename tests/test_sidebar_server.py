@@ -51,10 +51,13 @@ class SidebarServerTest(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertIn("controlsDirty", script)
+            self.assertIn("controlsSaving", script)
             self.assertIn("markControlsDirty", script)
             self.assertIn("delayedQueueAction", script)
             self.assertIn("countdown", script)
             self.assertIn("force: true", script)
+            self.assertIn("setActiveStatus", script)
+            self.assertIn("setStatusMessage", script)
 
     def test_sidebar_queue_action_decodes_encoded_queue_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

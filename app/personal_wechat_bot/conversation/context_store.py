@@ -28,7 +28,7 @@ class ConversationContextSnapshot:
     def render_for_prompt(self, max_file_chars: int = 6000) -> str:
         lines = [
             f"当前独立上下文: conversation_id={self.conversation_id} session_id={self.session_id}",
-            "上下文来源: 后端消息、后台附件解析产物、OCR fallback 摘要和本地任务记录；模型不能直接访问微信原始文件。",
+            "上下文来源: 后端消息、后台附件解析产物、OCR 工具结果和本地任务记录；模型不能直接访问微信原始文件。",
         ]
         if self.recent_messages:
             lines.append("近期消息:")
@@ -77,9 +77,13 @@ class ConversationContextSnapshot:
             for item in self.file_refs:
                 parse = item.get("parse") if isinstance(item.get("parse"), dict) else {}
                 workspace = item.get("workspace") if isinstance(item.get("workspace"), dict) else {}
+                artifacts = item.get("artifacts") if isinstance(item.get("artifacts"), dict) else {}
                 header = (
                     f"- {item.get('name', '')} file_id={item.get('file_id', '')} "
                     f"workspace_ref={workspace.get('workspace_dir', '')} "
+                    f"content={artifacts.get('content_path', '')} "
+                    f"table_index={artifacts.get('table_index_path', '')} "
+                    f"media_index={artifacts.get('media_index_path', '')} "
                     f"status={parse.get('status', item.get('status', ''))} kind={parse.get('kind', item.get('kind', ''))}"
                 )
                 lines.append(header)
@@ -160,8 +164,6 @@ class ConversationContextStore:
 
     def record_message(self, message: NormalizedMessage) -> None:
         session_id = self.current_session_id(message.conversation_id)
-        attachments = _attachment_refs_from_metadata(message.metadata)
-        quote = _quote_ref_from_metadata(message.metadata)
         payload = {
             "type": "message",
             "message_id": message.message_id,
@@ -175,8 +177,8 @@ class ConversationContextStore:
             "text": _message_text_for_context(message.text),
             "raw_text": message.text,
             "source": message.metadata.get("source", ""),
-            "attachments": attachments,
-            "quote": quote,
+            "attachments": _attachment_refs_from_metadata(message.metadata),
+            "quote": _quote_ref_from_metadata(message.metadata),
             "created_at": utc_now_iso(),
         }
         self._append_event(message.conversation_id, session_id, payload)
@@ -294,11 +296,7 @@ def _attachment_refs_from_metadata(metadata: dict[str, Any]) -> list[dict[str, A
     attachments = metadata.get("attachments", [])
     if not isinstance(attachments, list):
         return []
-    refs: list[dict[str, Any]] = []
-    for item in attachments:
-        if isinstance(item, dict):
-            refs.append(dict(item))
-    return refs
+    return [dict(item) for item in attachments if isinstance(item, dict)]
 
 
 def _quote_ref_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -406,8 +404,7 @@ def _text_matches_quote(candidate: str, quote_text: str) -> bool:
 
 
 def _normalize_for_match(text: str) -> str:
-    lowered = text.lower()
-    return re.sub(r"\s+", " ", lowered).strip()
+    return re.sub(r"\s+", " ", text.lower()).strip()
 
 
 def _quote_window_message(item: dict[str, Any]) -> dict[str, Any]:
@@ -429,7 +426,11 @@ def _message_text_for_context(text: str) -> str:
         if stripped.startswith("[后台附件内容]"):
             skipping_content = True
             continue
-        if stripped.startswith("[后台附件]") or stripped.startswith("[后台附件解析]") or stripped.startswith("[后台附件已阻止]"):
+        if (
+            stripped.startswith("[后台附件]")
+            or stripped.startswith("[后台附件解析]")
+            or stripped.startswith("[后台附件已阻止]")
+        ):
             skipping_content = False
             lines.append(stripped)
             continue
@@ -454,7 +455,7 @@ def _analyze_mixed_context(
         steps.append("优先使用本 session 的后台附件解析内容进行分析、提取、总结或任务拆解")
         steps.append("如果解析内容不足，再在 file_workspace 的 staged copy 上安排 LibreOffice/OCR/CLI 处理")
     if urls:
-        steps.append("对网址先做 pin/read，再结合网页文字和图片 OCR 结果分析")
+        steps.append("对网址先做 web.fetch，再结合网页文字分析")
     if tasks:
         steps.append("结合近期工具结果，避免重复执行已经完成的任务")
     if not steps:
@@ -477,7 +478,7 @@ def _guess_intent(text: str, *, has_files: bool, has_urls: bool) -> str:
         if has_urls:
             return "web_reading_or_analysis_task"
         return "analysis_or_task_request"
-    if any(word in text for word in ["清空当前对话上下文"]):
+    if any(word in text for word in CLEAR_CONTEXT_PHRASES):
         return "reset_context"
     if "#" in text:
         return "topic_or_command"

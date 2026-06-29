@@ -46,7 +46,7 @@ class FakeDocumentTranslateTool:
                     call_id=request.call_id,
                     tool_name=self.manifest.name,
                     status="blocked",
-                    summary="文件读取被白名单规则阻止",
+                    summary="文件读取被文件访问权限阻止",
                     error=f"{type(exc).__name__}: {exc}",
                 )
             original = safe_input.stem

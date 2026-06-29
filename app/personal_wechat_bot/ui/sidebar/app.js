@@ -3,8 +3,10 @@ const state = {
   activeStatus: "pending",
   refreshing: false,
   controlsDirty: false,
+  controlsSaving: false,
   actionInProgress: false,
   manualProbe: null,
+  statusMessage: "",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -22,7 +24,7 @@ async function api(path, options = {}) {
 }
 
 async function refresh({ forceControls = false, force = false } = {}) {
-  if (state.refreshing || (state.actionInProgress && !force)) return;
+  if (state.refreshing || ((state.actionInProgress || state.controlsSaving) && !force)) return;
   state.refreshing = true;
   try {
     state.data = await api("/api/state");
@@ -37,12 +39,13 @@ async function refresh({ forceControls = false, force = false } = {}) {
 function render({ forceControls = false } = {}) {
   const data = state.data;
   if (!data) return;
-  if (forceControls || !state.controlsDirty) {
+  if (forceControls || (!state.controlsDirty && !state.controlsSaving)) {
     syncControls(data.config);
   }
 
   const readiness = data.readiness;
   $("#readinessLine").textContent =
+    state.statusMessage ||
     `${readiness.status} | blockers ${readiness.summary.blockers} | warnings ${readiness.summary.warnings}`;
 
   $("#pendingCount").textContent = data.queues.pending.count;
@@ -59,7 +62,7 @@ function syncControls(config) {
   $("#sendEnabled").checked = config.send_enabled;
   $("#driverSelect").value = config.send_driver;
   state.controlsDirty = false;
-  setDirtyIndicator(false);
+  setDirtyIndicator("clean");
 }
 
 function renderQueue() {
@@ -125,18 +128,26 @@ function renderProbe() {
 }
 
 async function saveControls() {
-  await api("/api/controls", {
-    method: "POST",
-    body: JSON.stringify({
-      mode: $("#modeSelect").value,
-      send_enabled: $("#sendEnabled").checked,
-      send_driver: $("#driverSelect").value,
-    }),
-  });
-  state.controlsDirty = false;
-  state.manualProbe = null;
-  setDirtyIndicator(false);
-  await refresh({ forceControls: true, force: true });
+  if (state.controlsSaving) return;
+  state.controlsSaving = true;
+  setDirtyIndicator("saving");
+  try {
+    await api("/api/controls", {
+      method: "POST",
+      body: JSON.stringify({
+        mode: $("#modeSelect").value,
+        send_enabled: $("#sendEnabled").checked,
+        send_driver: $("#driverSelect").value,
+      }),
+    });
+    state.controlsDirty = false;
+    state.manualProbe = null;
+    setStatusMessage("controls saved");
+    await refresh({ forceControls: true, force: true });
+  } finally {
+    state.controlsSaving = false;
+    setDirtyIndicator(state.controlsDirty ? "dirty" : "clean");
+  }
 }
 
 async function queueAction(queueId, action) {
@@ -144,7 +155,11 @@ async function queueAction(queueId, action) {
     method: "POST",
     body: JSON.stringify({ reviewer: "sidebar" }),
   });
-  $("#readinessLine").textContent = `${action} ok`;
+  const nextStatus = payload.item?.status || payload.status;
+  if (nextStatus && state.data?.queues?.[nextStatus]) {
+    setActiveStatus(nextStatus);
+  }
+  setStatusMessage(`${action} ok`);
   state.manualProbe = null;
   await refresh({ force: true });
   return payload;
@@ -164,13 +179,24 @@ async function probeWindowsGuarded() {
 
 function markControlsDirty() {
   state.controlsDirty = true;
-  setDirtyIndicator(true);
+  setDirtyIndicator("dirty");
 }
 
-function setDirtyIndicator(dirty) {
+function setDirtyIndicator(status) {
   const button = $("#saveControls");
-  button.textContent = dirty ? "Save controls *" : "Save controls";
-  button.classList.toggle("dirty", dirty);
+  button.disabled = status === "saving";
+  button.textContent = status === "saving" ? "Saving..." : (status === "dirty" ? "Save controls *" : "Save controls");
+  button.classList.toggle("dirty", status === "dirty");
+}
+
+function setStatusMessage(message) {
+  state.statusMessage = message;
+  $("#readinessLine").textContent = message;
+  setTimeout(() => {
+    if (state.statusMessage === message) {
+      state.statusMessage = "";
+    }
+  }, 2500);
 }
 
 function countdown(prefix, seconds) {
@@ -227,11 +253,16 @@ function escapeHtml(value) {
 document.addEventListener("click", (event) => {
   const tab = event.target.closest(".tab");
   if (!tab) return;
-  state.activeStatus = tab.dataset.status;
-  document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-  tab.classList.add("active");
+  setActiveStatus(tab.dataset.status);
   renderQueue();
 });
+
+function setActiveStatus(status) {
+  state.activeStatus = status;
+  document.querySelectorAll(".tab").forEach((item) => {
+    item.classList.toggle("active", item.dataset.status === status);
+  });
+}
 
 ["modeSelect", "sendEnabled", "driverSelect"].forEach((id) => {
   $(`#${id}`).addEventListener("change", markControlsDirty);
@@ -247,7 +278,7 @@ $("#probeButton").addEventListener("click", () => probeWindowsGuarded().catch((e
 
 refresh({ forceControls: true });
 setInterval(() => {
-  if (!state.actionInProgress) {
+  if (!state.actionInProgress && !state.controlsSaving) {
     refresh();
   }
 }, 2000);

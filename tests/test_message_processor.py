@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from app.personal_wechat_bot.bootstrap import build_runtime
-from app.personal_wechat_bot.config.loader import add_contact, create_default_config, load_config
+from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config
 from app.personal_wechat_bot.domain.models import RawWeChatMessage
 from app.personal_wechat_bot.processor.message_processor import MessageProcessor
 
@@ -36,11 +36,11 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertTrue(entries[0].is_self)
 
-    def test_processor_runs_private_whitelist_closed_loop(self) -> None:
+    def test_processor_runs_private_accepted_channel_closed_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            add_contact(data_dir, "wxid_alice")
+            accept_contact(data_dir, "wxid_alice")
             runtime = build_runtime(load_config(data_dir))
             processor = MessageProcessor(runtime)
 

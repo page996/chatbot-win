@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from app.personal_wechat_bot.config.loader import (
+    accept_contact,
+    accept_group,
     add_contact,
     add_group,
     create_default_config,
@@ -12,6 +14,14 @@ from app.personal_wechat_bot.config.loader import (
 
 def init_config(data_dir: str) -> None:
     create_default_config(data_dir)
+
+
+def accept_contact_channel(data_dir: str, wechat_id: str) -> None:
+    accept_contact(data_dir, wechat_id)
+
+
+def accept_group_channel(data_dir: str, group_name: str) -> None:
+    accept_group(data_dir, group_name)
 
 
 def whitelist_contact(data_dir: str, wechat_id: str) -> None:

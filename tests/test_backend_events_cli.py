@@ -18,7 +18,7 @@ class BackendEventsCliTest(unittest.TestCase):
             inbox = data_dir / "inbox"
             event_file = data_dir / "backend_events.jsonl"
             self._run("--data-dir", str(data_dir), "init")
-            self._run("--data-dir", str(data_dir), "add-contact", "PAGE")
+            self._run("--data-dir", str(data_dir), "accept-contact", "PAGE")
             (inbox / "note.txt").write_text("hello backend", encoding="utf-8")
 
             append_output = self._run(
@@ -40,19 +40,20 @@ class BackendEventsCliTest(unittest.TestCase):
             self.assertEqual(append_payload["status"], "ok")
             self.assertFalse(append_payload["send_enabled"])
 
-            poll_output = self._run(
-                "--data-dir",
-                str(data_dir),
-                "poll-backend-events",
-                "--event-file",
-                str(event_file),
-                "--loops",
-                "1",
-                "--interval",
-                "0",
-                "--verbose",
+            poll_payload = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "poll-backend-events",
+                    "--event-file",
+                    str(event_file),
+                    "--loops",
+                    "1",
+                    "--interval",
+                    "0",
+                    "--verbose",
+                )
             )
-            poll_payload = json.loads(poll_output)
 
             self.assertEqual(poll_payload["status"], "stopped")
             self.assertEqual(poll_payload["processed_count"], 1)
@@ -65,21 +66,22 @@ class BackendEventsCliTest(unittest.TestCase):
             inbox = data_dir / "inbox"
             event_file = data_dir / "backend_events.jsonl"
             self._run("--data-dir", str(data_dir), "init")
-            self._run("--data-dir", str(data_dir), "add-contact", "PAGE")
+            self._run("--data-dir", str(data_dir), "accept-contact", "PAGE")
             (inbox / "scan-note.txt").write_text("scan backend", encoding="utf-8")
 
-            scan_output = self._run(
-                "--data-dir",
-                str(data_dir),
-                "scan-backend-files",
-                "--event-file",
-                str(event_file),
-                "--chat-title",
-                "PAGE",
-                "--sender-name",
-                "PAGE",
+            scan_payload = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "scan-backend-files",
+                    "--event-file",
+                    str(event_file),
+                    "--chat-title",
+                    "PAGE",
+                    "--sender-name",
+                    "PAGE",
+                )
             )
-            scan_payload = json.loads(scan_output)
 
             self.assertEqual(scan_payload["created_count"], 1)
             self.assertFalse(scan_payload["send_enabled"])

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from app.personal_wechat_bot.config.loader import (
-    add_contact,
+    accept_contact,
     create_default_config,
     load_config,
     set_deepseek_provider,
@@ -15,7 +16,7 @@ from app.personal_wechat_bot.control.preflight import build_preflight_report
 
 
 class PreflightTest(unittest.TestCase):
-    def test_preflight_reports_safe_send_policy(self) -> None:
+    def test_preflight_reports_safe_send_policy_and_channel_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -27,7 +28,8 @@ class PreflightTest(unittest.TestCase):
             self.assertFalse(report["send_policy"]["send_enabled"])
             self.assertFalse(report["send_policy"]["real_send_implemented"])
             self.assertTrue(report["wechat_access"]["read_only"])
-            self.assertEqual(report["whitelist"]["mode"], "legacy_not_used_for_routing")
+            self.assertEqual(report["accepted_conversations"]["mode"], "channel_auto_accept")
+            self.assertEqual(report["legacy_whitelist"]["mode"], "compatibility_alias_not_used_for_routing")
             self.assertEqual(
                 report["conversation_channels"]["policy"],
                 "auto_accept_wechat_contacts_and_groups",
@@ -50,20 +52,35 @@ class PreflightTest(unittest.TestCase):
             self.assertEqual(report["status"], "warn")
             self.assertIn("MISSING_DEEPSEEK_PREFLIGHT_TEST", " ".join(report["warnings"]))
 
-    def test_preflight_can_show_whitelist_without_secret_values(self) -> None:
+    def test_preflight_can_show_accepted_channels_without_secret_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            add_contact(data_dir, "wxid_xiaoming")
+            accept_contact(data_dir, "wxid_xiaoming")
             config = load_config(data_dir)
 
-            hidden = build_preflight_report(config, show_whitelist=False)
-            shown = build_preflight_report(config, show_whitelist=True)
+            hidden = build_preflight_report(config, show_accepted=False)
+            shown = build_preflight_report(config, show_accepted=True)
+            legacy_shown = build_preflight_report(config, show_whitelist=True)
 
-            self.assertIsNone(hidden["whitelist"]["contacts"])
-            self.assertEqual(shown["whitelist"]["contacts"], ["wxid_xiaoming"])
+            self.assertIsNone(hidden["accepted_conversations"]["contacts"])
+            self.assertEqual(shown["accepted_conversations"]["contacts"], ["wxid_xiaoming"])
+            self.assertEqual(legacy_shown["accepted_conversations"]["contacts"], ["wxid_xiaoming"])
+            self.assertEqual(shown["legacy_whitelist"]["contacts"], ["wxid_xiaoming"])
             self.assertIn("api_key_env", shown["model"])
             self.assertIn("api_key_present", shown["model"])
+
+    def test_legacy_whitelist_files_are_migrated_to_accepted_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            (data_dir / "accepted_contacts.json").unlink()
+            (data_dir / "contacts_whitelist.json").write_text(json.dumps(["wxid_legacy"]), encoding="utf-8")
+
+            config = load_config(data_dir)
+
+            self.assertEqual(config.accepted_contacts, {"wxid_legacy"})
+            self.assertEqual(config.contacts_whitelist, {"wxid_legacy"})
 
     def test_preflight_detects_present_api_key_without_exposing_value(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,7 +106,6 @@ class PreflightTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config_path = data_dir / "config.json"
-            import json
 
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             raw["providers"]["chat"]["api_key_env_pool"] = ["POOL_KEY_A", "POOL_KEY_B"]

@@ -29,6 +29,8 @@ def create_default_config(data_dir: str | Path = "data") -> BotConfig:
     root.mkdir(parents=True, exist_ok=True)
     config = BotConfig(data_dir=str(root))
     _write_json(root / "config.json", _config_to_json(config))
+    _write_json(root / "accepted_contacts.json", [])
+    _write_json(root / "accepted_groups.json", [])
     _write_json(root / "contacts_whitelist.json", [])
     _write_json(root / "groups_whitelist.json", [])
     _write_json(root / "topic_rules.json", {"topics": config.topics, "avoid_topics": []})
@@ -44,8 +46,8 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
     if raw is None:
         raise ConfigError(f"missing config: {root / 'config.json'}; run init first")
 
-    contacts = set(_read_json(root / "contacts_whitelist.json", []))
-    groups = set(_read_json(root / "groups_whitelist.json", []))
+    contacts = _read_accept_list(root, "accepted_contacts.json", "contacts_whitelist.json")
+    groups = _read_accept_list(root, "accepted_groups.json", "groups_whitelist.json")
     topic_raw = _read_json(root / "topic_rules.json", {})
     blocklist = _read_json(root / "search_blocklist.json", raw.get("search_blocklist", []))
 
@@ -62,8 +64,8 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         send_confirm_required=bool(raw.get("send_confirm_required", True)),
         send_max_chars=int(raw.get("send_max_chars", 800)),
         send_min_interval_seconds=int(raw.get("send_min_interval_seconds", 5)),
-        contacts_whitelist=contacts,
-        groups_whitelist=groups,
+        accepted_contacts=contacts,
+        accepted_groups=groups,
         group_cooldown_seconds=int(raw.get("group_cooldown_seconds", 60)),
         context_window_messages=int(raw.get("context_window_messages", 20)),
         topics=list(topic_raw.get("topics", raw.get("topics", ["日常闲聊", "学习", "AI"]))),
@@ -88,29 +90,39 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
 def save_config(config: BotConfig) -> None:
     root = Path(config.data_dir)
     _write_json(root / "config.json", _config_to_json(config))
-    _write_json(root / "contacts_whitelist.json", sorted(config.contacts_whitelist))
-    _write_json(root / "groups_whitelist.json", sorted(config.groups_whitelist))
+    _write_json(root / "accepted_contacts.json", sorted(config.accepted_contacts))
+    _write_json(root / "accepted_groups.json", sorted(config.accepted_groups))
+    _write_json(root / "contacts_whitelist.json", sorted(config.accepted_contacts))
+    _write_json(root / "groups_whitelist.json", sorted(config.accepted_groups))
     _write_json(root / "topic_rules.json", {"topics": config.topics, "avoid_topics": config.avoid_topics})
     _write_json(root / "search_blocklist.json", config.search_blocklist)
 
 
-def add_contact(data_dir: str | Path, wechat_id: str) -> None:
+def accept_contact(data_dir: str | Path, wechat_id: str) -> None:
     config = load_config(data_dir)
-    config.contacts_whitelist.add(wechat_id)
+    config.accepted_contacts.add(wechat_id)
     save_config(config)
+
+
+def accept_group(data_dir: str | Path, group_name: str) -> None:
+    config = load_config(data_dir)
+    config.accepted_groups.add(group_name)
+    save_config(config)
+
+
+def add_contact(data_dir: str | Path, wechat_id: str) -> None:
+    accept_contact(data_dir, wechat_id)
 
 
 def add_group(data_dir: str | Path, group_name: str) -> None:
-    config = load_config(data_dir)
-    config.groups_whitelist.add(group_name)
-    save_config(config)
+    accept_group(data_dir, group_name)
 
 
 def rename_group(data_dir: str | Path, old_name: str, new_name: str) -> None:
     config = load_config(data_dir)
-    if old_name in config.groups_whitelist:
-        config.groups_whitelist.remove(old_name)
-    config.groups_whitelist.add(new_name)
+    if old_name in config.accepted_groups:
+        config.accepted_groups.remove(old_name)
+    config.accepted_groups.add(new_name)
     save_config(config)
 
 
@@ -234,6 +246,18 @@ def _provider_from_llm(llm: LLMConfig) -> ProviderConfig:
 
 def _config_to_json(config: BotConfig) -> dict[str, Any]:
     payload = asdict(config)
-    payload["contacts_whitelist"] = sorted(config.contacts_whitelist)
-    payload["groups_whitelist"] = sorted(config.groups_whitelist)
+    payload["accepted_contacts"] = sorted(config.accepted_contacts)
+    payload["accepted_groups"] = sorted(config.accepted_groups)
+    payload["contacts_whitelist"] = sorted(config.accepted_contacts)
+    payload["groups_whitelist"] = sorted(config.accepted_groups)
     return payload
+
+
+def _read_accept_list(root: Path, preferred_name: str, legacy_name: str) -> set[str]:
+    preferred = _read_json(root / preferred_name, None)
+    if isinstance(preferred, list):
+        return {str(item) for item in preferred if str(item).strip()}
+    legacy = _read_json(root / legacy_name, [])
+    if isinstance(legacy, list):
+        return {str(item) for item in legacy if str(item).strip()}
+    return set()

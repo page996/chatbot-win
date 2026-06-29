@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -152,6 +153,7 @@ class FileWorkspace:
         analysis_path = derived_dir / "analysis.json"
         chunks = _write_chunks(derived_dir / "chunks", result.text)
         table_artifacts = _write_table_artifacts(staged, result)
+        media_artifacts = _write_media_artifacts(staged)
         payload = {
             "file_id": staged.file_id,
             "conversation_id": staged.conversation_id,
@@ -163,16 +165,25 @@ class FileWorkspace:
             "analysis_path": str(analysis_path),
             "chunks": chunks,
             "table_artifacts": table_artifacts,
+            "media_artifacts": media_artifacts,
             "result": asdict(result),
             "updated_at": utc_now_iso(),
         }
         _write_json(derived_dir / "parse_result.json", payload)
-        analysis = _analysis_payload(staged, result, chunks, table_artifacts)
+        analysis = _analysis_payload(staged, result, chunks, table_artifacts, media_artifacts)
         _write_json(analysis_path, analysis)
         content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
         if result.text:
             preview_path.write_text(result.text, encoding="utf-8")
-        self._update_manifest_parse_artifacts(staged, result, content_path, analysis_path, chunks, table_artifacts)
+        self._update_manifest_parse_artifacts(
+            staged,
+            result,
+            content_path,
+            analysis_path,
+            chunks,
+            table_artifacts,
+            media_artifacts,
+        )
 
     def staged_from_manifest(self, manifest_path: str | Path) -> StagedFile:
         safe_manifest_path = _ensure_within(Path(manifest_path).resolve(), self.root)
@@ -267,12 +278,14 @@ class FileWorkspace:
         analysis_path: Path,
         chunks: list[dict[str, Any]],
         table_artifacts: dict[str, Any] | None = None,
+        media_artifacts: dict[str, Any] | None = None,
     ) -> None:
         manifest_path = Path(staged.manifest_path)
         manifest = _read_json(manifest_path, {})
         if not isinstance(manifest, dict):
             return
         table_artifacts = table_artifacts if isinstance(table_artifacts, dict) else {}
+        media_artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
         manifest["parse"] = {
             "status": result.status,
             "kind": result.kind,
@@ -289,6 +302,19 @@ class FileWorkspace:
             "table_chunks": [
                 dict(item)
                 for item in table_artifacts.get("chunks", [])
+                if isinstance(item, dict)
+            ],
+            "media_dir": str(media_artifacts.get("media_dir", "")),
+            "media_index_path": str(media_artifacts.get("index_path", "")),
+            "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
+            "media_images": [
+                dict(item)
+                for item in media_artifacts.get("images", [])
+                if isinstance(item, dict)
+            ],
+            "media_audio": [
+                dict(item)
+                for item in media_artifacts.get("audio", [])
                 if isinstance(item, dict)
             ],
             "updated_at": utc_now_iso(),
@@ -311,10 +337,13 @@ def _analysis_payload(
     result: AttachmentParseResult,
     chunks: list[dict[str, Any]],
     table_artifacts: dict[str, Any] | None = None,
+    media_artifacts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     text = result.text or ""
     suffix = Path(staged.staged_path).suffix.lower()
     table_artifacts = table_artifacts if isinstance(table_artifacts, dict) else {}
+    media_artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
+    media = _document_media_analysis(Path(staged.staged_path), suffix, media_artifacts)
     table_chunks = [
         dict(item)
         for item in table_artifacts.get("chunks", [])
@@ -331,9 +360,26 @@ def _analysis_payload(
         "estimated_tokens": _estimate_tokens(text),
         "char_count": len(text),
         "line_count": len(text.splitlines()) if text else 0,
-        "has_images": False,
+        "has_images": media["has_images"],
         "has_tables": result.kind == "spreadsheet" or bool(table_chunks),
-        "has_audio": False,
+        "has_audio": media["has_audio"],
+        "media": media,
+        "blocked_capabilities": _blocked_capabilities(media),
+        "media_status": str(media_artifacts.get("status", "")),
+        "media_dir": str(media_artifacts.get("media_dir", "")),
+        "media_index_path": str(media_artifacts.get("index_path", "")),
+        "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
+        "media_images": [
+            dict(item)
+            for item in media_artifacts.get("images", [])
+            if isinstance(item, dict)
+        ],
+        "media_audio": [
+            dict(item)
+            for item in media_artifacts.get("audio", [])
+            if isinstance(item, dict)
+        ],
+        "media_error": str(media_artifacts.get("error", "")),
         "external_links": _extract_links(text),
         "chunked": len(chunks) > 1,
         "chunk_count": len(chunks),
@@ -371,6 +417,7 @@ def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysi
         result.summary or "",
         "",
         *_table_content_lines(analysis),
+        *_media_content_lines(analysis),
         "## Text",
         "",
         result.text or "",
@@ -406,6 +453,46 @@ def _table_content_lines(analysis: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
+    media = analysis.get("media") if isinstance(analysis.get("media"), dict) else {}
+    blocked = analysis.get("blocked_capabilities", [])
+    has_media = bool(media.get("has_images") or media.get("has_audio"))
+    extracted_count = int(analysis.get("media_extract_count", 0) or 0)
+    error = str(analysis.get("media_error", "")).strip()
+    if not (has_media or extracted_count or error or blocked):
+        return []
+    lines = [
+        "## Embedded Media",
+        "",
+        f"- has_images: {bool(media.get('has_images', False))}",
+        f"- image_count: {int(media.get('image_count', 0) or 0)}",
+        f"- has_audio: {bool(media.get('has_audio', False))}",
+        f"- audio_count: {int(media.get('audio_count', 0) or 0)}",
+        f"- extract_status: {analysis.get('media_status', '')}",
+        f"- extract_count: {analysis.get('media_extract_count', 0)}",
+        f"- index: {analysis.get('media_index_path', '')}",
+    ]
+    if error:
+        lines.append(f"- error: {error}")
+    if blocked:
+        lines.append(f"- blocked_capabilities: {', '.join(str(item) for item in blocked)}")
+    samples = media.get("samples", [])
+    if isinstance(samples, list) and samples:
+        lines.append(f"- samples: {', '.join(str(item) for item in samples[:5])}")
+    media_images = analysis.get("media_images", [])
+    if isinstance(media_images, list) and media_images:
+        first = media_images[0]
+        if isinstance(first, dict):
+            lines.append(f"- first_image: {first.get('path', '')}")
+    media_audio = analysis.get("media_audio", [])
+    if isinstance(media_audio, list) and media_audio:
+        first = media_audio[0]
+        if isinstance(first, dict):
+            lines.append(f"- first_audio: {first.get('path', '')}")
+    lines.append("")
+    return lines
+
+
 def _write_table_artifacts(staged: StagedFile, result: AttachmentParseResult) -> dict[str, Any]:
     suffix = Path(staged.staged_path).suffix.lower()
     tables_dir = Path(staged.derived_dir) / "tables"
@@ -416,6 +503,77 @@ def _write_table_artifacts(staged: StagedFile, result: AttachmentParseResult) ->
     return write_table_artifacts(staged.staged_path, tables_dir)
 
 
+def _write_media_artifacts(staged: StagedFile) -> dict[str, Any]:
+    suffix = Path(staged.staged_path).suffix.lower()
+    media_dir = Path(staged.derived_dir) / "media"
+    if suffix != ".docx":
+        if media_dir.exists():
+            shutil.rmtree(media_dir)
+        return {}
+    return _extract_docx_media(Path(staged.staged_path), media_dir)
+
+
+def _extract_docx_media(path: Path, media_dir: Path) -> dict[str, Any]:
+    image_suffixes = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".emf", ".wmf"}
+    audio_suffixes = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma"}
+    media_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = media_dir / "images"
+    audio_dir = media_dir / "audio"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    images: list[dict[str, Any]] = []
+    audio: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(path) as docx:
+            for name in docx.namelist():
+                lowered = name.lower()
+                if not lowered.startswith("word/media/"):
+                    continue
+                suffix = Path(lowered).suffix
+                if suffix in image_suffixes:
+                    output = images_dir / _safe_filename(Path(name).name, suffix)
+                    output.write_bytes(docx.read(name))
+                    images.append(_media_item(name, output, suffix))
+                elif suffix in audio_suffixes:
+                    output = audio_dir / _safe_filename(Path(name).name, suffix)
+                    output.write_bytes(docx.read(name))
+                    audio.append(_media_item(name, output, suffix))
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        payload = {
+            "status": "failed",
+            "media_dir": str(media_dir),
+            "index_path": str(media_dir / "index.json"),
+            "extract_count": 0,
+            "images": [],
+            "audio": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        _write_json(media_dir / "index.json", payload)
+        return payload
+
+    payload = {
+        "status": "completed",
+        "media_dir": str(media_dir),
+        "index_path": str(media_dir / "index.json"),
+        "extract_count": len(images) + len(audio),
+        "images": images,
+        "audio": audio,
+        "error": "",
+    }
+    _write_json(media_dir / "index.json", payload)
+    return payload
+
+
+def _media_item(source_name: str, output: Path, suffix: str) -> dict[str, Any]:
+    return {
+        "source_name": source_name,
+        "name": output.name,
+        "path": str(output),
+        "suffix": suffix,
+        "bytes": output.stat().st_size if output.exists() else 0,
+    }
+
+
 def _needs_table_artifact_refresh(staged: StagedFile, result: AttachmentParseResult) -> bool:
     suffix = Path(staged.staged_path).suffix.lower()
     if result.kind != "spreadsheet" and suffix not in SPREADSHEET_SUFFIXES:
@@ -424,6 +582,99 @@ def _needs_table_artifact_refresh(staged: StagedFile, result: AttachmentParseRes
     if not isinstance(analysis, dict):
         return True
     return not analysis.get("table_index_path") or int(analysis.get("table_chunk_count", 0) or 0) <= 0
+
+
+def _document_media_analysis(path: Path, suffix: str, media_artifacts: dict[str, Any] | None = None) -> dict[str, Any]:
+    if suffix == ".docx":
+        return _docx_media_analysis(path, media_artifacts)
+    if suffix == ".pdf":
+        return _pdf_media_analysis(path)
+    return {
+        "has_images": suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"},
+        "has_audio": False,
+        "image_count": 1 if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"} else 0,
+        "audio_count": 0,
+        "samples": [],
+        "embedded": False,
+        "detection": "suffix",
+    }
+
+
+def _docx_media_analysis(path: Path, media_artifacts: dict[str, Any] | None = None) -> dict[str, Any]:
+    image_suffixes = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".emf", ".wmf"}
+    audio_suffixes = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma"}
+    images: list[str] = []
+    audio: list[str] = []
+    extracted_images = [
+        str(item.get("path", ""))
+        for item in (media_artifacts or {}).get("images", [])
+        if isinstance(item, dict) and item.get("path")
+    ]
+    extracted_audio = [
+        str(item.get("path", ""))
+        for item in (media_artifacts or {}).get("audio", [])
+        if isinstance(item, dict) and item.get("path")
+    ]
+    try:
+        with zipfile.ZipFile(path) as docx:
+            for name in docx.namelist():
+                lowered = name.lower()
+                if not lowered.startswith("word/media/"):
+                    continue
+                suffix = Path(lowered).suffix
+                if suffix in image_suffixes:
+                    images.append(name)
+                elif suffix in audio_suffixes:
+                    audio.append(name)
+    except (OSError, zipfile.BadZipFile):
+        return {
+            "has_images": False,
+            "has_audio": False,
+            "image_count": 0,
+            "audio_count": 0,
+            "samples": [],
+            "embedded": True,
+            "detection": "docx_zip_failed",
+        }
+    return {
+        "has_images": bool(images),
+        "has_audio": bool(audio),
+        "image_count": len(images),
+        "audio_count": len(audio),
+        "samples": [*images[:5], *audio[:5]][:5],
+        "extracted_image_count": len(extracted_images),
+        "extracted_audio_count": len(extracted_audio),
+        "extracted_samples": [*extracted_images[:5], *extracted_audio[:5]][:5],
+        "embedded": True,
+        "detection": "docx_zip_media",
+    }
+
+
+def _pdf_media_analysis(path: Path) -> dict[str, Any]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        data = b""
+    image_hits = sum(data.count(token) for token in [b"/Subtype /Image", b"/Image"])
+    audio_hits = sum(data.lower().count(token) for token in [b"/sound", b"/movie", b"/richmedia"])
+    return {
+        "has_images": image_hits > 0,
+        "has_audio": audio_hits > 0,
+        "image_count": int(image_hits),
+        "audio_count": int(audio_hits),
+        "samples": [],
+        "embedded": True,
+        "detection": "pdf_resource_heuristic",
+    }
+
+
+def _blocked_capabilities(media: dict[str, Any]) -> list[str]:
+    blocked: list[str] = []
+    if media.get("embedded") and media.get("has_images"):
+        blocked.append("embedded_image_extraction_and_ocr")
+    if media.get("embedded") and media.get("has_audio"):
+        blocked.append("embedded_audio_extraction_and_asr")
+    return blocked
 
 
 def _write_chunks(chunks_dir: Path, text: str) -> list[dict[str, Any]]:

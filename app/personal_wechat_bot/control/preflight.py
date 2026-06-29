@@ -17,7 +17,14 @@ from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
 )
 
 
-def build_preflight_report(config: BotConfig, show_whitelist: bool = False) -> dict[str, Any]:
+def build_preflight_report(
+    config: BotConfig,
+    show_accepted: bool = False,
+    *,
+    show_whitelist: bool | None = None,
+) -> dict[str, Any]:
+    if show_whitelist is not None:
+        show_accepted = show_accepted or show_whitelist
     chat_provider = config.providers.get("chat", config.llm)
     key_pool = ApiKeyPool(chat_provider, config.data_dir)
     key_refs = key_pool.refs()
@@ -76,12 +83,20 @@ def build_preflight_report(config: BotConfig, show_whitelist: bool = False) -> d
             "key_pool_available_count": key_pool.available_count(),
             "max_concurrency": chat_provider.max_concurrency,
         },
-        "whitelist": {
-            "mode": "legacy_not_used_for_routing",
-            "contacts_count": len(config.contacts_whitelist),
-            "groups_count": len(config.groups_whitelist),
-            "contacts": sorted(config.contacts_whitelist) if show_whitelist else None,
-            "groups": sorted(config.groups_whitelist) if show_whitelist else None,
+        "accepted_conversations": {
+            "mode": "channel_auto_accept",
+            "contacts_count": len(config.accepted_contacts),
+            "groups_count": len(config.accepted_groups),
+            "contacts": sorted(config.accepted_contacts) if show_accepted else None,
+            "groups": sorted(config.accepted_groups) if show_accepted else None,
+            "legacy_files_synced": ["contacts_whitelist.json", "groups_whitelist.json"],
+        },
+        "legacy_whitelist": {
+            "mode": "compatibility_alias_not_used_for_routing",
+            "contacts_count": len(config.accepted_contacts),
+            "groups_count": len(config.accepted_groups),
+            "contacts": sorted(config.accepted_contacts) if show_accepted else None,
+            "groups": sorted(config.accepted_groups) if show_accepted else None,
         },
         "conversation_channels": {
             "policy": CHANNEL_POLICY,
@@ -145,8 +160,8 @@ def _warnings(config: BotConfig, api_key_present: bool) -> list[str]:
         warnings.append("send_enabled is true but send_driver is not implemented")
     if config.send_enabled and config.mode != "confirm" and config.send_confirm_required:
         warnings.append("send is enabled but mode is not confirm while send_confirm_required is true")
-    if not config.contacts_whitelist and not config.groups_whitelist:
-        warnings.append("no contacts or groups are whitelisted")
+    if not config.accepted_contacts and not config.accepted_groups:
+        warnings.append("no accepted contacts or groups recorded yet; new WeChat conversations will auto-register channels")
     chat_provider = config.providers.get("chat", config.llm)
     if chat_provider.base_url and not api_key_present:
         warnings.append(f"chat provider base_url is configured but {chat_provider.api_key_env} is missing")

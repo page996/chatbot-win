@@ -4,16 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.memory.file_index import FileIndex
+from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.backend_events import (
     BackendEventJsonlDriver,
     append_backend_event,
 )
-from app.personal_wechat_bot.bootstrap import build_runtime
-from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 
 
 class BackendEventJsonlDriverTest(unittest.TestCase):
@@ -157,15 +157,11 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
 
         self.assertEqual(result["processed"][0]["route"]["action"], "process")
         self.assertIn("channel auto registered", result["processed"][0]["route"]["reason"])
-        staged_files = [
-            item
-            for item in (self.data_dir / "file_workspace").rglob("*")
-            if item.is_file()
-        ]
+        staged_files = [item for item in (self.data_dir / "file_workspace").rglob("*") if item.is_file()]
         self.assertTrue(staged_files)
         self.assertTrue((self.data_dir / "conversation_channels" / "index.json").exists())
 
-    def test_polling_runner_stages_attachment_after_whitelist_route(self) -> None:
+    def test_polling_runner_stages_attachment_after_channel_route(self) -> None:
         note = self.inbox / "note.txt"
         note.write_text("hello", encoding="utf-8")
         append_backend_event(
@@ -191,7 +187,7 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertTrue((self.data_dir / "file_workspace").exists())
 
     def test_clear_context_with_attachment_stages_into_new_session(self) -> None:
-        self.config.contacts_whitelist.add("PAGE")
+        self.config.accepted_contacts.add("PAGE")
         note = self.inbox / "note.txt"
         note.write_text("hello", encoding="utf-8")
         append_backend_event(

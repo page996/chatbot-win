@@ -114,6 +114,8 @@ def _artifact_refs(staged) -> dict[str, Any]:
     analysis = _read_json(derived_dir / "analysis.json", {})
     chunks = analysis.get("chunks", []) if isinstance(analysis, dict) else []
     table_chunks = analysis.get("table_chunks", []) if isinstance(analysis, dict) else []
+    media_images = analysis.get("media_images", []) if isinstance(analysis, dict) else []
+    media_audio = analysis.get("media_audio", []) if isinstance(analysis, dict) else []
     return {
         "content_path": str(derived_dir / "content.md"),
         "analysis_path": str(derived_dir / "analysis.json"),
@@ -130,6 +132,23 @@ def _artifact_refs(staged) -> dict[str, Any]:
             if isinstance(item, dict)
         ]
         if isinstance(table_chunks, list)
+        else [],
+        "media_dir": str(analysis.get("media_dir", "")) if isinstance(analysis, dict) else "",
+        "media_index_path": str(analysis.get("media_index_path", "")) if isinstance(analysis, dict) else "",
+        "media_extract_count": int(analysis.get("media_extract_count", 0) or 0) if isinstance(analysis, dict) else 0,
+        "media_images": [
+            dict(item)
+            for item in media_images
+            if isinstance(item, dict)
+        ]
+        if isinstance(media_images, list)
+        else [],
+        "media_audio": [
+            dict(item)
+            for item in media_audio
+            if isinstance(item, dict)
+        ]
+        if isinstance(media_audio, list)
         else [],
     }
 

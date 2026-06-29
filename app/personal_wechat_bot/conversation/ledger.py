@@ -380,6 +380,12 @@ def _attach_parse_artifact_refs(attachment: dict[str, Any]) -> None:
         "content_path": str(content_path),
         "analysis_path": str(analysis_path),
         "parse_result_path": str(Path(derived_dir) / "parse_result.json"),
+        "chunks_dir": artifacts.get("chunks_dir", str(Path(derived_dir) / "chunks")),
+        "table_index_path": artifacts.get("table_index_path", ""),
+        "table_chunk_count": artifacts.get("table_chunk_count", 0),
+        "media_dir": artifacts.get("media_dir", str(Path(derived_dir) / "media")),
+        "media_index_path": artifacts.get("media_index_path", str(Path(derived_dir) / "media" / "index.json")),
+        "media_extract_count": artifacts.get("media_extract_count", 0),
     }
 
 

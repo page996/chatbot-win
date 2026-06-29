@@ -9,7 +9,7 @@ from app.personal_wechat_bot.control.preflight import build_preflight_report
 
 def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]:
     config = load_config(data_dir)
-    preflight = build_preflight_report(config, show_whitelist=True)
+    preflight = build_preflight_report(config, show_accepted=True)
     checks = _checks(preflight)
     blockers = [item for item in checks if item["status"] == "blocker"]
     warnings = [item for item in checks if item["status"] == "warn"]

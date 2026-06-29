@@ -23,6 +23,7 @@ class ConversationContextStoreTest(unittest.TestCase):
                             "name": "report.pdf",
                             "kind": "file",
                             "workspace": {"workspace_dir": "workspace/c1/session_default/file123"},
+                            "artifacts": {"content_path": "workspace/c1/session_default/file123/derived/content.md"},
                             "parse": {
                                 "status": "parsed",
                                 "kind": "pdf",

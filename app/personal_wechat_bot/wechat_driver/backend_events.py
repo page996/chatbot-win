@@ -37,11 +37,7 @@ class BackendMessageEvent:
 
 
 class BackendEventJsonlDriver:
-    """Read local backend message events without touching the WeChat UI.
-
-    This is the stable ingestion seam for future providers such as an exported
-    WeChat database reader or a WeChat file-cache watcher.
-    """
+    """Read local backend message events without touching the WeChat UI."""
 
     def __init__(
         self,
@@ -132,7 +128,13 @@ class BackendEventJsonlDriver:
             },
         )
 
-    def enrich_message_attachments(self, raw: RawWeChatMessage, *, conversation_id: str, session_id: str) -> RawWeChatMessage:
+    def enrich_message_attachments(
+        self,
+        raw: RawWeChatMessage,
+        *,
+        conversation_id: str,
+        session_id: str,
+    ) -> RawWeChatMessage:
         if raw.driver_meta.get("source") != "backend_events_jsonl":
             return raw
         pending = raw.driver_meta.get("backend_attachments_pending")
@@ -181,6 +183,7 @@ class BackendEventJsonlDriver:
             observed_at=raw.observed_at,
             driver_meta=meta,
         )
+
 
 def append_backend_event(
     event_path: str | Path,
