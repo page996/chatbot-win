@@ -79,6 +79,29 @@ class ReplyGateTest(unittest.TestCase):
         self.assertEqual(result.status, "sent")
         self.assertEqual(driver.sent_texts, ["hello"])
 
+    def test_auto_mode_uses_guarded_send_executor(self) -> None:
+        driver = _SendingDriver()
+        config = BotConfig(send_enabled=True, send_driver="fake", send_confirm_required=False)
+        executor = GuardedSendExecutor(config, driver)
+        gate = ReplyGate(mode="auto", auto_executor=executor)
+
+        result = gate.handle(_reply("message-1", "hello"))
+
+        self.assertEqual(result.status, "sent")
+        self.assertEqual(driver.sent_texts, ["hello"])
+
+    def test_auto_mode_still_honors_confirm_required_guard(self) -> None:
+        driver = _SendingDriver()
+        config = BotConfig(send_enabled=True, send_driver="fake", send_confirm_required=True)
+        executor = GuardedSendExecutor(config, driver)
+        gate = ReplyGate(mode="auto", auto_executor=executor)
+
+        result = gate.handle(_reply("message-1", "hello"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "confirm_required")
+        self.assertEqual(driver.sent_texts, [])
+
 
 def _reply(message_id: str, text: str) -> ReplyCandidate:
     return ReplyCandidate(

@@ -137,6 +137,31 @@ class BackendEventsCliTest(unittest.TestCase):
             self.assertEqual(raw_event["quote"]["text"], "被引用的正文")
             self.assertEqual(raw_event["quote"]["message_id"], "quoted-id")
 
+    def test_run_agent_cli_starts_backend_event_loop_without_wechat_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            event_file = Path(tmp) / "events.jsonl"
+            self._run("--data-dir", str(data_dir), "init")
+
+            payload = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "run-agent",
+                    "--loops",
+                    "1",
+                    "--interval",
+                    "0",
+                    "--backend-event-file",
+                    str(event_file),
+                    "--no-wechat-ocr",
+                )
+            )
+
+            self.assertEqual(payload["status"], "stopped")
+            self.assertEqual(payload["loops"], 1)
+            self.assertEqual(payload["runners"][0]["name"], "backend-events")
+
     def _run(self, *args: str) -> str:
         completed = subprocess.run(
             [sys.executable, "-m", "app.personal_wechat_bot.main", *args],

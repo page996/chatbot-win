@@ -25,6 +25,7 @@ from app.personal_wechat_bot.control.audit import (
 from app.personal_wechat_bot.control.preflight import build_preflight_report
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
+from app.personal_wechat_bot.control.sidebar_window import run_sidebar_window
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     list_confirm_queue,
@@ -35,6 +36,7 @@ from app.personal_wechat_bot.control.send_commands import (
     set_send_controls,
 )
 from app.personal_wechat_bot.replay.runner import ReplayRunner
+from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.runtime.ocr_window_runner import OcrWindowPollingRunner
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
@@ -74,9 +76,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("send-readiness")
 
+    run_agent = sub.add_parser("run-agent")
+    run_agent.add_argument("--loops", type=int, default=None)
+    run_agent.add_argument("--interval", type=float, default=1.0)
+    run_agent.add_argument("--backend-event-file", default=None)
+    run_agent.add_argument("--no-backend-events", action="store_true")
+    run_agent.add_argument("--no-wechat-ocr", action="store_true")
+    run_agent.add_argument("--ocr-output", default=None)
+    run_agent.add_argument("--ocr-capture-mode", choices=["window", "screen", "auto"], default="auto")
+    run_agent.add_argument("--verbose", action="store_true")
+
     sidebar = sub.add_parser("send-sidebar")
     sidebar.add_argument("--host", default="127.0.0.1")
     sidebar.add_argument("--port", type=int, default=8765)
+
+    sidebar_window = sub.add_parser("send-sidebar-window")
+    sidebar_window.add_argument("--interval-ms", type=int, default=2000)
 
     send_driver_probe = sub.add_parser("send-driver-probe")
     send_driver_probe.add_argument("--driver", default=None)
@@ -265,8 +280,60 @@ def main(argv: list[str] | None = None) -> None:
         result = build_send_readiness_report(args.data_dir)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command == "run-agent":
+        config = load_config(args.data_dir)
+        runtime = build_runtime(config)
+        runners = []
+        if not args.no_backend_events:
+            event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
+            runners.append(
+                (
+                    "backend-events",
+                    PollingRunner(
+                        runtime,
+                        BackendEventJsonlDriver(
+                            event_file,
+                            runtime.file_index,
+                            allowed_input_roots=resolve_allowed_roots(config.data_dir, config.file_read_roots),
+                            allowed_extensions=config.file_allowed_extensions,
+                            max_input_bytes=config.file_max_bytes,
+                            file_workspace=runtime.file_workspace,
+                            context_store=runtime.context_store,
+                        ),
+                        poll_interval_seconds=0,
+                    ),
+                )
+            )
+        if not args.no_wechat_ocr:
+            runners.append(
+                (
+                    "wechat-ocr",
+                    OcrWindowPollingRunner(
+                        runtime=runtime,
+                        ocr_engine=RapidOcrSubprocessEngine(),
+                        output_path=args.ocr_output or str(Path(args.data_dir) / "wechat_window.bmp"),
+                        poll_interval_seconds=0,
+                        capture_mode=args.ocr_capture_mode,
+                    ),
+                )
+            )
+        if not runners:
+            raise SystemExit("run-agent requires at least one input source")
+        result = AgentRunner(runners, poll_interval_seconds=args.interval).run_forever(max_loops=args.loops)
+        if not args.verbose:
+            for item in result.get("runners", []):
+                if isinstance(item, dict):
+                    detail = item.get("detail")
+                    if isinstance(detail, dict):
+                        detail.pop("snapshot", None)
+                        detail.pop("capture", None)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "send-sidebar":
         run_sidebar_server(args.data_dir, host=args.host, port=args.port)
+        return
+    if args.command == "send-sidebar-window":
+        run_sidebar_window(args.data_dir, poll_interval_ms=args.interval_ms)
         return
     if args.command == "send-driver-probe":
         _delay_for_foreground_switch(args.delay_seconds)

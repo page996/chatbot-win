@@ -21,12 +21,14 @@ from app.personal_wechat_bot.normalizer.normalizer import MessageNormalizer
 from app.personal_wechat_bot.persona.topic_classifier import AITopicClassifier
 from app.personal_wechat_bot.reply_gate.gate import ReplyGate
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
 from app.personal_wechat_bot.router.deduper import Deduper
 from app.personal_wechat_bot.router.cooldown import ConversationCooldown
 from app.personal_wechat_bot.router.router import Router
 from app.personal_wechat_bot.tools.defaults import register_default_tools
 from app.personal_wechat_bot.tools.registry import ToolRegistry
 from app.personal_wechat_bot.tools.runtime import ToolRuntime
+from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
@@ -81,6 +83,7 @@ def build_runtime(config: BotConfig) -> BotRuntime:
     tools = ToolRuntime(registry, event_logger)
     link_annotations = LinkAnnotationService(ledger_store, tools)
     tool_orchestrator = ToolTaskOrchestrator(data_root, max_parallel=2)
+    send_driver = build_send_driver(config)
     return BotRuntime(
         config=config,
         normalizer=MessageNormalizer(),
@@ -95,7 +98,11 @@ def build_runtime(config: BotConfig) -> BotRuntime:
             ledger_context=ledger_context,
         ),
         cooldown=ConversationCooldown(config.group_cooldown_seconds, data_root / "conversation_cooldowns.sqlite"),
-        reply_gate=ReplyGate(mode=config.mode, confirm_queue=ConfirmQueue(data_root / "confirm_queue.jsonl")),
+        reply_gate=ReplyGate(
+            mode=config.mode,
+            confirm_queue=ConfirmQueue(data_root / "confirm_queue.jsonl"),
+            auto_executor=GuardedSendExecutor(config, send_driver),
+        ),
         event_logger=event_logger,
         file_index=file_index,
         model_router=model_router,

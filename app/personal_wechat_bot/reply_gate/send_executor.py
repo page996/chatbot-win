@@ -30,6 +30,14 @@ class GuardedSendExecutor:
         result = self.driver.send_message(reply.conversation_id, reply.text)
         return SendResult(reply.message_id, reply.conversation_id, result.status, result.reason, result.sent_at)
 
+    def execute_auto(self, reply: ReplyCandidate) -> SendResult:
+        decision = self._can_send(reply, confirmed=False)
+        if not decision.allowed:
+            return SendResult(reply.message_id, reply.conversation_id, "failed", decision.reason)
+        assert self.driver is not None
+        result = self.driver.send_message(reply.conversation_id, reply.text)
+        return SendResult(reply.message_id, reply.conversation_id, result.status, result.reason, result.sent_at)
+
     def _can_send(self, reply: ReplyCandidate, *, confirmed: bool) -> SendExecutionDecision:
         if not self.config.send_enabled:
             return SendExecutionDecision(False, "send_enabled_false")
