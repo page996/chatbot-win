@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,7 @@ class AttachmentPipeline:
                 original_name=attachment.original_name or safe_path.name,
             )
             parse_result = self.file_workspace.parse_or_get_cached(staged, self.attachment_parser)
+            artifacts = _artifact_refs(staged)
             return {
                 "status": "indexed",
                 "file_id": file_id,
@@ -94,6 +96,7 @@ class AttachmentPipeline:
                     "text": parse_result.text,
                     "error": parse_result.error,
                 },
+                "artifacts": artifacts,
             }
         except (FileNotFoundError, PermissionError) as exc:
             return {
@@ -102,3 +105,24 @@ class AttachmentPipeline:
                 "kind": attachment.kind,
                 "reason": f"{type(exc).__name__}: {exc}",
             }
+
+
+def _artifact_refs(staged) -> dict[str, Any]:
+    derived_dir = Path(staged.derived_dir)
+    analysis = _read_json(derived_dir / "analysis.json", {})
+    chunks = analysis.get("chunks", []) if isinstance(analysis, dict) else []
+    return {
+        "content_path": str(derived_dir / "content.md"),
+        "analysis_path": str(derived_dir / "analysis.json"),
+        "parse_result_path": str(derived_dir / "parse_result.json"),
+        "chunks_dir": str(derived_dir / "chunks"),
+        "chunk_count": len(chunks) if isinstance(chunks, list) else 0,
+        "chunks": [dict(item) for item in chunks if isinstance(item, dict)] if isinstance(chunks, list) else [],
+    }
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)

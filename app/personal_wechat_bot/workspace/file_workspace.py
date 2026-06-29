@@ -13,6 +13,10 @@ from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntim
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 
 
+CHUNK_TOKEN_TARGET = 1600
+CHUNK_CHAR_TARGET = CHUNK_TOKEN_TARGET * 4
+
+
 @dataclass(frozen=True)
 class StagedFile:
     file_id: str
@@ -145,6 +149,7 @@ class FileWorkspace:
         content_path = derived_dir / "content.md"
         preview_path = derived_dir / "preview.txt"
         analysis_path = derived_dir / "analysis.json"
+        chunks = _write_chunks(derived_dir / "chunks", result.text)
         payload = {
             "file_id": staged.file_id,
             "conversation_id": staged.conversation_id,
@@ -154,16 +159,17 @@ class FileWorkspace:
             "source_path": staged.staged_path,
             "content_path": str(content_path),
             "analysis_path": str(analysis_path),
+            "chunks": chunks,
             "result": asdict(result),
             "updated_at": utc_now_iso(),
         }
         _write_json(derived_dir / "parse_result.json", payload)
-        analysis = _analysis_payload(staged, result)
+        analysis = _analysis_payload(staged, result, chunks)
         _write_json(analysis_path, analysis)
         content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
         if result.text:
             preview_path.write_text(result.text, encoding="utf-8")
-        self._update_manifest_parse_artifacts(staged, result, content_path, analysis_path)
+        self._update_manifest_parse_artifacts(staged, result, content_path, analysis_path, chunks)
 
     def staged_from_manifest(self, manifest_path: str | Path) -> StagedFile:
         safe_manifest_path = _ensure_within(Path(manifest_path).resolve(), self.root)
@@ -254,6 +260,7 @@ class FileWorkspace:
         result: AttachmentParseResult,
         content_path: Path,
         analysis_path: Path,
+        chunks: list[dict[str, Any]],
     ) -> None:
         manifest_path = Path(staged.manifest_path)
         manifest = _read_json(manifest_path, {})
@@ -266,6 +273,9 @@ class FileWorkspace:
             "error": result.error,
             "content_path": str(content_path),
             "analysis_path": str(analysis_path),
+            "chunks_dir": str(Path(staged.derived_dir) / "chunks"),
+            "chunk_count": len(chunks),
+            "chunks": chunks,
             "updated_at": utc_now_iso(),
         }
         manifest["updated_at"] = utc_now_iso()
@@ -281,7 +291,7 @@ def _safe_filename(name: str, fallback_suffix: str) -> str:
     return cleaned[:180]
 
 
-def _analysis_payload(staged: StagedFile, result: AttachmentParseResult) -> dict[str, Any]:
+def _analysis_payload(staged: StagedFile, result: AttachmentParseResult, chunks: list[dict[str, Any]]) -> dict[str, Any]:
     text = result.text or ""
     suffix = Path(staged.staged_path).suffix.lower()
     return {
@@ -299,7 +309,10 @@ def _analysis_payload(staged: StagedFile, result: AttachmentParseResult) -> dict
         "has_tables": result.kind == "spreadsheet",
         "has_audio": False,
         "external_links": _extract_links(text),
-        "chunked": False,
+        "chunked": len(chunks) > 1,
+        "chunk_count": len(chunks),
+        "chunks_dir": str(Path(staged.derived_dir) / "chunks") if chunks else "",
+        "chunks": chunks,
         "created_at": utc_now_iso(),
     }
 
@@ -326,6 +339,92 @@ def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysi
     if result.error:
         lines.extend(["## Error", "", result.error, ""])
     return "\n".join(lines)
+
+
+def _write_chunks(chunks_dir: Path, text: str) -> list[dict[str, Any]]:
+    if not text:
+        return []
+    chunks = _split_text(text, CHUNK_CHAR_TARGET)
+    if not chunks:
+        return []
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    refs: list[dict[str, Any]] = []
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+        path = chunks_dir / f"chunk_{index:04d}.md"
+        token_estimate = _estimate_tokens(chunk)
+        path.write_text(
+            "\n".join(
+                [
+                    f"# Chunk {index}/{total}",
+                    "",
+                    f"- token_estimate: {token_estimate}",
+                    "",
+                    chunk,
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        refs.append(
+            {
+                "index": index,
+                "path": str(path),
+                "token_estimate": token_estimate,
+                "char_count": len(chunk),
+            }
+        )
+    return refs
+
+
+def _split_text(text: str, max_chars: int) -> list[str]:
+    normalized = text.strip()
+    if not normalized:
+        return []
+    if len(normalized) <= max_chars:
+        return [normalized]
+    paragraphs = re.split(r"\n\s*\n", normalized)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        if len(paragraph) > max_chars:
+            if current:
+                chunks.append("\n\n".join(current))
+                current = []
+                current_len = 0
+            chunks.extend(_split_long_text(paragraph, max_chars))
+            continue
+        added_len = len(paragraph) + (2 if current else 0)
+        if current and current_len + added_len > max_chars:
+            chunks.append("\n\n".join(current))
+            current = [paragraph]
+            current_len = len(paragraph)
+        else:
+            current.append(paragraph)
+            current_len += added_len
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+def _split_long_text(text: str, max_chars: int) -> list[str]:
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        if end < len(text):
+            boundary = max(text.rfind("\n", start, end), text.rfind(" ", start, end))
+            if boundary > start + max_chars // 2:
+                end = boundary
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end
+    return chunks
 
 
 def _file_type(suffix: str, kind: str) -> str:

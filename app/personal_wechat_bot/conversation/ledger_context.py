@@ -272,6 +272,8 @@ def _file_lines(file_refs: list[dict[str, Any]]) -> list[str]:
             f"kind={item.get('kind', '')} status={item.get('status', '')} "
             f"manifest={workspace.get('manifest_path', '')} "
             f"content={artifacts.get('content_path', '')} "
+            f"chunk_count={artifacts.get('chunk_count', '')} "
+            f"chunks_dir={artifacts.get('chunks_dir', '')} "
             f"parse_status={parse.get('status', '')} summary={_compact(str(parse.get('summary', '')), 300)}"
         )
     return lines

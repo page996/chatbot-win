@@ -237,6 +237,7 @@ class LedgerContextAssemblerTest(unittest.TestCase):
                             "file_id": "f1",
                             "name": "a.txt",
                             "workspace": {"manifest_path": "manifest.json", "derived_dir": "derived"},
+                            "artifacts": {"content_path": "derived/content.md", "chunk_count": 3, "chunks_dir": "derived/chunks"},
                             "parse": {"status": "parsed", "summary": "ok", "text": "body"},
                         }
                     ]
@@ -250,6 +251,8 @@ class LedgerContextAssemblerTest(unittest.TestCase):
             self.assertIn("Available file refs", rendered)
             self.assertIn("content=derived", rendered)
             self.assertIn("content.md", rendered)
+            self.assertIn("chunk_count=3", rendered)
+            self.assertIn("chunks_dir=derived/chunks", rendered)
 
 
 def _message(

@@ -55,6 +55,7 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertEqual((Path(staged.derived_dir) / "preview.txt").read_text(encoding="utf-8"), "parsed text")
             self.assertTrue((Path(staged.derived_dir) / "content.md").exists())
             self.assertTrue((Path(staged.derived_dir) / "analysis.json").exists())
+            self.assertTrue((Path(staged.derived_dir) / "chunks" / "chunk_0001.md").exists())
 
     def test_parse_result_writes_standard_artifacts_and_manifest_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -78,6 +79,28 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertIn("hello https://example.com", content)
             self.assertEqual(manifest["parse"]["content_path"], str(derived / "content.md"))
             self.assertEqual(manifest["parse"]["analysis_path"], str(derived / "analysis.json"))
+            self.assertEqual(manifest["parse"]["chunk_count"], 1)
+
+    def test_long_parse_result_is_chunked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "long.txt"
+            source.write_text("long", encoding="utf-8")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+            long_text = "\n\n".join(f"paragraph {index} " + ("x" * 500) for index in range(60))
+
+            workspace.write_parse_result(staged, AttachmentParseResult("parsed", "text", "summary", long_text))
+
+            derived = Path(staged.derived_dir)
+            analysis = json.loads((derived / "analysis.json").read_text(encoding="utf-8"))
+            manifest = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
+            chunks = list((derived / "chunks").glob("chunk_*.md"))
+
+            self.assertTrue(analysis["chunked"])
+            self.assertGreater(analysis["chunk_count"], 1)
+            self.assertEqual(analysis["chunk_count"], len(chunks))
+            self.assertEqual(manifest["parse"]["chunk_count"], analysis["chunk_count"])
+            self.assertTrue(all(path.read_text(encoding="utf-8").startswith("# Chunk") for path in chunks))
 
     def test_staged_file_can_be_reloaded_from_manifest_for_later_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

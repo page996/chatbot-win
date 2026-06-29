@@ -35,8 +35,36 @@ class AttachmentPipelineTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "indexed")
             self.assertEqual(result["parse"]["text"], "parsed text")
+            self.assertEqual(result["artifacts"]["chunk_count"], 1)
             self.assertTrue(Path(result["workspace"]["staged_path"]).exists())
             self.assertTrue((Path(result["workspace"]["derived_dir"]) / "content.md").exists())
+
+    def test_process_returns_chunk_artifacts_for_long_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inbox = root / "inbox"
+            inbox.mkdir()
+            source = inbox / "long.txt"
+            source.write_text("hello", encoding="utf-8")
+            long_text = "\n\n".join(f"row {index} " + ("x" * 500) for index in range(60))
+            pipeline = AttachmentPipeline(
+                file_index=FileIndex(root / "file_index.sqlite"),
+                file_workspace=FileWorkspace(root / "file_workspace"),
+                attachment_parser=_Parser(long_text),
+                allowed_input_roots=[inbox],
+                allowed_extensions=[".txt"],
+                max_input_bytes=1024,
+            )
+
+            result = pipeline.process(
+                IncomingAttachment(path="long.txt", original_name="long.txt", kind="file"),
+                conversation_id="conv1",
+                session_id="session1",
+            )
+
+            self.assertEqual(result["status"], "indexed")
+            self.assertGreater(result["artifacts"]["chunk_count"], 1)
+            self.assertTrue(Path(result["artifacts"]["chunks"][0]["path"]).exists())
 
     def test_process_blocks_disallowed_file_without_copying(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
