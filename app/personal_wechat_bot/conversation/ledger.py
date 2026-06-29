@@ -77,6 +77,52 @@ class ConversationLedgerStore:
         self._render_conversation(message.conversation_id)
         return entry
 
+    def annotate_link(
+        self,
+        conversation_id: str,
+        entry_id: str,
+        url_id: str,
+        *,
+        status: str,
+        summary: str = "",
+        text: str = "",
+        source_path: str = "",
+        error: str = "",
+    ) -> bool:
+        entries = self._read_entries(conversation_id)
+        changed = False
+        updated: list[dict[str, Any]] = []
+        for item in entries:
+            if item.get("entry_id") != entry_id:
+                updated.append(item)
+                continue
+            item = dict(item)
+            item["links"] = _annotated_links(item.get("links", []), url_id, status, source_path, summary, error)
+            if text and status == "completed":
+                annotation_path = self._write_annotation(
+                    conversation_id,
+                    entry_id,
+                    url_id,
+                    text=text,
+                    summary=summary,
+                    source_path=source_path,
+                )
+                item["text_blocks"] = _upsert_text_block(
+                    item.get("text_blocks", []),
+                    kind="annotation:web",
+                    source_ref=str(annotation_path),
+                    text=_web_annotation_text(summary, text),
+                    metadata={"url_id": url_id, "status": status},
+                )
+            item["updated_at"] = utc_now_iso()
+            updated.append(item)
+            changed = True
+        if not changed:
+            return False
+        self._rewrite_entries(conversation_id, updated)
+        self._render_conversation(conversation_id)
+        return True
+
     def append_reply(
         self,
         reply: ReplyCandidate,
@@ -168,6 +214,9 @@ class ConversationLedgerStore:
     def conversation_markdown_path(self, conversation_id: str) -> Path:
         return self._conversation_dir(conversation_id) / "conversation.md"
 
+    def annotations_dir(self, conversation_id: str) -> Path:
+        return self._conversation_dir(conversation_id) / "annotations"
+
     def _conversation_dir(self, conversation_id: str) -> Path:
         return self.root / _safe_segment(conversation_id)
 
@@ -231,6 +280,37 @@ class ConversationLedgerStore:
             lines.extend(_render_entry_markdown(item))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+    def _write_annotation(
+        self,
+        conversation_id: str,
+        entry_id: str,
+        url_id: str,
+        *,
+        text: str,
+        summary: str,
+        source_path: str,
+    ) -> Path:
+        path = self.annotations_dir(conversation_id) / f"{_safe_segment(entry_id)}_{_safe_segment(url_id)}.md"
+        lines = [
+            "# Web Annotation",
+            "",
+            f"entry_id: {entry_id}",
+            f"url_id: {url_id}",
+            f"source_path: {source_path}",
+            "",
+            "## Summary",
+            "",
+            summary,
+            "",
+            "## Text",
+            "",
+            text,
+            "",
+        ]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return path
 
 
 def _text_blocks_from_message(message: NormalizedMessage) -> list[dict[str, Any]]:
@@ -325,6 +405,95 @@ def _links_from_text(text: str) -> list[dict[str, Any]]:
     for url in _URL_RE.findall(text):
         links.append({"url": url, "url_id": hashlib.sha256(url.encode("utf-8")).hexdigest()[:16], "status": "pending"})
     return links
+
+
+def _annotated_links(
+    links: Any,
+    url_id: str,
+    status: str,
+    source_path: str,
+    summary: str,
+    error: str,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    found = False
+    raw_links = links if isinstance(links, list) else []
+    for item in raw_links:
+        if not isinstance(item, dict):
+            continue
+        link = dict(item)
+        if str(link.get("url_id", "")) == url_id:
+            link["status"] = status
+            link["annotation_path"] = source_path
+            link["summary"] = summary
+            link["error"] = error
+            link["updated_at"] = utc_now_iso()
+            found = True
+        result.append(link)
+    if not found:
+        result.append(
+            {
+                "url_id": url_id,
+                "url": "",
+                "status": status,
+                "annotation_path": source_path,
+                "summary": summary,
+                "error": error,
+                "updated_at": utc_now_iso(),
+            }
+        )
+    return result
+
+
+def _upsert_text_block(
+    blocks: Any,
+    *,
+    kind: str,
+    source_ref: str,
+    text: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    replaced = False
+    raw_blocks = blocks if isinstance(blocks, list) else []
+    for item in raw_blocks:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == kind and item.get("source_ref") == source_ref:
+            result.append(
+                asdict(
+                    LedgerTextBlock(
+                        kind=kind,
+                        text=text,
+                        source_ref=source_ref,
+                        token_estimate=_estimate_tokens(text),
+                        metadata=metadata,
+                    )
+                )
+            )
+            replaced = True
+        else:
+            result.append(dict(item))
+    if not replaced:
+        result.append(
+            asdict(
+                LedgerTextBlock(
+                    kind=kind,
+                    text=text,
+                    source_ref=source_ref,
+                    token_estimate=_estimate_tokens(text),
+                    metadata=metadata,
+                )
+            )
+        )
+    return result
+
+
+def _web_annotation_text(summary: str, text: str, max_chars: int = 3000) -> str:
+    content = summary.strip() or text.strip()
+    if len(content) <= max_chars:
+        return content
+    return content[: max_chars - 1].rstrip() + "..."
 
 
 def _render_entry_markdown(item: dict[str, Any]) -> list[str]:

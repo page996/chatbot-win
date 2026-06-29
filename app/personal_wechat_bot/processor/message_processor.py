@@ -39,7 +39,10 @@ class MessageProcessor:
         if pending_context_item is not None:
             item["context"] = pending_context_item
 
-        self.runtime.ledger_store.append_message(message)
+        ledger_entry = self.runtime.ledger_store.append_message(message)
+        link_annotations = self._annotate_links(ledger_entry)
+        if link_annotations:
+            item["link_annotations"] = link_annotations
 
         if message.is_self:
             item["context_only"] = True
@@ -133,6 +136,20 @@ class MessageProcessor:
                 message_id=raw.raw_id,
             )
             return raw
+
+    def _annotate_links(self, ledger_entry) -> list[dict[str, Any]]:
+        annotate = getattr(getattr(self.runtime, "link_annotations", None), "annotate_entry", None)
+        if annotate is None:
+            return []
+        try:
+            return annotate(ledger_entry)
+        except Exception as exc:
+            self.runtime.event_logger.log(
+                "message.link_annotation_error",
+                {"type": type(exc).__name__, "message": str(exc)},
+                message_id=ledger_entry.message_id,
+            )
+            return []
 
     def _mark_done(self, *message_ids: str) -> None:
         for message_id in dict.fromkeys(item for item in message_ids if item):

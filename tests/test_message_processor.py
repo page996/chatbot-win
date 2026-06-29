@@ -96,6 +96,47 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertEqual(channel_types, {"private", "group"})
             self.assertTrue((data_dir / "conversation_channels" / "index.json").exists())
 
+    def test_processor_runs_link_annotation_after_ledger_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            runtime.link_annotations = _FakeLinkAnnotations(runtime.ledger_store)
+            processor = MessageProcessor(runtime)
+
+            result = processor.process(
+                RawWeChatMessage(
+                    raw_id="msg-link",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    text="read https://example.com/a",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                )
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["link_annotations"][0]["status"], "ok")
+            entries = runtime.ledger_store.read_entries(result["message"]["conversation_id"])
+            self.assertEqual(entries[0].links[0]["status"], "completed")
+
+
+class _FakeLinkAnnotations:
+    def __init__(self, ledger_store):
+        self.ledger_store = ledger_store
+
+    def annotate_entry(self, entry):
+        url_id = entry.links[0]["url_id"]
+        self.ledger_store.annotate_link(
+            entry.conversation_id,
+            entry.entry_id,
+            url_id,
+            status="completed",
+            summary="summary",
+            text="page text",
+            source_path="web_fetch/page.md",
+        )
+        return [{"status": "ok", "url_id": url_id}]
+
 
 if __name__ == "__main__":
     unittest.main()

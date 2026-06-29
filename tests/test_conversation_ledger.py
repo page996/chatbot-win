@@ -136,6 +136,32 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertIn("[recalled]", markdown)
             self.assertNotIn("visible text", markdown)
 
+    def test_annotate_link_updates_link_and_adds_annotation_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            entry = store.append_message(_message("m1", "read https://example.com/a"))
+            url_id = entry.links[0]["url_id"]
+
+            changed = store.annotate_link(
+                "conv1",
+                entry.entry_id,
+                url_id,
+                status="completed",
+                summary="summary text",
+                text="full fetched page text",
+                source_path="tool_outputs/web_fetch/a.md",
+            )
+            updated = store.read_entries("conv1")[0]
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+
+            self.assertTrue(changed)
+            self.assertEqual(updated.links[0]["status"], "completed")
+            self.assertEqual(updated.links[0]["annotation_path"], "tool_outputs/web_fetch/a.md")
+            self.assertEqual(updated.text_blocks[-1]["kind"], "annotation:web")
+            self.assertIn("summary text", updated.text_blocks[-1]["text"])
+            self.assertIn("[block:annotation:web", markdown)
+            self.assertTrue((store.annotations_dir("conv1") / f"{entry.entry_id}_{url_id}.md").exists())
+
     def test_append_reply_uses_conversation_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))

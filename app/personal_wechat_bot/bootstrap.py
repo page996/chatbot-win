@@ -10,6 +10,7 @@ from app.personal_wechat_bot.conversation.context_store import ConversationConte
 from app.personal_wechat_bot.conversation.engine import ConversationEngine
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import LedgerContextAssembler
+from app.personal_wechat_bot.conversation.link_annotations import LinkAnnotationService
 from app.personal_wechat_bot.llm.fake import FakeLLMClient
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool, ConversationKeyAssigner
 from app.personal_wechat_bot.llm.model_router import ModelRouter
@@ -47,6 +48,7 @@ class BotRuntime:
     context_store: ConversationContextStore
     ledger_store: ConversationLedgerStore
     ledger_context: LedgerContextAssembler
+    link_annotations: LinkAnnotationService
     file_workspace: FileWorkspace
     active_driver: object | None = None
 
@@ -77,6 +79,7 @@ def build_runtime(config: BotConfig) -> BotRuntime:
     registry = ToolRegistry()
     register_default_tools(registry, data_root=data_root, config=config, file_index=file_index)
     tools = ToolRuntime(registry, event_logger)
+    link_annotations = LinkAnnotationService(ledger_store, tools)
     tool_orchestrator = ToolTaskOrchestrator(data_root, max_parallel=2)
     return BotRuntime(
         config=config,
@@ -102,5 +105,6 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         context_store=context_store,
         ledger_store=ledger_store,
         ledger_context=ledger_context,
+        link_annotations=link_annotations,
         file_workspace=file_workspace,
     )
