@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Any
+
+from app.personal_wechat_bot.bootstrap import BotRuntime
+from app.personal_wechat_bot.domain.models import RawWeChatMessage, SpeakDecision
+
+
+class MessageProcessor:
+    def __init__(self, runtime: BotRuntime):
+        self.runtime = runtime
+
+    def process(self, raw: RawWeChatMessage) -> dict[str, Any] | None:
+        self.runtime.event_logger.log("message.raw", asdict(raw))
+        message = self.runtime.normalizer.normalize(raw)
+        if message is None:
+            return None
+
+        self.runtime.event_logger.log("message.normalized", message, message_id=message.message_id)
+        original_message_id = message.message_id
+
+        reset_session_id = self.runtime.context_store.maybe_reset_for_message(message)
+        if reset_session_id:
+            pending_context_item = {"session_id": reset_session_id, "reset": True}
+        else:
+            pending_context_item = None
+
+        raw = self._enrich_backend_attachments(raw, message.conversation_id)
+        if raw.driver_meta.get("backend_attachments_pending") is False:
+            enriched = self.runtime.normalizer.normalize(raw)
+            if enriched is not None and enriched != message:
+                message = enriched
+                self.runtime.event_logger.log("message.enriched", message, message_id=message.message_id)
+
+        route = self.runtime.router.decide(message)
+        self.runtime.event_logger.log("route.decision", route, message_id=message.message_id)
+        item: dict[str, Any] = {"message": asdict(message), "route": asdict(route)}
+        if pending_context_item is not None:
+            item["context"] = pending_context_item
+
+        self.runtime.ledger_store.append_message(message)
+
+        if message.is_self:
+            item["context_only"] = True
+            self.runtime.router.mark_done(message.message_id)
+            return item
+
+        if route.action != "process":
+            if route.action == "ignore":
+                self.runtime.router.mark_done(message.message_id)
+            return item
+
+        self.runtime.context_store.record_message(message)
+
+        if message.metadata.get("context_only"):
+            item["context_only"] = True
+            self._mark_done(original_message_id, message.message_id)
+            return item
+
+        speak = self.runtime.topic_classifier.decide(message)
+        speak = self._apply_group_cooldown(
+            message.conversation_type,
+            message.conversation_id,
+            message.received_at,
+            speak,
+        )
+        self.runtime.event_logger.log("topic.decision", speak, message_id=message.message_id)
+        item["speak"] = asdict(speak)
+
+        try:
+            reply = self.runtime.conversation.generate_reply(message, speak)
+        except Exception as exc:
+            error = {"type": type(exc).__name__, "message": str(exc)}
+            self.runtime.event_logger.log("reply.error", error, message_id=message.message_id)
+            item["error"] = error
+            return item
+
+        if reply is None:
+            self._mark_done(original_message_id, message.message_id)
+            return item
+
+        self.runtime.context_store.record_reply(reply)
+        self.runtime.ledger_store.append_reply(
+            reply,
+            chat_title=message.chat_title,
+            conversation_type=message.conversation_type,
+        )
+        self.runtime.event_logger.log("reply.candidate", reply, message_id=message.message_id)
+        send = self.runtime.reply_gate.handle(reply)
+        self.runtime.event_logger.log("send.result", send, message_id=message.message_id)
+        item["reply"] = asdict(reply)
+        item["send"] = asdict(send)
+        self._mark_done(original_message_id, message.message_id)
+        return item
+
+    def _apply_group_cooldown(
+        self,
+        conversation_type: str,
+        conversation_id: str,
+        received_at: str,
+        speak: SpeakDecision,
+    ) -> SpeakDecision:
+        if speak.decision != "speak" or conversation_type != "group":
+            return speak
+        allowed, reason = self.runtime.cooldown.allow(conversation_id, received_at)
+        if allowed:
+            return speak
+        return SpeakDecision(
+            conversation_id=speak.conversation_id,
+            decision="wait",
+            reason=reason,
+            topic=speak.topic,
+            confidence=speak.confidence,
+            style_context=speak.style_context,
+            daily_trace_context=speak.daily_trace_context,
+        )
+
+    def _enrich_backend_attachments(self, raw: RawWeChatMessage, conversation_id: str) -> RawWeChatMessage:
+        if not raw.driver_meta.get("backend_attachments_pending"):
+            return raw
+        driver = getattr(self.runtime, "active_driver", None)
+        enrich = getattr(driver, "enrich_message_attachments", None)
+        if enrich is None:
+            return raw
+        session_id = self.runtime.context_store.current_session_id(conversation_id)
+        try:
+            return enrich(raw, conversation_id=conversation_id, session_id=session_id)
+        except Exception as exc:
+            self.runtime.event_logger.log(
+                "message.attachment_enrich_error",
+                {"type": type(exc).__name__, "message": str(exc)},
+                message_id=raw.raw_id,
+            )
+            return raw
+
+    def _mark_done(self, *message_ids: str) -> None:
+        for message_id in dict.fromkeys(item for item in message_ids if item):
+            self.runtime.router.mark_done(message_id)

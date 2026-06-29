@@ -1,0 +1,4 @@
+rapidocr-onnxruntime
+onnxruntime-gpu
+Pillow
+numpy

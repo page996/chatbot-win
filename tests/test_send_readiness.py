@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from app.personal_wechat_bot.config.loader import create_default_config
+from app.personal_wechat_bot.control.send_commands import set_send_controls
+from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+class SendReadinessTest(unittest.TestCase):
+    def test_current_project_is_blocked_until_real_send_driver_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            report = build_send_readiness_report(data_dir)
+            blockers = {item["id"] for item in report["checks"] if item["status"] == "blocker"}
+
+            self.assertEqual(report["status"], "blocked")
+            self.assertIn("real_send_driver", blockers)
+            self.assertIn("send_enabled", blockers)
+            self.assertIn("wechat_write_access", blockers)
+            self.assertIn("send_driver_name", blockers)
+            self.assertFalse(report["send_policy"]["send_enabled"])
+
+    def test_send_readiness_cli_returns_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            completed = subprocess.run(
+                [sys.executable, "-m", "app.personal_wechat_bot.main", "--data-dir", str(data_dir), "init"],
+                cwd=ROOT.parent,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+            )
+            self.assertIn("initialized", completed.stdout)
+
+            output = subprocess.run(
+                [sys.executable, "-m", "app.personal_wechat_bot.main", "--data-dir", str(data_dir), "send-readiness"],
+                cwd=ROOT.parent,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+            )
+            payload = json.loads(output.stdout)
+
+            self.assertEqual(payload["status"], "blocked")
+            self.assertFalse(payload["send_policy"]["send_enabled"])
+
+    def test_guarded_driver_removes_send_driver_blockers_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="windows_guarded")
+
+            report = build_send_readiness_report(data_dir)
+            blockers = {item["id"] for item in report["checks"] if item["status"] == "blocker"}
+
+            self.assertNotIn("real_send_driver", blockers)
+            self.assertNotIn("send_enabled", blockers)
+            self.assertNotIn("wechat_write_access", blockers)
+            self.assertNotIn("send_driver_name", blockers)
+
+
+if __name__ == "__main__":
+    unittest.main()

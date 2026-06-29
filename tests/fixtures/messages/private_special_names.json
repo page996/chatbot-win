@@ -1,0 +1,48 @@
+{
+  "messages": [
+    {
+      "raw_id": "special-1",
+      "chat_title": "+！@#￥%……&*",
+      "sender_name": "+！@#￥%……&*",
+      "sender_wechat_id": "wxid_symbols",
+      "text": "特殊符号名字测试",
+      "is_self": false,
+      "is_group": false,
+      "observed_at": "2026-06-04T12:03:00+08:00",
+      "driver_meta": {}
+    },
+    {
+      "raw_id": "special-2",
+      "chat_title": "さくら",
+      "sender_name": "さくら",
+      "sender_wechat_id": "wxid_sakura",
+      "text": "日本語の名前テスト",
+      "is_self": false,
+      "is_group": false,
+      "observed_at": "2026-06-04T12:03:01+08:00",
+      "driver_meta": {}
+    },
+    {
+      "raw_id": "special-3",
+      "chat_title": "민준",
+      "sender_name": "민준",
+      "sender_wechat_id": "wxid_minjun",
+      "text": "한국어 이름 테스트",
+      "is_self": false,
+      "is_group": false,
+      "observed_at": "2026-06-04T12:03:02+08:00",
+      "driver_meta": {}
+    },
+    {
+      "raw_id": "special-4",
+      "chat_title": "Alice",
+      "sender_name": "Alice",
+      "sender_wechat_id": "wxid_alice",
+      "text": "English name test",
+      "is_self": false,
+      "is_group": false,
+      "observed_at": "2026-06-04T12:03:03+08:00",
+      "driver_meta": {}
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "messages": [
+    {
+      "raw_id": "group-miss-1",
+      "chat_title": "学习群",
+      "sender_name": "小刚",
+      "sender_wechat_id": "wxid_xiaogang",
+      "text": "这条消息由 fake AI 判断为无关",
+      "is_self": false,
+      "is_group": true,
+      "observed_at": "2026-06-04T12:02:00+08:00",
+      "driver_meta": {
+        "topic_decision": "silent",
+        "topic": "无关"
+      }
+    }
+  ]
+}

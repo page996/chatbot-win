@@ -1,0 +1,15 @@
+{
+  "messages": [
+    {
+      "raw_id": "tool-search-1",
+      "chat_title": "小明",
+      "sender_name": "小明",
+      "sender_wechat_id": "wxid_xiaoming",
+      "text": "#检索 transformer interpretability",
+      "is_self": false,
+      "is_group": false,
+      "observed_at": "2026-06-04T12:06:00+08:00",
+      "driver_meta": {}
+    }
+  ]
+}

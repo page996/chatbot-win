@@ -1,0 +1,18 @@
+{
+  "messages": [
+    {
+      "raw_id": "group-match-1",
+      "chat_title": "学习群",
+      "sender_name": "小刚",
+      "sender_wechat_id": "wxid_xiaogang",
+      "text": "我们继续聊刚才那个话题",
+      "is_self": false,
+      "is_group": true,
+      "observed_at": "2026-06-04T12:01:00+08:00",
+      "driver_meta": {
+        "topic_decision": "speak",
+        "topic": "学习"
+      }
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from app.personal_wechat_bot.bootstrap import build_runtime
+from app.personal_wechat_bot.config.loader import add_contact, create_default_config, load_config
+from app.personal_wechat_bot.domain.models import RawWeChatMessage
+from app.personal_wechat_bot.processor.message_processor import MessageProcessor
+
+
+class MessageProcessorTest(unittest.TestCase):
+    def test_processor_records_self_message_without_replying(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+
+            result = processor.process(
+                RawWeChatMessage(
+                    raw_id="self-1",
+                    chat_title="小明",
+                    sender_name="me",
+                    text="hello",
+                    is_self=True,
+                )
+            )
+
+            self.assertIsNotNone(result)
+            self.assertTrue(result["message"]["is_self"])
+            self.assertTrue(result["context_only"])
+            self.assertNotIn("reply", result)
+            entries = runtime.ledger_store.read_entries(result["message"]["conversation_id"])
+            self.assertEqual(len(entries), 1)
+            self.assertTrue(entries[0].is_self)
+
+    def test_processor_runs_private_whitelist_closed_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            add_contact(data_dir, "wxid_alice")
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+
+            result = processor.process(
+                RawWeChatMessage(
+                    raw_id="msg-1",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="今天有点累",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                )
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["route"]["action"], "process")
+            self.assertEqual(result["send"]["status"], "skipped")
+
+    def test_processor_auto_registers_unknown_private_and_group_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+
+            private_result = processor.process(
+                RawWeChatMessage(
+                    raw_id="private-new",
+                    chat_title="New Friend",
+                    sender_name="New Friend",
+                    sender_wechat_id="wxid_new_friend",
+                    text="hello",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                )
+            )
+            group_result = processor.process(
+                RawWeChatMessage(
+                    raw_id="group-new",
+                    chat_title="New Group",
+                    sender_name="Group Member",
+                    sender_wechat_id="wxid_member",
+                    text="@bot hello",
+                    is_group=True,
+                    observed_at="2026-06-28T01:01:00+00:00",
+                    driver_meta={"topic_decision": "speak"},
+                )
+            )
+            channels = runtime.channel_store.list_channels()
+            channel_types = {item.conversation_type for item in channels}
+
+            self.assertEqual(private_result["route"]["action"], "process")
+            self.assertEqual(group_result["route"]["action"], "process")
+            self.assertEqual(channel_types, {"private", "group"})
+            self.assertTrue((data_dir / "conversation_channels" / "index.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

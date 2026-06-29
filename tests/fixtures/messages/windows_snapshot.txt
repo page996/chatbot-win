@@ -1,0 +1,2 @@
+[private] 小明 | 小明 | wxid_xiaoming | 今天复习得有点累
+[group] 学习群 | 小刚 | wxid_xiaogang | 我们继续聊 AI

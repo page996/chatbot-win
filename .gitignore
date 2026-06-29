@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+data/
+.env
+API key.md
+API keys.md
+vendor/

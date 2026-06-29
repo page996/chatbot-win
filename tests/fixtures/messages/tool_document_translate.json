@@ -1,0 +1,15 @@
+{
+  "messages": [
+    {
+      "raw_id": "tool-doc-1",
+      "chat_title": "小明",
+      "sender_name": "小明",
+      "sender_wechat_id": "wxid_xiaoming",
+      "text": "#翻译 文本:This is a short paragraph with LaTeX $a^2+b^2=c^2$.",
+      "is_self": false,
+      "is_group": false,
+      "observed_at": "2026-06-04T12:05:00+08:00",
+      "driver_meta": {}
+    }
+  ]
+}

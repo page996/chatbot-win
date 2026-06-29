@@ -1,0 +1,48 @@
+{
+  "messages": [
+    {
+      "raw_id": "group-special-1",
+      "chat_title": "群+！@#￥%……&*",
+      "sender_name": "小明",
+      "sender_wechat_id": "wxid_xiaoming",
+      "text": "特殊群名测试",
+      "is_self": false,
+      "is_group": true,
+      "observed_at": "2026-06-04T12:04:00+08:00",
+      "driver_meta": {"topic_decision": "speak", "topic": "测试"}
+    },
+    {
+      "raw_id": "group-special-2",
+      "chat_title": "研究会さくら",
+      "sender_name": "さくら",
+      "sender_wechat_id": "wxid_sakura",
+      "text": "日本語の群名テスト",
+      "is_self": false,
+      "is_group": true,
+      "observed_at": "2026-06-04T12:04:01+08:00",
+      "driver_meta": {"topic_decision": "speak", "topic": "测试"}
+    },
+    {
+      "raw_id": "group-special-3",
+      "chat_title": "스터디",
+      "sender_name": "민준",
+      "sender_wechat_id": "wxid_minjun",
+      "text": "한국어 그룹 이름 테스트",
+      "is_self": false,
+      "is_group": true,
+      "observed_at": "2026-06-04T12:04:02+08:00",
+      "driver_meta": {"topic_decision": "speak", "topic": "测试"}
+    },
+    {
+      "raw_id": "group-special-4",
+      "chat_title": "Study Group",
+      "sender_name": "Alice",
+      "sender_wechat_id": "wxid_alice",
+      "text": "English group name test",
+      "is_self": false,
+      "is_group": true,
+      "observed_at": "2026-06-04T12:04:03+08:00",
+      "driver_meta": {"topic_decision": "speak", "topic": "测试"}
+    }
+  ]
+}
