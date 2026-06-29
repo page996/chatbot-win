@@ -9,6 +9,7 @@ from app.personal_wechat_bot.control.audit import (
     build_artifact_cleanup_report,
     build_plan_audit,
 )
+from app.personal_wechat_bot.control.send_commands import set_send_controls
 
 
 class AuditCleanupTest(unittest.TestCase):
@@ -88,6 +89,24 @@ class AuditCleanupTest(unittest.TestCase):
 
             self.assertTrue(send_audit.exists())
             self.assertTrue(any(item["relative_path"] == "send_audit.jsonl" for item in report["retained"]))
+
+    def test_plan_audit_reports_guarded_real_send_rollout_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="windows_guarded")
+            plan = root / "plan.md"
+            plan.write_text("在发送模块实现前，需要人工复制候选回复到微信。", encoding="utf-8")
+
+            report = build_plan_audit(data_dir, plan_path=plan)
+            real_send_item = next(item for item in report["cleanup_order"] if item["item"] == "real-wechat-send")
+
+            self.assertTrue(report["current_truth"]["send_enabled"])
+            self.assertTrue(report["current_truth"]["real_send_implemented"])
+            self.assertFalse(report["current_truth"]["wechat_read_only"])
+            self.assertEqual(real_send_item["status"], "guarded_confirm_rollout_ready")
+            self.assertIn("confirm-mode", real_send_item["action"])
 
 
 if __name__ == "__main__":

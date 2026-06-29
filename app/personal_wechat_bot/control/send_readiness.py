@@ -35,13 +35,7 @@ def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]
         },
         "checks": checks,
         "required_next_steps": _required_next_steps(blockers),
-        "recommended_rollout": [
-            "keep dry_run while validating ingestion and channel isolation",
-            "implement a real send driver behind an explicit feature flag",
-            "run confirm mode first and require manual approval from confirm_queue",
-            "limit initial real sending to one private conversation and very low rate",
-            "only consider auto mode after confirm-mode audit logs are clean",
-        ],
+        "recommended_rollout": _recommended_rollout(preflight),
     }
 
 
@@ -51,7 +45,14 @@ def _checks(preflight: dict[str, Any]) -> list[dict[str, str]]:
     model = preflight.get("model", {})
     channels = preflight.get("conversation_channels", {})
     checks: list[dict[str, str]] = []
-    checks.append(_check("dry_run_active", "pass" if send_policy.get("dry_run") else "warn", "dry_run is active"))
+    checks.append(
+        _check(
+            "rollout_mode",
+            "pass" if send_policy.get("dry_run") else "warn",
+            "dry_run is active",
+            f"{preflight.get('mode')} mode is active; keep guarded rollout narrow",
+        )
+    )
     checks.append(
         _check(
             "real_send_driver",
@@ -131,3 +132,26 @@ def _required_next_steps(blockers: list[dict[str, str]]) -> list[str]:
     if "api_keys" in ids:
         next_steps.append("configure at least one available model API key")
     return next_steps
+
+
+def _recommended_rollout(preflight: dict[str, Any]) -> list[str]:
+    send_policy = preflight.get("send_policy", {})
+    wechat_access = preflight.get("wechat_access", {})
+    if send_policy.get("real_send_implemented"):
+        steps = [
+            "keep confirm mode active while validating guarded real sends",
+            "approve/send only from the sidebar or confirm queue after reviewing message text",
+            "switch focus to the exact target WeChat chat before probe/send countdown ends",
+            "limit initial real sending to one private conversation and very low rate",
+            "only consider auto mode after confirm-mode audit logs are clean",
+        ]
+        if not send_policy.get("send_enabled") or wechat_access.get("read_only"):
+            steps.insert(0, "enable guarded sending only after driver probe reports ready")
+        return steps
+    return [
+        "keep dry_run while validating ingestion and channel isolation",
+        "implement a real send driver behind an explicit feature flag",
+        "run confirm mode first and require manual approval from confirm_queue",
+        "limit initial real sending to one private conversation and very low rate",
+        "only consider auto mode after confirm-mode audit logs are clean",
+    ]

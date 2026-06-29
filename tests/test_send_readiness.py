@@ -72,6 +72,11 @@ class SendReadinessTest(unittest.TestCase):
             self.assertNotIn("send_enabled", blockers)
             self.assertNotIn("wechat_write_access", blockers)
             self.assertNotIn("send_driver_name", blockers)
+            self.assertIn("keep confirm mode active", " ".join(report["recommended_rollout"]))
+            self.assertNotIn("implement a real send driver", " ".join(report["recommended_rollout"]))
+            rollout = next(item for item in report["checks"] if item["id"] == "rollout_mode")
+            self.assertEqual(rollout["status"], "warn")
+            self.assertIn("confirm mode is active", rollout["detail"])
 
 
 if __name__ == "__main__":
