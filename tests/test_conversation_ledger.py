@@ -202,6 +202,55 @@ class LedgerContextAssemblerTest(unittest.TestCase):
             self.assertIn("Quoted-message window", rendered)
             self.assertIn("file message", rendered)
 
+    def test_budget_keeps_quote_window_and_trims_recent_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            quoted = _message("quoted", "important quoted content")
+            store.append_message(quoted)
+            for index in range(20):
+                store.append_message(_message(f"m{index}", f"recent filler message {index} " + ("x" * 80)))
+            current = _message("current", "continue quoted task", metadata={"quote": {"message_id": "quoted"}})
+            store.append_message(current)
+
+            snapshot = LedgerContextAssembler(store, max_recent_entries=25, token_budget=90).build_snapshot(current)
+            rendered = snapshot.render_for_prompt()
+            section_names = [section.name for section in snapshot.sections]
+
+            self.assertIn("quote", section_names)
+            self.assertIn("important quoted content", rendered)
+            self.assertTrue(
+                "earlier recent context omitted by token budget" in rendered
+                or "recent context omitted because forced context used the token budget" in rendered
+            )
+            self.assertGreater(snapshot.estimated_tokens, snapshot.token_budget)
+            self.assertLessEqual(snapshot.estimated_tokens, 180)
+
+    def test_file_section_includes_content_artifact_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            message = _message(
+                "m1",
+                "file message",
+                metadata={
+                    "attachments": [
+                        {
+                            "file_id": "f1",
+                            "name": "a.txt",
+                            "workspace": {"manifest_path": "manifest.json", "derived_dir": "derived"},
+                            "parse": {"status": "parsed", "summary": "ok", "text": "body"},
+                        }
+                    ]
+                },
+            )
+            store.append_message(message)
+
+            snapshot = LedgerContextAssembler(store, max_recent_entries=5, token_budget=300).build_snapshot(message)
+            rendered = snapshot.render_for_prompt()
+
+            self.assertIn("Available file refs", rendered)
+            self.assertIn("content=derived", rendered)
+            self.assertIn("content.md", rendered)
+
 
 def _message(
     message_id: str,
