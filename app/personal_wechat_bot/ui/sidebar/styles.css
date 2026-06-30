@@ -364,6 +364,9 @@ h2 {
   color: #92400e;
   font-size: 12px;
   line-height: 1.4;
+  display: grid;
+  gap: 8px;
+  justify-items: start;
 }
 
 .channel-main,
@@ -373,6 +376,13 @@ h2 {
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.channel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 7px;
 }
 
 .channel-main strong {

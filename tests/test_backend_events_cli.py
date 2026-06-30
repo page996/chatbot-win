@@ -137,6 +137,35 @@ class BackendEventsCliTest(unittest.TestCase):
             self.assertEqual(raw_event["quote"]["text"], "被引用的正文")
             self.assertEqual(raw_event["quote"]["message_id"], "quoted-id")
 
+    def test_append_backend_event_cli_accepts_history_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            event_file = data_dir / "backend_events.jsonl"
+            self._run("--data-dir", str(data_dir), "init")
+
+            append_payload = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "append-backend-event",
+                    "--event-file",
+                    str(event_file),
+                    "--chat-title",
+                    "PAGE",
+                    "--sender-name",
+                    "PAGE",
+                    "--text",
+                    "current",
+                    "--history-json",
+                    '[{"sender_name":"PAGE","text":"old one"},{"sender_name":"Agent","text":"old self"}]',
+                )
+            )
+            raw_event = json.loads(event_file.read_text(encoding="utf-8").splitlines()[0])
+
+            self.assertEqual(append_payload["status"], "ok")
+            self.assertEqual(len(raw_event["history"]), 2)
+            self.assertEqual(raw_event["history"][0]["text"], "old one")
+
     def test_run_agent_cli_starts_backend_event_loop_without_wechat_ocr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"

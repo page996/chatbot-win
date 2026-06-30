@@ -19,6 +19,7 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
+from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
 
 
 QUEUE_STATUSES = ("pending", "approved", "rejected", "sent", "failed")
@@ -36,6 +37,9 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "sidebar_role": "audit_and_send_controls_only",
             "window_probe_role": "diagnostic_only",
             "supports_multi_conversation": True,
+            "send_driver_boundary": "windows_guarded requires foreground WeChat for output; backend events can receive multiple conversations without page OCR",
+            "input_pipeline": "POST /api/backend-events or append-backend-event -> backend_events.jsonl -> run-agent/poll-backend-events -> conversation_ledgers",
+            "background_send_status": "not_supported_by_windows_guarded",
         },
         "config": {
             "mode": config.mode,
@@ -49,14 +53,46 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "queues": queues,
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
-        "wechat_window_probe": build_wechat_window_probe(max_children=80, max_controls=160),
+        "wechat_window_probe": build_wechat_window_probe(max_children=80, max_controls=160, data_dir=data_dir),
         "audit": list_send_audit(data_dir, limit=30),
     }
 
 
 def build_sidebar_wechat_probe(data_dir: str | Path = "data") -> dict[str, Any]:
-    _ = data_dir
-    return build_wechat_window_probe()
+    return build_wechat_window_probe(data_dir=data_dir)
+
+
+def delete_sidebar_channel(data_dir: str | Path, conversation_id: str) -> dict[str, Any]:
+    channel_id = str(conversation_id or "").strip()
+    if not channel_id:
+        raise ValueError("conversation_id is required")
+    store = _channel_store(data_dir)
+    deleted = store.delete_channel(channel_id)
+    return {
+        "status": "ok",
+        "deleted_count": 1 if deleted else 0,
+        "deleted_conversation_ids": [channel_id] if deleted else [],
+        "retained": ["conversation_ledgers", "file_workspace", "conversation_sessions"],
+    }
+
+
+def cleanup_sidebar_channels(data_dir: str | Path, *, hidden_only: bool = True) -> dict[str, Any]:
+    if not hidden_only:
+        raise ValueError("only hidden channel cleanup is supported")
+    state = _channel_state(data_dir)
+    hidden_items = state.get("hidden_items_all", [])
+    store = _channel_store(data_dir)
+    deleted: list[str] = []
+    for item in hidden_items if isinstance(hidden_items, list) else []:
+        conversation_id = str(item.get("conversation_id", "")).strip() if isinstance(item, dict) else ""
+        if conversation_id and store.delete_channel(conversation_id):
+            deleted.append(conversation_id)
+    return {
+        "status": "ok",
+        "deleted_count": len(deleted),
+        "deleted_conversation_ids": deleted,
+        "retained": ["conversation_ledgers", "file_workspace", "conversation_sessions"],
+    }
 
 
 def update_sidebar_controls(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +114,19 @@ def update_sidebar_controls(data_dir: str | Path, payload: dict[str, Any]) -> di
     return {"status": "ok", "send_controls": controls}
 
 
+def append_sidebar_backend_event(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    event_file = _backend_event_file_path(data_dir, payload)
+    raw_id = append_backend_event_payload(event_file, payload)
+    return {
+        "status": "ok",
+        "event_file": str(event_file),
+        "raw_id": raw_id,
+        "capture_source": "backend_http_ingest",
+        "will_write_ledger": True,
+        "send_enabled": False,
+    }
+
+
 def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     reviewer = str(payload.get("reviewer", "sidebar"))
     note = str(payload.get("note", ""))
@@ -90,17 +139,35 @@ def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, paylo
     raise ValueError(f"unknown queue action: {action}")
 
 
-def _channel_state(data_dir: str | Path) -> dict[str, Any]:
+def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> Path:
+    root = Path(data_dir).resolve()
+    raw = str(payload.get("event_file") or payload.get("eventFile") or "").strip()
+    path = Path(raw) if raw else root / "backend_events.jsonl"
+    if not path.is_absolute():
+        path = root / path
+    resolved = path.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("event_file must stay inside data_dir")
+    return resolved
+
+
+def _channel_store(data_dir: str | Path) -> ConversationChannelStore:
     config = load_config(data_dir)
     root = Path(data_dir)
     chat_provider = config.providers.get("chat", config.llm)
     key_pool = ApiKeyPool(chat_provider, root)
-    store = ConversationChannelStore(
+    return ConversationChannelStore(
         root,
         key_pool,
         file_workspace_root=root / "file_workspace",
         context_root=root / "conversation_ledgers",
     )
+
+
+def _channel_state(data_dir: str | Path) -> dict[str, Any]:
+    config = load_config(data_dir)
+    root = Path(data_dir)
+    store = _channel_store(root)
     visible_policy = _visible_channel_policy(root, config)
     channels = []
     hidden = []
@@ -138,6 +205,7 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
         "group_count": sum(1 for item in channels if item["conversation_type"] == "group"),
         "items": sorted(channels, key=lambda item: item.get("updated_at", ""), reverse=True),
         "hidden_items": sorted(hidden, key=lambda item: item.get("updated_at", ""), reverse=True)[:20],
+        "hidden_items_all": sorted(hidden, key=lambda item: item.get("updated_at", ""), reverse=True),
     }
 
 

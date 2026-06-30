@@ -27,7 +27,7 @@ class SidebarWindowTest(unittest.TestCase):
 
     def test_sidebar_geometry_uses_default_when_wechat_missing(self) -> None:
         original = sidebar_window._wechat_anchor
-        sidebar_window._wechat_anchor = lambda: None
+        sidebar_window._wechat_anchor = lambda data_dir=None: None
         try:
             geometry = sidebar_window._sidebar_geometry(width=420, height=700)
         finally:
@@ -38,7 +38,7 @@ class SidebarWindowTest(unittest.TestCase):
     def test_sidebar_geometry_places_inside_wechat_when_right_side_has_no_room(self) -> None:
         original_anchor = sidebar_window._wechat_anchor
         original_work_area = sidebar_window._work_area
-        sidebar_window._wechat_anchor = lambda: {"left": 100, "top": 80, "right": 1000, "bottom": 780}
+        sidebar_window._wechat_anchor = lambda data_dir=None: {"left": 100, "top": 80, "right": 1000, "bottom": 780}
         sidebar_window._work_area = lambda: {"left": 0, "top": 0, "right": 1024, "bottom": 768}
         try:
             geometry = sidebar_window._sidebar_geometry(width=420, height=700)
@@ -66,6 +66,39 @@ class SidebarWindowTest(unittest.TestCase):
             sidebar_window.Win32WindowProbe = original_probe
 
         self.assertEqual(anchor, {"left": 100, "top": 100, "right": 1100, "bottom": 800})
+
+    def test_wechat_anchor_prefers_active_window_binding(self) -> None:
+        class _Store:
+            def __init__(self, data_dir):
+                self.data_dir = data_dir
+
+            def list_bindings(self):
+                return [{"conversation_id": "private-page", "status": "active"}]
+
+            def resolve_status(self, conversation_id):
+                return {
+                    "status": "ok",
+                    "window": WindowInfo(
+                        hwnd=9,
+                        title="微信",
+                        width=900,
+                        height=700,
+                        left=200,
+                        top=120,
+                        right=1100,
+                        bottom=820,
+                        process_name="Weixin.exe",
+                    ),
+                }
+
+        original_store = sidebar_window.WeChatWindowBindingStore
+        sidebar_window.WeChatWindowBindingStore = _Store
+        try:
+            anchor = sidebar_window._wechat_anchor(data_dir="data")
+        finally:
+            sidebar_window.WeChatWindowBindingStore = original_store
+
+        self.assertEqual(anchor, {"left": 200, "top": 120, "right": 1100, "bottom": 820})
 
     def test_launch_result_json_is_stable(self) -> None:
         payload = sidebar_window.result_as_json(

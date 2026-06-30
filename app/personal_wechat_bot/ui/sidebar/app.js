@@ -155,7 +155,11 @@ function renderChannels(data) {
   if (channels.hidden_count) {
     const note = document.createElement("div");
     note.className = "channel-note";
-    note.textContent = `已隐藏 ${channels.hidden_count} 个旧探测/乱码通道：${reasonSummary(channels.hidden_reasons || {})}`;
+    note.innerHTML = `
+      <span>已隐藏 ${channels.hidden_count} 个旧探测/乱码通道：${escapeHtml(reasonSummary(channels.hidden_reasons || {}))}</span>
+      <button class="ghost small" type="button">清理隐藏通道</button>
+    `;
+    note.querySelector("button").addEventListener("click", () => cleanupHiddenChannels());
     list.append(note);
   }
   if (!items.length) {
@@ -176,7 +180,10 @@ function renderChannels(data) {
         <span>${escapeHtml(channel.session_scope || "独立 session")}</span>
         <span>${escapeHtml(shortTime(channel.updated_at || ""))}</span>
       </div>
+      <div class="channel-actions"></div>
     `;
+    const actions = node.querySelector(".channel-actions");
+    actions.append(actionButton("清除通道", "ghost small", () => deleteChannel(channel.conversation_id)));
     list.append(node);
   }
 }
@@ -296,6 +303,25 @@ async function queueAction(queueId, action) {
 async function delayedQueueAction(queueId, action) {
   await countdown("请切到目标微信聊天窗口", 3);
   await queueAction(queueId, action);
+}
+
+async function deleteChannel(conversationId) {
+  if (!conversationId) return;
+  await api(`/api/channels/delete/${encodeURIComponent(conversationId)}`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  setStatusMessage("通道已清除，对话文件和文件中间层已保留");
+  await refresh({ force: true });
+}
+
+async function cleanupHiddenChannels() {
+  await api("/api/channels/cleanup-hidden", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  setStatusMessage("隐藏通道已清理，对话文件和文件中间层已保留");
+  await refresh({ force: true });
 }
 
 async function probeNow() {

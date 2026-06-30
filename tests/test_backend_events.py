@@ -128,6 +128,61 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(messages[0].driver_meta["quote"]["message_id"], "quoted-message-id")
         self.assertEqual(messages[0].driver_meta["quote"]["text"], "被引用内容")
 
+    def test_backend_event_history_is_emitted_before_current_as_context_only(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="current task",
+            history=[
+                {"sender_name": "PAGE", "text": "earlier one", "observed_at": "2026-06-29T00:00:00+00:00"},
+                {"sender_name": "Agent", "text": "earlier self", "observed_at": "2026-06-29T00:01:00+00:00"},
+            ],
+        )
+
+        messages = self.driver.read_new_messages()
+        second = self.driver.read_new_messages()
+
+        self.assertEqual([item.text for item in messages], ["earlier one", "earlier self", "current task"])
+        self.assertTrue(messages[0].driver_meta["context_only"])
+        self.assertTrue(messages[1].driver_meta["context_only"])
+        self.assertFalse(messages[2].driver_meta["context_only"])
+        self.assertEqual(second, [])
+
+    def test_polling_runner_backfills_history_into_ledger_without_replying_to_history(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="current task",
+            history=[
+                {"sender_name": "PAGE", "text": "already happened"},
+                {"sender_name": "PAGE", "text": "already happened too"},
+            ],
+        )
+        runtime = build_runtime(self.config)
+        driver = BackendEventJsonlDriver(
+            self.event_file,
+            runtime.file_index,
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+            file_workspace=runtime.file_workspace,
+            session_store=runtime.session_store,
+        )
+
+        result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_forever(max_loops=1)
+
+        self.assertEqual(result["processed_count"], 3)
+        self.assertTrue(result["processed"][0]["context_only"])
+        self.assertTrue(result["processed"][1]["context_only"])
+        self.assertNotIn("reply", result["processed"][0])
+        entries = runtime.ledger_store.read_entries(result["processed"][-1]["message"]["conversation_id"])
+        self.assertEqual(
+            [entry.text_blocks[0]["text"] for entry in entries[:3]],
+            ["already happened", "already happened too", "current task"],
+        )
+
     def test_driver_never_sends(self) -> None:
         result = self.driver.send_message("conversation", "hello")
 

@@ -79,6 +79,36 @@ class WindowIntrospectionTest(unittest.TestCase):
             )
         )
 
+    def test_active_target_prefers_bound_window_over_foreground_noise(self) -> None:
+        active = window_introspection._active_target(
+            [
+                {"hwnd": 131926, "title": "微信", "process_name": "Weixin.exe"},
+            ],
+            {"hwnd": 44588, "title": "Windows PowerShell", "process_name": "powershell.exe"},
+            [
+                {
+                    "conversation_id": "private-page",
+                    "chat_title": "PAGE",
+                    "hwnd": 131926,
+                    "status": "active",
+                }
+            ],
+        )
+
+        self.assertEqual(active["status"], "bound_window")
+        self.assertEqual(active["source"], "window_binding")
+        self.assertEqual(active["conversation_id"], "private-page")
+
+    def test_active_target_uses_visible_wechat_window_before_foreground_noise(self) -> None:
+        active = window_introspection._active_target(
+            [{"hwnd": 131926, "title": "微信", "process_name": "Weixin.exe"}],
+            {"hwnd": 44588, "title": "Windows PowerShell", "process_name": "powershell.exe"},
+            [],
+        )
+
+        self.assertEqual(active["status"], "wechat_window_available")
+        self.assertEqual(active["source"], "visible_wechat_window")
+
 
 if __name__ == "__main__":
     unittest.main()

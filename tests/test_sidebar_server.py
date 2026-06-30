@@ -80,6 +80,41 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("windows", payload)
             self.assertIn("ui_automation", payload)
 
+    def test_sidebar_server_accepts_backend_event_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            event_file = data_dir / "backend_events.jsonl"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/backend-events",
+                    data=json.dumps(
+                        {
+                            "event_file": str(event_file),
+                            "chat_title": "PAGE",
+                            "sender_name": "PAGE",
+                            "text": "current",
+                            "history": [{"sender_name": "PAGE", "text": "old"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            raw_event = json.loads(event_file.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["capture_source"], "backend_http_ingest")
+            self.assertEqual(raw_event["history"][0]["text"], "old")
+
     def test_sidebar_queue_action_decodes_encoded_queue_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"

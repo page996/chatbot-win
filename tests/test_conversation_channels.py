@@ -110,6 +110,35 @@ class ConversationChannelStoreTest(unittest.TestCase):
             self.assertEqual(len(channels), 12)
             self.assertTrue((root / "conversation_channels" / "index.json").exists())
 
+    def test_delete_channel_removes_registry_and_index_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            channel = store.ensure_channel(_message(conversation_id="private-delete", conversation_type="private"))
+            ledger_file = root / "conversation_ledgers" / "private-delete" / "conversation.md"
+            workspace_file = root / "file_workspace" / "private-delete" / "session_default" / "file.txt"
+            ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            workspace_file.parent.mkdir(parents=True, exist_ok=True)
+            ledger_file.write_text("keep ledger", encoding="utf-8")
+            workspace_file.write_text("keep file", encoding="utf-8")
+
+            deleted = store.delete_channel(channel.conversation_id)
+            deleted_again = store.delete_channel(channel.conversation_id)
+            index = (root / "conversation_channels" / "index.json").read_text(encoding="utf-8")
+
+            self.assertTrue(deleted)
+            self.assertFalse(deleted_again)
+            self.assertIsNone(store.get_channel(channel.conversation_id))
+            self.assertNotIn("private-delete", index)
+            self.assertTrue(ledger_file.exists())
+            self.assertTrue(workspace_file.exists())
+
 
 def _message(
     conversation_id: str,

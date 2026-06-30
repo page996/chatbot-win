@@ -82,12 +82,14 @@ def build_wechat_window_probe(
     max_children: int = 200,
     max_controls: int = 300,
     max_depth: int = 8,
+    data_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     raw_windows = Win32WindowProbe(include_invisible=False).find_wechat_windows()
     windows = filter_wechat_chat_windows(raw_windows)
     foreground = foreground_window_info()
     targets = [_window_payload(item, max_children=max_children, max_controls=max_controls, max_depth=max_depth) for item in windows]
-    active = _active_target(targets, foreground)
+    bindings = _active_bindings(data_dir) if data_dir is not None else []
+    active = _active_target(targets, foreground, bindings)
     dependency = _uia_dependency_status()
     return {
         "status": "ok" if windows else "not_found",
@@ -98,6 +100,8 @@ def build_wechat_window_probe(
         ),
         "foreground": foreground,
         "active": active,
+        "active_source": active.get("source", ""),
+        "bindings": bindings,
         "windows": targets,
         "ignored_windows": [asdict(item) for item in raw_windows if item not in windows],
         "ui_automation": dependency,
@@ -117,15 +121,50 @@ def _window_payload(window: WindowInfo, *, max_children: int, max_controls: int,
     }
 
 
-def _active_target(targets: list[dict[str, Any]], foreground: dict[str, Any]) -> dict[str, Any]:
+def _active_bindings(data_dir: str | Path | None) -> list[dict[str, Any]]:
+    if data_dir is None:
+        return []
+    try:
+        from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
+
+        return WeChatWindowBindingStore(data_dir).list_bindings()
+    except Exception:
+        return []
+
+
+def _active_target(targets: list[dict[str, Any]], foreground: dict[str, Any], bindings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    bindings = bindings or []
+    active_binding_ids = {
+        int(item.get("hwnd", 0) or 0): item
+        for item in bindings
+        if str(item.get("status", "active")) == "active" and int(item.get("hwnd", 0) or 0)
+    }
+    for target in targets:
+        binding = active_binding_ids.get(int(target.get("hwnd", 0) or 0))
+        if binding:
+            return {
+                "status": "bound_window",
+                "source": "window_binding",
+                "hwnd": target.get("hwnd", 0),
+                "title": binding.get("chat_title") or target.get("title", ""),
+                "conversation_id": binding.get("conversation_id", ""),
+            }
+    if targets:
+        first = targets[0]
+        return {
+            "status": "wechat_window_available",
+            "source": "visible_wechat_window",
+            "hwnd": first.get("hwnd", 0),
+            "title": first.get("title", ""),
+        }
     foreground_hwnd = int(foreground.get("hwnd", 0) or 0)
     for target in targets:
         if int(target.get("hwnd", 0) or 0) == foreground_hwnd:
-            return {"status": "matched_foreground", "hwnd": foreground_hwnd, "title": target.get("title", "")}
+            return {"status": "matched_foreground", "source": "foreground", "hwnd": foreground_hwnd, "title": target.get("title", "")}
     process = str(foreground.get("process_name", "")).lower()
     if process in {"wechat.exe", "weixin.exe", "wechatappex.exe"}:
-        return {"status": "foreground_wechat_child_or_popup", "hwnd": foreground_hwnd, "title": foreground.get("title", "")}
-    return {"status": "not_wechat_foreground", "hwnd": foreground_hwnd, "title": foreground.get("title", "")}
+        return {"status": "foreground_wechat_child_or_popup", "source": "foreground", "hwnd": foreground_hwnd, "title": foreground.get("title", "")}
+    return {"status": "not_wechat_foreground", "source": "foreground", "hwnd": foreground_hwnd, "title": foreground.get("title", "")}
 
 
 def _is_candidate_chat_window(window: WindowInfo) -> bool:

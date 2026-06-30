@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from app.personal_wechat_bot.control.sidebar_server import _handler_factory
+from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.window_introspection import filter_wechat_chat_windows
 from app.personal_wechat_bot.wechat_driver.windows_readonly import Win32WindowProbe
 
@@ -44,7 +45,7 @@ def run_sidebar_window(data_dir: str | Path = "data", *, poll_interval_ms: int =
     if result.pid is not None:
         tracker = threading.Thread(
             target=_track_sidebar_window,
-            args=(result.pid, poll_interval_ms, result.geometry["width"], result.geometry["height"]),
+            args=(result.pid, poll_interval_ms, result.geometry["width"], result.geometry["height"], Path(data_dir)),
             daemon=True,
         )
         tracker.start()
@@ -68,7 +69,7 @@ def launch_sidebar_window(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f"http://{actual_host}:{actual_port}/?window=1&launch={int(time.time())}"
-    geometry = _sidebar_geometry(width=width, height=height)
+    geometry = _sidebar_geometry(width=width, height=height, data_dir=data_dir)
     profile_dir = (Path(data_dir) / "runtime" / "sidebar_browser_profile").resolve()
     _close_existing_sidebar_windows()
     browser, pid = _open_app_window(url, geometry=geometry, profile_dir=profile_dir)
@@ -100,19 +101,41 @@ def _available_port(host: str, requested: int) -> int:
         return int(probe.getsockname()[1])
 
 
-def _sidebar_geometry(*, width: int, height: int) -> dict[str, int]:
-    target = _wechat_anchor()
+def _sidebar_geometry(*, width: int, height: int, data_dir: str | Path | None = None) -> dict[str, int]:
+    target = _wechat_anchor(data_dir=data_dir)
     if target:
         return _geometry_next_to_anchor(target, width=width, height=height)
     return {"x": 80, "y": 80, "width": width, "height": height}
 
 
-def _wechat_anchor() -> dict[str, int] | None:
+def _wechat_anchor(data_dir: str | Path | None = None) -> dict[str, int] | None:
+    bound = _bound_wechat_anchor(data_dir)
+    if bound is not None:
+        return bound
     windows = filter_wechat_chat_windows(Win32WindowProbe(include_invisible=False).find_wechat_windows())
     if not windows:
         return None
     window = windows[0]
     return {"left": window.left, "top": window.top, "right": window.right, "bottom": window.bottom}
+
+
+def _bound_wechat_anchor(data_dir: str | Path | None) -> dict[str, int] | None:
+    if data_dir is None:
+        return None
+    try:
+        store = WeChatWindowBindingStore(data_dir)
+        for binding in store.list_bindings():
+            conversation_id = str(binding.get("conversation_id", "")).strip()
+            if not conversation_id or str(binding.get("status", "active")) != "active":
+                continue
+            status = store.resolve_status(conversation_id)
+            window = status.get("window")
+            if window is None:
+                continue
+            return {"left": window.left, "top": window.top, "right": window.right, "bottom": window.bottom}
+    except Exception:
+        return None
+    return None
 
 
 def _geometry_next_to_anchor(anchor: dict[str, int], *, width: int, height: int) -> dict[str, int]:
@@ -165,7 +188,7 @@ def _open_app_window(url: str, *, geometry: dict[str, int], profile_dir: Path | 
     return "default", None
 
 
-def _track_sidebar_window(pid: int, poll_interval_ms: int, width: int, height: int) -> None:
+def _track_sidebar_window(pid: int, poll_interval_ms: int, width: int, height: int, data_dir: Path) -> None:
     if sys.platform != "win32" or pid <= 0:
         return
     interval = max(0.25, poll_interval_ms / 1000)
@@ -180,7 +203,7 @@ def _track_sidebar_window(pid: int, poll_interval_ms: int, width: int, height: i
             time.sleep(interval)
             continue
         misses = 0
-        geometry = _sidebar_geometry(width=width, height=height)
+        geometry = _sidebar_geometry(width=width, height=height, data_dir=data_dir)
         if geometry != last_geometry:
             _move_window(hwnd, geometry)
             last_geometry = geometry

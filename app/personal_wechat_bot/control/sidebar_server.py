@@ -8,8 +8,11 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from app.personal_wechat_bot.control.sidebar_api import (
+    append_sidebar_backend_event,
     build_sidebar_wechat_probe,
     build_sidebar_state,
+    cleanup_sidebar_channels,
+    delete_sidebar_channel,
     sidebar_queue_action,
     update_sidebar_controls,
 )
@@ -51,7 +54,17 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/controls":
                     self._json(update_sidebar_controls(data_dir, payload))
                     return
+                if parsed.path == "/api/backend-events":
+                    self._json(append_sidebar_backend_event(data_dir, payload))
+                    return
+                if parsed.path == "/api/channels/cleanup-hidden":
+                    self._json(cleanup_sidebar_channels(data_dir, hidden_only=True))
+                    return
                 parts = [part for part in parsed.path.split("/") if part]
+                if len(parts) == 4 and parts[:3] == ["api", "channels", "delete"]:
+                    _, _, _, conversation_id = parts
+                    self._json(delete_sidebar_channel(data_dir, unquote(conversation_id)))
+                    return
                 if len(parts) == 4 and parts[:2] == ["api", "queue"]:
                     _, _, queue_id, action = parts
                     self._json(sidebar_queue_action(data_dir, action, unquote(queue_id), payload))

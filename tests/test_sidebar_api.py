@@ -6,7 +6,10 @@ from pathlib import Path
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.control.sidebar_api import (
+    append_sidebar_backend_event,
     build_sidebar_state,
+    cleanup_sidebar_channels,
+    delete_sidebar_channel,
     sidebar_queue_action,
     update_sidebar_controls,
 )
@@ -133,6 +136,80 @@ class SidebarApiTest(unittest.TestCase):
 
             self.assertEqual([item["chat_title"] for item in state["channels"]["items"]], ["PAGE"])
             self.assertEqual(state["channels"]["hidden_reasons"]["untrusted_legacy_channel"], 1)
+
+    def test_sidebar_cleanup_hidden_channels_deletes_only_hidden_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            trusted = MessageNormalizer().normalize(
+                RawWeChatMessage("1", "PAGE", "PAGE", "hello", driver_meta={"source": "backend_events_jsonl"})
+            )
+            hidden = MessageNormalizer().normalize(
+                RawWeChatMessage("2", "+25", "+25", "8/10/16", driver_meta={"source": "backend_events_jsonl"})
+            )
+            assert trusted is not None and hidden is not None
+            store.ensure_channel(trusted)
+            store.ensure_channel(hidden)
+            ledger_file = data_dir / "conversation_ledgers" / hidden.conversation_id / "conversation.md"
+            ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            ledger_file.write_text("keep", encoding="utf-8")
+
+            result = cleanup_sidebar_channels(data_dir)
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(result["deleted_conversation_ids"], [hidden.conversation_id])
+            self.assertEqual(state["channels"]["count"], 1)
+            self.assertEqual(state["channels"]["hidden_count"], 0)
+            self.assertIsNotNone(store.get_channel(trusted.conversation_id))
+            self.assertIsNone(store.get_channel(hidden.conversation_id))
+            self.assertTrue(ledger_file.exists())
+
+    def test_sidebar_delete_channel_removes_specific_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            message = MessageNormalizer().normalize(
+                RawWeChatMessage("1", "PAGE", "PAGE", "hello", driver_meta={"source": "backend_events_jsonl"})
+            )
+            assert message is not None
+            store.ensure_channel(message)
+
+            result = delete_sidebar_channel(data_dir, message.conversation_id)
+
+            self.assertEqual(result["deleted_count"], 1)
+            self.assertIsNone(store.get_channel(message.conversation_id))
+
+    def test_backend_event_ingest_rejects_event_file_outside_data_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            outside = Path(tmp) / "outside.jsonl"
+            create_default_config(data_dir)
+
+            with self.assertRaises(ValueError):
+                append_sidebar_backend_event(
+                    data_dir,
+                    {
+                        "event_file": str(outside),
+                        "chat_title": "PAGE",
+                        "sender_name": "PAGE",
+                        "text": "hello",
+                    },
+                )
 
     def test_sidebar_controls_update_mode_and_send_switch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

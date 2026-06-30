@@ -29,11 +29,13 @@ class BackendMessageEvent:
     chat_title: str
     sender_name: str
     text: str
+    is_self: bool = False
     is_group: bool = False
     sender_wechat_id: str | None = None
     observed_at: str = ""
     attachments: tuple[BackendAttachment, ...] = ()
     quote: dict[str, Any] | None = None
+    history: tuple["BackendMessageEvent", ...] = ()
 
 
 class BackendEventJsonlDriver:
@@ -69,7 +71,8 @@ class BackendEventJsonlDriver:
             embedded_media_ocr=self.attachment_parser.ocr_engine,
         )
         self.session_store = session_store or context_store
-        self._seen_raw_ids: set[str] = set()
+        self._seen_event_ids: set[str] = set()
+        self._seen_message_raw_ids: set[str] = set()
 
     def health_check(self) -> bool:
         return self.event_path.exists() and self.event_path.is_file()
@@ -81,12 +84,25 @@ class BackendEventJsonlDriver:
         messages: list[RawWeChatMessage] = []
         for line_no, line in enumerate(self.event_path.read_text(encoding="utf-8").splitlines(), start=1):
             event = _parse_event_line(line, line_no=line_no)
-            if event is None or event.raw_id in self._seen_raw_ids:
+            if event is None or event.raw_id in self._seen_event_ids:
                 continue
-            self._seen_raw_ids.add(event.raw_id)
-            raw = self._to_raw_message(event, line_no=line_no)
+            self._seen_event_ids.add(event.raw_id)
+            for raw in self._event_messages(event, line_no=line_no):
+                if raw.raw_id in self._seen_message_raw_ids:
+                    continue
+                self._seen_message_raw_ids.add(raw.raw_id)
+                messages.append(raw)
+        return messages
+
+    def _event_messages(self, event: BackendMessageEvent, line_no: int) -> list[RawWeChatMessage]:
+        messages: list[RawWeChatMessage] = []
+        for index, history_event in enumerate(event.history):
+            raw = self._to_raw_message(history_event, line_no=line_no, history_index=index, context_only=True)
             if raw is not None:
                 messages.append(raw)
+        current = self._to_raw_message(event, line_no=line_no)
+        if current is not None:
+            messages.append(current)
         return messages
 
     def send_message(self, conversation_id: str, text: str) -> SendResult:
@@ -97,7 +113,14 @@ class BackendEventJsonlDriver:
             reason="backend_event_driver_never_sends",
         )
 
-    def _to_raw_message(self, event: BackendMessageEvent, line_no: int) -> RawWeChatMessage | None:
+    def _to_raw_message(
+        self,
+        event: BackendMessageEvent,
+        line_no: int,
+        *,
+        history_index: int | None = None,
+        context_only: bool = False,
+    ) -> RawWeChatMessage | None:
         conversation_type = "group" if event.is_group else "private"
         conversation_id = conversation_id_for(conversation_type, event.chat_title)
         session_id = (
@@ -110,23 +133,26 @@ class BackendEventJsonlDriver:
         if not text.strip():
             return None
         return RawWeChatMessage(
-            raw_id=event.raw_id,
+            raw_id=event.raw_id if history_index is None else f"{event.raw_id}:history:{history_index}",
             chat_title=event.chat_title,
             sender_name=event.sender_name,
             sender_wechat_id=event.sender_wechat_id,
             text=text,
+            is_self=event.is_self,
             is_group=event.is_group,
             observed_at=event.observed_at or utc_now_iso(),
             driver_meta={
                 "source": "backend_events_jsonl",
                 "event_path": str(self.event_path),
                 "line_no": line_no,
+                "history_index": history_index,
                 "conversation_id_hint": conversation_id,
                 "session_id": session_id,
                 "original_text": event.text,
                 "backend_attachments_pending": True,
                 "attachments": attachments,
                 "quote": event.quote or {},
+                "context_only": context_only,
             },
         )
 
@@ -194,22 +220,27 @@ def append_backend_event(
     sender_name: str,
     text: str = "",
     sender_wechat_id: str = "",
+    is_self: bool = False,
     is_group: bool = False,
-    attachments: list[str] | None = None,
+    attachments: list[str | dict[str, Any]] | None = None,
     observed_at: str = "",
     quote: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> str:
     payload = {
         "chat_title": chat_title,
         "sender_name": sender_name,
         "sender_wechat_id": sender_wechat_id,
         "text": text,
+        "is_self": bool(is_self),
         "is_group": is_group,
         "observed_at": observed_at or utc_now_iso(),
-        "attachments": [{"path": item} for item in attachments or []],
+        "attachments": [_attachment_payload(item) for item in attachments or []],
     }
     if quote:
         payload["quote"] = quote
+    if history:
+        payload["history"] = [_history_payload(item) for item in history if isinstance(item, dict)]
     raw_id = _event_raw_id(payload)
     payload["raw_id"] = raw_id
     path = Path(event_path)
@@ -217,6 +248,42 @@ def append_backend_event(
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return raw_id
+
+
+def append_backend_event_payload(event_path: str | Path, payload: dict[str, Any]) -> str:
+    """Append a structured backend-captured WeChat event to the local event bus."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("backend event payload must be a JSON object")
+    chat_title = str(payload.get("chat_title") or payload.get("chatTitle") or "").strip()
+    sender_name = str(payload.get("sender_name") or payload.get("senderName") or "").strip()
+    if not chat_title:
+        raise ValueError("chat_title is required")
+    if not sender_name:
+        raise ValueError("sender_name is required")
+    attachments = payload.get("attachments", payload.get("attachment", []))
+    if isinstance(attachments, (str, dict)):
+        attachments = [attachments]
+    if not isinstance(attachments, list):
+        attachments = []
+    history = payload.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    quote = payload.get("quote")
+    parsed_quote = _parse_quote(quote) if quote is not None else None
+    return append_backend_event(
+        event_path,
+        chat_title=chat_title,
+        sender_name=sender_name,
+        sender_wechat_id=str(payload.get("sender_wechat_id") or payload.get("senderWechatId") or "").strip(),
+        text=str(payload.get("text", "")).strip(),
+        is_self=bool(payload.get("is_self", payload.get("isSelf", False))),
+        is_group=bool(payload.get("is_group", payload.get("group", False))),
+        attachments=attachments,
+        observed_at=str(payload.get("observed_at") or payload.get("observedAt") or "").strip(),
+        quote=parsed_quote,
+        history=[item for item in history if isinstance(item, dict)],
+    )
 
 
 def _parse_event_line(line: str, line_no: int) -> BackendMessageEvent | None:
@@ -229,6 +296,37 @@ def _parse_event_line(line: str, line_no: int) -> BackendMessageEvent | None:
         return None
     if not isinstance(payload, dict):
         return None
+    return _parse_event_payload(payload, line_no=line_no, include_history=True)
+
+
+def _parse_history(values: Any, *, parent: dict[str, Any], line_no: int) -> tuple[BackendMessageEvent, ...]:
+    if not isinstance(values, list):
+        return ()
+    history: list[BackendMessageEvent] = []
+    for index, item in enumerate(values):
+        if not isinstance(item, dict):
+            continue
+        merged = {
+            "chat_title": parent.get("chat_title", ""),
+            "sender_name": parent.get("sender_name", ""),
+            "sender_wechat_id": parent.get("sender_wechat_id", ""),
+            "is_self": parent.get("is_self", False),
+            "is_group": parent.get("is_group", False),
+            **item,
+        }
+        event = _parse_event_payload(merged, line_no=line_no, suffix=f"history:{index}")
+        if event is not None:
+            history.append(event)
+    return tuple(history)
+
+
+def _parse_event_payload(
+    payload: dict[str, Any],
+    *,
+    line_no: int,
+    suffix: str = "",
+    include_history: bool = False,
+) -> BackendMessageEvent | None:
     chat_title = str(payload.get("chat_title", "")).strip()
     sender_name = str(payload.get("sender_name", "")).strip()
     if not chat_title or not sender_name:
@@ -236,18 +334,55 @@ def _parse_event_line(line: str, line_no: int) -> BackendMessageEvent | None:
     text = str(payload.get("text", "")).strip()
     attachments = _parse_attachments(payload.get("attachments", []))
     quote = _parse_quote(payload.get("quote"))
-    raw_id = str(payload.get("raw_id", "")).strip() or _event_raw_id({**payload, "_line_no": line_no})
+    seed = {**payload, "_line_no": line_no}
+    if suffix:
+        seed["_suffix"] = suffix
+    raw_id = str(payload.get("raw_id", "")).strip() or _event_raw_id(seed)
     return BackendMessageEvent(
         raw_id=raw_id,
         chat_title=chat_title,
         sender_name=sender_name,
         sender_wechat_id=str(payload.get("sender_wechat_id", "")).strip() or None,
         text=text,
+        is_self=bool(payload.get("is_self", False)),
         is_group=bool(payload.get("is_group", False)),
         observed_at=str(payload.get("observed_at", "")).strip(),
         attachments=attachments,
         quote=quote,
+        history=_parse_history(payload.get("history", []), parent=payload, line_no=line_no) if include_history else (),
     )
+
+
+def _attachment_payload(value: str | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(value, str):
+        path = value.strip()
+        return {"path": path} if path else {}
+    if not isinstance(value, dict):
+        return {}
+    path = str(value.get("path", "")).strip()
+    payload: dict[str, Any] = {"path": path}
+    original_name = str(value.get("original_name") or value.get("name") or "").strip()
+    kind = str(value.get("kind") or "file").strip()
+    if original_name:
+        payload["original_name"] = original_name
+    if kind:
+        payload["kind"] = kind
+    return {key: item for key, item in payload.items() if item}
+
+
+def _history_payload(value: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(value)
+    attachments = payload.get("attachments", [])
+    if isinstance(attachments, (str, dict)):
+        attachments = [attachments]
+    if isinstance(attachments, list):
+        payload["attachments"] = [_attachment_payload(item) for item in attachments if isinstance(item, (str, dict))]
+    quote = _parse_quote(payload.get("quote")) if "quote" in payload else None
+    if quote:
+        payload["quote"] = quote
+    elif "quote" in payload:
+        payload.pop("quote", None)
+    return payload
 
 
 def _parse_attachment(value: Any) -> BackendAttachment | None:

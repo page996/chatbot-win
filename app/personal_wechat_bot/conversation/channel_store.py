@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import threading
 import uuid
 from dataclasses import asdict, dataclass
@@ -139,6 +140,16 @@ class ConversationChannelStore:
                 channels.append(_channel_from_payload(payload))
         return channels
 
+    def delete_channel(self, conversation_id: str) -> bool:
+        with self._lock:
+            path = self._channel_path(conversation_id)
+            if not path.exists():
+                return False
+            channel_dir = path.parent
+            shutil.rmtree(channel_dir)
+            self._remove_from_index(conversation_id)
+            return True
+
     def _assign_key_refs(self, conversation_id: str, slots: int) -> list[str]:
         refs = self.key_pool.refs()
         available = [item.ref for item in refs if item.available]
@@ -192,6 +203,24 @@ class ConversationChannelStore:
                 "updated_at": payload.get("updated_at", ""),
             }
         )
+        self._write_json(
+            index_path,
+            {
+                "policy": CHANNEL_POLICY,
+                "channels": sorted(kept, key=lambda item: str(item.get("updated_at", ""))),
+                "updated_at": utc_now_iso(),
+            },
+        )
+
+    def _remove_from_index(self, conversation_id: str) -> None:
+        index_path = self.root / "index.json"
+        index = self._read_channel_payload(index_path)
+        channels = index.get("channels", []) if isinstance(index.get("channels"), list) else []
+        kept = [
+            item
+            for item in channels
+            if isinstance(item, dict) and item.get("conversation_id") != conversation_id
+        ]
         self._write_json(
             index_path,
             {

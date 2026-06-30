@@ -5,6 +5,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.bootstrap import build_runtime
@@ -23,6 +24,7 @@ from app.personal_wechat_bot.control.audit import (
     build_plan_audit,
 )
 from app.personal_wechat_bot.control.preflight import build_preflight_report
+from app.personal_wechat_bot.control.sidebar_api import cleanup_sidebar_channels, delete_sidebar_channel
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
 from app.personal_wechat_bot.control.sidebar_window import run_sidebar_window
@@ -200,12 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
     append_backend.add_argument("--sender-name", required=True)
     append_backend.add_argument("--sender-wechat-id", default="")
     append_backend.add_argument("--text", default="")
+    append_backend.add_argument("--self", action="store_true", dest="is_self")
     append_backend.add_argument("--group", action="store_true")
+    append_backend.add_argument("--observed-at", default="")
     append_backend.add_argument("--attachment", action="append", default=[])
     append_backend.add_argument("--quote-text", default="")
     append_backend.add_argument("--quote-message-id", default="")
     append_backend.add_argument("--quote-sender-name", default="")
     append_backend.add_argument("--quote-received-at", default="")
+    append_backend.add_argument("--history-json", default="")
+    append_backend.add_argument("--history-file", default="")
 
     poll_backend = sub.add_parser("poll-backend-events")
     poll_backend.add_argument("--event-file", default=None)
@@ -261,6 +267,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("wechat-window-bindings")
+
+    delete_channel = sub.add_parser("delete-channel")
+    delete_channel.add_argument("conversation_id")
+
+    sub.add_parser("cleanup-hidden-channels")
 
     capture = sub.add_parser("wechat-capture")
     capture.add_argument("--hwnd", type=int, default=None)
@@ -474,9 +485,12 @@ def main(argv: list[str] | None = None) -> None:
             sender_name=args.sender_name,
             sender_wechat_id=args.sender_wechat_id,
             text=args.text,
+            is_self=args.is_self,
             is_group=args.group,
+            observed_at=args.observed_at,
             attachments=args.attachment,
             quote=_quote_payload(args),
+            history=_history_payload(args),
         )
         print(json.dumps({"status": "ok", "event_file": event_file, "raw_id": raw_id, "send_enabled": False}, ensure_ascii=False, indent=2))
         return
@@ -604,6 +618,14 @@ def main(argv: list[str] | None = None) -> None:
         store = WeChatWindowBindingStore(args.data_dir)
         print(json.dumps({"status": "ok", "bindings": store.list_bindings(), "send_enabled": False}, ensure_ascii=False, indent=2))
         return
+    if args.command == "delete-channel":
+        result = delete_sidebar_channel(args.data_dir, args.conversation_id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "cleanup-hidden-channels":
+        result = cleanup_sidebar_channels(args.data_dir, hidden_only=True)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "wechat-capture":
         hwnd = args.hwnd
         if hwnd is None:
@@ -664,6 +686,31 @@ def _quote_payload(args: argparse.Namespace) -> dict[str, str] | None:
     if not cleaned:
         return None
     return {**cleaned, "source": "append_backend_event_cli"}
+
+
+def _history_payload(args: argparse.Namespace) -> list[dict[str, Any]]:
+    history: list[dict[str, Any]] = []
+    raw_json = str(getattr(args, "history_json", "") or "").strip()
+    if raw_json:
+        parsed = json.loads(raw_json)
+        history.extend(_history_items(parsed, source="append_backend_event_cli"))
+    raw_file = str(getattr(args, "history_file", "") or "").strip()
+    if raw_file:
+        parsed = json.loads(Path(raw_file).read_text(encoding="utf-8"))
+        history.extend(_history_items(parsed, source=f"append_backend_event_cli:{raw_file}"))
+    return history
+
+
+def _history_items(value: Any, *, source: str) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else [value]
+    items: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise ValueError("history items must be JSON objects")
+        cleaned = {key: item[key] for key in item if item[key] not in (None, "")}
+        cleaned.setdefault("source", source)
+        items.append(cleaned)
+    return items
 
 
 def _ocr_parse_payload(parse_result) -> dict[str, object] | None:
