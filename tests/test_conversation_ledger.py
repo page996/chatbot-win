@@ -26,6 +26,18 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertIn("000001", markdown)
             self.assertIn("hello https://example.com/a", markdown)
 
+    def test_append_message_persists_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            entry = store.append_message(_message("m1", "hello", metadata={"session_id": "session_new"}))
+
+            entries = store.read_entries("conv1")
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+
+            self.assertEqual(entry.session_id, "session_new")
+            self.assertEqual(entries[0].session_id, "session_new")
+            self.assertIn("[session:session_new]", markdown)
+
     def test_records_self_message_without_losing_role(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
@@ -202,6 +214,21 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(entry.conversation_type, "group")
             self.assertEqual(entry.role, "assistant")
 
+    def test_append_reply_persists_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            reply = ReplyCandidate(
+                message_id="m1",
+                conversation_id="conv1",
+                text="reply",
+                send_mode="dry_run",
+                model="fake",
+            )
+
+            entry = store.append_reply(reply, session_id="session_new")
+
+            self.assertEqual(entry.session_id, "session_new")
+
 
 class LedgerContextAssemblerTest(unittest.TestCase):
     def test_build_snapshot_uses_active_entries_quote_window_and_files(self) -> None:
@@ -307,6 +334,40 @@ class LedgerContextAssemblerTest(unittest.TestCase):
 
             self.assertIn("table_index=derived/tables/index.json", rendered)
             self.assertIn("table_chunk_count=2", rendered)
+
+    def test_recent_context_is_scoped_to_current_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("old", "old session text", metadata={"session_id": "old_session"}))
+            current = _message("current", "new session text", metadata={"session_id": "new_session"})
+            store.append_message(current)
+
+            snapshot = LedgerContextAssembler(store, max_recent_entries=5, token_budget=300).build_snapshot(current)
+            rendered = snapshot.render_for_prompt()
+
+            self.assertEqual(snapshot.session_id, "new_session")
+            self.assertEqual([item["message_id"] for item in snapshot.recent_entries], ["current"])
+            self.assertIn("new session text", rendered)
+            self.assertNotIn("old session text", rendered)
+
+    def test_explicit_quote_can_restore_cross_session_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("old", "old quoted text", metadata={"session_id": "old_session"}))
+            current = _message(
+                "current",
+                "continue quote",
+                metadata={"session_id": "new_session", "quote": {"message_id": "old"}},
+            )
+            store.append_message(current)
+
+            snapshot = LedgerContextAssembler(store, max_recent_entries=5, token_budget=300).build_snapshot(current)
+            rendered = snapshot.render_for_prompt()
+
+            self.assertEqual([item["message_id"] for item in snapshot.recent_entries], ["current"])
+            self.assertEqual(snapshot.quote_context["status"], "found")
+            self.assertIn("Quoted-message window", rendered)
+            self.assertIn("old quoted text", rendered)
 
 
 def _message(

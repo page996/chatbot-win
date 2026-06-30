@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.conversation.context_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, utc_now_iso
 
 
@@ -24,6 +25,7 @@ class LedgerEntry:
     entry_id: str
     message_id: str
     conversation_id: str
+    session_id: str
     conversation_type: str
     chat_title: str
     sender_name: str
@@ -57,6 +59,7 @@ class ConversationLedgerStore:
             entry_id=_entry_id(message.message_id, message.conversation_id),
             message_id=message.message_id,
             conversation_id=message.conversation_id,
+            session_id=_session_id_from_metadata(message.metadata),
             conversation_type=message.conversation_type,
             chat_title=message.chat_title,
             sender_name=message.sender_name,
@@ -130,12 +133,14 @@ class ConversationLedgerStore:
         chat_title: str = "",
         sender_name: str = "agent",
         conversation_type: str = "private",
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> LedgerEntry:
         entries = self._read_entries(reply.conversation_id)
         entry = LedgerEntry(
             entry_id=_entry_id(f"reply:{reply.message_id}:{reply.created_at}", reply.conversation_id),
             message_id=reply.message_id,
             conversation_id=reply.conversation_id,
+            session_id=session_id or DEFAULT_SESSION_ID,
             conversation_type=conversation_type,
             chat_title=chat_title,
             sender_name=sender_name,
@@ -268,6 +273,7 @@ class ConversationLedgerStore:
             "conversation_id": conversation_id,
             "last_sequence": entry.sequence,
             "last_entry_id": entry.entry_id,
+            "last_session_id": entry.session_id,
             "updated_at": utc_now_iso(),
         }
         _write_json(path, payload)
@@ -572,6 +578,9 @@ def _render_entry_markdown(item: dict[str, Any]) -> list[str]:
     sender = str(item.get("sender_name", ""))
     status = str(item.get("status", "active"))
     lines = [f"## {sequence:06d} {received_at} {sender}", ""]
+    session_id = str(item.get("session_id") or DEFAULT_SESSION_ID)
+    lines.append(f"[session:{session_id}]")
+    lines.append("")
     if status != "active":
         lines.append(f"[{status}] message_id={item.get('message_id', '')}")
         lines.append("")
@@ -649,6 +658,7 @@ def _entry_from_payload(payload: dict[str, Any]) -> LedgerEntry:
         entry_id=str(payload.get("entry_id", "")),
         message_id=str(payload.get("message_id", "")),
         conversation_id=str(payload.get("conversation_id", "")),
+        session_id=str(payload.get("session_id") or DEFAULT_SESSION_ID),
         conversation_type=str(payload.get("conversation_type", "")),
         chat_title=str(payload.get("chat_title", "")),
         sender_name=str(payload.get("sender_name", "")),
@@ -671,6 +681,11 @@ def _entry_from_payload(payload: dict[str, Any]) -> LedgerEntry:
 def _attachment_source_ref(attachment: dict[str, Any]) -> str:
     workspace = attachment.get("workspace") if isinstance(attachment.get("workspace"), dict) else {}
     return str(workspace.get("manifest_path") or workspace.get("derived_dir") or workspace.get("workspace_dir") or "")
+
+
+def _session_id_from_metadata(metadata: dict[str, Any]) -> str:
+    session_id = str(metadata.get("session_id") or "").strip()
+    return session_id or DEFAULT_SESSION_ID
 
 
 def _entry_id(message_id: str, conversation_id: str) -> str:

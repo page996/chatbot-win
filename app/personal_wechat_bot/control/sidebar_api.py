@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.config.loader import load_config
+from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     list_confirm_queue,
@@ -23,8 +25,16 @@ QUEUE_STATUSES = ("pending", "approved", "rejected", "sent", "failed")
 def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
     config = load_config(data_dir)
     queues = {status: list_confirm_queue(data_dir, status=status) for status in QUEUE_STATUSES}
+    channels = _channel_state(data_dir)
     return {
         "status": "ok",
+        "role": "visual_audit_console",
+        "capture": {
+            "owner": "backend_message_sources",
+            "sidebar_role": "audit_and_send_controls_only",
+            "window_probe_role": "diagnostic_only",
+            "supports_multi_conversation": True,
+        },
         "config": {
             "mode": config.mode,
             "send_enabled": config.send_enabled,
@@ -33,6 +43,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "send_max_chars": config.send_max_chars,
             "send_min_interval_seconds": config.send_min_interval_seconds,
         },
+        "channels": channels,
         "queues": queues,
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
@@ -75,3 +86,42 @@ def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, paylo
     if action == "send-approved":
         return send_approved_confirm_item(data_dir, queue_id)
     raise ValueError(f"unknown queue action: {action}")
+
+
+def _channel_state(data_dir: str | Path) -> dict[str, Any]:
+    config = load_config(data_dir)
+    root = Path(data_dir)
+    chat_provider = config.providers.get("chat", config.llm)
+    key_pool = ApiKeyPool(chat_provider, root)
+    store = ConversationChannelStore(
+        root,
+        key_pool,
+        file_workspace_root=root / "file_workspace",
+        context_root=root / "conversation_context",
+    )
+    channels = []
+    for channel in store.list_channels():
+        payload = {
+            "conversation_id": channel.conversation_id,
+            "conversation_type": channel.conversation_type,
+            "chat_title": channel.chat_title,
+            "status": channel.status,
+            "key_slots": channel.key_slots,
+            "api_key_refs": channel.api_key_refs,
+            "session_scope": channel.session_scope,
+            "backend_dir": channel.backend_dir,
+            "context_dir": channel.context_dir,
+            "file_workspace_dir": channel.file_workspace_dir,
+            "sender_names": channel.sender_names,
+            "sender_wechat_ids": channel.sender_wechat_ids,
+            "updated_at": channel.updated_at,
+        }
+        channels.append(payload)
+    return {
+        "status": "ok",
+        "policy": "auto_accept_wechat_contacts_and_groups",
+        "count": len(channels),
+        "private_count": sum(1 for item in channels if item["conversation_type"] == "private"),
+        "group_count": sum(1 for item in channels if item["conversation_type"] == "group"),
+        "items": sorted(channels, key=lambda item: item.get("updated_at", ""), reverse=True),
+    }

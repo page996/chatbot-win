@@ -6,6 +6,7 @@ from pathlib import Path
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config
+from app.personal_wechat_bot.conversation.context_store import CLEAR_CONTEXT_PHRASES, DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import RawWeChatMessage
 from app.personal_wechat_bot.processor.message_processor import MessageProcessor
 
@@ -118,6 +119,31 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertEqual(result["link_annotations"][0]["status"], "ok")
             entries = runtime.ledger_store.read_entries(result["message"]["conversation_id"])
             self.assertEqual(entries[0].links[0]["status"], "completed")
+
+    def test_processor_threads_current_session_into_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+
+            result = processor.process(
+                RawWeChatMessage(
+                    raw_id="clear-context",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    text=CLEAR_CONTEXT_PHRASES[0],
+                    observed_at="2026-06-28T01:00:00+00:00",
+                )
+            )
+
+            self.assertIsNotNone(result)
+            session_id = result["message"]["metadata"]["session_id"]
+            entries = runtime.ledger_store.read_entries(result["message"]["conversation_id"])
+            self.assertNotEqual(session_id, DEFAULT_SESSION_ID)
+            self.assertEqual(result["context"]["session_id"], session_id)
+            self.assertEqual(entries[0].session_id, session_id)
+            self.assertEqual(entries[-1].session_id, session_id)
 
 
 class _FakeLinkAnnotations:

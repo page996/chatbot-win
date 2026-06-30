@@ -36,6 +36,7 @@ button {
 
 .topbar,
 .dock-panel,
+.channels,
 .controls,
 .queue-item,
 .inspector,
@@ -87,7 +88,8 @@ h2 {
 }
 
 #readinessLine,
-#wechatDetail,
+#captureDetail,
+.diagnostic-copy,
 .handle-sub,
 .conversation,
 .audit-item p {
@@ -266,17 +268,18 @@ h2 {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 8px;
 }
 
 .metric {
-  min-height: 60px;
+  min-height: 54px;
   border: 1px solid #d9e2ee;
   border-radius: 10px;
   background: #ffffff;
-  padding: 8px;
+  padding: 7px;
   text-align: left;
+  min-width: 0;
 }
 
 .metric span {
@@ -288,7 +291,7 @@ h2 {
 .metric strong {
   display: block;
   margin-top: 3px;
-  font-size: 22px;
+  font-size: 18px;
 }
 
 .metric.active {
@@ -298,9 +301,67 @@ h2 {
 
 .queue-list,
 .audit-list,
-.handle-list {
+.handle-list,
+.channel-list {
   display: grid;
   gap: 8px;
+}
+
+.channels {
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.channel-stats {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0;
+  color: #667085;
+  font-size: 12px;
+}
+
+.channel-stats span {
+  border: 1px solid #d9e2ee;
+  border-radius: 7px;
+  padding: 5px 7px;
+  background: #f8fafc;
+}
+
+.channel-stats strong {
+  color: #182230;
+}
+
+.channel-item {
+  border: 1px solid #e4eaf2;
+  border-radius: 8px;
+  padding: 8px;
+  background: #ffffff;
+}
+
+.channel-main,
+.channel-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+.channel-main strong {
+  min-width: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.channel-main span,
+.channel-meta span,
+.channel-item p {
+  color: #667085;
+  font-size: 11px;
+}
+
+.channel-item p {
+  margin: 4px 0 7px;
+  overflow-wrap: anywhere;
 }
 
 .queue-item {
@@ -366,6 +427,10 @@ h2 {
 .audit {
   border-radius: 10px;
   padding: 10px;
+}
+
+.diagnostic-copy {
+  margin: 6px 0 8px;
 }
 
 .handle-item {

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>WeChat Agent Console</title>
-    <link rel="stylesheet" href="/styles.css?v=20260630-1" />
+    <link rel="stylesheet" href="/styles.css?v=20260630-2" />
   </head>
   <body>
     <main class="shell">
@@ -16,16 +16,28 @@
             <p id="readinessLine">Loading runtime state</p>
           </div>
         </div>
-        <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+        <button id="refreshButton" class="icon-button" title="Refresh" aria-label="Refresh">R</button>
       </header>
 
       <section class="dock-panel">
         <div>
-          <span class="eyebrow">WeChat Target</span>
-          <strong id="wechatTitle">Searching</strong>
-          <p id="wechatDetail">Waiting for a WeChat window handle.</p>
+          <span class="eyebrow">Backend Capture</span>
+          <strong id="captureRole">Message source owned by backend</strong>
+          <p id="captureDetail">Sidebar is an audit surface, not a chat capture driver.</p>
         </div>
-        <button id="probeButton" class="ghost">Probe</button>
+        <button id="probeButton" class="ghost">Diag</button>
+      </section>
+
+      <section class="channels">
+        <div class="section-head">
+          <h2>Conversation Channels</h2>
+          <span id="channelCount">0</span>
+        </div>
+        <div class="channel-stats">
+          <span><strong id="privateCount">0</strong> private</span>
+          <span><strong id="groupCount">0</strong> groups</span>
+        </div>
+        <div id="channelList" class="channel-list"></div>
       </section>
 
       <section class="controls">
@@ -55,6 +67,14 @@
           <span>Approved</span>
           <strong id="approvedCount">0</strong>
         </button>
+        <button class="metric" data-status="rejected">
+          <span>Rejected</span>
+          <strong id="rejectedCount">0</strong>
+        </button>
+        <button class="metric" data-status="sent">
+          <span>Sent</span>
+          <strong id="sentCount">0</strong>
+        </button>
         <button class="metric" data-status="failed">
           <span>Failed</span>
           <strong id="failedCount">0</strong>
@@ -65,9 +85,10 @@
 
       <section class="inspector">
         <div class="section-head">
-          <h2>Window Handles</h2>
+          <h2>Capture Diagnostics</h2>
           <button id="toggleProbe" class="ghost small">Details</button>
         </div>
+        <p id="diagnosticDetail" class="diagnostic-copy">Window handles are diagnostic only. They do not select the active conversation.</p>
         <div id="handleList" class="handle-list"></div>
         <pre id="probeBox" hidden></pre>
       </section>
@@ -80,6 +101,6 @@
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
-    <script src="/app.js?v=20260630-1"></script>
+    <script src="/app.js?v=20260630-2"></script>
   </body>
 </html>

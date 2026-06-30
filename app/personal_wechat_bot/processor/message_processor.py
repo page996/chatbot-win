@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 from app.personal_wechat_bot.bootstrap import BotRuntime
-from app.personal_wechat_bot.domain.models import RawWeChatMessage, SpeakDecision
+from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage, SpeakDecision
 
 
 class MessageProcessor:
@@ -25,10 +25,13 @@ class MessageProcessor:
             pending_context_item = {"session_id": reset_session_id, "reset": True}
         else:
             pending_context_item = None
+        session_id = reset_session_id or self.runtime.context_store.current_session_id(message.conversation_id)
+        message = self._with_session_id(message, session_id)
 
         raw = self._enrich_backend_attachments(raw, message.conversation_id)
         if raw.driver_meta.get("backend_attachments_pending") is False:
             enriched = self.runtime.normalizer.normalize(raw)
+            enriched = self._with_session_id(enriched, session_id) if enriched is not None else None
             if enriched is not None and enriched != message:
                 message = enriched
                 self.runtime.event_logger.log("message.enriched", message, message_id=message.message_id)
@@ -88,6 +91,7 @@ class MessageProcessor:
             reply,
             chat_title=message.chat_title,
             conversation_type=message.conversation_type,
+            session_id=session_id,
         )
         self.runtime.event_logger.log("reply.candidate", reply, message_id=message.message_id)
         send = self.runtime.reply_gate.handle(reply)
@@ -154,3 +158,8 @@ class MessageProcessor:
     def _mark_done(self, *message_ids: str) -> None:
         for message_id in dict.fromkeys(item for item in message_ids if item):
             self.runtime.router.mark_done(message_id)
+
+    def _with_session_id(self, message: NormalizedMessage, session_id: str) -> NormalizedMessage:
+        metadata = dict(message.metadata)
+        metadata["session_id"] = session_id
+        return replace(message, metadata=metadata)

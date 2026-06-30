@@ -44,6 +44,8 @@ function render({ forceControls = false } = {}) {
     syncControls(data);
   }
   renderReadiness(data);
+  renderCapture(data);
+  renderChannels(data);
   renderWechatProbe(data.wechat_window_probe || {});
   renderCounts(data);
   renderQueue();
@@ -57,6 +59,16 @@ function renderReadiness(data) {
   $("#readinessLine").textContent =
     state.statusMessage ||
     `${readiness.status || "unknown"} / blockers ${summary.blockers || 0} / warnings ${summary.warnings || 0}`;
+}
+
+function renderCapture(data) {
+  const capture = data.capture || {};
+  $("#captureRole").textContent = capture.owner || "backend_message_sources";
+  $("#captureDetail").textContent = [
+    capture.sidebar_role || "audit_and_send_controls_only",
+    capture.supports_multi_conversation ? "multi-conversation ready" : "",
+    capture.window_probe_role ? `window probe: ${capture.window_probe_role}` : "",
+  ].filter(Boolean).join(" / ");
 }
 
 function syncControls(data) {
@@ -90,12 +102,11 @@ function renderWechatProbe(probe) {
   const foreground = probe.foreground || {};
   const windows = probe.windows || [];
   const first = windows[0] || {};
-  const title = active.title || foreground.title || first.title || "No WeChat window";
-  $("#wechatTitle").textContent = title || "(untitled)";
-  $("#wechatDetail").textContent = [
+  $("#diagnosticDetail").textContent = [
+    active.title || foreground.title || first.title || "No exposed WeChat chat window",
     active.status || probe.status || "unknown",
     foreground.process_name || first.process_name || "",
-    first.hwnd ? `hwnd ${first.hwnd}` : "",
+    first.hwnd ? `hwnd ${first.hwnd}` : "diagnostic only",
     probe.ui_automation?.available ? "UIA ready" : (probe.ui_automation?.reason || "UIA unknown"),
   ].filter(Boolean).join(" / ");
 
@@ -132,9 +143,41 @@ function renderWechatProbe(probe) {
   }
 }
 
+function renderChannels(data) {
+  const channels = data.channels || { items: [] };
+  const items = channels.items || [];
+  $("#channelCount").textContent = channels.count || items.length || 0;
+  $("#privateCount").textContent = channels.private_count || 0;
+  $("#groupCount").textContent = channels.group_count || 0;
+  const list = $("#channelList");
+  list.innerHTML = "";
+  if (!items.length) {
+    list.append(emptyNode("No backend channels registered yet"));
+    return;
+  }
+  for (const channel of items.slice(0, 5)) {
+    const node = document.createElement("article");
+    node.className = "channel-item";
+    node.innerHTML = `
+      <div class="channel-main">
+        <strong>${escapeHtml(channel.chat_title || channel.conversation_id || "(untitled)")}</strong>
+        <span>${escapeHtml(channel.conversation_type || "")}</span>
+      </div>
+      <p>${escapeHtml(channel.conversation_id || "")}</p>
+      <div class="channel-meta">
+        <span>keys ${escapeHtml((channel.api_key_refs || []).length || channel.key_slots || 0)}</span>
+        <span>${escapeHtml(shortTime(channel.updated_at || ""))}</span>
+      </div>
+    `;
+    list.append(node);
+  }
+}
+
 function renderCounts(data) {
   $("#pendingCount").textContent = data.queues?.pending?.count || 0;
   $("#approvedCount").textContent = data.queues?.approved?.count || 0;
+  $("#rejectedCount").textContent = data.queues?.rejected?.count || 0;
+  $("#sentCount").textContent = data.queues?.sent?.count || 0;
   $("#failedCount").textContent = data.queues?.failed?.count || 0;
 }
 
@@ -367,7 +410,7 @@ $("#saveControls").addEventListener("click", () => saveControls().catch((error) 
   $("#readinessLine").textContent = `Save failed: ${error.message}`;
 }));
 $("#probeButton").addEventListener("click", () => probeNow().catch((error) => {
-  $("#wechatDetail").textContent = `Probe failed: ${error.message}`;
+  $("#diagnosticDetail").textContent = `Probe failed: ${error.message}`;
 }));
 $("#toggleProbe").addEventListener("click", () => {
   state.probeExpanded = !state.probeExpanded;

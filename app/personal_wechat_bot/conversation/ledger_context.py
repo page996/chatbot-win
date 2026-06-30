@@ -44,6 +44,7 @@ class LedgerContextSnapshot:
             f"Ledger markdown: {self.ledger_path}",
             f"Context budget: estimated_tokens={self.estimated_tokens} budget={self.token_budget}",
             "Only active ledger entries are visible. Recalled or removed entries are excluded from reasoning.",
+            "Recent context is scoped to the current session. Explicitly quoted messages may restore a narrow cross-session window.",
         ]
         for section in self.sections:
             if not section.lines:
@@ -68,19 +69,22 @@ class LedgerContextAssembler:
         self.token_budget = token_budget
 
     def build_snapshot(self, message: NormalizedMessage) -> LedgerContextSnapshot:
+        session_id = _session_id_from_message(message)
         entries = [as_payload(item) for item in self.ledger_store.read_entries(message.conversation_id)]
+        session_entries = _filter_entries_for_session(entries, session_id)
         quote = _quote_from_message(message)
         quote_context = (
             self.ledger_store.lookup_quote_context(message.conversation_id, quote)
             if quote
             else {}
         )
-        visible_entries = entries[-self.max_recent_entries :]
+        visible_entries = session_entries[-self.max_recent_entries :]
         quote_entries = quote_context.get("entries", []) if isinstance(quote_context, dict) else []
         file_refs = _collect_file_refs([*visible_entries, *quote_entries])
-        link_refs = _collect_link_refs(visible_entries)
-        memory = _read_memory(self.ledger_store.conversation_markdown_path(message.conversation_id).parent / "memory")
-        analysis = _analyze(entries, message)
+        link_refs = _collect_link_refs([*visible_entries, *quote_entries])
+        conversation_dir = self.ledger_store.conversation_markdown_path(message.conversation_id).parent
+        memory = _read_memory(_memory_dir(conversation_dir, session_id))
+        analysis = _analyze(session_entries, message)
         sections = _budget_sections(
             _build_sections(
                 memory=memory,
@@ -94,7 +98,7 @@ class LedgerContextAssembler:
         )
         return LedgerContextSnapshot(
             conversation_id=message.conversation_id,
-            session_id=str(message.metadata.get("session_id") or DEFAULT_SESSION_ID),
+            session_id=session_id,
             ledger_path=str(self.ledger_store.conversation_markdown_path(message.conversation_id)),
             recent_entries=visible_entries,
             quote_context=quote_context,
@@ -115,6 +119,7 @@ def as_payload(entry: Any) -> dict[str, Any]:
         "entry_id": entry.entry_id,
         "message_id": entry.message_id,
         "conversation_id": entry.conversation_id,
+        "session_id": getattr(entry, "session_id", DEFAULT_SESSION_ID) or DEFAULT_SESSION_ID,
         "conversation_type": entry.conversation_type,
         "chat_title": entry.chat_title,
         "sender_name": entry.sender_name,
@@ -258,6 +263,25 @@ def _analysis_lines(analysis: dict[str, Any]) -> list[str]:
             continue
         lines.append(f"- {key}: {value}")
     return lines
+
+
+def _filter_entries_for_session(entries: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
+    return [item for item in entries if _entry_session_id(item) == session_id]
+
+
+def _entry_session_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("session_id") or DEFAULT_SESSION_ID)
+
+
+def _session_id_from_message(message: NormalizedMessage) -> str:
+    session_id = str(message.metadata.get("session_id") or "").strip()
+    return session_id or DEFAULT_SESSION_ID
+
+
+def _memory_dir(conversation_dir: Path, session_id: str) -> Path:
+    if session_id == DEFAULT_SESSION_ID:
+        return conversation_dir / "memory"
+    return conversation_dir / "sessions" / session_id / "memory"
 
 
 def _file_lines(file_refs: list[dict[str, Any]]) -> list[str]:
