@@ -99,10 +99,14 @@ class BackendAttachmentParser:
         error = transcript.error if transcript is not None else "local_asr_not_configured"
         backend = transcript.backend if transcript is not None else "local_asr_subprocess"
         bytes_note = f" bytes={path.stat().st_size}" if path.exists() else ""
+        if transcript is not None and transcript.status == "failed":
+            summary = f"音频已保存到文件中间层，本地 ASR 转写失败 backend={backend}{bytes_note}"
+        else:
+            summary = f"音频已保存到文件中间层，本地 ASR 暂不可用 backend={backend}{bytes_note}"
         return AttachmentParseResult(
             "skipped",
             "audio",
-            f"音频已保存到文件中间层，本地 ASR 暂不可用 backend={backend}{bytes_note}",
+            summary,
             error=error or "local_asr_not_configured",
         )
 

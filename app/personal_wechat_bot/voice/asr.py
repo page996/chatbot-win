@@ -48,10 +48,12 @@ class LocalAsrSubprocessEngine:
         python_executable: str | Path | None = None,
         *,
         model: str = "base",
+        language: str = "auto",
         timeout_seconds: int = 300,
     ):
         self.python_executable = Path(python_executable) if python_executable else _default_asr_python()
         self.model = model
+        self.language = language
         self.timeout_seconds = timeout_seconds
 
     def health(self) -> AsrHealth:
@@ -63,27 +65,27 @@ class LocalAsrSubprocessEngine:
                 detail="asr python not found",
                 install=(
                     "Create vendor/asr-python with Python 3.10-3.12, then install "
-                    "faster-whisper and its runtime dependencies there."
+                    "requirements-asr.txt there."
                 ),
             )
         command = [
             str(self.python_executable),
             "-c",
-            "import faster_whisper; print('ok')",
+            "import faster_whisper; import pocketsphinx; print('ok')",
         ]
         try:
             completed = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return AsrHealth("local_asr_subprocess", False, detail=str(exc), model=self.model)
         detail = (completed.stderr or completed.stdout).strip()
-        if completed.returncode != 0 and "faster_whisper" in detail:
-            detail = "missing dependency: faster-whisper"
+        if completed.returncode != 0:
+            detail = _missing_dependency_detail(detail)
         return AsrHealth(
             "local_asr_subprocess",
             completed.returncode == 0,
             detail=detail,
             model=self.model,
-            install="vendor/asr-python/Scripts/python.exe -m pip install faster-whisper",
+            install="vendor/asr-python/Scripts/python.exe -m pip install -r requirements-asr.txt",
         )
 
     def transcribe(self, audio_path: str | Path) -> AsrTranscript:
@@ -98,7 +100,7 @@ class LocalAsrSubprocessEngine:
                 error="local_asr_not_configured",
             )
         worker = Path(__file__).resolve().parents[3] / "scripts" / "local_asr_worker.py"
-        command = [str(self.python_executable), str(worker), str(source), "--model", self.model]
+        command = [str(self.python_executable), str(worker), str(source), "--model", self.model, "--language", self.language]
         try:
             completed = subprocess.run(
                 command,
@@ -164,3 +166,17 @@ def _default_asr_python() -> Path | None:
             return candidate
     found = shutil.which("python")
     return Path(found) if found else None
+
+
+def _missing_dependency_detail(detail: str) -> str:
+    missing: list[str] = []
+    for package, module in (
+        ("faster-whisper", "faster_whisper"),
+        ("pocketsphinx", "pocketsphinx"),
+        ("SpeechRecognition", "speech_recognition"),
+    ):
+        if module in detail or package in detail:
+            missing.append(package)
+    if missing:
+        return "missing dependency: " + ", ".join(dict.fromkeys(missing))
+    return detail

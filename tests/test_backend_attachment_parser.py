@@ -80,12 +80,30 @@ class BackendAttachmentParserTest(unittest.TestCase):
             path = Path(tmp) / "voice.m4a"
             path.write_bytes(b"fake audio")
 
-            result = BackendAttachmentParser(max_preview_chars=100).parse(path)
+            result = BackendAttachmentParser(
+                asr_engine=_FakeAsr("", status="blocked", error="local_asr_not_configured"),
+                max_preview_chars=100,
+            ).parse(path)
 
             self.assertEqual(result.status, "skipped")
             self.assertEqual(result.kind, "audio")
             self.assertIn("本地 ASR 暂不可用", result.summary)
             self.assertEqual(result.error, "local_asr_not_configured")
+
+    def test_audio_attachment_reports_asr_decode_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "voice.m4a"
+            path.write_bytes(b"fake audio")
+
+            result = BackendAttachmentParser(
+                asr_engine=_FakeAsr("", status="failed", error="invalid_audio_format"),
+                max_preview_chars=100,
+            ).parse(path)
+
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual(result.kind, "audio")
+            self.assertIn("本地 ASR 转写失败", result.summary)
+            self.assertEqual(result.error, "invalid_audio_format")
 
     def test_audio_attachment_uses_injected_asr_engine(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

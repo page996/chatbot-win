@@ -307,6 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_asr = sub.add_parser("local-asr")
     local_asr.add_argument("audio")
     local_asr.add_argument("--model", default="base")
+    local_asr.add_argument("--language", default="auto")
 
     ocr_snapshot = sub.add_parser("ocr-snapshot")
     ocr_snapshot.add_argument("image")
@@ -712,7 +713,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "local-asr":
-        engine = LocalAsrSubprocessEngine(model=args.model)
+        engine = LocalAsrSubprocessEngine(model=args.model, language=args.language)
         transcript = engine.transcribe(args.audio)
         result = {
             "status": transcript.status,
