@@ -31,6 +31,7 @@ class BackendMessageEvent:
     chat_title: str
     sender_name: str
     text: str
+    event_type: str = "message"
     is_self: bool = False
     is_group: bool = False
     sender_wechat_id: str | None = None
@@ -38,6 +39,8 @@ class BackendMessageEvent:
     attachments: tuple[BackendAttachment, ...] = ()
     voice: dict[str, Any] | None = None
     quote: dict[str, Any] | None = None
+    recall: dict[str, Any] | None = None
+    source_payload: dict[str, Any] | None = None
     history: tuple["BackendMessageEvent", ...] = ()
 
 
@@ -141,6 +144,26 @@ class BackendEventJsonlDriver:
         voice_pending = _voice_needs_transcription(voice)
         text = _compose_pending_message_text(_message_text_with_voice(event.text, voice), attachments, voice)
         if not text.strip():
+            if event.event_type == "recall":
+                text = ""
+            else:
+                return None
+        meta_source = event.source_payload or {}
+        if not isinstance(meta_source, dict):
+            meta_source = {}
+        allow_empty = event.event_type == "recall"
+        context_only = context_only or event.event_type == "recall"
+        source_name = str(meta_source.get("source") or meta_source.get("adapter") or "backend_events_jsonl")
+        hook_meta = meta_source.get("hook") if isinstance(meta_source.get("hook"), dict) else {}
+        recall = event.recall or {}
+        if event.event_type == "recall" and not recall:
+            recall = {
+                "target_raw_id": str(meta_source.get("target_raw_id") or meta_source.get("targetRawId") or ""),
+                "target_message_id": str(meta_source.get("target_message_id") or meta_source.get("targetMessageId") or ""),
+                "reason": str(meta_source.get("reason") or "wechat_recall"),
+            }
+            recall = {key: value for key, value in recall.items() if value}
+        if event.event_type == "recall" and not recall:
             return None
         return RawWeChatMessage(
             raw_id=event.raw_id if history_index is None else f"{event.raw_id}:history:{history_index}",
@@ -153,6 +176,9 @@ class BackendEventJsonlDriver:
             observed_at=event.observed_at or utc_now_iso(),
             driver_meta={
                 "source": "backend_events_jsonl",
+                "backend_event_source": source_name,
+                "event_type": event.event_type,
+                "conversation_key": str(meta_source.get("conversation_key") or meta_source.get("talker_id") or meta_source.get("talker") or event.chat_title),
                 "event_path": str(self.event_path),
                 "line_no": line_no,
                 "history_index": history_index,
@@ -165,7 +191,11 @@ class BackendEventJsonlDriver:
                 "backend_media_pending": bool(attachments) or voice_pending,
                 "attachments": attachments,
                 "quote": event.quote or {},
+                "recall": recall,
+                "hook": hook_meta,
+                "source_payload": meta_source,
                 "context_only": context_only,
+                "allow_empty_message": allow_empty,
             },
         )
 
@@ -353,6 +383,7 @@ def append_backend_event(
     chat_title: str,
     sender_name: str,
     text: str = "",
+    event_type: str = "message",
     sender_wechat_id: str = "",
     is_self: bool = False,
     is_group: bool = False,
@@ -360,9 +391,13 @@ def append_backend_event(
     voice: dict[str, Any] | None = None,
     observed_at: str = "",
     quote: dict[str, Any] | None = None,
+    recall: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    raw_id: str = "",
+    source_payload: dict[str, Any] | None = None,
 ) -> str:
     payload = {
+        "event_type": event_type or "message",
         "chat_title": chat_title,
         "sender_name": sender_name,
         "sender_wechat_id": sender_wechat_id,
@@ -377,9 +412,13 @@ def append_backend_event(
         payload["voice"] = parsed_voice
     if quote:
         payload["quote"] = quote
+    if recall:
+        payload["recall"] = recall
     if history:
         payload["history"] = [_history_payload(item) for item in history if isinstance(item, dict)]
-    raw_id = _event_raw_id(payload)
+    if source_payload:
+        payload["source_payload"] = source_payload
+    raw_id = raw_id.strip() or _event_raw_id(payload)
     payload["raw_id"] = raw_id
     path = Path(event_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -393,8 +432,11 @@ def append_backend_event_payload(event_path: str | Path, payload: dict[str, Any]
 
     if not isinstance(payload, dict):
         raise ValueError("backend event payload must be a JSON object")
+    event_type = str(payload.get("event_type") or payload.get("eventType") or "message").strip().lower()
     chat_title = str(payload.get("chat_title") or payload.get("chatTitle") or "").strip()
     sender_name = str(payload.get("sender_name") or payload.get("senderName") or "").strip()
+    if event_type == "recall" and not sender_name:
+        sender_name = "system"
     if not chat_title:
         raise ValueError("chat_title is required")
     if not sender_name:
@@ -409,19 +451,27 @@ def append_backend_event_payload(event_path: str | Path, payload: dict[str, Any]
         history = []
     quote = payload.get("quote")
     parsed_quote = _parse_quote(quote) if quote is not None else None
+    recall = _parse_recall(payload.get("recall") or payload)
+    source_payload = payload.get("source_payload") or payload.get("sourcePayload") or {}
+    if not isinstance(source_payload, dict):
+        source_payload = {}
     return append_backend_event(
         event_path,
         chat_title=chat_title,
         sender_name=sender_name,
         sender_wechat_id=str(payload.get("sender_wechat_id") or payload.get("senderWechatId") or "").strip(),
         text=str(payload.get("text", "")).strip(),
+        event_type=event_type,
         is_self=bool(payload.get("is_self", payload.get("isSelf", False))),
         is_group=bool(payload.get("is_group", payload.get("group", False))),
         attachments=attachments,
         voice=_voice_payload(payload),
         observed_at=str(payload.get("observed_at") or payload.get("observedAt") or "").strip(),
         quote=parsed_quote,
+        recall=recall,
         history=[item for item in history if isinstance(item, dict)],
+        raw_id=str(payload.get("raw_id") or payload.get("rawId") or "").strip(),
+        source_payload=source_payload,
     )
 
 
@@ -467,12 +517,16 @@ def _parse_event_payload(
     include_history: bool = False,
 ) -> BackendMessageEvent | None:
     chat_title = str(payload.get("chat_title", "")).strip()
+    event_type = str(payload.get("event_type") or "message").strip().lower()
     sender_name = str(payload.get("sender_name", "")).strip()
+    if event_type == "recall" and not sender_name:
+        sender_name = "system"
     if not chat_title or not sender_name:
         return None
     text = str(payload.get("text", "")).strip()
     attachments = _parse_attachments(payload.get("attachments", []))
     quote = _parse_quote(payload.get("quote"))
+    recall = _parse_recall(payload.get("recall") or payload)
     voice = _normalize_voice(payload.get("voice"), allow_pending=True)
     seed = {**payload, "_line_no": line_no}
     if suffix:
@@ -480,18 +534,21 @@ def _parse_event_payload(
     raw_id = str(payload.get("raw_id", "")).strip() or _event_raw_id(seed)
     return BackendMessageEvent(
         raw_id=raw_id,
-        chat_title=chat_title,
-        sender_name=sender_name,
-        sender_wechat_id=str(payload.get("sender_wechat_id", "")).strip() or None,
-        text=text,
-        is_self=bool(payload.get("is_self", False)),
-        is_group=bool(payload.get("is_group", False)),
-        observed_at=str(payload.get("observed_at", "")).strip(),
-        attachments=attachments,
-        voice=voice,
-        quote=quote,
-        history=_parse_history(payload.get("history", []), parent=payload, line_no=line_no) if include_history else (),
-    )
+            chat_title=chat_title,
+            sender_name=sender_name,
+            sender_wechat_id=str(payload.get("sender_wechat_id", "")).strip() or None,
+            text=text,
+            event_type=event_type,
+            is_self=bool(payload.get("is_self", False)),
+            is_group=bool(payload.get("is_group", False)),
+            observed_at=str(payload.get("observed_at", "")).strip(),
+            attachments=attachments,
+            voice=voice,
+            quote=quote,
+            recall=recall,
+            source_payload=_source_payload(payload),
+            history=_parse_history(payload.get("history", []), parent=payload, line_no=line_no) if include_history else (),
+        )
 
 
 def _attachment_payload(value: str | dict[str, Any]) -> dict[str, Any]:
@@ -571,6 +628,40 @@ def _parse_quote(value: Any) -> dict[str, Any] | None:
     }
     cleaned = {key: item for key, item in quote.items() if item}
     return cleaned or None
+
+
+def _parse_recall(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    recall = {
+        "target_raw_id": str(
+            value.get("target_raw_id")
+            or value.get("targetRawId")
+            or value.get("recalled_raw_id")
+            or value.get("recalledRawId")
+            or ""
+        ).strip(),
+        "target_message_id": str(
+            value.get("target_message_id")
+            or value.get("targetMessageId")
+            or value.get("recalled_message_id")
+            or value.get("recalledMessageId")
+            or ""
+        ).strip(),
+        "reason": str(value.get("reason") or "wechat_recall").strip(),
+        "sender_name": str(value.get("sender_name") or value.get("senderName") or "").strip(),
+        "sender_wechat_id": str(value.get("sender_wechat_id") or value.get("senderWechatId") or "").strip(),
+        "observed_at": str(value.get("observed_at") or value.get("observedAt") or "").strip(),
+    }
+    cleaned = {key: item for key, item in recall.items() if item}
+    return cleaned or None
+
+
+def _source_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    source_payload = payload.get("source_payload") or payload.get("sourcePayload")
+    if isinstance(source_payload, dict):
+        return dict(source_payload)
+    return {}
 
 
 def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:

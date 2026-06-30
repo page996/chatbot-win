@@ -262,6 +262,87 @@ class BackendEventsCliTest(unittest.TestCase):
             self.assertEqual(payload["capability"]["mode"], "readable_file_cache_only")
             self.assertFalse(payload["send_enabled"])
 
+    def test_import_hook_events_cli_appends_backend_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            hook_file = Path(tmp) / "hook_events.jsonl"
+            backend_file = Path(tmp) / "backend_events.jsonl"
+            self._run("--data-dir", str(data_dir), "init")
+            hook_file.write_text(
+                json.dumps(
+                    {
+                        "talker": "wxid_page",
+                        "talker_name": "PAGE",
+                        "sender_name": "PAGE",
+                        "msgid": "hook-1",
+                        "text": "hook hello",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            payload = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "import-hook-events",
+                    "--hook-event-file",
+                    str(hook_file),
+                    "--backend-event-file",
+                    str(backend_file),
+                )
+            )
+            raw_event = json.loads(backend_file.read_text(encoding="utf-8").splitlines()[0])
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["appended_count"], 1)
+            self.assertEqual(raw_event["text"], "hook hello")
+            self.assertEqual(raw_event["source_payload"]["conversation_key"], "wxid_page")
+            self.assertFalse(payload["send_enabled"])
+
+    def test_run_agent_cli_can_import_hook_events_before_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            hook_file = Path(tmp) / "hook_events.jsonl"
+            backend_file = Path(tmp) / "backend_events.jsonl"
+            self._run("--data-dir", str(data_dir), "init")
+            hook_file.write_text(
+                json.dumps(
+                    {
+                        "talker": "wxid_page",
+                        "talker_name": "PAGE",
+                        "sender_name": "PAGE",
+                        "msgid": "hook-2",
+                        "text": "hook task",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            payload = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "run-agent",
+                    "--loops",
+                    "1",
+                    "--interval",
+                    "0",
+                    "--hook-event-file",
+                    str(hook_file),
+                    "--backend-event-file",
+                    str(backend_file),
+                )
+            )
+
+            self.assertEqual(payload["status"], "stopped")
+            self.assertEqual(payload["processed_count"], 1)
+            self.assertTrue(backend_file.exists())
+
     def _run(self, *args: str) -> str:
         completed = subprocess.run(
             [sys.executable, "-m", "app.personal_wechat_bot.main", *args],

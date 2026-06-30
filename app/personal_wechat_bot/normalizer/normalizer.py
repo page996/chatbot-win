@@ -11,7 +11,8 @@ class MessageNormalizer:
         if not text and not raw.driver_meta.get("allow_empty_message"):
             return None
         conversation_type = "group" if raw.is_group else "private"
-        conversation_id = conversation_id_for(conversation_type, raw.chat_title)
+        conversation_key = str(raw.driver_meta.get("conversation_key") or raw.chat_title).strip() or raw.chat_title
+        conversation_id = conversation_id_for(conversation_type, conversation_key)
         raw_key = raw.raw_id.strip()
         message_key = raw_key or f"{raw.sender_name}:{raw.sender_wechat_id or ''}:{text}:{raw.observed_at}"
         message_id = _stable_hash(f"{message_key}:{conversation_id}")

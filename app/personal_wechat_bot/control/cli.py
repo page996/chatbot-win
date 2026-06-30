@@ -78,6 +78,7 @@ from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import (
     default_wechat_voice_roots,
     voice_cache_capability,
 )
+from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--loops", type=int, default=None)
     run_agent.add_argument("--interval", type=float, default=1.0)
     run_agent.add_argument("--backend-event-file", default=None)
+    run_agent.add_argument("--hook-event-file", default=None)
+    run_agent.add_argument("--hook-state-file", default=None)
     run_agent.add_argument("--no-backend-events", action="store_true")
     run_agent.add_argument(
         "--no-wechat-ocr",
@@ -239,6 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
     append_backend.add_argument("--quote-received-at", default="")
     append_backend.add_argument("--history-json", default="")
     append_backend.add_argument("--history-file", default="")
+    append_backend.add_argument("--raw-id", default="")
+    append_backend.add_argument("--conversation-key", default="")
+
+    import_hook = sub.add_parser("import-hook-events")
+    import_hook.add_argument("--hook-event-file", required=True)
+    import_hook.add_argument("--backend-event-file", default=None)
+    import_hook.add_argument("--state-file", default=None)
 
     poll_backend = sub.add_parser("poll-backend-events")
     poll_backend.add_argument("--event-file", default=None)
@@ -375,6 +385,12 @@ def main(argv: list[str] | None = None) -> None:
         runners = []
         if not args.no_backend_events:
             event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
+            if args.hook_event_file:
+                HookEventJsonlImporter(
+                    args.hook_event_file,
+                    event_file,
+                    state_path=args.hook_state_file or Path(args.data_dir) / "hook_events_state.json",
+                ).import_new()
             runners.append(
                 (
                     "backend-events",
@@ -554,8 +570,20 @@ def main(argv: list[str] | None = None) -> None:
             voice=_voice_payload(args),
             quote=_quote_payload(args),
             history=_history_payload(args),
+            raw_id=args.raw_id,
+            source_payload=_source_payload_args(args),
         )
         print(json.dumps({"status": "ok", "event_file": event_file, "raw_id": raw_id, "send_enabled": False}, ensure_ascii=False, indent=2))
+        return
+    if args.command == "import-hook-events":
+        event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
+        importer = HookEventJsonlImporter(
+            args.hook_event_file,
+            event_file,
+            state_path=args.state_file or Path(args.data_dir) / "hook_events_state.json",
+        )
+        result = importer.import_new()
+        print(json.dumps({**result.__dict__, "send_enabled": False}, ensure_ascii=False, indent=2))
         return
     if args.command == "poll-backend-events":
         config = load_config(args.data_dir)
@@ -831,6 +859,16 @@ def _history_payload(args: argparse.Namespace) -> list[dict[str, Any]]:
         parsed = json.loads(Path(raw_file).read_text(encoding="utf-8"))
         history.extend(_history_items(parsed, source=f"append_backend_event_cli:{raw_file}"))
     return history
+
+
+def _source_payload_args(args: argparse.Namespace) -> dict[str, Any] | None:
+    conversation_key = str(getattr(args, "conversation_key", "") or "").strip()
+    if not conversation_key:
+        return None
+    return {
+        "source": "append_backend_event_cli",
+        "conversation_key": conversation_key,
+    }
 
 
 def _history_items(value: Any, *, source: str) -> list[dict[str, Any]]:

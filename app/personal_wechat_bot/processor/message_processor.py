@@ -28,6 +28,11 @@ class MessageProcessor:
         session_id = reset_session_id or self.runtime.session_store.current_session_id(message.conversation_id)
         message = self._with_session_id(message, session_id)
 
+        recall_item = self._handle_recall_event(message)
+        if recall_item is not None:
+            self._mark_done(original_message_id, message.message_id)
+            return recall_item
+
         raw = self._enrich_backend_media(raw, message.conversation_id)
         if raw.driver_meta.get("backend_media_pending") is False or raw.driver_meta.get("backend_attachments_pending") is False:
             enriched = self.runtime.normalizer.normalize(raw)
@@ -147,6 +152,55 @@ class MessageProcessor:
                 message_id=raw.raw_id,
             )
             return raw
+
+    def _handle_recall_event(self, message: NormalizedMessage) -> dict[str, Any] | None:
+        if message.metadata.get("event_type") != "recall":
+            return None
+        recall = message.metadata.get("recall") if isinstance(message.metadata.get("recall"), dict) else {}
+        target_message_id = str(recall.get("target_message_id") or recall.get("message_id") or "").strip()
+        target_raw_id = str(recall.get("target_raw_id") or recall.get("raw_id") or "").strip()
+        target_id = target_message_id
+        if not target_id and target_raw_id:
+            target_id = self.runtime.normalizer.normalize(
+                RawWeChatMessage(
+                    raw_id=target_raw_id,
+                    chat_title=message.chat_title,
+                    sender_name=str(recall.get("sender_name") or message.sender_name),
+                    text=str(recall.get("text") or ""),
+                    is_self=bool(recall.get("is_self", False)),
+                    is_group=message.conversation_type == "group",
+                    sender_wechat_id=str(recall.get("sender_wechat_id") or "") or None,
+                    observed_at=str(recall.get("observed_at") or message.received_at),
+                    driver_meta={
+                        "allow_empty_message": True,
+                        "conversation_key": str(message.metadata.get("conversation_key") or message.chat_title),
+                    },
+                )
+            ).message_id
+        changed = False
+        if target_id:
+            changed = self.runtime.ledger_store.mark_recalled(
+                message.conversation_id,
+                target_id,
+                reason=str(recall.get("reason") or "wechat_recall"),
+            )
+        return {
+            "message": asdict(message),
+            "route": {
+                "message_id": message.message_id,
+                "conversation_id": message.conversation_id,
+                "action": "ignore",
+                "reason": "recall_event",
+                "requires_topic_decision": False,
+            },
+            "recall": {
+                "status": "marked" if changed else "not_found",
+                "target_message_id": target_id,
+                "target_raw_id": target_raw_id,
+                "reason": str(recall.get("reason") or "wechat_recall"),
+            },
+            "context_only": True,
+        }
 
     def _annotate_links(self, ledger_entry) -> list[dict[str, Any]]:
         annotate = getattr(getattr(self.runtime, "link_annotations", None), "annotate_entry", None)
