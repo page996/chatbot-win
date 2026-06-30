@@ -30,6 +30,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
     config = load_config(data_dir)
     queues = {status: list_confirm_queue(data_dir, status=status) for status in QUEUE_STATUSES}
     channels = _channel_state(data_dir)
+    send_bridge = bridge_state(data_dir, limit=12)
     return {
         "status": "ok",
         "role": "visual_audit_console",
@@ -40,7 +41,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "supports_multi_conversation": True,
             "send_driver_boundary": "windows_guarded requires foreground WeChat for output; backend events can receive multiple conversations without page OCR",
             "input_pipeline": "POST /api/backend-events or append-backend-event -> backend_events.jsonl -> run-agent/poll-backend-events -> conversation_ledgers",
-            "background_send_status": _background_send_status(config),
+            "background_send_status": _background_send_status(config, send_bridge),
         },
         "config": {
             "mode": config.mode,
@@ -54,7 +55,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "queues": queues,
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
-        "send_bridge": bridge_state(data_dir, limit=12),
+        "send_bridge": send_bridge,
         "wechat_window_probe": build_wechat_window_probe(max_children=80, max_controls=160, data_dir=data_dir),
         "audit": list_send_audit(data_dir, limit=30),
     }
@@ -179,10 +180,14 @@ def _cleanup_note(cleanup: dict[str, Any]) -> str:
     return "通道不存在或已被清理"
 
 
-def _background_send_status(config: Any) -> str:
+def _background_send_status(config: Any, bridge: dict[str, Any]) -> str:
     if str(getattr(config, "send_driver", "")) == "bridge_outbox":
-        return "bridge_outbox_ready" if bool(getattr(config, "send_enabled", False)) else "bridge_outbox_configured_disabled"
-    return "bridge_outbox_available"
+        if not bool(getattr(config, "send_enabled", False)):
+            return "bridge_outbox_configured_disabled"
+        if int(bridge.get("manual_bound_count", 0) or 0) > 0:
+            return "bridge_outbox_ready_for_manual_channels"
+        return "bridge_outbox_waiting_for_manual_capture"
+    return "bridge_outbox_manual_capture_only_available"
 
 
 def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> Path:

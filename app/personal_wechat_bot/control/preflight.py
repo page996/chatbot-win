@@ -15,6 +15,7 @@ from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
     is_real_send_driver_implemented,
     registered_send_drivers,
 )
+from app.personal_wechat_bot.wechat_driver.bridge_send import manual_bridge_bindings
 
 
 def build_preflight_report(
@@ -30,7 +31,8 @@ def build_preflight_report(
     key_refs = key_pool.refs()
     api_key_present = any(item.available for item in key_refs)
     file_roots = resolve_allowed_roots(config.data_dir, config.file_read_roots)
-    warnings = _warnings(config, api_key_present)
+    manual_bound_channels = manual_bridge_bindings(config.data_dir)
+    warnings = _warnings(config, api_key_present, manual_bound_count=len(manual_bound_channels))
     ocr_health = RapidOcrSubprocessEngine().health()
     office_health = LibreOfficeRuntime().health()
     real_send_implemented = is_real_send_driver_implemented(config.send_driver)
@@ -68,6 +70,20 @@ def build_preflight_report(
             "send_driver": config.send_driver,
             "implemented_send_drivers": implemented_send_drivers(),
             "registered_send_drivers": registered_send_drivers(),
+            "manual_bound_channels": {
+                "count": len(manual_bound_channels),
+                "policy": "bridge_outbox_manual_captured_channels_only",
+                "items": [
+                    {
+                        "conversation_id": item.conversation_id,
+                        "conversation_type": item.conversation_type,
+                        "chat_title": item.chat_title,
+                        "status": item.status,
+                        "last_seen_at": item.last_seen_at,
+                    }
+                    for item in manual_bound_channels
+                ],
+            },
         },
         "model": {
             "provider_id": chat_provider.provider_id,
@@ -154,7 +170,7 @@ def build_preflight_report(
     }
 
 
-def _warnings(config: BotConfig, api_key_present: bool) -> list[str]:
+def _warnings(config: BotConfig, api_key_present: bool, *, manual_bound_count: int = 0) -> list[str]:
     warnings: list[str] = []
     if config.mode == "auto":
         warnings.append("auto mode requested; use confirm mode first before real sending")
@@ -162,6 +178,8 @@ def _warnings(config: BotConfig, api_key_present: bool) -> list[str]:
         warnings.append("send_enabled is true but send_driver is not implemented")
     if config.send_enabled and config.mode != "confirm" and config.send_confirm_required:
         warnings.append("send is enabled but mode is not confirm while send_confirm_required is true")
+    if config.send_enabled and config.send_driver == "bridge_outbox" and manual_bound_count <= 0:
+        warnings.append("bridge_outbox requires at least one manually captured WeChat channel binding")
     if not config.accepted_contacts and not config.accepted_groups:
         warnings.append("no accepted contacts or groups recorded yet; new WeChat conversations will auto-register channels")
     chat_provider = config.providers.get("chat", config.llm)

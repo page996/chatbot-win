@@ -78,6 +78,18 @@ class SendReadinessTest(unittest.TestCase):
             self.assertEqual(rollout["status"], "warn")
             self.assertIn("confirm mode is active", rollout["detail"])
 
+    def test_bridge_outbox_readiness_blocks_without_manual_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+
+            report = build_send_readiness_report(data_dir)
+            blockers = {item["id"] for item in report["checks"] if item["status"] == "blocker"}
+
+            self.assertIn("manual_bridge_channels", blockers)
+            self.assertIn("manually bind", " ".join(report["required_next_steps"]))
+
 
 if __name__ == "__main__":
     unittest.main()

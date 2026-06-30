@@ -20,6 +20,7 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.domain.models import ReplyCandidate, SendResult
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_state
+from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -121,6 +122,7 @@ class SendCommandsTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            _write_manual_binding(data_dir, "private-1")
             queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
             queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
             queue.approve(queue_id, reviewer="tester")
@@ -133,6 +135,23 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(queue.get(queue_id)["status"], "queued_to_bridge")
             self.assertEqual(bridge["pending_count"], 1)
             self.assertEqual(bridge["items"][0]["text"], "hello bridge")
+
+    def test_send_approved_confirm_item_blocks_bridge_for_unbound_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
+            queue.approve(queue_id, reviewer="tester")
+
+            result = send_approved_confirm_item(data_dir, queue_id)
+            bridge = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["send_result"]["reason"], "bridge_requires_manual_captured_channel")
+            self.assertEqual(queue.get(queue_id)["status"], "failed")
+            self.assertEqual(bridge["count"], 0)
 
     def test_probe_send_controls_reports_configured_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,6 +324,37 @@ class _SendingDriver:
     def send_message(self, conversation_id: str, text: str) -> SendResult:
         self.sent_texts.append(text)
         return SendResult(message_id="sent-id", conversation_id=conversation_id, status="sent", reason="fake_sent")
+
+
+def _write_manual_binding(data_dir: Path, conversation_id: str) -> None:
+    store = WeChatWindowBindingStore(data_dir)
+    now = "2026-06-30T00:00:00+00:00"
+    store._write(
+        {
+            "bindings": [
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "PAGE",
+                    "hwnd": 100,
+                    "title": "微信",
+                    "process_id": 200,
+                    "process_name": "Weixin.exe",
+                    "class_name": "WeChatMainWndForPC",
+                    "width": 1000,
+                    "height": 700,
+                    "left": 100,
+                    "top": 100,
+                    "right": 1100,
+                    "bottom": 800,
+                    "bound_at": now,
+                    "last_seen_at": now,
+                    "status": "active",
+                }
+            ],
+            "updated_at": now,
+        }
+    )
 
 
 if __name__ == "__main__":

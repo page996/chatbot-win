@@ -235,8 +235,11 @@ function renderQueue() {
 }
 
 function renderBridge(bridge) {
-  $("#bridgePendingCount").textContent = `${bridge.pending_count || 0} 待消费`;
-  $("#bridgePath").textContent = bridge.outbox_path || "未创建 outbox";
+  const manualCount = bridge.manual_bound_count || 0;
+  $("#bridgePendingCount").textContent = `${bridge.pending_count || 0} 待消费 / ${manualCount} 手动通道`;
+  $("#bridgePath").textContent = manualCount
+    ? (bridge.outbox_path || "未创建 outbox")
+    : "仅手动抓取并绑定过的微信通道可进入非前台桥";
   const list = $("#bridgeList");
   list.innerHTML = "";
   const items = bridge.items || [];
@@ -539,6 +542,9 @@ function backgroundSendText(value) {
     bridge_outbox_available: "bridge_outbox 可入队",
     bridge_outbox_configured_disabled: "bridge_outbox 已配置，发送未启用",
     bridge_outbox_ready: "bridge_outbox 已启用",
+    bridge_outbox_manual_capture_only_available: "仅手动抓取通道可用",
+    bridge_outbox_waiting_for_manual_capture: "等待手动抓取通道",
+    bridge_outbox_ready_for_manual_channels: "已启用，仅限手动通道",
   }[value] || value;
 }
 

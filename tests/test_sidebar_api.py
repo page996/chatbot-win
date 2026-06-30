@@ -42,6 +42,8 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("audit", state)
             self.assertIn("send_bridge", state)
             self.assertIn("queued_to_bridge", state["queues"])
+            self.assertEqual(state["send_bridge"]["manual_bound_count"], 0)
+            self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_manual_capture_only_available")
 
     def test_sidebar_channel_state_hides_probe_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

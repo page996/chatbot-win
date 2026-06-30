@@ -156,6 +156,21 @@ class PreflightTest(unittest.TestCase):
             self.assertFalse(report["wechat_access"]["read_only"])
             self.assertTrue(report["wechat_access"]["write_access_configured"])
 
+    def test_preflight_warns_bridge_outbox_needs_manual_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            config.mode = "confirm"
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+
+            report = build_preflight_report(config)
+
+            self.assertEqual(report["status"], "warn")
+            self.assertEqual(report["wechat_access"]["manual_bound_channels"]["count"], 0)
+            self.assertIn("bridge_outbox requires at least one manually captured WeChat channel binding", report["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()

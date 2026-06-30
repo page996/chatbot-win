@@ -38,7 +38,7 @@ _SEND_DRIVER_SPECS: dict[str, SendDriverSpec] = {
         name=BRIDGE_OUTBOX_SEND_DRIVER,
         builder=lambda config: BridgeOutboxSendDriver(send_enabled=config.send_enabled, data_dir=config.data_dir),
         real_send_implemented=True,
-        description="Non-foreground bridge outbox producer; external bridge must deliver and acknowledge",
+        description="Non-foreground bridge outbox producer for manually captured channels only",
     ),
 }
 
