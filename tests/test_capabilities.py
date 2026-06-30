@@ -50,6 +50,8 @@ class CapabilitiesTest(unittest.TestCase):
 
         self.assertIn("ocr", payload)
         self.assertIn("libreoffice", payload)
+        self.assertIn("asr", payload)
+        self.assertIn("wechat_voice_to_text", payload)
         self.assertFalse(payload["send_enabled"])
 
 

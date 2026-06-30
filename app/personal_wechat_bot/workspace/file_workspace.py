@@ -12,6 +12,7 @@ from typing import Any
 from app.personal_wechat_bot.domain.models import utc_now_iso
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import OcrEngine
+from app.personal_wechat_bot.voice.asr import AsrEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import (
     AUDIO_SUFFIXES,
     IMAGE_SUFFIXES,
@@ -156,6 +157,7 @@ class FileWorkspace:
         result: AttachmentParseResult,
         *,
         embedded_media_ocr: OcrEngine | None = None,
+        embedded_media_asr: AsrEngine | None = None,
     ) -> None:
         derived_dir = Path(staged.derived_dir)
         derived_dir.mkdir(parents=True, exist_ok=True)
@@ -164,7 +166,11 @@ class FileWorkspace:
         analysis_path = derived_dir / "analysis.json"
         chunks = _write_chunks(derived_dir / "chunks", result.text)
         table_artifacts = _write_table_artifacts(staged, result)
-        media_artifacts = _write_media_artifacts(staged, embedded_media_ocr=embedded_media_ocr)
+        media_artifacts = _write_media_artifacts(
+            staged,
+            embedded_media_ocr=embedded_media_ocr,
+            embedded_media_asr=embedded_media_asr,
+        )
         payload = {
             "file_id": staged.file_id,
             "conversation_id": staged.conversation_id,
@@ -226,17 +232,29 @@ class FileWorkspace:
         parser: Any,
         *,
         embedded_media_ocr: OcrEngine | None = None,
+        embedded_media_asr: AsrEngine | None = None,
     ) -> AttachmentParseResult:
         cached = self.read_parse_result(staged)
         if cached is not None:
             if _needs_table_artifact_refresh(staged, cached) or _needs_media_artifact_refresh(
                 staged,
                 embedded_media_ocr=embedded_media_ocr,
+                embedded_media_asr=embedded_media_asr,
             ):
-                self.write_parse_result(staged, cached, embedded_media_ocr=embedded_media_ocr)
+                self.write_parse_result(
+                    staged,
+                    cached,
+                    embedded_media_ocr=embedded_media_ocr,
+                    embedded_media_asr=embedded_media_asr,
+                )
             return cached
         result = parser.parse(staged.staged_path)
-        self.write_parse_result(staged, result, embedded_media_ocr=embedded_media_ocr)
+        self.write_parse_result(
+            staged,
+            result,
+            embedded_media_ocr=embedded_media_ocr,
+            embedded_media_asr=embedded_media_asr,
+        )
         return result
 
     def file_dir(self, conversation_id: str, session_id: str, file_id: str) -> Path:
@@ -331,6 +349,10 @@ class FileWorkspace:
             "media_ocr_dir": str(media_artifacts.get("ocr_dir", "")),
             "media_ocr_count": int(media_artifacts.get("ocr_count", 0) or 0),
             "media_ocr_error_count": int(media_artifacts.get("ocr_error_count", 0) or 0),
+            "media_asr_status": str(media_artifacts.get("asr_status", "")),
+            "media_asr_dir": str(media_artifacts.get("asr_dir", "")),
+            "media_asr_count": int(media_artifacts.get("asr_count", 0) or 0),
+            "media_asr_error_count": int(media_artifacts.get("asr_error_count", 0) or 0),
             "media_images": [
                 dict(item)
                 for item in media_artifacts.get("images", [])
@@ -388,7 +410,7 @@ def _analysis_payload(
         "has_tables": result.kind == "spreadsheet" or bool(table_chunks),
         "has_audio": media["has_audio"],
         "media": media,
-        "blocked_capabilities": _blocked_capabilities(media),
+        "blocked_capabilities": _blocked_capabilities(media, media_artifacts),
         "media_status": str(media_artifacts.get("status", "")),
         "media_dir": str(media_artifacts.get("media_dir", "")),
         "media_index_path": str(media_artifacts.get("index_path", "")),
@@ -397,6 +419,10 @@ def _analysis_payload(
         "media_ocr_dir": str(media_artifacts.get("ocr_dir", "")),
         "media_ocr_count": int(media_artifacts.get("ocr_count", 0) or 0),
         "media_ocr_error_count": int(media_artifacts.get("ocr_error_count", 0) or 0),
+        "media_asr_status": str(media_artifacts.get("asr_status", "")),
+        "media_asr_dir": str(media_artifacts.get("asr_dir", "")),
+        "media_asr_count": int(media_artifacts.get("asr_count", 0) or 0),
+        "media_asr_error_count": int(media_artifacts.get("asr_error_count", 0) or 0),
         "media_images": [
             dict(item)
             for item in media_artifacts.get("images", [])
@@ -502,6 +528,9 @@ def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
         f"- ocr_status: {analysis.get('media_ocr_status', '')}",
         f"- ocr_count: {analysis.get('media_ocr_count', 0)}",
         f"- ocr_dir: {analysis.get('media_ocr_dir', '')}",
+        f"- asr_status: {analysis.get('media_asr_status', '')}",
+        f"- asr_count: {analysis.get('media_asr_count', 0)}",
+        f"- asr_dir: {analysis.get('media_asr_dir', '')}",
     ]
     if error:
         lines.append(f"- error: {error}")
@@ -522,6 +551,8 @@ def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
         first = media_audio[0]
         if isinstance(first, dict):
             lines.append(f"- first_audio: {first.get('path', '')}")
+            if first.get("asr_path"):
+                lines.append(f"- first_audio_asr: {first.get('asr_path', '')}")
     lines.append("")
     return lines
 
@@ -536,14 +567,32 @@ def _write_table_artifacts(staged: StagedFile, result: AttachmentParseResult) ->
     return write_table_artifacts(staged.staged_path, tables_dir)
 
 
-def _write_media_artifacts(staged: StagedFile, *, embedded_media_ocr: OcrEngine | None = None) -> dict[str, Any]:
+def _write_media_artifacts(
+    staged: StagedFile,
+    *,
+    embedded_media_ocr: OcrEngine | None = None,
+    embedded_media_asr: AsrEngine | None = None,
+) -> dict[str, Any]:
     suffix = Path(staged.staged_path).suffix.lower()
     media_dir = Path(staged.derived_dir) / "media"
-    if suffix != ".docx":
-        if media_dir.exists():
-            shutil.rmtree(media_dir)
-        return {}
-    return _extract_docx_media(Path(staged.staged_path), media_dir, embedded_media_ocr=embedded_media_ocr)
+    if suffix == ".docx":
+        return _extract_docx_media(
+            Path(staged.staged_path),
+            media_dir,
+            embedded_media_ocr=embedded_media_ocr,
+            embedded_media_asr=embedded_media_asr,
+        )
+    if suffix == ".pdf":
+        return _extract_pdf_media(Path(staged.staged_path), media_dir, embedded_media_ocr=embedded_media_ocr)
+    if suffix in AUDIO_SUFFIXES:
+        return _write_standalone_audio_artifacts(
+            Path(staged.staged_path),
+            media_dir,
+            embedded_media_asr=embedded_media_asr,
+        )
+    if media_dir.exists():
+        shutil.rmtree(media_dir)
+    return {}
 
 
 def _extract_docx_media(
@@ -551,6 +600,7 @@ def _extract_docx_media(
     media_dir: Path,
     *,
     embedded_media_ocr: OcrEngine | None = None,
+    embedded_media_asr: AsrEngine | None = None,
 ) -> dict[str, Any]:
     image_suffixes = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".emf", ".wmf"}
     audio_suffixes = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma"}
@@ -590,21 +640,120 @@ def _extract_docx_media(
         return payload
 
     ocr_payload = _write_media_ocr_artifacts(images, media_dir / "ocr", embedded_media_ocr)
+    asr_payload = _write_media_asr_artifacts(audio, media_dir / "asr", embedded_media_asr)
     payload = {
         "status": "completed",
         "media_dir": str(media_dir),
         "index_path": str(media_dir / "index.json"),
         "extract_count": len(images) + len(audio),
         "images": ocr_payload["images"],
-        "audio": audio,
+        "audio": asr_payload["audio"],
         "ocr_status": ocr_payload["status"],
         "ocr_dir": ocr_payload["ocr_dir"],
         "ocr_count": ocr_payload["ocr_count"],
         "ocr_error_count": ocr_payload["error_count"],
+        "asr_status": asr_payload["status"],
+        "asr_dir": asr_payload["asr_dir"],
+        "asr_count": asr_payload["asr_count"],
+        "asr_error_count": asr_payload["error_count"],
         "error": "",
     }
     _write_json(media_dir / "index.json", payload)
     return payload
+
+
+def _extract_pdf_media(
+    path: Path,
+    media_dir: Path,
+    *,
+    embedded_media_ocr: OcrEngine | None = None,
+) -> dict[str, Any]:
+    media_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = media_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    images: list[dict[str, Any]] = []
+    errors: list[str] = []
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        for page_index, page in enumerate(reader.pages, start=1):
+            for image_index, image in enumerate(getattr(page, "images", []) or [], start=1):
+                suffix = Path(str(getattr(image, "name", ""))).suffix.lower() or ".bin"
+                output = images_dir / _safe_filename(f"page_{page_index:04d}_image_{image_index:04d}{suffix}", suffix)
+                data = getattr(image, "data", b"")
+                if data:
+                    output.write_bytes(data)
+                    images.append(_media_item(f"page:{page_index}:image:{image_index}", output, suffix))
+    except Exception as exc:
+        errors.append(f"pypdf_image_extract:{type(exc).__name__}: {exc}")
+
+    render_payload = _render_pdf_pages(path, media_dir / "pages")
+    for item in render_payload.get("images", []):
+        if isinstance(item, dict):
+            images.append(dict(item))
+
+    ocr_payload = _write_media_ocr_artifacts(images, media_dir / "ocr", embedded_media_ocr)
+    payload = {
+        "status": "completed" if images or not errors else "failed",
+        "media_dir": str(media_dir),
+        "index_path": str(media_dir / "index.json"),
+        "extract_count": len(images),
+        "images": ocr_payload["images"],
+        "audio": [],
+        "ocr_status": ocr_payload["status"],
+        "ocr_dir": ocr_payload["ocr_dir"],
+        "ocr_count": ocr_payload["ocr_count"],
+        "ocr_error_count": ocr_payload["error_count"],
+        "asr_status": "not_needed",
+        "asr_dir": "",
+        "asr_count": 0,
+        "asr_error_count": 0,
+        "page_render_status": render_payload.get("status", ""),
+        "page_render_dir": render_payload.get("render_dir", ""),
+        "page_render_count": render_payload.get("render_count", 0),
+        "error": "; ".join(errors + ([str(render_payload.get("error", ""))] if render_payload.get("error") else [])),
+    }
+    _write_json(media_dir / "index.json", payload)
+    return payload
+
+
+def _render_pdf_pages(path: Path, render_dir: Path) -> dict[str, Any]:
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except Exception:
+        return {
+            "status": "skipped_missing_pymupdf",
+            "render_dir": "",
+            "render_count": 0,
+            "images": [],
+            "error": "PyMuPDF is not installed; install it in vendor/ocr-python for scanned PDF page rendering",
+        }
+    try:
+        document = fitz.open(str(path))
+        render_dir.mkdir(parents=True, exist_ok=True)
+        images: list[dict[str, Any]] = []
+        for page_index in range(min(len(document), 20)):
+            page = document[page_index]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            output = render_dir / f"page_{page_index + 1:04d}.png"
+            pix.save(str(output))
+            images.append(_media_item(f"page:{page_index + 1}:render", output, ".png"))
+        return {
+            "status": "completed",
+            "render_dir": str(render_dir),
+            "render_count": len(images),
+            "images": images,
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "render_dir": str(render_dir),
+            "render_count": 0,
+            "images": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _media_item(source_name: str, output: Path, suffix: str) -> dict[str, Any]:
@@ -615,6 +764,109 @@ def _media_item(source_name: str, output: Path, suffix: str) -> dict[str, Any]:
         "suffix": suffix,
         "bytes": output.stat().st_size if output.exists() else 0,
     }
+
+
+def _write_standalone_audio_artifacts(
+    path: Path,
+    media_dir: Path,
+    *,
+    embedded_media_asr: AsrEngine | None,
+) -> dict[str, Any]:
+    media_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir = media_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    copied = audio_dir / _safe_filename(path.name, path.suffix)
+    if not copied.exists() or _sha256_file(copied) != _sha256_file(path):
+        shutil.copy2(path, copied)
+    audio = [_media_item(path.name, copied, path.suffix.lower())]
+    asr_payload = _write_media_asr_artifacts(audio, media_dir / "asr", embedded_media_asr)
+    payload = {
+        "status": "completed",
+        "media_dir": str(media_dir),
+        "index_path": str(media_dir / "index.json"),
+        "extract_count": 1,
+        "images": [],
+        "audio": asr_payload["audio"],
+        "ocr_status": "not_needed",
+        "ocr_dir": "",
+        "ocr_count": 0,
+        "ocr_error_count": 0,
+        "asr_status": asr_payload["status"],
+        "asr_dir": asr_payload["asr_dir"],
+        "asr_count": asr_payload["asr_count"],
+        "asr_error_count": asr_payload["error_count"],
+        "error": "",
+    }
+    _write_json(media_dir / "index.json", payload)
+    return payload
+
+
+def _write_media_asr_artifacts(
+    audio: list[dict[str, Any]],
+    asr_dir: Path,
+    embedded_media_asr: AsrEngine | None,
+) -> dict[str, Any]:
+    if not audio:
+        return {"status": "not_needed", "asr_dir": "", "asr_count": 0, "error_count": 0, "audio": audio}
+    if embedded_media_asr is None:
+        updated = [dict(item, asr_status="skipped_no_asr_engine") for item in audio]
+        return {"status": "skipped_no_asr_engine", "asr_dir": "", "asr_count": 0, "error_count": 0, "audio": updated}
+    asr_dir.mkdir(parents=True, exist_ok=True)
+    updated: list[dict[str, Any]] = []
+    asr_count = 0
+    error_count = 0
+    for index, item in enumerate(audio, start=1):
+        audio_path = Path(str(item.get("path", "")))
+        output_path = asr_dir / f"{index:04d}_{Path(str(item.get('name', 'audio'))).stem}.md"
+        current = dict(item)
+        transcript = embedded_media_asr.transcribe(audio_path)
+        output_path.write_text(_media_asr_markdown(current, transcript.status, text=transcript.text, error=transcript.error), encoding="utf-8")
+        current.update(
+            {
+                "asr_status": transcript.status,
+                "asr_path": str(output_path),
+                "asr_backend": transcript.backend,
+                "asr_model": transcript.model,
+                "asr_text": _compact(transcript.text, 2000),
+                "asr_error": transcript.error,
+            }
+        )
+        if transcript.status == "transcribed":
+            asr_count += 1
+        elif transcript.status in {"failed", "blocked"}:
+            error_count += 1
+        updated.append(current)
+    if error_count and asr_count:
+        status = "partial"
+    elif error_count:
+        status = "failed"
+    else:
+        status = "completed"
+    return {
+        "status": status,
+        "asr_dir": str(asr_dir),
+        "asr_count": asr_count,
+        "error_count": error_count,
+        "audio": updated,
+    }
+
+
+def _media_asr_markdown(item: dict[str, Any], status: str, *, text: str = "", error: str = "") -> str:
+    lines = [
+        f"# Audio ASR: {item.get('name', '')}",
+        "",
+        f"- source_name: {item.get('source_name', '')}",
+        f"- audio_path: {item.get('path', '')}",
+        f"- status: {status}",
+        "",
+        "## Text",
+        "",
+        text,
+        "",
+    ]
+    if error:
+        lines.extend(["## Error", "", error, ""])
+    return "\n".join(lines)
 
 
 def _write_media_ocr_artifacts(
@@ -700,18 +952,23 @@ def _needs_media_artifact_refresh(
     staged: StagedFile,
     *,
     embedded_media_ocr: OcrEngine | None = None,
+    embedded_media_asr: AsrEngine | None = None,
 ) -> bool:
-    if Path(staged.staged_path).suffix.lower() != ".docx":
+    suffix = Path(staged.staged_path).suffix.lower()
+    if suffix not in {".docx", ".pdf", *AUDIO_SUFFIXES}:
         return False
     index = _read_json(Path(staged.derived_dir) / "media" / "index.json", None)
     if not isinstance(index, dict):
         return True
     images = index.get("images", [])
-    if embedded_media_ocr is None:
-        return False
     if not isinstance(images, list):
         return True
-    return any(isinstance(item, dict) and not item.get("ocr_status") for item in images)
+    if embedded_media_ocr is not None and any(isinstance(item, dict) and not item.get("ocr_status") for item in images):
+        return True
+    audio = index.get("audio", [])
+    if embedded_media_asr is not None and isinstance(audio, list):
+        return any(isinstance(item, dict) and not item.get("asr_status") for item in audio)
+    return False
 
 
 def _document_media_analysis(path: Path, suffix: str, media_artifacts: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -798,11 +1055,14 @@ def _pdf_media_analysis(path: Path) -> dict[str, Any]:
     }
 
 
-def _blocked_capabilities(media: dict[str, Any]) -> list[str]:
+def _blocked_capabilities(media: dict[str, Any], media_artifacts: dict[str, Any] | None = None) -> list[str]:
+    artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
     blocked: list[str] = []
-    if media.get("embedded") and media.get("has_images"):
+    ocr_count = int(artifacts.get("ocr_count", 0) or 0)
+    asr_count = int(artifacts.get("asr_count", 0) or 0)
+    if media.get("embedded") and media.get("has_images") and ocr_count <= 0:
         blocked.append("embedded_image_extraction_and_ocr")
-    if media.get("embedded") and media.get("has_audio"):
+    if media.get("has_audio") and asr_count <= 0:
         blocked.append("embedded_audio_extraction_and_asr")
     return blocked
 

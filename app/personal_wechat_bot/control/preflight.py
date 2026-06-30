@@ -10,6 +10,8 @@ from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
+from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionBridge
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
     implemented_send_drivers,
     is_real_send_driver_implemented,
@@ -34,6 +36,8 @@ def build_preflight_report(
     manual_bound_channels = manual_bridge_bindings(config.data_dir)
     warnings = _warnings(config, api_key_present, manual_bound_count=len(manual_bound_channels))
     ocr_health = RapidOcrSubprocessEngine().health()
+    asr_health = LocalAsrSubprocessEngine().health()
+    wechat_voice = WeChatVoiceTranscriptionBridge(config.data_dir).health()
     office_health = LibreOfficeRuntime().health()
     real_send_implemented = is_real_send_driver_implemented(config.send_driver)
     write_access_configured = config.send_enabled and real_send_implemented
@@ -135,11 +139,12 @@ def build_preflight_report(
             "max_bytes": config.file_max_bytes,
             "multimedia_parse": {
                 "images": "file_layer_ocr_to_workspace_artifacts",
-                "voice_messages": "backend_event_voice_text_supported; upstream must provide WeChat built-in transcript",
-                "audio_files": "preserved_and_indexed; local_asr_not_configured",
+                "voice_messages": "backend_event_pending_voice_supported; WeChat built-in transcript first, local ASR fallback when audio path is provided",
+                "voice_main_path": "wechat_builtin_voice_to_text_bridge_for_manually_bound_windows",
+                "audio_files": "preserved_and_indexed; local_asr_fallback_when_available",
                 "docx_embedded_images": "extracted_and_ocr_if_ocr_engine_available",
-                "docx_embedded_audio": "extracted_only; local_asr_not_configured",
-                "pdf_embedded_media": "heuristic_detection_only",
+                "docx_embedded_audio": "extracted_and_local_asr_if_available",
+                "pdf_embedded_media": "image_extraction_plus_optional_page_render_ocr",
             },
         },
         "runtime_guards": {
@@ -162,6 +167,15 @@ def build_preflight_report(
                 "scope": "http_text_only",
                 "available": True,
             },
+            "asr": {
+                "name": "voice.local_asr",
+                "scope": "tool_layer_file_workspace_only",
+                "backend": asr_health.backend,
+                "available": asr_health.available,
+                "detail": asr_health.detail,
+                "install": asr_health.install,
+            },
+            "wechat_voice_to_text": wechat_voice,
         },
         "ocr": {
             "backend": ocr_health.backend,
@@ -173,6 +187,13 @@ def build_preflight_report(
             "available": office_health.available,
             "executable": office_health.executable,
             "version": office_health.version,
+        },
+        "asr": {
+            "backend": asr_health.backend,
+            "available": asr_health.available,
+            "model": asr_health.model,
+            "detail": asr_health.detail,
+            "install": asr_health.install,
         },
         "warnings": warnings,
     }

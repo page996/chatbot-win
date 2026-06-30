@@ -12,6 +12,7 @@ from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionBridge, result_payload
 from app.personal_wechat_bot.workspace.attachment_pipeline import AttachmentPipeline, IncomingAttachment
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
@@ -52,6 +53,7 @@ class BackendEventJsonlDriver:
         attachment_parser: BackendAttachmentParser | None = None,
         file_workspace: FileWorkspace | None = None,
         attachment_pipeline: AttachmentPipeline | None = None,
+        voice_transcription_bridge: WeChatVoiceTranscriptionBridge | None = None,
         session_store: ConversationSessionStore | None = None,
         context_store: ConversationSessionStore | None = None,
     ):
@@ -70,7 +72,9 @@ class BackendEventJsonlDriver:
             allowed_extensions=self.allowed_extensions,
             max_input_bytes=self.max_input_bytes,
             embedded_media_ocr=self.attachment_parser.ocr_engine,
+            embedded_media_asr=self.attachment_parser.asr_engine,
         )
+        self.voice_transcription_bridge = voice_transcription_bridge or WeChatVoiceTranscriptionBridge(self.event_path.parent)
         self.session_store = session_store or context_store
         self._seen_event_ids: set[str] = set()
         self._seen_message_raw_ids: set[str] = set()
@@ -130,8 +134,9 @@ class BackendEventJsonlDriver:
             else DEFAULT_SESSION_ID
         )
         attachments = [_attachment_pending(item) for item in event.attachments]
-        voice = _normalize_voice(event.voice)
-        text = _compose_pending_message_text(_message_text_with_voice(event.text, voice), attachments)
+        voice = _normalize_voice(event.voice, allow_pending=True)
+        voice_pending = _voice_needs_transcription(voice)
+        text = _compose_pending_message_text(_message_text_with_voice(event.text, voice), attachments, voice)
         if not text.strip():
             return None
         return RawWeChatMessage(
@@ -152,7 +157,9 @@ class BackendEventJsonlDriver:
                 "session_id": session_id,
                 "original_text": event.text,
                 "voice": voice,
-                "backend_attachments_pending": True,
+                "backend_attachments_pending": bool(attachments),
+                "backend_voice_pending": voice_pending,
+                "backend_media_pending": bool(attachments) or voice_pending,
                 "attachments": attachments,
                 "quote": event.quote or {},
                 "context_only": context_only,
@@ -168,13 +175,22 @@ class BackendEventJsonlDriver:
     ) -> RawWeChatMessage:
         if raw.driver_meta.get("source") != "backend_events_jsonl":
             return raw
-        pending = raw.driver_meta.get("backend_attachments_pending")
+        pending = raw.driver_meta.get("backend_media_pending") or raw.driver_meta.get("backend_attachments_pending")
         if not pending:
             return raw
+        meta = dict(raw.driver_meta)
+        voice = _normalize_voice(meta.get("voice"), allow_pending=True)
+        voice_fallback_attachment: dict[str, Any] | None = None
+        if meta.get("backend_voice_pending"):
+            voice, voice_fallback_attachment = self._transcribe_pending_voice(conversation_id, session_id, voice)
+            meta["voice"] = voice
+            meta["backend_voice_pending"] = False
         attachments_meta = raw.driver_meta.get("attachments", [])
         if not isinstance(attachments_meta, list):
-            return raw
+            attachments_meta = []
         indexed: list[dict[str, Any]] = []
+        if voice_fallback_attachment is not None:
+            indexed.append(voice_fallback_attachment)
         for item in attachments_meta:
             if not isinstance(item, dict):
                 continue
@@ -200,13 +216,15 @@ class BackendEventJsonlDriver:
         allowed = [item for item in indexed if item.get("status") == "indexed"]
         blocked = [item for item in indexed if item.get("status") == "blocked"]
         text = _compose_message_text(
-            _message_text_with_voice(str(raw.driver_meta.get("original_text", raw.text)), _normalize_voice(raw.driver_meta.get("voice"))),
-            allowed,
+            _message_text_with_voice(str(raw.driver_meta.get("original_text", raw.text)), voice),
+            [item for item in allowed if not _is_voice_fallback_attachment(item)],
             blocked,
         )
-        meta = dict(raw.driver_meta)
+        if not text.strip():
+            text = _voice_status_text(voice)
         meta["attachments"] = indexed
         meta["backend_attachments_pending"] = False
+        meta["backend_media_pending"] = False
         return RawWeChatMessage(
             raw_id=raw.raw_id,
             chat_title=raw.chat_title,
@@ -218,6 +236,71 @@ class BackendEventJsonlDriver:
             observed_at=raw.observed_at,
             driver_meta=meta,
         )
+
+    def _transcribe_pending_voice(
+        self,
+        conversation_id: str,
+        session_id: str,
+        voice: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if not voice or str(voice.get("text", "")).strip():
+            return voice, None
+        if self.voice_transcription_bridge is None:
+            bridge_payload = {"status": "blocked", "error": "wechat_voice_bridge_not_configured"}
+            fallback_attachment = self._local_asr_voice_fallback(conversation_id, session_id, voice)
+            return _voice_from_transcription_failure(voice, bridge_payload, fallback_attachment), fallback_attachment
+        result = self.voice_transcription_bridge.transcribe_selected_voice(conversation_id)
+        payload = result_payload(result)
+        if result.status == "transcribed" and result.text.strip():
+            return _normalize_voice(
+                {
+                    **voice,
+                    "status": "transcribed",
+                    "source": result.source,
+                    "text": result.text,
+                    "method": result.method,
+                    "bridge": payload,
+                },
+                allow_pending=True,
+            ), None
+        fallback_attachment = self._local_asr_voice_fallback(conversation_id, session_id, voice)
+        fallback_text = _voice_fallback_text(fallback_attachment)
+        if fallback_text:
+            return _normalize_voice(
+                {
+                    **voice,
+                    "status": "transcribed",
+                    "source": "local_asr_fallback",
+                    "text": fallback_text,
+                    "method": "file_workspace_local_asr",
+                    "bridge": payload,
+                    "fallback": _voice_fallback_summary(fallback_attachment),
+                },
+                allow_pending=True,
+            ), fallback_attachment
+        return _voice_from_transcription_failure(voice, payload, fallback_attachment), fallback_attachment
+
+    def _local_asr_voice_fallback(
+        self,
+        conversation_id: str,
+        session_id: str,
+        voice: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        audio_path = _voice_audio_path(voice)
+        if not audio_path:
+            return None
+        fallback = self.attachment_pipeline.process(
+            IncomingAttachment(
+                path=audio_path,
+                original_name=_voice_audio_name(voice) or Path(audio_path).name,
+                kind="audio",
+                source="backend_event_voice_audio",
+            ),
+            conversation_id=conversation_id,
+            session_id=session_id,
+        )
+        fallback["source"] = "backend_event_voice_audio"
+        return fallback
 
 
 def append_backend_event(
@@ -245,7 +328,7 @@ def append_backend_event(
         "observed_at": observed_at or utc_now_iso(),
         "attachments": [_attachment_payload(item) for item in attachments or []],
     }
-    parsed_voice = _normalize_voice(voice)
+    parsed_voice = _normalize_voice(voice, allow_pending=True)
     if parsed_voice:
         payload["voice"] = parsed_voice
     if quote:
@@ -346,7 +429,7 @@ def _parse_event_payload(
     text = str(payload.get("text", "")).strip()
     attachments = _parse_attachments(payload.get("attachments", []))
     quote = _parse_quote(payload.get("quote"))
-    voice = _normalize_voice(payload.get("voice"))
+    voice = _normalize_voice(payload.get("voice"), allow_pending=True)
     seed = {**payload, "_line_no": line_no}
     if suffix:
         seed["_suffix"] = suffix
@@ -452,6 +535,24 @@ def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         voice = dict(raw)
     else:
         voice = {}
+    explicit_voice_keys = {
+        "voice_text",
+        "voiceText",
+        "transcript",
+        "voice_status",
+        "voiceStatus",
+        "voice_duration",
+        "voiceDuration",
+        "voice_audio",
+        "voiceAudio",
+        "voice_audio_path",
+        "voiceAudioPath",
+        "voice_audio_name",
+        "voiceAudioName",
+    }
+    has_voice_marker = bool(voice) or any(str(payload.get(key, "")).strip() for key in explicit_voice_keys)
+    if not has_voice_marker:
+        return None
     text = str(
         voice.get("text")
         or payload.get("voice_text")
@@ -459,34 +560,60 @@ def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         or payload.get("transcript")
         or ""
     ).strip()
-    if not text:
-        return None
+    status = str(voice.get("status") or payload.get("voice_status") or payload.get("voiceStatus") or ("transcribed" if text else "pending")).strip()
     duration = str(
         voice.get("duration")
         or payload.get("voice_duration")
         or payload.get("voiceDuration")
         or ""
     ).strip()
+    audio_path = str(
+        voice.get("audio_path")
+        or voice.get("path")
+        or voice.get("file_path")
+        or payload.get("voice_audio")
+        or payload.get("voiceAudio")
+        or payload.get("voice_audio_path")
+        or payload.get("voiceAudioPath")
+        or ""
+    ).strip()
+    audio_name = str(
+        voice.get("audio_name")
+        or voice.get("name")
+        or payload.get("voice_audio_name")
+        or payload.get("voiceAudioName")
+        or ""
+    ).strip()
+    if not text and status not in {"pending", "selected", "detected", "blocked", "failed"} and not audio_path:
+        return None
     return _normalize_voice(
         {
             **voice,
+            "status": status,
             "text": text,
             "duration": duration,
-        }
+            "audio_path": audio_path,
+            "audio_name": audio_name,
+        },
+        allow_pending=True,
     )
 
 
-def _normalize_voice(value: Any) -> dict[str, Any]:
+def _normalize_voice(value: Any, *, allow_pending: bool = False) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
+    if not value:
+        return {}
     text = str(value.get("text", "")).strip()
-    if not text:
+    status = str(value.get("status") or ("transcribed" if text else "pending")).strip().lower()
+    if not text and not (allow_pending and status in {"pending", "selected", "detected", "blocked", "failed"}):
         return {}
     return {
-        "status": str(value.get("status") or "transcribed").strip(),
+        "status": status,
         "source": str(value.get("source") or "wechat_builtin_voice_to_text").strip(),
         "text": text,
         "duration": str(value.get("duration", "")).strip(),
+        **_optional_voice_fields(value),
     }
 
 
@@ -500,6 +627,98 @@ def _message_text_with_voice(text: str, voice: dict[str, Any]) -> str:
     if clean_text:
         return f"{clean_text}\n[微信语音转文字]\n{voice_text}"
     return voice_text
+
+
+def _voice_needs_transcription(voice: dict[str, Any]) -> bool:
+    if not voice:
+        return False
+    if str(voice.get("text", "")).strip():
+        return False
+    return str(voice.get("status") or "pending").strip() in {"pending", "selected", "detected"}
+
+
+def _voice_status_text(voice: dict[str, Any]) -> str:
+    if not voice:
+        return ""
+    text = str(voice.get("text", "")).strip()
+    if text:
+        return text
+    status = str(voice.get("status") or "pending").strip()
+    error = str(voice.get("error", "")).strip()
+    suffix = f" error={error}" if error else ""
+    return f"[微信语音转文字未完成] status={status}{suffix}".strip()
+
+
+def _voice_audio_path(voice: dict[str, Any]) -> str:
+    for key in ("audio_path", "path", "file_path", "local_path"):
+        value = str(voice.get(key, "")).strip()
+        if value:
+            return value
+    audio = voice.get("audio")
+    if isinstance(audio, dict):
+        for key in ("path", "file_path", "local_path"):
+            value = str(audio.get(key, "")).strip()
+            if value:
+                return value
+    return ""
+
+
+def _voice_audio_name(voice: dict[str, Any]) -> str:
+    for key in ("audio_name", "name", "filename", "file_name"):
+        value = str(voice.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def _voice_fallback_text(attachment: dict[str, Any] | None) -> str:
+    if not isinstance(attachment, dict) or attachment.get("status") != "indexed":
+        return ""
+    parse = attachment.get("parse")
+    if not isinstance(parse, dict):
+        return ""
+    if parse.get("kind") != "audio":
+        return ""
+    return str(parse.get("raw_text") or parse.get("text") or "").strip()
+
+
+def _voice_fallback_summary(attachment: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(attachment, dict):
+        return {"status": "not_available", "reason": "voice_audio_path_missing"}
+    parse = attachment.get("parse") if isinstance(attachment.get("parse"), dict) else {}
+    return {
+        "source": attachment.get("source", ""),
+        "status": attachment.get("status", ""),
+        "name": attachment.get("name", ""),
+        "kind": attachment.get("kind", ""),
+        "file_id": attachment.get("file_id", ""),
+        "parse_status": parse.get("status", ""),
+        "parse_error": parse.get("error", ""),
+    }
+
+
+def _is_voice_fallback_attachment(attachment: dict[str, Any]) -> bool:
+    return str(attachment.get("source", "")).strip() == "backend_event_voice_audio"
+
+
+def _voice_from_transcription_failure(
+    voice: dict[str, Any],
+    bridge_payload: dict[str, Any],
+    fallback_attachment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    fallback = _voice_fallback_summary(fallback_attachment)
+    error = str(bridge_payload.get("error") or fallback.get("parse_error") or "voice_transcription_unavailable")
+    return {
+        **voice,
+        "status": str(bridge_payload.get("status") or "blocked"),
+        "source": str(bridge_payload.get("source") or voice.get("source") or "wechat_builtin_voice_to_text"),
+        "text": "",
+        "method": str(bridge_payload.get("method") or ""),
+        "error": error,
+        "blockers": bridge_payload.get("blockers", []),
+        "bridge": bridge_payload,
+        "fallback": fallback,
+    }
 
 
 def _compose_message_text(
@@ -534,11 +753,24 @@ def _attachment_pending(attachment: BackendAttachment) -> dict[str, Any]:
     }
 
 
-def _compose_pending_message_text(text: str, attachments: list[dict[str, Any]]) -> str:
+def _compose_pending_message_text(text: str, attachments: list[dict[str, Any]], voice: dict[str, Any] | None = None) -> str:
     lines = [text.strip()] if text.strip() else []
+    if voice and _voice_needs_transcription(voice):
+        duration = str(voice.get("duration", "")).strip()
+        duration_note = f" duration={duration}" if duration else ""
+        lines.append(f"[微信语音待转文字]{duration_note}")
     for item in attachments:
         lines.append(f"[后台附件待处理] {item.get('name', '')} kind={item.get('kind', 'file')}")
     return "\n".join(lines).strip()
+
+
+def _optional_voice_fields(value: dict[str, Any]) -> dict[str, Any]:
+    optional: dict[str, Any] = {}
+    for key in ("method", "error", "blockers", "bridge", "fallback", "audio_path", "audio_name"):
+        item = value.get(key)
+        if item not in (None, "", [], {}):
+            optional[key] = item
+    return optional
 
 
 def _event_raw_id(payload: dict[str, Any]) -> str:

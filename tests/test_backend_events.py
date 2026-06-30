@@ -9,11 +9,14 @@ from app.personal_wechat_bot.config.loader import create_default_config, load_co
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
+from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.backend_events import (
     BackendEventJsonlDriver,
     append_backend_event,
+    append_backend_event_payload,
 )
+from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionResult
 
 
 class BackendEventJsonlDriverTest(unittest.TestCase):
@@ -30,7 +33,10 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
             allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
             allowed_extensions=self.config.file_allowed_extensions,
             max_input_bytes=self.config.file_max_bytes,
-            attachment_parser=BackendAttachmentParser(ocr_engine=_FakeOcr("图片 OCR 内容")),
+            attachment_parser=BackendAttachmentParser(
+                ocr_engine=_FakeOcr("图片 OCR 内容"),
+                asr_engine=_FakeAsr("", status="blocked", error="local_asr_not_configured"),
+            ),
         )
 
     def tearDown(self) -> None:
@@ -147,6 +153,96 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(messages[0].driver_meta["voice"]["text"], "这是微信自带转文字")
         self.assertEqual(messages[0].driver_meta["voice"]["source"], "wechat_builtin_voice_to_text")
 
+    def test_backend_event_payload_accepts_pending_voice_without_text(self) -> None:
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "PAGE",
+                "sender_name": "PAGE",
+                "voice_status": "pending",
+                "voice_duration": "4s",
+            },
+        )
+
+        messages = self.driver.read_new_messages()
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("[微信语音待转文字]", messages[0].text)
+        self.assertTrue(messages[0].driver_meta["backend_voice_pending"])
+
+    def test_pending_voice_uses_wechat_builtin_bridge_before_ledger(self) -> None:
+        bridge = _FakeVoiceBridge(WeChatVoiceTranscriptionResult(status="transcribed", text="微信主路径转写成功", method="fake"))
+        driver = BackendEventJsonlDriver(
+            self.event_file,
+            FileIndex(self.data_dir / "file_index_voice.sqlite"),
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+            attachment_parser=BackendAttachmentParser(
+                ocr_engine=_FakeOcr(""),
+                asr_engine=_FakeAsr("", status="blocked", error="local_asr_not_configured"),
+            ),
+            voice_transcription_bridge=bridge,
+        )
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "PAGE",
+                "sender_name": "PAGE",
+                "voice_status": "pending",
+            },
+        )
+
+        messages = driver.read_new_messages()
+        enriched = driver.enrich_message_attachments(
+            messages[0],
+            conversation_id=messages[0].driver_meta["conversation_id_hint"],
+            session_id=messages[0].driver_meta["session_id"],
+        )
+
+        self.assertEqual(enriched.text, "微信主路径转写成功")
+        self.assertEqual(enriched.driver_meta["voice"]["source"], "wechat_builtin_voice_to_text")
+        self.assertEqual(enriched.driver_meta["backend_voice_pending"], False)
+        self.assertEqual(bridge.calls, 1)
+
+    def test_pending_voice_falls_back_to_local_asr_when_audio_path_exists(self) -> None:
+        audio = self.inbox / "voice.m4a"
+        audio.write_bytes(b"fake audio")
+        bridge = _FakeVoiceBridge(WeChatVoiceTranscriptionResult(status="blocked", error="wechat_builtin_transcript_not_observed"))
+        driver = BackendEventJsonlDriver(
+            self.event_file,
+            FileIndex(self.data_dir / "file_index_voice_asr.sqlite"),
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+            attachment_parser=BackendAttachmentParser(
+                ocr_engine=_FakeOcr(""),
+                asr_engine=_FakeAsr("本地 ASR fallback 成功"),
+            ),
+            voice_transcription_bridge=bridge,
+        )
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "PAGE",
+                "sender_name": "PAGE",
+                "voice_status": "pending",
+                "voice_audio_path": "voice.m4a",
+            },
+        )
+
+        messages = driver.read_new_messages()
+        enriched = driver.enrich_message_attachments(
+            messages[0],
+            conversation_id=messages[0].driver_meta["conversation_id_hint"],
+            session_id=messages[0].driver_meta["session_id"],
+        )
+
+        self.assertEqual(enriched.text, "本地 ASR fallback 成功")
+        self.assertEqual(enriched.driver_meta["voice"]["source"], "local_asr_fallback")
+        self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["kind"], "audio")
+        self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["raw_text"], "本地 ASR fallback 成功")
+
     def test_polling_runner_writes_backend_voice_text_to_ledger(self) -> None:
         append_backend_event(
             self.event_file,
@@ -171,6 +267,36 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(entry.text_blocks[0]["kind"], "voice:transcript")
         self.assertEqual(entry.text_blocks[0]["text"], "语音里安排一个任务")
 
+    def test_polling_runner_enriches_pending_voice_before_writing_ledger(self) -> None:
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "PAGE",
+                "sender_name": "PAGE",
+                "voice_status": "pending",
+            },
+        )
+        runtime = build_runtime(self.config)
+        driver = BackendEventJsonlDriver(
+            self.event_file,
+            runtime.file_index,
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+            file_workspace=runtime.file_workspace,
+            session_store=runtime.session_store,
+            voice_transcription_bridge=_FakeVoiceBridge(
+                WeChatVoiceTranscriptionResult(status="transcribed", text="主路径语音进入对话文件", method="fake")
+            ),
+        )
+
+        result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_forever(max_loops=1)
+        entry = runtime.ledger_store.read_entries(result["processed"][0]["message"]["conversation_id"])[0]
+
+        self.assertEqual(entry.text_blocks[0]["kind"], "voice:transcript")
+        self.assertEqual(entry.text_blocks[0]["text"], "主路径语音进入对话文件")
+        self.assertNotIn("待转文字", entry.text_blocks[0]["text"])
+
     def test_audio_attachment_is_staged_and_marked_asr_not_configured(self) -> None:
         audio = self.inbox / "voice.m4a"
         audio.write_bytes(b"fake audio")
@@ -193,7 +319,7 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(attachment["status"], "indexed")
         self.assertEqual(attachment["parse"]["kind"], "audio")
         self.assertEqual(attachment["parse"]["error"], "local_asr_not_configured")
-        self.assertIn("未配置本地 ASR", attachment["parse"]["summary"])
+        self.assertIn("本地 ASR 暂不可用", attachment["parse"]["summary"])
 
     def test_backend_event_history_is_emitted_before_current_as_context_only(self) -> None:
         append_backend_event(
@@ -347,6 +473,29 @@ class _FakeOcr:
 
     def read_text(self, image_path: str | Path) -> str:
         return self.text
+
+
+class _FakeAsr:
+    def __init__(self, text: str, *, status: str = "transcribed", error: str = ""):
+        self.text = text
+        self.status = status
+        self.error = error
+
+    def health(self) -> AsrHealth:
+        return AsrHealth("fake_asr", True)
+
+    def transcribe(self, audio_path: str | Path) -> AsrTranscript:
+        return AsrTranscript(self.status, self.text, backend="fake_asr", model="fake", source_path=str(audio_path), error=self.error)
+
+
+class _FakeVoiceBridge:
+    def __init__(self, result: WeChatVoiceTranscriptionResult):
+        self.result = result
+        self.calls = 0
+
+    def transcribe_selected_voice(self, conversation_id: str) -> WeChatVoiceTranscriptionResult:
+        self.calls += 1
+        return self.result
 
 
 if __name__ == "__main__":

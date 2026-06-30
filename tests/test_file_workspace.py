@@ -6,6 +6,7 @@ import json
 import zipfile
 from pathlib import Path
 
+from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
@@ -204,6 +205,71 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertEqual(analysis["media"]["audio_count"], 1)
             self.assertIn("local_asr_not_configured", content)
 
+    def test_audio_file_writes_local_asr_artifact_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "voice.m4a"
+            source.write_bytes(b"fake audio")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="audio")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "audio", "summary", "转写正文"),
+                embedded_media_asr=_FakeAsr("转写正文"),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            manifest = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
+            asr_path = Path(analysis["media_audio"][0]["asr_path"])
+            content = (Path(staged.derived_dir) / "content.md").read_text(encoding="utf-8")
+
+            self.assertEqual(analysis["media_asr_status"], "completed")
+            self.assertEqual(analysis["media_asr_count"], 1)
+            self.assertEqual(manifest["parse"]["media_asr_count"], 1)
+            self.assertTrue(asr_path.exists())
+            self.assertIn("转写正文", asr_path.read_text(encoding="utf-8"))
+            self.assertIn("first_audio_asr", content)
+
+    def test_docx_embedded_audio_uses_local_asr_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "audio.docx"
+            _write_docx_with_media(source, include_audio=True)
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "docx", "summary", "正文"),
+                embedded_media_asr=_FakeAsr("嵌入音频文本"),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(analysis["has_audio"])
+            self.assertEqual(analysis["media_asr_count"], 1)
+            self.assertIn("embedded_image_extraction_and_ocr", analysis["blocked_capabilities"])
+            self.assertNotIn("embedded_audio_extraction_and_asr", analysis["blocked_capabilities"])
+
+    def test_pdf_media_artifacts_record_extraction_and_render_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "pdf", "summary", "PDF text"),
+                embedded_media_ocr=_FakeOcr("PDF 图像文字"),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            media_index = json.loads(Path(analysis["media_index_path"]).read_text(encoding="utf-8"))
+
+            self.assertIn(analysis["media_status"], {"completed", "failed"})
+            self.assertIn("page_render_status", media_index)
+            self.assertTrue(Path(analysis["media_index_path"]).exists())
+
     def test_long_parse_result_is_chunked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "long.txt"
@@ -354,7 +420,18 @@ class _FakeOcr:
         return self.text
 
 
-def _write_docx_with_media(path: Path) -> None:
+class _FakeAsr:
+    def __init__(self, text: str):
+        self.text = text
+
+    def health(self) -> AsrHealth:
+        return AsrHealth("fake_asr", True)
+
+    def transcribe(self, audio_path: str | Path) -> AsrTranscript:
+        return AsrTranscript("transcribed", self.text, backend="fake_asr", model="fake", source_path=str(audio_path))
+
+
+def _write_docx_with_media(path: Path, *, include_audio: bool = False) -> None:
     document = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
@@ -364,6 +441,8 @@ def _write_docx_with_media(path: Path) -> None:
     with zipfile.ZipFile(path, "w") as docx:
         docx.writestr("word/document.xml", document)
         docx.writestr("word/media/image1.png", b"fake image bytes")
+        if include_audio:
+            docx.writestr("word/media/audio1.mp3", b"fake audio bytes")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 
 
@@ -14,7 +15,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
             path = Path(tmp) / "note.txt"
             path.write_text(" first line \n\n second line ", encoding="utf-8")
 
-            result = BackendAttachmentParser(max_preview_chars=100).parse(path)
+            result = BackendAttachmentParser(asr_engine=_FakeAsr("", status="blocked", error="local_asr_not_configured"), max_preview_chars=100).parse(path)
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "text")
@@ -83,8 +84,20 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "skipped")
             self.assertEqual(result.kind, "audio")
-            self.assertIn("未配置本地 ASR", result.summary)
+            self.assertIn("本地 ASR 暂不可用", result.summary)
             self.assertEqual(result.error, "local_asr_not_configured")
+
+    def test_audio_attachment_uses_injected_asr_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "voice.m4a"
+            path.write_bytes(b"fake audio")
+
+            result = BackendAttachmentParser(asr_engine=_FakeAsr("转写文本"), max_preview_chars=100).parse(path)
+
+            self.assertEqual(result.status, "parsed")
+            self.assertEqual(result.kind, "audio")
+            self.assertIn("本地 ASR", result.summary)
+            self.assertEqual(result.text, "转写文本")
 
     def test_csv_attachment_extracts_rows_with_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -116,6 +129,19 @@ class _FakeOcr:
 
     def read_text(self, image_path: str | Path) -> str:
         return self.text
+
+
+class _FakeAsr:
+    def __init__(self, text: str, *, status: str = "transcribed", error: str = ""):
+        self.text = text
+        self.status = status
+        self.error = error
+
+    def health(self) -> AsrHealth:
+        return AsrHealth("fake_asr", True)
+
+    def transcribe(self, audio_path: str | Path) -> AsrTranscript:
+        return AsrTranscript(self.status, self.text, backend="fake_asr", model="fake", source_path=str(audio_path), error=self.error)
 
 
 def _write_minimal_docx(path: Path, paragraphs: list[str]) -> None:

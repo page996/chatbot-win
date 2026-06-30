@@ -10,6 +10,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 from app.personal_wechat_bot.vision.ocr import OcrEngine
+from app.personal_wechat_bot.voice.asr import AsrEngine, LocalAsrSubprocessEngine
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
@@ -29,10 +30,12 @@ class BackendAttachmentParser:
     def __init__(
         self,
         ocr_engine: OcrEngine | None = None,
+        asr_engine: AsrEngine | None = None,
         max_preview_chars: int = 2000,
         worker_python: str | Path | None = None,
     ):
         self.ocr_engine = ocr_engine
+        self.asr_engine = asr_engine or LocalAsrSubprocessEngine()
         self.max_preview_chars = max_preview_chars
         self.worker_python = Path(worker_python) if worker_python else _default_worker_python()
 
@@ -85,14 +88,22 @@ class BackendAttachmentParser:
         return AttachmentParseResult("parsed", "image", "已完成图片 OCR 预览", preview)
 
     def _parse_audio(self, path: Path) -> AttachmentParseResult:
-        duration_note = ""
-        if path.exists():
-            duration_note = f" bytes={path.stat().st_size}"
+        transcript = self.asr_engine.transcribe(path) if self.asr_engine is not None else None
+        if transcript is not None and transcript.status == "transcribed" and transcript.text.strip():
+            return AttachmentParseResult(
+                "parsed",
+                "audio",
+                f"已完成本地 ASR 转写 backend={transcript.backend} model={transcript.model}".strip(),
+                _preview(transcript.text, self.max_preview_chars),
+            )
+        error = transcript.error if transcript is not None else "local_asr_not_configured"
+        backend = transcript.backend if transcript is not None else "local_asr_subprocess"
+        bytes_note = f" bytes={path.stat().st_size}" if path.exists() else ""
         return AttachmentParseResult(
             "skipped",
             "audio",
-            f"音频已保存到文件中间层，当前未配置本地 ASR 转写{duration_note}",
-            error="local_asr_not_configured",
+            f"音频已保存到文件中间层，本地 ASR 暂不可用 backend={backend}{bytes_note}",
+            error=error or "local_asr_not_configured",
         )
 
     def _parse_worker(self, path: Path, kind: str) -> AttachmentParseResult:

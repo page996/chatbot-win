@@ -10,6 +10,7 @@ from app.personal_wechat_bot.tools.registry import ToolRegistry
 from app.personal_wechat_bot.tools.search.external_search import FakeExternalSearchTool
 from app.personal_wechat_bot.tools.search.model_relevance_filter import FakeModelRelevanceFilter
 from app.personal_wechat_bot.tools.vision.ocr_tool import OcrImageTool
+from app.personal_wechat_bot.tools.voice.asr_tool import LocalAsrTool
 from app.personal_wechat_bot.tools.web.fetch import WebFetchTool
 
 
@@ -39,6 +40,14 @@ def register_default_tools(
     registry.register(
         OcrImageTool(
             data_root / "tool_outputs" / "vision_ocr",
+            file_index,
+            allowed_input_roots=[*input_roots, *workspace_roots],
+            max_input_bytes=config.file_max_bytes,
+        )
+    )
+    registry.register(
+        LocalAsrTool(
+            data_root / "tool_outputs" / "voice_asr",
             file_index,
             allowed_input_roots=[*input_roots, *workspace_roots],
             max_input_bytes=config.file_max_bytes,

@@ -28,8 +28,8 @@ class MessageProcessor:
         session_id = reset_session_id or self.runtime.session_store.current_session_id(message.conversation_id)
         message = self._with_session_id(message, session_id)
 
-        raw = self._enrich_backend_attachments(raw, message.conversation_id)
-        if raw.driver_meta.get("backend_attachments_pending") is False:
+        raw = self._enrich_backend_media(raw, message.conversation_id)
+        if raw.driver_meta.get("backend_media_pending") is False or raw.driver_meta.get("backend_attachments_pending") is False:
             enriched = self.runtime.normalizer.normalize(raw)
             enriched = self._with_session_id(enriched, session_id) if enriched is not None else None
             if enriched is not None and enriched != message:
@@ -126,8 +126,12 @@ class MessageProcessor:
             daily_trace_context=speak.daily_trace_context,
         )
 
-    def _enrich_backend_attachments(self, raw: RawWeChatMessage, conversation_id: str) -> RawWeChatMessage:
-        if not raw.driver_meta.get("backend_attachments_pending"):
+    def _enrich_backend_media(self, raw: RawWeChatMessage, conversation_id: str) -> RawWeChatMessage:
+        if not (
+            raw.driver_meta.get("backend_media_pending")
+            or raw.driver_meta.get("backend_attachments_pending")
+            or raw.driver_meta.get("backend_voice_pending")
+        ):
             return raw
         driver = getattr(self.runtime, "active_driver", None)
         enrich = getattr(driver, "enrich_message_attachments", None)
@@ -138,7 +142,7 @@ class MessageProcessor:
             return enrich(raw, conversation_id=conversation_id, session_id=session_id)
         except Exception as exc:
             self.runtime.event_logger.log(
-                "message.attachment_enrich_error",
+                "message.media_enrich_error",
                 {"type": type(exc).__name__, "message": str(exc)},
                 message_id=raw.raw_id,
             )

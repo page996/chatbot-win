@@ -44,6 +44,7 @@ from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.vision.window_capture import Win32WindowCapture
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.wechat_driver.fake import FakeWeChatDriver
@@ -66,6 +67,10 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
 )
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
+from app.personal_wechat_bot.wechat_driver.voice_transcription import (
+    WeChatVoiceTranscriptionBridge,
+    result_payload as voice_bridge_result_payload,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -218,6 +223,9 @@ def build_parser() -> argparse.ArgumentParser:
     append_backend.add_argument("--attachment", action="append", default=[])
     append_backend.add_argument("--voice-text", default="")
     append_backend.add_argument("--voice-duration", default="")
+    append_backend.add_argument("--voice-pending", action="store_true")
+    append_backend.add_argument("--voice-audio", default="")
+    append_backend.add_argument("--voice-audio-name", default="")
     append_backend.add_argument("--quote-text", default="")
     append_backend.add_argument("--quote-message-id", default="")
     append_backend.add_argument("--quote-sender-name", default="")
@@ -280,6 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("wechat-window-bindings")
 
+    wechat_voice = sub.add_parser("wechat-voice-transcribe")
+    wechat_voice.add_argument("--conversation-id", required=True)
+
     delete_channel = sub.add_parser("delete-channel")
     delete_channel.add_argument("conversation_id")
 
@@ -292,6 +303,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ocr_image = sub.add_parser("ocr-image")
     ocr_image.add_argument("image")
+
+    local_asr = sub.add_parser("local-asr")
+    local_asr.add_argument("audio")
+    local_asr.add_argument("--model", default="base")
 
     ocr_snapshot = sub.add_parser("ocr-snapshot")
     ocr_snapshot.add_argument("image")
@@ -644,6 +659,11 @@ def main(argv: list[str] | None = None) -> None:
         store = WeChatWindowBindingStore(args.data_dir)
         print(json.dumps({"status": "ok", "bindings": store.list_bindings(), "send_enabled": False}, ensure_ascii=False, indent=2))
         return
+    if args.command == "wechat-voice-transcribe":
+        bridge = WeChatVoiceTranscriptionBridge(args.data_dir)
+        result = bridge.transcribe_selected_voice(args.conversation_id)
+        print(json.dumps({"status": result.status, "result": voice_bridge_result_payload(result), "send_enabled": False}, ensure_ascii=False, indent=2))
+        return
     if args.command == "delete-channel":
         result = delete_sidebar_channel(args.data_dir, args.conversation_id)
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -671,9 +691,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "capabilities":
         ocr = RapidOcrSubprocessEngine().health()
         office = LibreOfficeRuntime().health()
+        asr = LocalAsrSubprocessEngine().health()
+        wechat_voice = WeChatVoiceTranscriptionBridge(args.data_dir).health()
         result = {
             "ocr": ocr.__dict__,
             "libreoffice": office.__dict__,
+            "asr": asr.__dict__,
+            "wechat_voice_to_text": wechat_voice,
             "send_enabled": False,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -685,6 +709,16 @@ def main(argv: list[str] | None = None) -> None:
             result = {"status": "ok", "text": text}
         except Exception as exc:
             result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "local-asr":
+        engine = LocalAsrSubprocessEngine(model=args.model)
+        transcript = engine.transcribe(args.audio)
+        result = {
+            "status": transcript.status,
+            "transcript": transcript.__dict__,
+            "send_enabled": False,
+        }
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "ocr-snapshot":
@@ -716,14 +750,18 @@ def _quote_payload(args: argparse.Namespace) -> dict[str, str] | None:
 
 def _voice_payload(args: argparse.Namespace) -> dict[str, str] | None:
     text = str(getattr(args, "voice_text", "")).strip()
-    if not text:
+    audio_path = str(getattr(args, "voice_audio", "")).strip()
+    pending = bool(getattr(args, "voice_pending", False))
+    if not text and not pending and not audio_path:
         return None
     duration = str(getattr(args, "voice_duration", "")).strip()
     voice = {
-        "status": "transcribed",
+        "status": "transcribed" if text else "pending",
         "source": "wechat_builtin_voice_to_text",
         "text": text,
         "duration": duration,
+        "audio_path": audio_path,
+        "audio_name": str(getattr(args, "voice_audio_name", "")).strip(),
     }
     return {key: value for key, value in voice.items() if value}
 
