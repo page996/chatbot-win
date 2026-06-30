@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import json
 import shutil
 import subprocess
@@ -101,6 +102,7 @@ class LocalAsrSubprocessEngine:
             )
         worker = Path(__file__).resolve().parents[3] / "scripts" / "local_asr_worker.py"
         command = [str(self.python_executable), str(worker), str(source), "--model", self.model, "--language", self.language]
+        env = _asr_subprocess_env()
         try:
             completed = subprocess.run(
                 command,
@@ -110,6 +112,7 @@ class LocalAsrSubprocessEngine:
                 check=False,
                 encoding="utf-8",
                 errors="replace",
+                env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return AsrTranscript(
@@ -166,6 +169,15 @@ def _default_asr_python() -> Path | None:
             return candidate
     found = shutil.which("python")
     return Path(found) if found else None
+
+
+def _asr_subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    repo_root = Path(__file__).resolve().parents[3]
+    env.setdefault("HF_HOME", str(repo_root / "vendor" / "asr-models" / "huggingface"))
+    env.setdefault("HF_HUB_DISABLE_XET", "1")
+    env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    return env
 
 
 def _missing_dependency_detail(detail: str) -> str:
