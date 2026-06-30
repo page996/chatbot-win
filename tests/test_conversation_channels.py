@@ -20,7 +20,7 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 root,
                 ApiKeyPool(provider),
                 file_workspace_root=root / "file_workspace",
-                context_root=root / "conversation_context",
+                context_root=root / "conversation_ledgers",
             )
             message = _message(conversation_id="private-1", conversation_type="private", chat_title="Alice")
 
@@ -29,7 +29,7 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 root,
                 ApiKeyPool(provider),
                 file_workspace_root=root / "file_workspace",
-                context_root=root / "conversation_context",
+                context_root=root / "conversation_ledgers",
             ).get_channel("private-1")
 
             self.assertEqual(first.key_slots, 1)
@@ -47,7 +47,7 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 root,
                 ApiKeyPool(provider),
                 file_workspace_root=root / "file_workspace",
-                context_root=root / "conversation_context",
+                context_root=root / "conversation_ledgers",
             )
 
             channel = store.ensure_channel(
@@ -68,7 +68,7 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 root,
                 ApiKeyPool(provider, root),
                 file_workspace_root=root / "file_workspace",
-                context_root=root / "conversation_context",
+                context_root=root / "conversation_ledgers",
             )
             store.ensure_channel(_message(conversation_id="group-rotate", conversation_type="group"))
 
@@ -89,7 +89,7 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 root,
                 ApiKeyPool(provider),
                 file_workspace_root=root / "file_workspace",
-                context_root=root / "conversation_context",
+                context_root=root / "conversation_ledgers",
             )
 
             with ThreadPoolExecutor(max_workers=4) as executor:

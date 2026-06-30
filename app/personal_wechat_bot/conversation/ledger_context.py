@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from app.personal_wechat_bot.conversation.context_store import DEFAULT_SESSION_ID
+from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.domain.models import NormalizedMessage
 
@@ -83,7 +83,7 @@ class LedgerContextAssembler:
         file_refs = _collect_file_refs([*visible_entries, *quote_entries])
         link_refs = _collect_link_refs([*visible_entries, *quote_entries])
         conversation_dir = self.ledger_store.conversation_markdown_path(message.conversation_id).parent
-        memory = _read_memory(_memory_dir(conversation_dir, session_id))
+        memory = _read_memory(memory_dir_for_conversation(conversation_dir, session_id))
         analysis = _analyze(session_entries, message)
         sections = _budget_sections(
             _build_sections(
@@ -278,7 +278,7 @@ def _session_id_from_message(message: NormalizedMessage) -> str:
     return session_id or DEFAULT_SESSION_ID
 
 
-def _memory_dir(conversation_dir: Path, session_id: str) -> Path:
+def memory_dir_for_conversation(conversation_dir: Path, session_id: str) -> Path:
     if session_id == DEFAULT_SESSION_ID:
         return conversation_dir / "memory"
     return conversation_dir / "sessions" / session_id / "memory"

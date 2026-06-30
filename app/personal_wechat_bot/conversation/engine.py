@@ -4,7 +4,6 @@ import hashlib
 import re
 
 from app.personal_wechat_bot.config.schema import BotConfig
-from app.personal_wechat_bot.conversation.context_store import ConversationContextStore
 from app.personal_wechat_bot.conversation.ledger_context import LedgerContextAssembler
 from app.personal_wechat_bot.conversation.prompt_builder import PromptBuilder
 from app.personal_wechat_bot.domain.models import (
@@ -25,14 +24,12 @@ class ConversationEngine:
         llm: LLMClient,
         tools: ToolRuntime,
         tool_orchestrator: ToolTaskOrchestrator | None = None,
-        context_store: ConversationContextStore | None = None,
         ledger_context: LedgerContextAssembler | None = None,
     ):
         self.config = config
         self.llm = llm
         self.tools = tools
         self.tool_orchestrator = tool_orchestrator
-        self.context_store = context_store
         self.ledger_context = ledger_context
         self.prompt_builder = PromptBuilder()
 
@@ -59,13 +56,7 @@ class ConversationEngine:
                 summary=tool_result.summary,
             )
 
-        context_snapshot = (
-            self.ledger_context.build_snapshot(message)
-            if self.ledger_context is not None
-            else self.context_store.build_snapshot(message)
-            if self.context_store is not None
-            else None
-        )
+        context_snapshot = self.ledger_context.build_snapshot(message) if self.ledger_context is not None else None
         prompt = self.prompt_builder.build(message, speak_decision, context_snapshot=context_snapshot)
         raw_text = self.llm.generate_reply(prompt)
         text = _clean_visible_reply(raw_text)

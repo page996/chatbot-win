@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from app.personal_wechat_bot.conversation.context_store import ConversationContextSnapshot
+from typing import Protocol
+
 from app.personal_wechat_bot.domain.models import NormalizedMessage, SpeakDecision
+
+
+class PromptContextSnapshot(Protocol):
+    def render_for_prompt(self) -> str:
+        ...
 
 
 class PromptBuilder:
@@ -9,7 +15,7 @@ class PromptBuilder:
         self,
         message: NormalizedMessage,
         speak_decision: SpeakDecision,
-        context_snapshot: ConversationContextSnapshot | None = None,
+        context_snapshot: PromptContextSnapshot | None = None,
     ) -> str:
         context_text = context_snapshot.render_for_prompt() if context_snapshot is not None else ""
         return (

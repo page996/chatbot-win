@@ -35,10 +35,12 @@ from app.personal_wechat_bot.control.send_commands import (
     send_approved_confirm_item,
     set_send_controls,
 )
+from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.runtime.ocr_window_runner import OcrWindowPollingRunner
+from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.vision.window_capture import Win32WindowCapture
@@ -61,6 +63,7 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     foreground_window_info,
 )
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
+from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.ocr_snapshot_parser import parse_ocr_snapshot
 
 
@@ -143,6 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup_artifacts = sub.add_parser("cleanup-artifacts")
     cleanup_artifacts.add_argument("--apply", action="store_true")
+
+    maintain_memory = sub.add_parser("maintain-memory")
+    maintain_memory.add_argument("--conversation-id", required=True)
+    maintain_memory.add_argument("--session-id", default="session_default")
+
+    sub.add_parser("maintain-memory-all")
 
     accept_contact = sub.add_parser("accept-contact")
     accept_contact.add_argument("wechat_id")
@@ -238,6 +247,19 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_snapshot.add_argument("--output", default=None)
     wechat_snapshot.add_argument("--probe-handles", action="store_true")
 
+    bind_window = sub.add_parser("bind-wechat-window")
+    bind_window.add_argument("--chat-title", required=True)
+    bind_window.add_argument("--group", action="store_true")
+    bind_window.add_argument("--conversation-id", default="")
+    bind_window.add_argument(
+        "--delay-seconds",
+        type=float,
+        default=0.0,
+        help="wait before binding so you can switch focus to the target WeChat chat window",
+    )
+
+    sub.add_parser("wechat-window-bindings")
+
     capture = sub.add_parser("wechat-capture")
     capture.add_argument("--hwnd", type=int, default=None)
     capture.add_argument("--output", default="data/wechat_window.bmp")
@@ -259,6 +281,13 @@ def build_parser() -> argparse.ArgumentParser:
     poll_ocr.add_argument("--interval", type=float, default=1.0)
     poll_ocr.add_argument("--capture-mode", choices=["window", "screen", "auto"], default="auto")
     poll_ocr.add_argument("--delay-seconds", type=float, default=0.0)
+
+    diagnose_ocr = sub.add_parser("ocr-window-diagnose")
+    diagnose_ocr.add_argument("--chat-title", default="")
+    diagnose_ocr.add_argument("--output", default="data/wechat_window_diagnose.bmp")
+    diagnose_ocr.add_argument("--capture-mode", choices=["window", "screen", "auto"], default="auto")
+    diagnose_ocr.add_argument("--delay-seconds", type=float, default=0.0)
+    diagnose_ocr.add_argument("--show-ocr-text", action="store_true")
 
     sub.add_parser("capabilities")
     return parser
@@ -300,7 +329,7 @@ def main(argv: list[str] | None = None) -> None:
                             allowed_extensions=config.file_allowed_extensions,
                             max_input_bytes=config.file_max_bytes,
                             file_workspace=runtime.file_workspace,
-                            context_store=runtime.context_store,
+                            session_store=runtime.session_store,
                         ),
                         poll_interval_seconds=0,
                     ),
@@ -316,6 +345,7 @@ def main(argv: list[str] | None = None) -> None:
                         output_path=args.ocr_output or str(Path(args.data_dir) / "wechat_window.bmp"),
                         poll_interval_seconds=0,
                         capture_mode=args.ocr_capture_mode,
+                        window_binding_store=WeChatWindowBindingStore(args.data_dir),
                     ),
                 )
             )
@@ -391,6 +421,16 @@ def main(argv: list[str] | None = None) -> None:
         result = build_artifact_cleanup_report(args.data_dir, apply=args.apply)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command == "maintain-memory":
+        maintainer = MemoryMaintainer(ConversationLedgerStore(args.data_dir))
+        result = maintainer.maintain(args.conversation_id, session_id=args.session_id)
+        print(json.dumps(result_payload(result), ensure_ascii=False, indent=2))
+        return
+    if args.command == "maintain-memory-all":
+        maintainer = MemoryMaintainer(ConversationLedgerStore(args.data_dir))
+        results = [result_payload(item) for item in maintainer.maintain_all()]
+        print(json.dumps({"status": "ok", "results": results}, ensure_ascii=False, indent=2))
+        return
     if args.command == "accept-contact":
         accept_contact_channel(args.data_dir, args.wechat_id)
         print(f"accepted contact channel {args.wechat_id}")
@@ -465,7 +505,7 @@ def main(argv: list[str] | None = None) -> None:
             allowed_extensions=config.file_allowed_extensions,
             max_input_bytes=config.file_max_bytes,
             file_workspace=runtime.file_workspace,
-            context_store=runtime.context_store,
+            session_store=runtime.session_store,
         )
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
         result = runner.run_forever(max_loops=args.loops)
@@ -561,6 +601,21 @@ def main(argv: list[str] | None = None) -> None:
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command == "bind-wechat-window":
+        _delay_for_foreground_switch(args.delay_seconds)
+        store = WeChatWindowBindingStore(args.data_dir)
+        result = store.bind_foreground(
+            chat_title=args.chat_title,
+            conversation_type="group" if args.group else "private",
+            conversation_id=args.conversation_id,
+        )
+        result["send_enabled"] = False
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "wechat-window-bindings":
+        store = WeChatWindowBindingStore(args.data_dir)
+        print(json.dumps({"status": "ok", "bindings": store.list_bindings(), "send_enabled": False}, ensure_ascii=False, indent=2))
+        return
     if args.command == "wechat-capture":
         hwnd = args.hwnd
         if hwnd is None:
@@ -626,6 +681,7 @@ def main(argv: list[str] | None = None) -> None:
             output_path=args.output,
             poll_interval_seconds=args.interval,
             capture_mode=args.capture_mode,
+            window_binding_store=WeChatWindowBindingStore(args.data_dir),
         )
         result = runner.run_forever(max_loops=args.loops)
         if args.verbose:
@@ -634,6 +690,24 @@ def main(argv: list[str] | None = None) -> None:
             result.pop("processed", None)
             result.pop("ocr_text", None)
             result.pop("capture", None)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "ocr-window-diagnose":
+        _delay_for_foreground_switch(args.delay_seconds)
+        config = load_config(args.data_dir)
+        runtime = build_runtime(config)
+        runner = OcrWindowPollingRunner(
+            runtime=runtime,
+            ocr_engine=RapidOcrSubprocessEngine(),
+            chat_title=args.chat_title,
+            output_path=args.output,
+            poll_interval_seconds=0,
+            capture_mode=args.capture_mode,
+            window_binding_store=WeChatWindowBindingStore(args.data_dir),
+        )
+        result = runner.diagnose_once()
+        if not args.show_ocr_text:
+            result.pop("ocr_text", None)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 

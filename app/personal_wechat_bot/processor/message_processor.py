@@ -20,12 +20,12 @@ class MessageProcessor:
         self.runtime.event_logger.log("message.normalized", message, message_id=message.message_id)
         original_message_id = message.message_id
 
-        reset_session_id = self.runtime.context_store.maybe_reset_for_message(message)
+        reset_session_id = self.runtime.session_store.maybe_reset_for_message(message)
         if reset_session_id:
             pending_context_item = {"session_id": reset_session_id, "reset": True}
         else:
             pending_context_item = None
-        session_id = reset_session_id or self.runtime.context_store.current_session_id(message.conversation_id)
+        session_id = reset_session_id or self.runtime.session_store.current_session_id(message.conversation_id)
         message = self._with_session_id(message, session_id)
 
         raw = self._enrich_backend_attachments(raw, message.conversation_id)
@@ -46,6 +46,9 @@ class MessageProcessor:
         link_annotations = self._annotate_links(ledger_entry)
         if link_annotations:
             item["link_annotations"] = link_annotations
+        memory = self._maintain_memory(message.conversation_id, session_id)
+        if memory:
+            item["memory"] = memory
 
         if message.is_self:
             item["context_only"] = True
@@ -56,8 +59,6 @@ class MessageProcessor:
             if route.action == "ignore":
                 self.runtime.router.mark_done(message.message_id)
             return item
-
-        self.runtime.context_store.record_message(message)
 
         if message.metadata.get("context_only"):
             item["context_only"] = True
@@ -86,13 +87,15 @@ class MessageProcessor:
             self._mark_done(original_message_id, message.message_id)
             return item
 
-        self.runtime.context_store.record_reply(reply)
         self.runtime.ledger_store.append_reply(
             reply,
             chat_title=message.chat_title,
             conversation_type=message.conversation_type,
             session_id=session_id,
         )
+        memory = self._maintain_memory(message.conversation_id, session_id)
+        if memory:
+            item["memory_after_reply"] = memory
         self.runtime.event_logger.log("reply.candidate", reply, message_id=message.message_id)
         send = self.runtime.reply_gate.handle(reply)
         self.runtime.event_logger.log("send.result", send, message_id=message.message_id)
@@ -130,7 +133,7 @@ class MessageProcessor:
         enrich = getattr(driver, "enrich_message_attachments", None)
         if enrich is None:
             return raw
-        session_id = self.runtime.context_store.current_session_id(conversation_id)
+        session_id = self.runtime.session_store.current_session_id(conversation_id)
         try:
             return enrich(raw, conversation_id=conversation_id, session_id=session_id)
         except Exception as exc:
@@ -154,6 +157,22 @@ class MessageProcessor:
                 message_id=ledger_entry.message_id,
             )
             return []
+
+    def _maintain_memory(self, conversation_id: str, session_id: str) -> dict[str, Any]:
+        maintain = getattr(getattr(self.runtime, "memory_maintainer", None), "maintain", None)
+        if maintain is None:
+            return {}
+        try:
+            result = maintain(conversation_id, session_id=session_id)
+            payload = result.__dict__ if hasattr(result, "__dict__") else dict(result)
+            self.runtime.event_logger.log("memory.maintained", payload)
+            return payload
+        except Exception as exc:
+            self.runtime.event_logger.log(
+                "memory.maintain_error",
+                {"type": type(exc).__name__, "message": str(exc)},
+            )
+            return {}
 
     def _mark_done(self, *message_ids: str) -> None:
         for message_id in dict.fromkeys(item for item in message_ids if item):

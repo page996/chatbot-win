@@ -10,6 +10,7 @@ import app.personal_wechat_bot.runtime.ocr_window_runner as ocr_runner_module
 from app.personal_wechat_bot.runtime.ocr_window_runner import OcrWindowPollingRunner
 from app.personal_wechat_bot.vision.ocr import OcrHealth
 from app.personal_wechat_bot.vision.window_capture import WindowCaptureResult
+from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.windows_readonly import WindowInfo, Win32WindowProbe
 
 
@@ -214,6 +215,82 @@ class OcrWindowPollingRunnerTest(unittest.TestCase):
             self.assertEqual(result["snapshot"], "")
             self.assertIn("如果收到了这条消息", result["parse"]["evidence"][0])
 
+    def test_runner_blocks_wrong_chat_title_capture_without_writing_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            runner = OcrWindowPollingRunner(
+                runtime=runtime,
+                ocr_engine=_Ocr("OTHER\n这是另一个窗口的消息"),
+                capture=_Capture(),
+                window_probe=_Probe(),
+                chat_title="PAGE",
+                output_path=Path(tmp) / "window.bmp",
+                poll_interval_seconds=0,
+            )
+
+            result = runner.run_once()
+
+            self.assertEqual(result["status"], "chat_title_not_visible")
+            self.assertEqual(result["processed_count"], 0)
+            ledger_root = data_dir / "conversation_ledgers"
+            self.assertEqual(list(ledger_root.glob("*/messages.jsonl")), [])
+
+    def test_runner_does_not_fallback_to_other_window_when_binding_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            binding_store = WeChatWindowBindingStore(
+                data_dir,
+                window_probe=_Probe(),
+                foreground_provider=lambda: _foreground_window(1),
+            )
+            bind_result = binding_store.bind_foreground(chat_title="PAGE")
+            binding_store.window_probe = _EmptyProbe()
+            capture = _Capture()
+            runner = OcrWindowPollingRunner(
+                runtime=runtime,
+                ocr_engine=_Ocr("PAGE\nhello"),
+                capture=capture,
+                window_probe=_MultiProbe(),
+                chat_title="PAGE",
+                output_path=Path(tmp) / "window.bmp",
+                poll_interval_seconds=0,
+                window_binding_store=binding_store,
+            )
+
+            result = runner.run_once()
+
+            self.assertEqual(bind_result["status"], "ok")
+            self.assertEqual(result["status"], "bound_window_unavailable")
+            self.assertEqual(capture.calls, [])
+            self.assertEqual(binding_store.list_bindings()[0]["status"], "stale")
+
+    def test_diagnose_once_does_not_process_snapshot_or_write_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            runner = OcrWindowPollingRunner(
+                runtime=runtime,
+                ocr_engine=_Ocr("PAGE\n这是一条可以解析的消息"),
+                capture=_Capture(),
+                window_probe=_Probe(),
+                chat_title="PAGE",
+                output_path=Path(tmp) / "window.bmp",
+                poll_interval_seconds=0,
+            )
+
+            result = runner.diagnose_once()
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["readiness"], "ready_to_process")
+            self.assertTrue(result["will_write_ledger"])
+            self.assertEqual(result["processed_count"], 0)
+            self.assertEqual(list((data_dir / "conversation_ledgers").glob("*/messages.jsonl")), [])
+
 
 class _Ocr:
     def __init__(self, text: str):
@@ -240,15 +317,37 @@ class _Capture:
 
 class _Probe(Win32WindowProbe):
     def find_wechat_windows(self) -> list[WindowInfo]:
-        return [WindowInfo(hwnd=1, title="微信", width=100, height=100)]
+        return [WindowInfo(hwnd=1, title="微信", width=1000, height=700, process_name="Weixin.exe")]
+
+
+class _EmptyProbe(Win32WindowProbe):
+    def find_wechat_windows(self) -> list[WindowInfo]:
+        return []
 
 
 class _MultiProbe(Win32WindowProbe):
     def find_wechat_windows(self) -> list[WindowInfo]:
         return [
-            WindowInfo(hwnd=1, title="微信", width=100, height=100),
-            WindowInfo(hwnd=2, title="WxTrayIconMessageWindow", width=1200, height=700),
+            WindowInfo(hwnd=1, title="微信", width=1000, height=700, process_name="Weixin.exe"),
+            WindowInfo(hwnd=2, title="WeChat", width=1200, height=700, process_name="Weixin.exe"),
         ]
+
+
+def _foreground_window(hwnd: int) -> dict[str, object]:
+    return {
+        "hwnd": hwnd,
+        "title": "微信",
+        "width": 1000,
+        "height": 700,
+        "left": 100,
+        "top": 100,
+        "right": 1100,
+        "bottom": 800,
+        "process_id": 100,
+        "process_name": "Weixin.exe",
+        "class_name": "WeChatMainWndForPC",
+        "visible": True,
+    }
 
 
 if __name__ == "__main__":

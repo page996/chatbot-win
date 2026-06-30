@@ -82,6 +82,15 @@ class OcrSnapshotParserTest(unittest.TestCase):
 
         self.assertEqual(snapshot, "")
 
+    def test_blocks_capture_when_preferred_chat_title_is_not_visible(self) -> None:
+        text = "\n".join(["OTHER", "这是另一个窗口的消息"])
+
+        result = parse_ocr_snapshot(text, preferred_chat_title="PAGE")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, "chat_title_not_visible")
+        self.assertEqual(result.to_snapshots(), [])
+
     def test_allows_extra_ignored_names(self) -> None:
         text = "\n".join(["PAGE", "测试账号", "这个截图里的最后一句才是消息", "测试账号"])
 

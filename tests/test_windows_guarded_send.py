@@ -18,9 +18,9 @@ class WindowsGuardedSendDriverTest(unittest.TestCase):
             driver = WindowsGuardedSendDriver(
                 send_enabled=False,
                 data_dir=data_dir,
-                window_probe=_Probe([WindowInfo(1, "WeChat - PAGE")]),
+                window_probe=_Probe([_wechat_window(1, "WeChat - PAGE")]),
                 input_controller=controller,
-                foreground_provider=lambda: {"title": "WeChat - PAGE"},
+                foreground_provider=lambda: {"title": "WeChat - PAGE", "process_name": "WeChat.exe"},
                 process_provider=lambda: [],
             )
 
@@ -38,9 +38,9 @@ class WindowsGuardedSendDriverTest(unittest.TestCase):
             driver = WindowsGuardedSendDriver(
                 send_enabled=True,
                 data_dir=data_dir,
-                window_probe=_Probe([WindowInfo(1, "WeChat - OTHER")]),
+                window_probe=_Probe([_wechat_window(1, "WeChat - OTHER")]),
                 input_controller=controller,
-                foreground_provider=lambda: {"title": "WeChat - OTHER"},
+                foreground_provider=lambda: {"title": "WeChat - OTHER", "process_name": "WeChat.exe"},
                 process_provider=lambda: [],
             )
 
@@ -58,9 +58,9 @@ class WindowsGuardedSendDriverTest(unittest.TestCase):
             driver = WindowsGuardedSendDriver(
                 send_enabled=True,
                 data_dir=data_dir,
-                window_probe=_Probe([WindowInfo(1, "WeChat - PAGE")]),
+                window_probe=_Probe([_wechat_window(1, "WeChat - PAGE")]),
                 input_controller=controller,
-                foreground_provider=lambda: {"title": "WeChat - PAGE"},
+                foreground_provider=lambda: {"title": "WeChat - PAGE", "process_name": "WeChat.exe"},
                 process_provider=lambda: [],
             )
 
@@ -78,9 +78,9 @@ class WindowsGuardedSendDriverTest(unittest.TestCase):
             driver = WindowsGuardedSendDriver(
                 send_enabled=True,
                 data_dir=data_dir,
-                window_probe=_Probe([WindowInfo(1, "\u5fae\u4fe1 - PAGE")]),
+                window_probe=_Probe([_wechat_window(1, "\u5fae\u4fe1 - PAGE")]),
                 input_controller=controller,
-                foreground_provider=lambda: {"title": "\u5fae\u4fe1 - PAGE"},
+                foreground_provider=lambda: {"title": "\u5fae\u4fe1 - PAGE", "process_name": "WeChat.exe"},
                 process_provider=lambda: [],
             )
 
@@ -94,9 +94,9 @@ class WindowsGuardedSendDriverTest(unittest.TestCase):
         driver = WindowsGuardedSendDriver(
             send_enabled=True,
             data_dir="missing-data",
-            window_probe=_Probe([WindowInfo(1, "WeChat - PAGE")]),
+            window_probe=_Probe([_wechat_window(1, "WeChat - PAGE")]),
             input_controller=controller,
-            foreground_provider=lambda: {"title": "WeChat - PAGE"},
+            foreground_provider=lambda: {"title": "WeChat - PAGE", "process_name": "WeChat.exe"},
             process_provider=lambda: [],
         )
 
@@ -105,6 +105,25 @@ class WindowsGuardedSendDriverTest(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIn("conversation_channel_not_found", result.reason)
         self.assertEqual(controller.sent, [])
+
+    def test_probe_rejects_chrome_sidebar_with_wechat_title(self) -> None:
+        driver = WindowsGuardedSendDriver(
+            send_enabled=True,
+            data_dir="missing-data",
+            window_probe=_Probe([_wechat_window(1, "微信")]),
+            input_controller=_InputController(),
+            foreground_provider=lambda: {
+                "title": "WeChat Agent Send Queue - Google Chrome",
+                "process_name": "chrome.exe",
+                "class_name": "Chrome_WidgetWin_1",
+            },
+            process_provider=lambda: [],
+        )
+
+        probe = driver.probe()
+
+        self.assertEqual(probe.health, "blocked")
+        self.assertIn("foreground_not_wechat", probe.blockers)
 
 
 def _write_channel(data_dir: Path, conversation_id: str, chat_title: str) -> None:
@@ -119,6 +138,21 @@ class _Probe(Win32WindowProbe):
 
     def find_wechat_windows(self) -> list[WindowInfo]:
         return self.windows
+
+
+def _wechat_window(hwnd: int, title: str) -> WindowInfo:
+    return WindowInfo(
+        hwnd=hwnd,
+        title=title,
+        width=1000,
+        height=700,
+        left=100,
+        top=100,
+        right=1100,
+        bottom=800,
+        process_name="WeChat.exe",
+        class_name="WeChatMainWndForPC",
+    )
 
 
 class _InputController:

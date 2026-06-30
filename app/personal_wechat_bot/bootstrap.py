@@ -6,17 +6,18 @@ from pathlib import Path
 from app.personal_wechat_bot.config.schema import BotConfig
 from app.personal_wechat_bot.agent.tool_orchestrator import ToolTaskOrchestrator
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
-from app.personal_wechat_bot.conversation.context_store import ConversationContextStore
 from app.personal_wechat_bot.conversation.engine import ConversationEngine
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import LedgerContextAssembler
 from app.personal_wechat_bot.conversation.link_annotations import LinkAnnotationService
+from app.personal_wechat_bot.conversation.session_store import ConversationSessionStore
 from app.personal_wechat_bot.llm.fake import FakeLLMClient
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool, ConversationKeyAssigner
 from app.personal_wechat_bot.llm.model_router import ModelRouter
 from app.personal_wechat_bot.llm.openai_client import RelayOpenAIClient
 from app.personal_wechat_bot.logging.event_log import EventLogger
 from app.personal_wechat_bot.memory.file_index import FileIndex
+from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer
 from app.personal_wechat_bot.normalizer.normalizer import MessageNormalizer
 from app.personal_wechat_bot.persona.topic_classifier import AITopicClassifier
 from app.personal_wechat_bot.reply_gate.gate import ReplyGate
@@ -47,9 +48,10 @@ class BotRuntime:
     key_pool: ApiKeyPool
     key_assigner: ConversationKeyAssigner
     channel_store: ConversationChannelStore
-    context_store: ConversationContextStore
+    session_store: ConversationSessionStore
     ledger_store: ConversationLedgerStore
     ledger_context: LedgerContextAssembler
+    memory_maintainer: MemoryMaintainer
     link_annotations: LinkAnnotationService
     file_workspace: FileWorkspace
     active_driver: object | None = None
@@ -59,9 +61,10 @@ def build_runtime(config: BotConfig) -> BotRuntime:
     data_root = Path(config.data_dir)
     event_logger = EventLogger(data_root / "logs.jsonl")
     file_index = FileIndex(data_root / "file_index.sqlite")
-    context_store = ConversationContextStore(data_root, max_recent_messages=config.context_window_messages)
+    session_store = ConversationSessionStore(data_root)
     ledger_store = ConversationLedgerStore(data_root)
     ledger_context = LedgerContextAssembler(ledger_store, max_recent_entries=config.context_window_messages + 10)
+    memory_maintainer = MemoryMaintainer(ledger_store)
     file_workspace = FileWorkspace(data_root / "file_workspace")
     model_router = ModelRouter(config.providers)
     chat_provider = model_router.chat_provider().config
@@ -71,7 +74,7 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         data_root,
         key_pool,
         file_workspace_root=data_root / "file_workspace",
-        context_root=data_root / "conversation_context",
+        context_root=data_root / "conversation_ledgers",
     )
     llm = (
         RelayOpenAIClient(chat_provider, key_pool=key_pool, channel_store=channel_store)
@@ -94,7 +97,6 @@ def build_runtime(config: BotConfig) -> BotRuntime:
             llm=llm,
             tools=tools,
             tool_orchestrator=tool_orchestrator,
-            context_store=context_store,
             ledger_context=ledger_context,
         ),
         cooldown=ConversationCooldown(config.group_cooldown_seconds, data_root / "conversation_cooldowns.sqlite"),
@@ -109,9 +111,10 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         key_pool=key_pool,
         key_assigner=key_assigner,
         channel_store=channel_store,
-        context_store=context_store,
+        session_store=session_store,
         ledger_store=ledger_store,
         ledger_context=ledger_context,
+        memory_maintainer=memory_maintainer,
         link_annotations=link_annotations,
         file_workspace=file_workspace,
     )

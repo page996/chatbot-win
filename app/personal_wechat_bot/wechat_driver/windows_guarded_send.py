@@ -14,6 +14,7 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     find_wechat_processes,
     foreground_window_info,
 )
+from app.personal_wechat_bot.wechat_driver.window_introspection import filter_wechat_chat_windows
 
 
 WINDOWS_GUARDED_SEND_DRIVER = "windows_guarded"
@@ -68,7 +69,10 @@ class WindowsGuardedSendDriver:
         return bool(self.window_probe.find_wechat_windows())
 
     def probe(self) -> WindowsGuardedSendProbe:
-        windows = [{"hwnd": item.hwnd, "title": item.title} for item in self.window_probe.find_wechat_windows()]
+        windows = [
+            {"hwnd": item.hwnd, "title": item.title}
+            for item in filter_wechat_chat_windows(self.window_probe.find_wechat_windows())
+        ]
         processes = self.process_provider()
         foreground = self.foreground_provider()
         blockers: list[str] = []
@@ -216,6 +220,23 @@ def _press_enter() -> None:
 
 
 def _foreground_looks_like_wechat(foreground: dict[str, Any]) -> bool:
+    process = Path(str(foreground.get("process_name", ""))).name.lower()
+    class_name = str(foreground.get("class_name", "")).lower()
+    if process in {
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "powershell.exe",
+        "windowsterminal.exe",
+        "cmd.exe",
+        "python.exe",
+        "pythonw.exe",
+    }:
+        return False
+    if any(token in class_name for token in ["chrome_widgetwin", "consolewindowclass", "applicationframewindow"]):
+        return False
+    if process in {"wechat.exe", "weixin.exe", "wechatappex.exe"}:
+        return True
     title = str(foreground.get("title", "")).lower()
     return "wechat" in title or "\u5fae\u4fe1" in title
 

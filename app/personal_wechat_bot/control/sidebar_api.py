@@ -97,7 +97,7 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
         root,
         key_pool,
         file_workspace_root=root / "file_workspace",
-        context_root=root / "conversation_context",
+        context_root=root / "conversation_ledgers",
     )
     channels = []
     for channel in store.list_channels():

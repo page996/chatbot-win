@@ -87,7 +87,21 @@ def parse_ocr_snapshot(
     if not normalized_lines:
         return None
 
-    chat_title = _normalize_line(preferred_chat_title) or _guess_chat_title(normalized_lines)
+    preferred = _normalize_line(preferred_chat_title)
+    if preferred and not _title_visible(normalized_lines, preferred):
+        return OcrSnapshotParseResult(
+            chat_title=preferred,
+            sender_name=preferred,
+            message="",
+            attachments=(),
+            raw_lines=raw_lines,
+            normalized_lines=normalized_lines,
+            status="chat_title_not_visible",
+            reason="preferred chat title was not visible in the OCR snapshot; refusing to write this capture into the conversation ledger",
+            evidence=normalized_lines[:8],
+        )
+
+    chat_title = preferred or _guess_chat_title(normalized_lines)
     if not chat_title:
         return None
 
@@ -188,6 +202,18 @@ def _guess_chat_title(lines: tuple[str, ...]) -> str:
             continue
         return line
     return ""
+
+
+def _title_visible(lines: tuple[str, ...], title: str) -> bool:
+    normalized_title = _compact_for_compare(title).lower()
+    if not normalized_title:
+        return False
+    for line in lines:
+        if line == title:
+            return True
+        if _compact_for_compare(line).lower() == normalized_title:
+            return True
+    return False
 
 
 def _guess_visible_context(

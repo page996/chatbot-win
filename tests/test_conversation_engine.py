@@ -5,7 +5,6 @@ import unittest
 from pathlib import Path
 
 from app.personal_wechat_bot.config.schema import BotConfig
-from app.personal_wechat_bot.conversation.context_store import ConversationContextStore
 from app.personal_wechat_bot.conversation.engine import ConversationEngine
 from app.personal_wechat_bot.domain.models import NormalizedMessage, SpeakDecision
 from app.personal_wechat_bot.logging.event_log import EventLogger
@@ -21,7 +20,6 @@ class ConversationEngineTest(unittest.TestCase):
                 config=BotConfig(mode="dry_run", data_dir=str(data_dir)),
                 llm=_SuffixMissingLlm(),
                 tools=ToolRuntime(ToolRegistry(), EventLogger(data_dir / "logs.jsonl")),
-                context_store=ConversationContextStore(data_dir),
             )
             message = NormalizedMessage(
                 message_id="message-1",

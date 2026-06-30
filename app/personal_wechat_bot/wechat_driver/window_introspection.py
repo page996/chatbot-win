@@ -16,6 +16,39 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
 
 
 VENDOR_UI_PATH = Path(__file__).resolve().parents[3] / "vendor" / "windows-ui"
+WECHAT_PROCESS_NAMES = {"wechat.exe", "weixin.exe", "wechatappex.exe"}
+KNOWN_WECHAT_CLASS_TOKENS = (
+    "wechat",
+    "weixin",
+    "mmuisdk",
+)
+REJECTED_PROCESS_NAMES = {
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "powershell.exe",
+    "windowsterminal.exe",
+    "cmd.exe",
+    "python.exe",
+    "pythonw.exe",
+}
+REJECTED_CLASS_TOKENS = (
+    "chrome_widgetwin",
+    "consolewindowclass",
+    "cabinetwclass",
+    "applicationframewindow",
+    "notepad",
+)
+WECHAT_TITLE_TOKENS = ("微信", "wechat", "寰俊")
+IGNORED_WINDOW_TOKENS = (
+    "tray",
+    "tooltip",
+    "popup",
+    "notification",
+    "wxtrayiconmessagewindow",
+    "wechat agent",
+    "send queue",
+)
 
 
 @dataclass(frozen=True)
@@ -51,7 +84,7 @@ def build_wechat_window_probe(
     max_depth: int = 8,
 ) -> dict[str, Any]:
     raw_windows = Win32WindowProbe(include_invisible=False).find_wechat_windows()
-    windows = [item for item in raw_windows if _is_candidate_chat_window(item)]
+    windows = filter_wechat_chat_windows(raw_windows)
     foreground = foreground_window_info()
     targets = [_window_payload(item, max_children=max_children, max_controls=max_controls, max_depth=max_depth) for item in windows]
     active = _active_target(targets, foreground)
@@ -96,11 +129,34 @@ def _active_target(targets: list[dict[str, Any]], foreground: dict[str, Any]) ->
 
 
 def _is_candidate_chat_window(window: WindowInfo) -> bool:
+    if not getattr(window, "visible", True):
+        return False
     if window.width < 500 or window.height < 300:
         return False
     if window.left <= -10000 or window.top <= -10000:
         return False
-    return True
+    title_and_class = f"{window.title} {window.class_name}".lower()
+    if any(token in title_and_class for token in IGNORED_WINDOW_TOKENS):
+        return False
+    if any(token in title_and_class for token in REJECTED_CLASS_TOKENS):
+        return False
+    process = Path(window.process_name).name.lower()
+    if process in REJECTED_PROCESS_NAMES:
+        return False
+    if process and process not in WECHAT_PROCESS_NAMES:
+        return False
+    if process in WECHAT_PROCESS_NAMES:
+        return True
+    if any(token in title_and_class for token in KNOWN_WECHAT_CLASS_TOKENS):
+        return True
+    title = window.title.lower()
+    if any(token in window.title or token in title for token in WECHAT_TITLE_TOKENS):
+        return True
+    return False
+
+
+def filter_wechat_chat_windows(windows: list[WindowInfo]) -> list[WindowInfo]:
+    return [item for item in windows if _is_candidate_chat_window(item)]
 
 
 def _child_windows(hwnd: int, *, max_children: int) -> list[ChildWindowInfo]:

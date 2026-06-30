@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.personal_wechat_bot.conversation.context_store import DEFAULT_SESSION_ID, ConversationContextStore
+from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID, ConversationSessionStore
 from app.personal_wechat_bot.domain.models import RawWeChatMessage, SendResult, utc_now_iso
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
@@ -49,7 +49,8 @@ class BackendEventJsonlDriver:
         attachment_parser: BackendAttachmentParser | None = None,
         file_workspace: FileWorkspace | None = None,
         attachment_pipeline: AttachmentPipeline | None = None,
-        context_store: ConversationContextStore | None = None,
+        session_store: ConversationSessionStore | None = None,
+        context_store: ConversationSessionStore | None = None,
     ):
         self.event_path = Path(event_path)
         self.file_index = file_index
@@ -67,7 +68,7 @@ class BackendEventJsonlDriver:
             max_input_bytes=self.max_input_bytes,
             embedded_media_ocr=self.attachment_parser.ocr_engine,
         )
-        self.context_store = context_store
+        self.session_store = session_store or context_store
         self._seen_raw_ids: set[str] = set()
 
     def health_check(self) -> bool:
@@ -100,8 +101,8 @@ class BackendEventJsonlDriver:
         conversation_type = "group" if event.is_group else "private"
         conversation_id = conversation_id_for(conversation_type, event.chat_title)
         session_id = (
-            self.context_store.current_session_id(conversation_id)
-            if self.context_store is not None
+            self.session_store.current_session_id(conversation_id)
+            if self.session_store is not None
             else DEFAULT_SESSION_ID
         )
         attachments = [_attachment_pending(item) for item in event.attachments]

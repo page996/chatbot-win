@@ -37,6 +37,48 @@ class WindowIntrospectionTest(unittest.TestCase):
             )
         )
 
+    def test_candidate_chat_window_rejects_non_wechat_process_with_wechat_title(self) -> None:
+        self.assertFalse(
+            window_introspection._is_candidate_chat_window(
+                WindowInfo(
+                    hwnd=3,
+                    title="WeChat Agent Send Queue - Google Chrome",
+                    width=1000,
+                    height=700,
+                    left=100,
+                    top=100,
+                    process_name="chrome.exe",
+                )
+            )
+        )
+        self.assertFalse(
+            window_introspection._is_candidate_chat_window(
+                WindowInfo(
+                    hwnd=5,
+                    title="微信",
+                    width=1000,
+                    height=700,
+                    left=100,
+                    top=100,
+                    process_name="powershell.exe",
+                    class_name="ConsoleWindowClass",
+                )
+            )
+        )
+        self.assertFalse(
+            window_introspection._is_candidate_chat_window(
+                WindowInfo(
+                    hwnd=4,
+                    title="WxTrayIconMessageWindow",
+                    width=1000,
+                    height=700,
+                    left=100,
+                    top=100,
+                    process_name="Weixin.exe",
+                )
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
