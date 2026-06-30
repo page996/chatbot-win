@@ -25,8 +25,8 @@ _PLAN_RESIDUAL_RULES = [
         "manual_snapshot_bridge",
         "\u624b\u5de5\u590d\u5236\u4e00\u6bb5\u4f60\u6574\u7406\u6210\u4e0a\u8ff0\u5feb\u7167\u683c\u5f0f\u7684\u6587\u672c",
         "superseded_historical_note",
-        "backend events and snapshot polling are now implemented; OCR window polling is fallback",
-        "keep as history, rely on audit-plan for the current input path",
+        "backend events and snapshot polling are implemented; WeChat page OCR ingestion is disabled",
+        "keep as history, rely on backend events, pure capture, or snapshot sources for current input",
     ),
     PlanResidualRule(
         "manual_reply_before_send_module",
@@ -39,8 +39,8 @@ _PLAN_RESIDUAL_RULES = [
         "uia_empty_window_bridge",
         "UIA \u6587\u672c\u4ecd\u4e3a\u7a7a",
         "fallback_historical_note",
-        "backend-first ingestion is primary; OCR/window capture remains fallback",
-        "keep as history, continue backend-side development first",
+        "backend-first ingestion is primary; OCR is no longer used to read WeChat pages",
+        "keep as history, continue backend-side development and pure window capture first",
     ),
     PlanResidualRule(
         "ocr_backend_missing",
@@ -295,10 +295,10 @@ def _cleanup_order(
         },
         {
             "priority": 4,
-            "item": "ocr-window-fallback",
-            "status": "retain_as_fallback",
-            "action": "do not remove; backend ingestion remains primary and OCR/window capture covers UI-only gaps",
-            "evidence": {},
+            "item": "page-ocr-ingestion",
+            "status": "disabled",
+            "action": "keep OCR only in the file/tool layer; use backend events, snapshot text, or pure wechat-capture for page acquisition",
+            "evidence": {"page_ocr_ingestion": "disabled"},
         },
         {
             "priority": 5,

@@ -39,7 +39,6 @@ from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
-from app.personal_wechat_bot.runtime.ocr_window_runner import OcrWindowPollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
@@ -64,7 +63,6 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
 )
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
-from app.personal_wechat_bot.wechat_driver.ocr_snapshot_parser import parse_ocr_snapshot
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,9 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--interval", type=float, default=1.0)
     run_agent.add_argument("--backend-event-file", default=None)
     run_agent.add_argument("--no-backend-events", action="store_true")
-    run_agent.add_argument("--no-wechat-ocr", action="store_true")
-    run_agent.add_argument("--ocr-output", default=None)
-    run_agent.add_argument("--ocr-capture-mode", choices=["window", "screen", "auto"], default="auto")
+    run_agent.add_argument(
+        "--no-wechat-ocr",
+        action="store_true",
+        help="deprecated compatibility flag; WeChat page OCR ingestion is always disabled",
+    )
+    run_agent.add_argument("--ocr-output", default=None, help=argparse.SUPPRESS)
+    run_agent.add_argument("--ocr-capture-mode", choices=["window", "screen", "auto"], default="auto", help=argparse.SUPPRESS)
     run_agent.add_argument("--verbose", action="store_true")
 
     sidebar = sub.add_parser("send-sidebar")
@@ -332,20 +334,6 @@ def main(argv: list[str] | None = None) -> None:
                             session_store=runtime.session_store,
                         ),
                         poll_interval_seconds=0,
-                    ),
-                )
-            )
-        if not args.no_wechat_ocr:
-            runners.append(
-                (
-                    "wechat-ocr",
-                    OcrWindowPollingRunner(
-                        runtime=runtime,
-                        ocr_engine=RapidOcrSubprocessEngine(),
-                        output_path=args.ocr_output or str(Path(args.data_dir) / "wechat_window.bmp"),
-                        poll_interval_seconds=0,
-                        capture_mode=args.ocr_capture_mode,
-                        window_binding_store=WeChatWindowBindingStore(args.data_dir),
                     ),
                 )
             )
@@ -652,63 +640,16 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "ocr-snapshot":
-        engine = RapidOcrSubprocessEngine()
-        try:
-            text = engine.read_text(args.image)
-            parse_result = parse_ocr_snapshot(text, preferred_chat_title=args.chat_title)
-            snapshot = parse_result.to_snapshot() if parse_result is not None else ""
-            status = "ok" if snapshot else (parse_result.status if parse_result is not None else "empty")
-            result = {
-                "status": status,
-                "snapshot": snapshot,
-                "ocr_text": text,
-                "parse": _ocr_parse_payload(parse_result),
-            }
-        except Exception as exc:
-            result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        _ = (args.image, args.chat_title)
+        print(json.dumps(_deprecated_page_ocr_payload("ocr-snapshot"), ensure_ascii=False, indent=2))
         return
     if args.command == "poll-ocr-window":
-        _delay_for_foreground_switch(args.delay_seconds)
-        config = load_config(args.data_dir)
-        if args.mode:
-            config.mode = args.mode
-        runtime = build_runtime(config)
-        runner = OcrWindowPollingRunner(
-            runtime=runtime,
-            ocr_engine=RapidOcrSubprocessEngine(),
-            chat_title=args.chat_title,
-            output_path=args.output,
-            poll_interval_seconds=args.interval,
-            capture_mode=args.capture_mode,
-            window_binding_store=WeChatWindowBindingStore(args.data_dir),
-        )
-        result = runner.run_forever(max_loops=args.loops)
-        if args.verbose:
-            pass
-        else:
-            result.pop("processed", None)
-            result.pop("ocr_text", None)
-            result.pop("capture", None)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        _ = (args.chat_title, args.output, args.mode, args.verbose, args.loops, args.interval, args.capture_mode, args.delay_seconds)
+        print(json.dumps(_deprecated_page_ocr_payload("poll-ocr-window"), ensure_ascii=False, indent=2))
         return
     if args.command == "ocr-window-diagnose":
-        _delay_for_foreground_switch(args.delay_seconds)
-        config = load_config(args.data_dir)
-        runtime = build_runtime(config)
-        runner = OcrWindowPollingRunner(
-            runtime=runtime,
-            ocr_engine=RapidOcrSubprocessEngine(),
-            chat_title=args.chat_title,
-            output_path=args.output,
-            poll_interval_seconds=0,
-            capture_mode=args.capture_mode,
-            window_binding_store=WeChatWindowBindingStore(args.data_dir),
-        )
-        result = runner.diagnose_once()
-        if not args.show_ocr_text:
-            result.pop("ocr_text", None)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        _ = (args.chat_title, args.output, args.capture_mode, args.delay_seconds, args.show_ocr_text)
+        print(json.dumps(_deprecated_page_ocr_payload("ocr-window-diagnose"), ensure_ascii=False, indent=2))
         return
 
 
@@ -734,6 +675,17 @@ def _ocr_parse_payload(parse_result) -> dict[str, object] | None:
         "message": parse_result.message,
         "attachments": list(parse_result.attachments),
         "evidence": list(parse_result.evidence),
+    }
+
+
+def _deprecated_page_ocr_payload(command: str) -> dict[str, object]:
+    return {
+        "status": "deprecated",
+        "command": command,
+        "reason": "WeChat page OCR ingestion is disabled. Use backend events or pure wechat-capture for page/window acquisition; OCR is reserved for file-layer tools such as ocr-image and vision.ocr.",
+        "will_write_ledger": False,
+        "processed_count": 0,
+        "send_enabled": False,
     }
 
 

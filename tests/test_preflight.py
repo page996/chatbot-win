@@ -35,8 +35,12 @@ class PreflightTest(unittest.TestCase):
                 "auto_accept_wechat_contacts_and_groups",
             )
             self.assertNotIn("poll-ocr-window", report["wechat_access"]["fallback_inputs"])
-            self.assertIn("poll-ocr-window", report["wechat_access"]["debug_inputs"])
+            self.assertNotIn("poll-ocr-window", report["wechat_access"]["debug_inputs"])
+            self.assertIn("wechat-capture", report["wechat_access"]["debug_inputs"])
+            self.assertIn("poll-ocr-window", report["wechat_access"]["deprecated_inputs"])
+            self.assertEqual(report["wechat_access"]["page_ocr_ingestion"], "disabled")
             self.assertEqual(report["tools"]["ocr"]["name"], "vision.ocr")
+            self.assertEqual(report["tools"]["ocr"]["scope"], "tool_layer_file_workspace_only")
             self.assertTrue(report["conversation_channels"]["auto_register_private"])
             self.assertTrue(report["conversation_channels"]["auto_register_groups"])
 
