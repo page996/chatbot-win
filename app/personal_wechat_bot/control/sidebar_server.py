@@ -8,7 +8,9 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from app.personal_wechat_bot.control.sidebar_api import (
+    ack_sidebar_bridge_item,
     append_sidebar_backend_event,
+    build_sidebar_bridge_state,
     build_sidebar_wechat_probe,
     build_sidebar_state,
     cleanup_sidebar_channels,
@@ -45,6 +47,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/wechat-probe":
                 self._json(build_sidebar_wechat_probe(data_dir))
                 return
+            if parsed.path == "/api/bridge":
+                self._json(build_sidebar_bridge_state(data_dir))
+                return
             self._static(parsed.path)
 
         def do_POST(self) -> None:
@@ -56,6 +61,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/backend-events":
                     self._json(append_sidebar_backend_event(data_dir, payload))
+                    return
+                if parsed.path == "/api/bridge/ack":
+                    self._json(ack_sidebar_bridge_item(data_dir, payload))
                     return
                 if parsed.path == "/api/channels/cleanup-hidden":
                     self._json(cleanup_sidebar_channels(data_dir, hidden_only=True))

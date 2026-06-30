@@ -141,14 +141,38 @@ class ConversationChannelStore:
         return channels
 
     def delete_channel(self, conversation_id: str) -> bool:
+        return self.delete_channel_with_cleanup(conversation_id)["deleted"]
+
+    def delete_channel_with_cleanup(self, conversation_id: str) -> dict[str, Any]:
         with self._lock:
             path = self._channel_path(conversation_id)
-            if not path.exists():
-                return False
+            payload = self._read_channel_payload(path)
+            if not path.exists() and not payload:
+                return {
+                    "deleted": False,
+                    "cleanup_policy": "missing",
+                    "removed": [],
+                    "retained": [],
+                }
+            cleanup_policy = _cleanup_policy_for(payload)
+            removed: list[str] = []
+            retained: list[str] = []
+            if cleanup_policy == "non_wechat_purge":
+                for target in self._associated_paths(conversation_id):
+                    if _remove_path(target):
+                        removed.append(str(target))
+            else:
+                retained.extend(str(target) for target in self._associated_paths(conversation_id))
             channel_dir = path.parent
-            shutil.rmtree(channel_dir)
+            if _remove_path(channel_dir):
+                removed.append(str(channel_dir))
             self._remove_from_index(conversation_id)
-            return True
+            return {
+                "deleted": True,
+                "cleanup_policy": cleanup_policy,
+                "removed": removed,
+                "retained": retained,
+            }
 
     def _assign_key_refs(self, conversation_id: str, slots: int) -> list[str]:
         refs = self.key_pool.refs()
@@ -165,6 +189,14 @@ class ConversationChannelStore:
 
     def _channel_path(self, conversation_id: str) -> Path:
         return self._channel_dir(conversation_id) / "channel.json"
+
+    def _associated_paths(self, conversation_id: str) -> list[Path]:
+        segment = _safe_segment(conversation_id)
+        return [
+            self.context_root / segment,
+            self.file_workspace_root / segment,
+            self.data_dir / "conversation_sessions" / segment,
+        ]
 
     def _read_channel_payload(self, path: Path) -> dict[str, Any]:
         if not path.exists():
@@ -284,3 +316,27 @@ def _stable_index(value: str, modulo: int) -> int:
 
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return int(digest[:8], 16) % modulo
+
+
+def _cleanup_policy_for(payload: dict[str, Any]) -> str:
+    if not payload:
+        return "non_wechat_purge"
+    if bool(payload.get("trusted_channel_source", False)):
+        return "wechat_preserve"
+    source_names = {str(item).strip() for item in payload.get("source_names", []) if str(item).strip()}
+    if source_names.intersection(TRUSTED_CHANNEL_SOURCES):
+        return "wechat_preserve"
+    sender_ids = {str(item).strip() for item in payload.get("sender_wechat_ids", []) if str(item).strip()}
+    if sender_ids:
+        return "wechat_preserve"
+    return "non_wechat_purge"
+
+
+def _remove_path(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return True

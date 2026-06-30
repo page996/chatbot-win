@@ -10,7 +10,8 @@ from app.personal_wechat_bot.domain.models import ReplyCandidate, utc_now_iso
 
 _ALLOWED_TRANSITIONS = {
     "pending": {"approved", "rejected"},
-    "approved": {"rejected", "sent", "failed"},
+    "approved": {"rejected", "queued_to_bridge", "sent", "failed"},
+    "queued_to_bridge": {"sent", "failed"},
 }
 
 
@@ -60,8 +61,8 @@ class ConfirmQueue:
         return self._transition(queue_id, "rejected", reviewer=reviewer, note=note)
 
     def mark_send_result(self, queue_id: str, status: str, reason: str, *, reviewer: str = "local_user") -> dict[str, Any]:
-        if status not in {"sent", "failed"}:
-            raise ValueError("status must be sent or failed")
+        if status not in {"queued_to_bridge", "sent", "failed"}:
+            raise ValueError("status must be queued_to_bridge, sent, or failed")
         return self._transition(queue_id, status, reviewer=reviewer, note=reason)
 
     def _transition(self, queue_id: str, status: str, *, reviewer: str, note: str) -> dict[str, Any]:

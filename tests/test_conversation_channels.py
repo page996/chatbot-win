@@ -123,21 +123,76 @@ class ConversationChannelStoreTest(unittest.TestCase):
             channel = store.ensure_channel(_message(conversation_id="private-delete", conversation_type="private"))
             ledger_file = root / "conversation_ledgers" / "private-delete" / "conversation.md"
             workspace_file = root / "file_workspace" / "private-delete" / "session_default" / "file.txt"
+            session_file = root / "conversation_sessions" / "private-delete" / "state.json"
             ledger_file.parent.mkdir(parents=True, exist_ok=True)
             workspace_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.parent.mkdir(parents=True, exist_ok=True)
             ledger_file.write_text("keep ledger", encoding="utf-8")
             workspace_file.write_text("keep file", encoding="utf-8")
+            session_file.write_text("keep session", encoding="utf-8")
 
-            deleted = store.delete_channel(channel.conversation_id)
+            cleanup = store.delete_channel_with_cleanup(channel.conversation_id)
             deleted_again = store.delete_channel(channel.conversation_id)
             index = (root / "conversation_channels" / "index.json").read_text(encoding="utf-8")
 
-            self.assertTrue(deleted)
+            self.assertTrue(cleanup["deleted"])
+            self.assertEqual(cleanup["cleanup_policy"], "wechat_preserve")
             self.assertFalse(deleted_again)
             self.assertIsNone(store.get_channel(channel.conversation_id))
             self.assertNotIn("private-delete", index)
             self.assertTrue(ledger_file.exists())
             self.assertTrue(workspace_file.exists())
+            self.assertTrue(session_file.exists())
+
+    def test_delete_untrusted_non_wechat_channel_purges_associated_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            conversation_id = "legacy-noise"
+            channel_path = root / "conversation_channels" / conversation_id / "channel.json"
+            ledger_file = root / "conversation_ledgers" / conversation_id / "conversation.md"
+            workspace_file = root / "file_workspace" / conversation_id / "session_default" / "file.txt"
+            session_file = root / "conversation_sessions" / conversation_id / "state.json"
+            channel_path.parent.mkdir(parents=True, exist_ok=True)
+            ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            workspace_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            channel_path.write_text(
+                """
+{
+  "conversation_id": "legacy-noise",
+  "conversation_type": "private",
+  "chat_title": "PTURE",
+  "status": "active",
+  "key_slots": 1,
+  "api_key_refs": [],
+  "session_scope": "per_conversation_current_session",
+  "sender_names": ["PTURE"],
+  "sender_wechat_ids": [],
+  "source_names": [],
+  "trusted_channel_source": false
+}
+""".strip(),
+                encoding="utf-8",
+            )
+            ledger_file.write_text("purge ledger", encoding="utf-8")
+            workspace_file.write_text("purge file", encoding="utf-8")
+            session_file.write_text("purge session", encoding="utf-8")
+
+            cleanup = store.delete_channel_with_cleanup(conversation_id)
+
+            self.assertTrue(cleanup["deleted"])
+            self.assertEqual(cleanup["cleanup_policy"], "non_wechat_purge")
+            self.assertFalse(channel_path.parent.exists())
+            self.assertFalse(ledger_file.parent.exists())
+            self.assertFalse((root / "file_workspace" / conversation_id).exists())
+            self.assertFalse(session_file.parent.exists())
 
 
 def _message(

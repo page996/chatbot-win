@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 审计面板</title>
-    <link rel="stylesheet" href="/styles.css?v=20260630-3" />
+    <link rel="stylesheet" href="/styles.css?v=20260630-5" />
   </head>
   <body>
     <main class="shell">
@@ -64,30 +64,53 @@
         <button id="saveControls" class="primary">保存</button>
       </section>
 
-      <section class="metrics">
-        <button class="metric active" data-status="pending">
-          <span>待审</span>
-          <strong id="pendingCount">0</strong>
-        </button>
-        <button class="metric" data-status="approved">
-          <span>已批</span>
-          <strong id="approvedCount">0</strong>
-        </button>
-        <button class="metric" data-status="rejected">
-          <span>拒绝</span>
-          <strong id="rejectedCount">0</strong>
-        </button>
-        <button class="metric" data-status="sent">
-          <span>已发</span>
-          <strong id="sentCount">0</strong>
-        </button>
-        <button class="metric" data-status="failed">
-          <span>失败</span>
-          <strong id="failedCount">0</strong>
-        </button>
-      </section>
+      <section class="send-console">
+        <div class="bookmark-tabs" role="tablist" aria-label="send console">
+          <button class="active" data-panel="queue">发送审核</button>
+          <button data-panel="bridge">非前台桥</button>
+        </div>
+        <div id="queuePanel">
+          <section class="metrics">
+            <button class="metric active" data-status="pending">
+              <span>待审</span>
+              <strong id="pendingCount">0</strong>
+            </button>
+            <button class="metric" data-status="approved">
+              <span>已批</span>
+              <strong id="approvedCount">0</strong>
+            </button>
+            <button class="metric" data-status="queued_to_bridge">
+              <span>入桥</span>
+              <strong id="bridgeQueuedCount">0</strong>
+            </button>
+            <button class="metric" data-status="rejected">
+              <span>拒绝</span>
+              <strong id="rejectedCount">0</strong>
+            </button>
+            <button class="metric" data-status="sent">
+              <span>已发</span>
+              <strong id="sentCount">0</strong>
+            </button>
+            <button class="metric" data-status="failed">
+              <span>失败</span>
+              <strong id="failedCount">0</strong>
+            </button>
+          </section>
 
-      <section id="queueList" class="queue-list" aria-live="polite"></section>
+          <section id="queueList" class="queue-list" aria-live="polite"></section>
+        </div>
+        <div id="bridgePanel" hidden>
+          <div class="bridge-summary">
+            <div>
+              <span class="eyebrow">Bridge Outbox</span>
+              <strong id="bridgePendingCount">0 待消费</strong>
+              <p id="bridgePath">等待桥接状态</p>
+            </div>
+            <button id="bridgeRefreshButton" class="ghost small">刷新</button>
+          </div>
+          <div id="bridgeList" class="bridge-list"></div>
+        </div>
+      </section>
 
       <section class="inspector">
         <div class="section-head">
@@ -108,6 +131,6 @@
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
-    <script src="/app.js?v=20260630-3"></script>
+    <script src="/app.js?v=20260630-5"></script>
   </body>
 </html>

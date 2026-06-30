@@ -7,6 +7,7 @@ const state = {
   actionInProgress: false,
   statusMessage: "",
   probeExpanded: false,
+  activePanel: "queue",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -49,6 +50,7 @@ function render({ forceControls = false } = {}) {
   renderWechatProbe(data.wechat_window_probe || {});
   renderCounts(data);
   renderQueue();
+  renderBridge(data.send_bridge || {});
   renderAudit();
   renderProbeJson();
 }
@@ -67,6 +69,7 @@ function renderCapture(data) {
   $("#captureDetail").textContent = [
     roleText(capture.sidebar_role || "audit_and_send_controls_only"),
     capture.supports_multi_conversation ? "多会话隔离已开启" : "",
+    capture.background_send_status ? `非前台发送：${backgroundSendText(capture.background_send_status)}` : "",
     capture.window_probe_role ? `窗口探测：${roleText(capture.window_probe_role)}` : "",
   ].filter(Boolean).join(" / ");
 }
@@ -94,7 +97,7 @@ function driverNames(data) {
   const names = registered.map((item) => item.name).filter(Boolean);
   const configured = data.config?.send_driver;
   if (configured && !names.includes(configured)) names.unshift(configured);
-  return names.length ? names : ["not_implemented", "windows_guarded"];
+  return names.length ? names : ["not_implemented", "windows_guarded", "bridge_outbox"];
 }
 
 function renderWechatProbe(probe) {
@@ -191,6 +194,7 @@ function renderChannels(data) {
 function renderCounts(data) {
   $("#pendingCount").textContent = data.queues?.pending?.count || 0;
   $("#approvedCount").textContent = data.queues?.approved?.count || 0;
+  $("#bridgeQueuedCount").textContent = data.queues?.queued_to_bridge?.count || 0;
   $("#rejectedCount").textContent = data.queues?.rejected?.count || 0;
   $("#sentCount").textContent = data.queues?.sent?.count || 0;
   $("#failedCount").textContent = data.queues?.failed?.count || 0;
@@ -225,6 +229,38 @@ function renderQueue() {
     if (item.status === "approved") {
       actions.append(actionButton("3秒后发送", "primary", () => delayedQueueAction(item.queue_id, "send-approved")));
       actions.append(actionButton("拒绝", "danger", () => queueAction(item.queue_id, "reject")));
+    }
+    list.append(node);
+  }
+}
+
+function renderBridge(bridge) {
+  $("#bridgePendingCount").textContent = `${bridge.pending_count || 0} 待消费`;
+  $("#bridgePath").textContent = bridge.outbox_path || "未创建 outbox";
+  const list = $("#bridgeList");
+  list.innerHTML = "";
+  const items = bridge.items || [];
+  if (!items.length) {
+    list.append(emptyNode("非前台桥 outbox 为空"));
+    return;
+  }
+  for (const item of items.slice(-10).reverse()) {
+    const node = document.createElement("article");
+    node.className = `bridge-item status-${item.status || "queued"}`;
+    node.innerHTML = `
+      <div class="queue-head">
+        <span>${escapeHtml(bridgeStatusText(item.status || "queued"))}</span>
+        <time>${escapeHtml(shortTime(item.created_at || ""))}</time>
+      </div>
+      <div class="conversation">${escapeHtml(item.conversation_id || "")}</div>
+      <div class="reply-text">${escapeHtml(item.text || "")}</div>
+      <p>${escapeHtml(item.bridge_id || "")}</p>
+      <div class="actions"></div>
+    `;
+    const actions = node.querySelector(".actions");
+    if ((item.status || "queued") === "queued") {
+      actions.append(actionButton("标记已发", "primary", () => ackBridge(item.bridge_id, "sent")));
+      actions.append(actionButton("标记失败", "danger", () => ackBridge(item.bridge_id, "failed")));
     }
     list.append(node);
   }
@@ -307,20 +343,34 @@ async function delayedQueueAction(queueId, action) {
 
 async function deleteChannel(conversationId) {
   if (!conversationId) return;
-  await api(`/api/channels/delete/${encodeURIComponent(conversationId)}`, {
+  const payload = await api(`/api/channels/delete/${encodeURIComponent(conversationId)}`, {
     method: "POST",
     body: JSON.stringify({}),
   });
-  setStatusMessage("通道已清除，对话文件和文件中间层已保留");
+  setStatusMessage(payload.note || "通道已清除");
   await refresh({ force: true });
 }
 
 async function cleanupHiddenChannels() {
-  await api("/api/channels/cleanup-hidden", {
+  const payload = await api("/api/channels/cleanup-hidden", {
     method: "POST",
     body: JSON.stringify({}),
   });
-  setStatusMessage("隐藏通道已清理，对话文件和文件中间层已保留");
+  setStatusMessage(payload.note || "隐藏通道已清理");
+  await refresh({ force: true });
+}
+
+async function ackBridge(bridgeId, status) {
+  if (!bridgeId) return;
+  await api("/api/bridge/ack", {
+    method: "POST",
+    body: JSON.stringify({
+      bridge_id: bridgeId,
+      status,
+      reason: status === "sent" ? "manual_sidebar_ack" : "manual_sidebar_failed",
+    }),
+  });
+  setStatusMessage(status === "sent" ? "桥接项已标记为已发" : "桥接项已标记为失败");
   await refresh({ force: true });
 }
 
@@ -355,6 +405,15 @@ function setActiveStatus(status) {
   state.activeStatus = status;
   $$(".metric").forEach((item) => item.classList.toggle("active", item.dataset.status === status));
   renderQueue();
+}
+
+function setActivePanel(panel) {
+  state.activePanel = panel;
+  $$(".bookmark-tabs button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.panel === panel);
+  });
+  $("#queuePanel").hidden = panel !== "queue";
+  $("#bridgePanel").hidden = panel !== "bridge";
 }
 
 function setMode(mode) {
@@ -440,9 +499,20 @@ function queueStatusText(status) {
     rejected: "已拒绝",
     sent: "已发送",
     failed: "失败",
+    queued: "已入桥",
+    queued_to_bridge: "已入非前台桥",
     dry_run: "演练",
     queued_for_confirm: "待审核",
     skipped: "跳过",
+  }[status] || status || "";
+}
+
+function bridgeStatusText(status) {
+  return {
+    queued: "待桥接",
+    sent: "已确认发送",
+    failed: "发送失败",
+    blocked: "已阻断",
   }[status] || status || "";
 }
 
@@ -460,6 +530,15 @@ function roleText(value) {
   return {
     audit_and_send_controls_only: "浮窗只做审计和发送控制",
     diagnostic_only: "仅诊断",
+  }[value] || value;
+}
+
+function backgroundSendText(value) {
+  return {
+    not_supported_by_windows_guarded: "windows_guarded 需要前台",
+    bridge_outbox_available: "bridge_outbox 可入队",
+    bridge_outbox_configured_disabled: "bridge_outbox 已配置，发送未启用",
+    bridge_outbox_ready: "bridge_outbox 已启用",
   }[value] || value;
 }
 
@@ -505,6 +584,11 @@ document.addEventListener("click", (event) => {
   if (modeButton) {
     setMode(modeButton.dataset.mode);
     markControlsDirty();
+    return;
+  }
+  const panelButton = event.target.closest(".bookmark-tabs button");
+  if (panelButton) {
+    setActivePanel(panelButton.dataset.panel);
   }
 });
 
@@ -517,12 +601,14 @@ $("#saveControls").addEventListener("click", () => saveControls().catch((error) 
 $("#probeButton").addEventListener("click", () => probeNow().catch((error) => {
   $("#diagnosticDetail").textContent = `探测失败：${error.message}`;
 }));
+$("#bridgeRefreshButton").addEventListener("click", () => refresh({ force: true }));
 $("#toggleProbe").addEventListener("click", () => {
   state.probeExpanded = !state.probeExpanded;
   renderProbeJson();
 });
 
 refresh({ forceControls: true });
+setActivePanel("queue");
 setInterval(() => {
   if (!state.actionInProgress && !state.controlsSaving) refresh();
 }, 1800);

@@ -20,9 +20,10 @@ from app.personal_wechat_bot.control.send_readiness import build_send_readiness_
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
+from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state
 
 
-QUEUE_STATUSES = ("pending", "approved", "rejected", "sent", "failed")
+QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent", "failed")
 
 
 def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -39,7 +40,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "supports_multi_conversation": True,
             "send_driver_boundary": "windows_guarded requires foreground WeChat for output; backend events can receive multiple conversations without page OCR",
             "input_pipeline": "POST /api/backend-events or append-backend-event -> backend_events.jsonl -> run-agent/poll-backend-events -> conversation_ledgers",
-            "background_send_status": "not_supported_by_windows_guarded",
+            "background_send_status": _background_send_status(config),
         },
         "config": {
             "mode": config.mode,
@@ -53,6 +54,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "queues": queues,
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
+        "send_bridge": bridge_state(data_dir, limit=12),
         "wechat_window_probe": build_wechat_window_probe(max_children=80, max_controls=160, data_dir=data_dir),
         "audit": list_send_audit(data_dir, limit=30),
     }
@@ -67,12 +69,13 @@ def delete_sidebar_channel(data_dir: str | Path, conversation_id: str) -> dict[s
     if not channel_id:
         raise ValueError("conversation_id is required")
     store = _channel_store(data_dir)
-    deleted = store.delete_channel(channel_id)
+    cleanup = store.delete_channel_with_cleanup(channel_id)
     return {
         "status": "ok",
-        "deleted_count": 1 if deleted else 0,
-        "deleted_conversation_ids": [channel_id] if deleted else [],
-        "retained": ["conversation_ledgers", "file_workspace", "conversation_sessions"],
+        "deleted_count": 1 if cleanup["deleted"] else 0,
+        "deleted_conversation_ids": [channel_id] if cleanup["deleted"] else [],
+        "cleanup": cleanup,
+        "note": _cleanup_note(cleanup),
     }
 
 
@@ -83,15 +86,21 @@ def cleanup_sidebar_channels(data_dir: str | Path, *, hidden_only: bool = True) 
     hidden_items = state.get("hidden_items_all", [])
     store = _channel_store(data_dir)
     deleted: list[str] = []
+    cleanups: list[dict[str, Any]] = []
     for item in hidden_items if isinstance(hidden_items, list) else []:
         conversation_id = str(item.get("conversation_id", "")).strip() if isinstance(item, dict) else ""
-        if conversation_id and store.delete_channel(conversation_id):
+        if not conversation_id:
+            continue
+        cleanup = store.delete_channel_with_cleanup(conversation_id)
+        if cleanup["deleted"]:
             deleted.append(conversation_id)
+            cleanups.append({"conversation_id": conversation_id, **cleanup})
     return {
         "status": "ok",
         "deleted_count": len(deleted),
         "deleted_conversation_ids": deleted,
-        "retained": ["conversation_ledgers", "file_workspace", "conversation_sessions"],
+        "cleanups": cleanups,
+        "note": "微信可信通道仅删除注册；非微信来源通道会同步清除 ledger、file_workspace、session",
     }
 
 
@@ -127,6 +136,28 @@ def append_sidebar_backend_event(data_dir: str | Path, payload: dict[str, Any]) 
     }
 
 
+def build_sidebar_bridge_state(data_dir: str | Path = "data") -> dict[str, Any]:
+    return bridge_state(data_dir, limit=50)
+
+
+def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    bridge_id = str(payload.get("bridge_id") or payload.get("bridgeId") or "").strip()
+    if not bridge_id:
+        raise ValueError("bridge_id is required")
+    status = str(payload.get("status", "")).strip()
+    reason = str(payload.get("reason", "")).strip()
+    external_message_id = str(payload.get("external_message_id") or payload.get("externalMessageId") or "").strip()
+    extra = payload.get("payload")
+    return bridge_ack(
+        data_dir,
+        bridge_id,
+        status=status,
+        reason=reason,
+        external_message_id=external_message_id,
+        payload=extra if isinstance(extra, dict) else {},
+    )
+
+
 def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     reviewer = str(payload.get("reviewer", "sidebar"))
     note = str(payload.get("note", ""))
@@ -137,6 +168,21 @@ def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, paylo
     if action == "send-approved":
         return send_approved_confirm_item(data_dir, queue_id)
     raise ValueError(f"unknown queue action: {action}")
+
+
+def _cleanup_note(cleanup: dict[str, Any]) -> str:
+    policy = str(cleanup.get("cleanup_policy", ""))
+    if policy == "wechat_preserve":
+        return "微信可信通道已清除注册，对话文件、文件中间层和 session 已保留"
+    if policy == "non_wechat_purge":
+        return "非微信来源通道已完全清理，包括对话文件、文件中间层和 session"
+    return "通道不存在或已被清理"
+
+
+def _background_send_status(config: Any) -> str:
+    if str(getattr(config, "send_driver", "")) == "bridge_outbox":
+        return "bridge_outbox_ready" if bool(getattr(config, "send_enabled", False)) else "bridge_outbox_configured_disabled"
+    return "bridge_outbox_available"
 
 
 def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> Path:

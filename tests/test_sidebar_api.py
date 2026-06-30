@@ -6,7 +6,9 @@ from pathlib import Path
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.control.sidebar_api import (
+    ack_sidebar_bridge_item,
     append_sidebar_backend_event,
+    build_sidebar_bridge_state,
     build_sidebar_state,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
@@ -38,6 +40,8 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("readiness", state)
             self.assertIn("driver_probe", state)
             self.assertIn("audit", state)
+            self.assertIn("send_bridge", state)
+            self.assertIn("queued_to_bridge", state["queues"])
 
     def test_sidebar_channel_state_hides_probe_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,11 +170,56 @@ class SidebarApiTest(unittest.TestCase):
             state = build_sidebar_state(data_dir)
 
             self.assertEqual(result["deleted_conversation_ids"], [hidden.conversation_id])
+            self.assertEqual(result["cleanups"][0]["cleanup_policy"], "wechat_preserve")
             self.assertEqual(state["channels"]["count"], 1)
             self.assertEqual(state["channels"]["hidden_count"], 0)
             self.assertIsNotNone(store.get_channel(trusted.conversation_id))
             self.assertIsNone(store.get_channel(hidden.conversation_id))
             self.assertTrue(ledger_file.exists())
+
+    def test_sidebar_delete_untrusted_channel_fully_purges_associated_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = "legacy-noise"
+            channel_file = data_dir / "conversation_channels" / conversation_id / "channel.json"
+            ledger_dir = data_dir / "conversation_ledgers" / conversation_id
+            workspace_dir = data_dir / "file_workspace" / conversation_id
+            session_dir = data_dir / "conversation_sessions" / conversation_id
+            channel_file.parent.mkdir(parents=True, exist_ok=True)
+            ledger_dir.mkdir(parents=True, exist_ok=True)
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            session_dir.mkdir(parents=True, exist_ok=True)
+            channel_file.write_text(
+                """
+{
+  "conversation_id": "legacy-noise",
+  "conversation_type": "private",
+  "chat_title": "NOISE",
+  "status": "active",
+  "key_slots": 1,
+  "api_key_refs": [],
+  "session_scope": "per_conversation_current_session",
+  "sender_names": ["NOISE"],
+  "sender_wechat_ids": [],
+  "source_names": [],
+  "trusted_channel_source": false
+}
+""".strip(),
+                encoding="utf-8",
+            )
+            (ledger_dir / "conversation.md").write_text("ledger", encoding="utf-8")
+            (workspace_dir / "file.txt").write_text("file", encoding="utf-8")
+            (session_dir / "state.json").write_text("session", encoding="utf-8")
+
+            result = delete_sidebar_channel(data_dir, conversation_id)
+
+            self.assertEqual(result["deleted_count"], 1)
+            self.assertEqual(result["cleanup"]["cleanup_policy"], "non_wechat_purge")
+            self.assertFalse(channel_file.parent.exists())
+            self.assertFalse(ledger_dir.exists())
+            self.assertFalse(workspace_dir.exists())
+            self.assertFalse(session_dir.exists())
 
     def test_sidebar_delete_channel_removes_specific_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -237,6 +286,21 @@ class SidebarApiTest(unittest.TestCase):
             approved = sidebar_queue_action(data_dir, "approve", queue_id, {"reviewer": "test"})
 
             self.assertEqual(approved["item"]["status"], "approved")
+
+    def test_sidebar_bridge_state_and_ack_are_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            ack = ack_sidebar_bridge_item(
+                data_dir,
+                {"bridge_id": "bridge:test", "status": "sent", "reason": "manual"},
+            )
+            state = build_sidebar_bridge_state(data_dir)
+
+            self.assertEqual(ack["status"], "ok")
+            self.assertEqual(state["status"], "ok")
+            self.assertEqual(state["ack_count"], 1)
 
 
 def _reply() -> ReplyCandidate:

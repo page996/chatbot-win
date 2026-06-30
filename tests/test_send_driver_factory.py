@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app.personal_wechat_bot.config.schema import BotConfig
+from app.personal_wechat_bot.wechat_driver.bridge_send import BRIDGE_OUTBOX_SEND_DRIVER
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
     build_send_driver,
     implemented_send_drivers,
@@ -24,6 +25,17 @@ class SendDriverFactoryTest(unittest.TestCase):
         self.assertTrue(any(item["name"] == WINDOWS_GUARDED_SEND_DRIVER for item in registered))
         self.assertTrue(is_real_send_driver_implemented(WINDOWS_GUARDED_SEND_DRIVER))
         self.assertIn(WINDOWS_GUARDED_SEND_DRIVER, implemented_send_drivers())
+
+    def test_bridge_outbox_is_registered_and_real_send_capable(self) -> None:
+        config = BotConfig(send_driver=BRIDGE_OUTBOX_SEND_DRIVER)
+
+        driver = build_send_driver(config)
+        registered = registered_send_drivers()
+
+        self.assertIsNotNone(driver)
+        self.assertTrue(any(item["name"] == BRIDGE_OUTBOX_SEND_DRIVER for item in registered))
+        self.assertTrue(is_real_send_driver_implemented(BRIDGE_OUTBOX_SEND_DRIVER))
+        self.assertIn(BRIDGE_OUTBOX_SEND_DRIVER, implemented_send_drivers())
 
     def test_probe_reports_registered_driver_blocked_when_send_disabled(self) -> None:
         config = BotConfig(send_enabled=False, send_driver=WINDOWS_GUARDED_SEND_DRIVER)

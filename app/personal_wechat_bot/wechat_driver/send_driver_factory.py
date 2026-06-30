@@ -6,6 +6,10 @@ from typing import Any
 
 from app.personal_wechat_bot.config.schema import BotConfig
 from app.personal_wechat_bot.reply_gate.send_executor import SendingDriver
+from app.personal_wechat_bot.wechat_driver.bridge_send import (
+    BRIDGE_OUTBOX_SEND_DRIVER,
+    BridgeOutboxSendDriver,
+)
 from app.personal_wechat_bot.wechat_driver.windows_guarded_send import (
     WINDOWS_GUARDED_SEND_DRIVER,
     WindowsGuardedSendDriver,
@@ -29,7 +33,13 @@ _SEND_DRIVER_SPECS: dict[str, SendDriverSpec] = {
         builder=lambda config: WindowsGuardedSendDriver(send_enabled=config.send_enabled, data_dir=config.data_dir),
         real_send_implemented=True,
         description="Windows WeChat guarded paste-and-enter sender; requires foreground chat title match",
-    )
+    ),
+    BRIDGE_OUTBOX_SEND_DRIVER: SendDriverSpec(
+        name=BRIDGE_OUTBOX_SEND_DRIVER,
+        builder=lambda config: BridgeOutboxSendDriver(send_enabled=config.send_enabled, data_dir=config.data_dir),
+        real_send_implemented=True,
+        description="Non-foreground bridge outbox producer; external bridge must deliver and acknowledge",
+    ),
 }
 
 

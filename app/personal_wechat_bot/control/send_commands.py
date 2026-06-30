@@ -75,7 +75,7 @@ def send_approved_confirm_item(data_dir: str | Path, queue_id: str, driver: Any 
     reply = _reply_from_queue_item(item)
     driver = driver if driver is not None else build_send_driver(config)
     result = GuardedSendExecutor(config, driver).execute_confirmed(reply)
-    final_status = "sent" if result.status == "sent" else "failed"
+    final_status = result.status if result.status in {"sent", "queued_to_bridge"} else "failed"
     updated = queue.mark_send_result(queue_id, final_status, result.reason)
     _audit(data_dir).append(
         "confirm_send_attempt",

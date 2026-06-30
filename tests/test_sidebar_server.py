@@ -13,6 +13,7 @@ from app.personal_wechat_bot.config.loader import create_default_config
 from app.personal_wechat_bot.control.sidebar_server import _handler_factory
 from app.personal_wechat_bot.domain.models import ReplyCandidate
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxStore
 
 
 class SidebarServerTest(unittest.TestCase):
@@ -60,6 +61,9 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("setActiveStatus", script)
             self.assertIn("setStatusMessage", script)
             self.assertIn("probeNow", script)
+            self.assertIn("renderBridge", script)
+            self.assertIn("/api/bridge/ack", script)
+            self.assertIn("queued_to_bridge", script)
 
     def test_sidebar_server_serves_wechat_probe_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -149,6 +153,33 @@ class SidebarServerTest(unittest.TestCase):
 
             self.assertEqual(payload["status"], "ok")
             self.assertEqual(payload["item"]["status"], "approved")
+
+    def test_sidebar_server_serves_bridge_state_and_ack_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            record = BridgeOutboxStore(data_dir).enqueue("private-1", "hello")
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                state = json.loads(urlopen(f"http://{host}:{port}/api/bridge", timeout=5).read().decode("utf-8"))
+                request = Request(
+                    f"http://{host}:{port}/api/bridge/ack",
+                    data=json.dumps({"bridge_id": record["bridge_id"], "status": "sent"}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                ack = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(state["status"], "ok")
+            self.assertEqual(state["pending_count"], 1)
+            self.assertEqual(ack["status"], "ok")
 
 
 if __name__ == "__main__":

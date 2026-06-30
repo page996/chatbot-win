@@ -38,7 +38,9 @@ button {
 .dock-panel,
 .channels,
 .controls,
+.send-console,
 .queue-item,
+.bridge-item,
 .inspector,
 .audit {
   background: #ffffff;
@@ -285,8 +287,41 @@ h2 {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 8px;
+}
+
+.send-console {
+  border-radius: 10px;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.bookmark-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.bookmark-tabs button {
+  min-height: 34px;
+  border: 0;
+  border-right: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475467;
+}
+
+.bookmark-tabs button:last-child {
+  border-right: 0;
+}
+
+.bookmark-tabs button.active {
+  background: #e7f6f3;
+  color: #0f766e;
+  font-weight: 800;
 }
 
 .metric {
@@ -319,7 +354,8 @@ h2 {
 .queue-list,
 .audit-list,
 .handle-list,
-.channel-list {
+.channel-list,
+.bridge-list {
   display: grid;
   gap: 8px;
 }
@@ -407,6 +443,53 @@ h2 {
   border-radius: 10px;
   padding: 10px;
   border-left-width: 4px;
+}
+
+.bridge-summary {
+  border: 1px solid #d9e2ee;
+  border-radius: 8px;
+  padding: 9px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+  background: #f8fafc;
+}
+
+.bridge-summary > div {
+  min-width: 0;
+}
+
+.bridge-summary strong,
+.bridge-summary p {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.bridge-summary strong {
+  margin-top: 2px;
+  font-size: 13px;
+}
+
+.bridge-summary p,
+.bridge-item p {
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.bridge-item {
+  border-radius: 10px;
+  padding: 10px;
+  border-left-width: 4px;
+}
+
+.status-queued {
+  border-left-color: #2563eb;
+}
+
+.status-queued_to_bridge {
+  border-left-color: #2563eb;
 }
 
 .status-pending {

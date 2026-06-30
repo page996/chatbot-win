@@ -51,6 +51,7 @@ from app.personal_wechat_bot.wechat_driver.backend_events import (
     BackendEventJsonlDriver,
     append_backend_event,
 )
+from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state
 from app.personal_wechat_bot.wechat_driver.backend_file_watcher import BackendFileWatcher
 from app.personal_wechat_bot.wechat_driver.snapshot_provider import (
     FileSnapshotProvider,
@@ -125,6 +126,15 @@ def build_parser() -> argparse.ArgumentParser:
     send_audit = sub.add_parser("send-audit")
     send_audit.add_argument("--limit", type=int, default=20)
     send_audit.add_argument("--status", default=None)
+
+    bridge_status = sub.add_parser("send-bridge-state")
+    bridge_status.add_argument("--limit", type=int, default=30)
+
+    bridge_ack_parser = sub.add_parser("send-bridge-ack")
+    bridge_ack_parser.add_argument("bridge_id")
+    bridge_ack_parser.add_argument("--status", choices=["sent", "failed", "blocked"], required=True)
+    bridge_ack_parser.add_argument("--reason", default="")
+    bridge_ack_parser.add_argument("--external-message-id", default="")
 
     confirm_approve = sub.add_parser("confirm-approve")
     confirm_approve.add_argument("queue_id")
@@ -397,6 +407,19 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "send-audit":
         result = list_send_audit(args.data_dir, limit=args.limit, status=args.status)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "send-bridge-state":
+        print(json.dumps(bridge_state(args.data_dir, limit=args.limit), ensure_ascii=False, indent=2))
+        return
+    if args.command == "send-bridge-ack":
+        result = bridge_ack(
+            args.data_dir,
+            args.bridge_id,
+            status=args.status,
+            reason=args.reason,
+            external_message_id=args.external_message_id,
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "confirm-approve":

@@ -18,12 +18,15 @@ class SidebarWindowTest(unittest.TestCase):
                     "items": [{"queue_id": "q1", "reply": {"conversation_id": "c1", "text": "hello"}}],
                 },
                 "approved": {"count": 0, "items": []},
+                "queued_to_bridge": {"count": 1, "items": [{"queue_id": "q2"}]},
                 "failed": {"count": 0, "items": []},
             },
         }
 
         self.assertEqual(sidebar_window.queue_counts(state)["pending"], 1)
+        self.assertEqual(sidebar_window.queue_counts(state)["queued_to_bridge"], 1)
         self.assertEqual(sidebar_window.flatten_queue_items(state)[0]["queue_id"], "q1")
+        self.assertEqual(sidebar_window.flatten_queue_items(state)[1]["status"], "queued_to_bridge")
 
     def test_sidebar_geometry_uses_default_when_wechat_missing(self) -> None:
         original = sidebar_window._wechat_anchor

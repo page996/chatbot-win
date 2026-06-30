@@ -407,7 +407,10 @@ def _browser_candidates() -> list[Path]:
     return [path for path in roots if path.exists()]
 
 
-def flatten_queue_items(state: dict[str, Any], statuses: tuple[str, ...] = ("pending", "approved", "failed")) -> list[dict[str, Any]]:
+def flatten_queue_items(
+    state: dict[str, Any],
+    statuses: tuple[str, ...] = ("pending", "approved", "queued_to_bridge", "failed"),
+) -> list[dict[str, Any]]:
     queues = state.get("queues", {})
     if not isinstance(queues, dict):
         return []
@@ -423,7 +426,10 @@ def flatten_queue_items(state: dict[str, Any], statuses: tuple[str, ...] = ("pen
     return items
 
 
-def queue_counts(state: dict[str, Any], statuses: tuple[str, ...] = ("pending", "approved", "failed", "rejected", "sent")) -> dict[str, int]:
+def queue_counts(
+    state: dict[str, Any],
+    statuses: tuple[str, ...] = ("pending", "approved", "queued_to_bridge", "failed", "rejected", "sent"),
+) -> dict[str, int]:
     queues = state.get("queues", {})
     counts: dict[str, int] = {}
     for status in statuses:

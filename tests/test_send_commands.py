@@ -19,6 +19,7 @@ from app.personal_wechat_bot.control.send_commands import (
 )
 from app.personal_wechat_bot.domain.models import ReplyCandidate, SendResult
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_state
 
 
 ROOT = Path(__file__).resolve().parent
@@ -114,6 +115,24 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["send_result"]["reason"], "send_driver_missing")
             self.assertEqual(queue.get(queue_id)["status"], "failed")
+
+    def test_send_approved_confirm_item_can_queue_to_bridge_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
+            queue.approve(queue_id, reviewer="tester")
+
+            result = send_approved_confirm_item(data_dir, queue_id)
+            bridge = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(result["status"], "queued_to_bridge")
+            self.assertEqual(result["send_result"]["status"], "queued_to_bridge")
+            self.assertEqual(queue.get(queue_id)["status"], "queued_to_bridge")
+            self.assertEqual(bridge["pending_count"], 1)
+            self.assertEqual(bridge["items"][0]["text"], "hello bridge")
 
     def test_probe_send_controls_reports_configured_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,6 +250,30 @@ class SendCommandsTest(unittest.TestCase):
 
             self.assertEqual(payload["probe"]["normalized_driver"], "windows_guarded")
             self.assertEqual(config.send_driver, "not_implemented")
+
+    def test_send_bridge_cli_returns_state_and_accepts_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            self._run("--data-dir", str(data_dir), "init")
+
+            state = json.loads(self._run("--data-dir", str(data_dir), "send-bridge-state"))
+            ack = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "send-bridge-ack",
+                    "bridge:test",
+                    "--status",
+                    "sent",
+                    "--reason",
+                    "manual",
+                )
+            )
+            updated = json.loads(self._run("--data-dir", str(data_dir), "send-bridge-state"))
+
+            self.assertEqual(state["status"], "ok")
+            self.assertEqual(ack["status"], "ok")
+            self.assertEqual(updated["ack_count"], 1)
 
     def _run(self, *args: str) -> str:
         completed = subprocess.run(
