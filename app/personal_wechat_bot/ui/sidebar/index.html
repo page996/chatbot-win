@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 审计面板</title>
-    <link rel="stylesheet" href="/styles.css?v=20260630-5" />
+    <link rel="stylesheet" href="/styles.css?v=20260630-6" />
   </head>
   <body>
     <main class="shell">
@@ -68,6 +68,7 @@
         <div class="bookmark-tabs" role="tablist" aria-label="send console">
           <button class="active" data-panel="queue">发送审核</button>
           <button data-panel="bridge">非前台桥</button>
+          <button data-panel="runtime">技能/人设</button>
         </div>
         <div id="queuePanel">
           <section class="metrics">
@@ -110,6 +111,50 @@
           </div>
           <div id="bridgeList" class="bridge-list"></div>
         </div>
+        <div id="runtimePanel" hidden>
+          <div class="runtime-summary">
+            <div>
+              <span class="eyebrow">长效注入</span>
+              <strong id="runtimePolicy">清空上下文不会影响已装备卡片</strong>
+              <p id="runtimeStorage">保存位置读取中</p>
+            </div>
+            <button id="runtimeRefreshButton" class="ghost small">刷新</button>
+          </div>
+
+          <section class="runtime-section">
+            <div class="section-head">
+              <h2>技能入口</h2>
+              <span id="skillCount">0</span>
+            </div>
+            <div id="skillList" class="card-list"></div>
+          </section>
+
+          <section class="runtime-section">
+            <div class="section-head">
+              <h2>人物卡</h2>
+              <span id="personaName">未装备</span>
+            </div>
+            <div id="personaList" class="card-list"></div>
+            <form id="personaForm" class="card-form">
+              <input id="personaCardName" type="text" placeholder="新人物卡名称" />
+              <textarea id="personaCardContent" rows="5" placeholder="人物设定、语气、边界、示例说话风格"></textarea>
+              <button class="primary" type="submit">保存并装备人物卡</button>
+            </form>
+          </section>
+
+          <section class="runtime-section">
+            <div class="section-head">
+              <h2>任务卡</h2>
+              <span id="taskCount">0</span>
+            </div>
+            <div id="taskList" class="card-list"></div>
+            <form id="taskForm" class="card-form">
+              <input id="taskCardName" type="text" placeholder="新任务卡名称" />
+              <textarea id="taskCardContent" rows="5" placeholder="长期任务目标、流程、约束和输出格式"></textarea>
+              <button class="primary" type="submit">保存并装备任务卡</button>
+            </form>
+          </section>
+        </div>
       </section>
 
       <section class="inspector">
@@ -131,6 +176,6 @@
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
-    <script src="/app.js?v=20260630-5"></script>
+    <script src="/app.js?v=20260630-6"></script>
   </body>
 </html>

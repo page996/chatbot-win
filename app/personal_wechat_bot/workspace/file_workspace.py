@@ -12,7 +12,11 @@ from typing import Any
 from app.personal_wechat_bot.domain.models import utc_now_iso
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import OcrEngine
-from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import (
+    AUDIO_SUFFIXES,
+    IMAGE_SUFFIXES,
+    AttachmentParseResult,
+)
 from app.personal_wechat_bot.workspace.table_artifacts import SPREADSHEET_SUFFIXES, write_table_artifacts
 
 
@@ -716,10 +720,10 @@ def _document_media_analysis(path: Path, suffix: str, media_artifacts: dict[str,
     if suffix == ".pdf":
         return _pdf_media_analysis(path)
     return {
-        "has_images": suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"},
-        "has_audio": False,
-        "image_count": 1 if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"} else 0,
-        "audio_count": 0,
+        "has_images": suffix in IMAGE_SUFFIXES,
+        "has_audio": suffix in AUDIO_SUFFIXES,
+        "image_count": 1 if suffix in IMAGE_SUFFIXES else 0,
+        "audio_count": 1 if suffix in AUDIO_SUFFIXES else 0,
         "samples": [],
         "embedded": False,
         "detection": "suffix",
@@ -898,8 +902,10 @@ def _file_type(suffix: str, kind: str) -> str:
         return "word"
     if suffix == ".pdf":
         return "pdf"
-    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
+    if suffix in IMAGE_SUFFIXES:
         return "image"
+    if suffix in AUDIO_SUFFIXES:
+        return "audio"
     return kind or "file"
 
 

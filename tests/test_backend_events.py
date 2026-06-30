@@ -113,6 +113,10 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertIn("[后台附件] screen.png file_id=", enriched.text)
         self.assertIn("图片 OCR 内容", enriched.text)
 
+    def test_audio_extensions_are_available_for_existing_configs(self) -> None:
+        self.assertIn(".m4a", self.config.file_allowed_extensions)
+        self.assertIn(".silk", self.config.file_allowed_extensions)
+
     def test_backend_event_preserves_quote_metadata(self) -> None:
         append_backend_event(
             self.event_file,
@@ -127,6 +131,69 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0].driver_meta["quote"]["message_id"], "quoted-message-id")
         self.assertEqual(messages[0].driver_meta["quote"]["text"], "被引用内容")
+
+    def test_backend_event_voice_text_becomes_voice_metadata(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            voice={"text": "这是微信自带转文字", "duration": "6s"},
+        )
+
+        messages = self.driver.read_new_messages()
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].text, "这是微信自带转文字")
+        self.assertEqual(messages[0].driver_meta["voice"]["text"], "这是微信自带转文字")
+        self.assertEqual(messages[0].driver_meta["voice"]["source"], "wechat_builtin_voice_to_text")
+
+    def test_polling_runner_writes_backend_voice_text_to_ledger(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            voice={"text": "语音里安排一个任务"},
+        )
+        runtime = build_runtime(self.config)
+        driver = BackendEventJsonlDriver(
+            self.event_file,
+            runtime.file_index,
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+            file_workspace=runtime.file_workspace,
+            session_store=runtime.session_store,
+        )
+
+        result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_forever(max_loops=1)
+        entry = runtime.ledger_store.read_entries(result["processed"][0]["message"]["conversation_id"])[0]
+
+        self.assertEqual(entry.text_blocks[0]["kind"], "voice:transcript")
+        self.assertEqual(entry.text_blocks[0]["text"], "语音里安排一个任务")
+
+    def test_audio_attachment_is_staged_and_marked_asr_not_configured(self) -> None:
+        audio = self.inbox / "voice.m4a"
+        audio.write_bytes(b"fake audio")
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="请听这段语音文件",
+            attachments=[{"path": "voice.m4a", "kind": "audio"}],
+        )
+
+        messages = self.driver.read_new_messages()
+        enriched = self.driver.enrich_message_attachments(
+            messages[0],
+            conversation_id=messages[0].driver_meta["conversation_id_hint"],
+            session_id=messages[0].driver_meta["session_id"],
+        )
+
+        attachment = enriched.driver_meta["attachments"][0]
+        self.assertEqual(attachment["status"], "indexed")
+        self.assertEqual(attachment["parse"]["kind"], "audio")
+        self.assertEqual(attachment["parse"]["error"], "local_asr_not_configured")
+        self.assertIn("未配置本地 ASR", attachment["parse"]["summary"])
 
     def test_backend_event_history_is_emitted_before_current_as_context_only(self) -> None:
         append_backend_event(

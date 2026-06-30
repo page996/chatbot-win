@@ -216,6 +216,8 @@ def build_parser() -> argparse.ArgumentParser:
     append_backend.add_argument("--group", action="store_true")
     append_backend.add_argument("--observed-at", default="")
     append_backend.add_argument("--attachment", action="append", default=[])
+    append_backend.add_argument("--voice-text", default="")
+    append_backend.add_argument("--voice-duration", default="")
     append_backend.add_argument("--quote-text", default="")
     append_backend.add_argument("--quote-message-id", default="")
     append_backend.add_argument("--quote-sender-name", default="")
@@ -512,6 +514,7 @@ def main(argv: list[str] | None = None) -> None:
             is_group=args.group,
             observed_at=args.observed_at,
             attachments=args.attachment,
+            voice=_voice_payload(args),
             quote=_quote_payload(args),
             history=_history_payload(args),
         )
@@ -709,6 +712,20 @@ def _quote_payload(args: argparse.Namespace) -> dict[str, str] | None:
     if not cleaned:
         return None
     return {**cleaned, "source": "append_backend_event_cli"}
+
+
+def _voice_payload(args: argparse.Namespace) -> dict[str, str] | None:
+    text = str(getattr(args, "voice_text", "")).strip()
+    if not text:
+        return None
+    duration = str(getattr(args, "voice_duration", "")).strip()
+    voice = {
+        "status": "transcribed",
+        "source": "wechat_builtin_voice_to_text",
+        "text": text,
+        "duration": duration,
+    }
+    return {key: value for key, value in voice.items() if value}
 
 
 def _history_payload(args: argparse.Namespace) -> list[dict[str, Any]]:

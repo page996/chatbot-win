@@ -34,6 +34,7 @@ class BackendMessageEvent:
     sender_wechat_id: str | None = None
     observed_at: str = ""
     attachments: tuple[BackendAttachment, ...] = ()
+    voice: dict[str, Any] | None = None
     quote: dict[str, Any] | None = None
     history: tuple["BackendMessageEvent", ...] = ()
 
@@ -129,7 +130,8 @@ class BackendEventJsonlDriver:
             else DEFAULT_SESSION_ID
         )
         attachments = [_attachment_pending(item) for item in event.attachments]
-        text = _compose_pending_message_text(event.text, attachments)
+        voice = _normalize_voice(event.voice)
+        text = _compose_pending_message_text(_message_text_with_voice(event.text, voice), attachments)
         if not text.strip():
             return None
         return RawWeChatMessage(
@@ -149,6 +151,7 @@ class BackendEventJsonlDriver:
                 "conversation_id_hint": conversation_id,
                 "session_id": session_id,
                 "original_text": event.text,
+                "voice": voice,
                 "backend_attachments_pending": True,
                 "attachments": attachments,
                 "quote": event.quote or {},
@@ -196,7 +199,11 @@ class BackendEventJsonlDriver:
             )
         allowed = [item for item in indexed if item.get("status") == "indexed"]
         blocked = [item for item in indexed if item.get("status") == "blocked"]
-        text = _compose_message_text(str(raw.driver_meta.get("original_text", raw.text)), allowed, blocked)
+        text = _compose_message_text(
+            _message_text_with_voice(str(raw.driver_meta.get("original_text", raw.text)), _normalize_voice(raw.driver_meta.get("voice"))),
+            allowed,
+            blocked,
+        )
         meta = dict(raw.driver_meta)
         meta["attachments"] = indexed
         meta["backend_attachments_pending"] = False
@@ -223,6 +230,7 @@ def append_backend_event(
     is_self: bool = False,
     is_group: bool = False,
     attachments: list[str | dict[str, Any]] | None = None,
+    voice: dict[str, Any] | None = None,
     observed_at: str = "",
     quote: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
@@ -237,6 +245,9 @@ def append_backend_event(
         "observed_at": observed_at or utc_now_iso(),
         "attachments": [_attachment_payload(item) for item in attachments or []],
     }
+    parsed_voice = _normalize_voice(voice)
+    if parsed_voice:
+        payload["voice"] = parsed_voice
     if quote:
         payload["quote"] = quote
     if history:
@@ -280,6 +291,7 @@ def append_backend_event_payload(event_path: str | Path, payload: dict[str, Any]
         is_self=bool(payload.get("is_self", payload.get("isSelf", False))),
         is_group=bool(payload.get("is_group", payload.get("group", False))),
         attachments=attachments,
+        voice=_voice_payload(payload),
         observed_at=str(payload.get("observed_at") or payload.get("observedAt") or "").strip(),
         quote=parsed_quote,
         history=[item for item in history if isinstance(item, dict)],
@@ -334,6 +346,7 @@ def _parse_event_payload(
     text = str(payload.get("text", "")).strip()
     attachments = _parse_attachments(payload.get("attachments", []))
     quote = _parse_quote(payload.get("quote"))
+    voice = _normalize_voice(payload.get("voice"))
     seed = {**payload, "_line_no": line_no}
     if suffix:
         seed["_suffix"] = suffix
@@ -348,6 +361,7 @@ def _parse_event_payload(
         is_group=bool(payload.get("is_group", False)),
         observed_at=str(payload.get("observed_at", "")).strip(),
         attachments=attachments,
+        voice=voice,
         quote=quote,
         history=_parse_history(payload.get("history", []), parent=payload, line_no=line_no) if include_history else (),
     )
@@ -377,6 +391,9 @@ def _history_payload(value: dict[str, Any]) -> dict[str, Any]:
         attachments = [attachments]
     if isinstance(attachments, list):
         payload["attachments"] = [_attachment_payload(item) for item in attachments if isinstance(item, (str, dict))]
+    voice = _voice_payload(payload)
+    if voice:
+        payload["voice"] = voice
     quote = _parse_quote(payload.get("quote")) if "quote" in payload else None
     if quote:
         payload["quote"] = quote
@@ -429,6 +446,62 @@ def _parse_quote(value: Any) -> dict[str, Any] | None:
     return cleaned or None
 
 
+def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    raw = payload.get("voice")
+    if isinstance(raw, dict):
+        voice = dict(raw)
+    else:
+        voice = {}
+    text = str(
+        voice.get("text")
+        or payload.get("voice_text")
+        or payload.get("voiceText")
+        or payload.get("transcript")
+        or ""
+    ).strip()
+    if not text:
+        return None
+    duration = str(
+        voice.get("duration")
+        or payload.get("voice_duration")
+        or payload.get("voiceDuration")
+        or ""
+    ).strip()
+    return _normalize_voice(
+        {
+            **voice,
+            "text": text,
+            "duration": duration,
+        }
+    )
+
+
+def _normalize_voice(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    text = str(value.get("text", "")).strip()
+    if not text:
+        return {}
+    return {
+        "status": str(value.get("status") or "transcribed").strip(),
+        "source": str(value.get("source") or "wechat_builtin_voice_to_text").strip(),
+        "text": text,
+        "duration": str(value.get("duration", "")).strip(),
+    }
+
+
+def _message_text_with_voice(text: str, voice: dict[str, Any]) -> str:
+    clean_text = text.strip()
+    voice_text = str(voice.get("text", "")).strip() if voice else ""
+    if not voice_text:
+        return clean_text
+    if clean_text and _normalize_for_match(clean_text) == _normalize_for_match(voice_text):
+        return clean_text
+    if clean_text:
+        return f"{clean_text}\n[微信语音转文字]\n{voice_text}"
+    return voice_text
+
+
 def _compose_message_text(
     text: str,
     allowed_attachments: list[dict[str, Any]],
@@ -471,3 +544,7 @@ def _compose_pending_message_text(text: str, attachments: list[dict[str, Any]]) 
 def _event_raw_id(payload: dict[str, Any]) -> str:
     data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(data.encode("utf-8")).hexdigest()[:24]
+
+
+def _normalize_for_match(text: str) -> str:
+    return " ".join(text.split()).lower()

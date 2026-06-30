@@ -12,6 +12,10 @@ from xml.etree import ElementTree
 from app.personal_wechat_bot.vision.ocr import OcrEngine
 
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".amr", ".silk"}
+
+
 @dataclass(frozen=True)
 class AttachmentParseResult:
     status: str
@@ -44,8 +48,10 @@ class BackendAttachmentParser:
                 return self._parse_worker(file_path, "pdf")
             if suffix in {".xlsx", ".xlsm", ".csv"}:
                 return self._parse_worker(file_path, "spreadsheet")
-            if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
+            if suffix in IMAGE_SUFFIXES:
                 return self._parse_image(file_path)
+            if suffix in AUDIO_SUFFIXES:
+                return self._parse_audio(file_path)
             return AttachmentParseResult("skipped", "file", f"暂不解析此类附件：{suffix or 'unknown'}")
         except Exception as exc:
             return AttachmentParseResult(
@@ -77,6 +83,17 @@ class BackendAttachmentParser:
         if not preview:
             return AttachmentParseResult("empty", "image", "图片 OCR 未识别到文本")
         return AttachmentParseResult("parsed", "image", "已完成图片 OCR 预览", preview)
+
+    def _parse_audio(self, path: Path) -> AttachmentParseResult:
+        duration_note = ""
+        if path.exists():
+            duration_note = f" bytes={path.stat().st_size}"
+        return AttachmentParseResult(
+            "skipped",
+            "audio",
+            f"音频已保存到文件中间层，当前未配置本地 ASR 转写{duration_note}",
+            error="local_asr_not_configured",
+        )
 
     def _parse_worker(self, path: Path, kind: str) -> AttachmentParseResult:
         if self.worker_python is None or not self.worker_python.exists():
@@ -150,8 +167,10 @@ def _kind_for_suffix(suffix: str) -> str:
         return "pdf"
     if suffix in {".xlsx", ".xlsm", ".csv"}:
         return "spreadsheet"
-    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
+    if suffix in IMAGE_SUFFIXES:
         return "image"
+    if suffix in AUDIO_SUFFIXES:
+        return "audio"
     return "file"
 
 

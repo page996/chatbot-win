@@ -74,6 +74,18 @@ class BackendAttachmentParserTest(unittest.TestCase):
             self.assertEqual(result.kind, "pdf")
             self.assertIn("worker Python 不可用", result.summary)
 
+    def test_audio_attachment_is_preserved_with_explicit_asr_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "voice.m4a"
+            path.write_bytes(b"fake audio")
+
+            result = BackendAttachmentParser(max_preview_chars=100).parse(path)
+
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual(result.kind, "audio")
+            self.assertIn("未配置本地 ASR", result.summary)
+            self.assertEqual(result.error, "local_asr_not_configured")
+
     def test_csv_attachment_extracts_rows_with_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "table.csv"

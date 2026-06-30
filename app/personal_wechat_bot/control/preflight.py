@@ -133,6 +133,14 @@ def build_preflight_report(
             "read_roots": [str(path) for path in file_roots],
             "allowed_extensions": list(config.file_allowed_extensions),
             "max_bytes": config.file_max_bytes,
+            "multimedia_parse": {
+                "images": "file_layer_ocr_to_workspace_artifacts",
+                "voice_messages": "backend_event_voice_text_supported; upstream must provide WeChat built-in transcript",
+                "audio_files": "preserved_and_indexed; local_asr_not_configured",
+                "docx_embedded_images": "extracted_and_ocr_if_ocr_engine_available",
+                "docx_embedded_audio": "extracted_only; local_asr_not_configured",
+                "pdf_embedded_media": "heuristic_detection_only",
+            },
         },
         "runtime_guards": {
             "persistent_dedup": True,

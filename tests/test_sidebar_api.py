@@ -9,10 +9,12 @@ from app.personal_wechat_bot.control.sidebar_api import (
     ack_sidebar_bridge_item,
     append_sidebar_backend_event,
     build_sidebar_bridge_state,
+    build_sidebar_runtime_cards,
     build_sidebar_state,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
     sidebar_queue_action,
+    sidebar_runtime_card_action,
     update_sidebar_controls,
 )
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
@@ -41,9 +43,11 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("driver_probe", state)
             self.assertIn("audit", state)
             self.assertIn("send_bridge", state)
+            self.assertIn("runtime_cards", state)
             self.assertIn("queued_to_bridge", state["queues"])
             self.assertEqual(state["send_bridge"]["manual_bound_count"], 0)
             self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_manual_capture_only_available")
+            self.assertIn("skill.file_workspace_agent", [item["card_id"] for item in state["runtime_cards"]["active"]["skills"]])
 
     def test_sidebar_channel_state_hides_probe_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -303,6 +307,21 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(ack["status"], "ok")
             self.assertEqual(state["status"], "ok")
             self.assertEqual(state["ack_count"], 1)
+
+    def test_sidebar_runtime_cards_actions_are_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            saved = sidebar_runtime_card_action(
+                data_dir,
+                "save-task",
+                {"name": "测试任务卡", "content": "持续生效的任务约束"},
+            )
+            state = build_sidebar_runtime_cards(data_dir)
+
+            self.assertEqual(saved["status"], "ok")
+            self.assertIn("持续生效的任务约束", "\n".join(item["content"] for item in state["active"]["tasks"]))
 
 
 def _reply() -> ReplyCandidate:

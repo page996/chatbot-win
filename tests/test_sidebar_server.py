@@ -63,6 +63,9 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("probeNow", script)
             self.assertIn("renderBridge", script)
             self.assertIn("/api/bridge/ack", script)
+            self.assertIn("renderRuntimeCards", script)
+            self.assertIn("/api/runtime-cards/", script)
+            self.assertIn("savePersonaCard", script)
             self.assertIn("queued_to_bridge", script)
 
     def test_sidebar_server_serves_wechat_probe_api(self) -> None:
@@ -180,6 +183,32 @@ class SidebarServerTest(unittest.TestCase):
             self.assertEqual(state["status"], "ok")
             self.assertEqual(state["pending_count"], 1)
             self.assertEqual(ack["status"], "ok")
+
+    def test_sidebar_server_serves_runtime_cards_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                state = json.loads(urlopen(f"http://{host}:{port}/api/runtime-cards", timeout=5).read().decode("utf-8"))
+                request = Request(
+                    f"http://{host}:{port}/api/runtime-cards/save-task",
+                    data=json.dumps({"name": "HTTP 任务卡", "content": "通过 HTTP 装备"}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                saved = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(state["status"], "ok")
+            self.assertEqual(saved["status"], "ok")
+            self.assertIn("通过 HTTP 装备", saved["runtime_cards"]["active"]["tasks"][0]["content"])
 
 
 if __name__ == "__main__":

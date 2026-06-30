@@ -68,6 +68,14 @@ class BotConfig:
             ".jpeg",
             ".bmp",
             ".webp",
+            ".mp3",
+            ".wav",
+            ".m4a",
+            ".aac",
+            ".ogg",
+            ".wma",
+            ".amr",
+            ".silk",
         ]
     )
     file_max_bytes: int = 20 * 1024 * 1024

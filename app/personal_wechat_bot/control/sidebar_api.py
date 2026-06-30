@@ -7,6 +7,7 @@ from typing import Any
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
+from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     list_confirm_queue,
@@ -52,6 +53,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "send_min_interval_seconds": config.send_min_interval_seconds,
         },
         "channels": channels,
+        "runtime_cards": build_sidebar_runtime_cards(data_dir),
         "queues": queues,
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
@@ -139,6 +141,15 @@ def append_sidebar_backend_event(data_dir: str | Path, payload: dict[str, Any]) 
 
 def build_sidebar_bridge_state(data_dir: str | Path = "data") -> dict[str, Any]:
     return bridge_state(data_dir, limit=50)
+
+
+def build_sidebar_runtime_cards(data_dir: str | Path = "data") -> dict[str, Any]:
+    return RuntimeCardStore(data_dir).state()
+
+
+def sidebar_runtime_card_action(data_dir: str | Path, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    result = RuntimeCardStore(data_dir).apply_action(action, payload)
+    return {"status": "ok", "runtime_cards": RuntimeCardStore(data_dir).state(), "result": result}
 
 
 def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:

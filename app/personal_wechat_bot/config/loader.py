@@ -76,12 +76,7 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         save_full_chat=bool(raw.get("save_full_chat", True)),
         save_raw_and_summary=bool(raw.get("save_raw_and_summary", True)),
         file_read_roots=list(raw.get("file_read_roots", ["inbox"])),
-        file_allowed_extensions=list(
-            raw.get(
-                "file_allowed_extensions",
-                [".txt", ".md", ".docx", ".pdf", ".xlsx", ".xlsm", ".csv", ".png", ".jpg", ".jpeg", ".bmp", ".webp"],
-            )
-        ),
+        file_allowed_extensions=_file_allowed_extensions_from_json(raw),
         file_max_bytes=int(raw.get("file_max_bytes", 20 * 1024 * 1024)),
         search_blocklist=list(blocklist),
     )
@@ -208,6 +203,25 @@ def _providers_from_json(raw: Any, fallback_llm: LLMConfig) -> dict[str, Provide
     if "chat" not in providers:
         providers["chat"] = _provider_from_llm(fallback_llm)
     return providers
+
+
+def _file_allowed_extensions_from_json(raw: dict[str, Any]) -> list[str]:
+    default_extensions = BotConfig().file_allowed_extensions
+    configured = raw.get("file_allowed_extensions", default_extensions)
+    values = configured if isinstance(configured, list) else default_extensions
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in [*values, *default_extensions]:
+        suffix = str(item).strip().lower()
+        if not suffix:
+            continue
+        if not suffix.startswith("."):
+            suffix = "." + suffix
+        if suffix in seen:
+            continue
+        seen.add(suffix)
+        normalized.append(suffix)
+    return normalized
 
 
 def _provider_from_json(name: str, raw: dict[str, Any]) -> ProviderConfig:

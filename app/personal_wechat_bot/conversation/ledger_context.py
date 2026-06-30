@@ -11,7 +11,7 @@ from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.domain.models import NormalizedMessage
 
 
-SectionName = Literal["memory", "analysis", "quote", "recent", "files", "links"]
+SectionName = Literal["runtime_cards", "memory", "analysis", "quote", "recent", "files", "links"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,7 @@ class LedgerContextSnapshot:
     link_refs: list[dict[str, Any]] = field(default_factory=list)
     memory: dict[str, Any] = field(default_factory=dict)
     analysis: dict[str, Any] = field(default_factory=dict)
+    runtime_card_lines: list[str] = field(default_factory=list)
     sections: list[ContextSection] = field(default_factory=list)
     token_budget: int = 3000
     estimated_tokens: int = 0
@@ -63,10 +64,12 @@ class LedgerContextAssembler:
         ledger_store: ConversationLedgerStore,
         max_recent_entries: int = 30,
         token_budget: int = 3000,
+        runtime_cards: Any | None = None,
     ):
         self.ledger_store = ledger_store
         self.max_recent_entries = max_recent_entries
         self.token_budget = token_budget
+        self.runtime_cards = runtime_cards
 
     def build_snapshot(self, message: NormalizedMessage) -> LedgerContextSnapshot:
         session_id = _session_id_from_message(message)
@@ -85,8 +88,10 @@ class LedgerContextAssembler:
         conversation_dir = self.ledger_store.conversation_markdown_path(message.conversation_id).parent
         memory = _read_memory(memory_dir_for_conversation(conversation_dir, session_id))
         analysis = _analyze(session_entries, message)
+        runtime_card_lines = self.runtime_cards.prompt_lines() if self.runtime_cards is not None else []
         sections = _budget_sections(
             _build_sections(
+                runtime_card_lines=runtime_card_lines,
                 memory=memory,
                 analysis=analysis,
                 quote_entries=quote_entries,
@@ -106,6 +111,7 @@ class LedgerContextAssembler:
             link_refs=link_refs,
             memory=memory,
             analysis=analysis,
+            runtime_card_lines=runtime_card_lines,
             sections=sections,
             token_budget=self.token_budget,
             estimated_tokens=sum(section.token_estimate for section in sections),
@@ -141,6 +147,7 @@ def as_payload(entry: Any) -> dict[str, Any]:
 
 def _build_sections(
     *,
+    runtime_card_lines: list[str],
     memory: dict[str, Any],
     analysis: dict[str, Any],
     quote_entries: list[dict[str, Any]],
@@ -149,6 +156,8 @@ def _build_sections(
     link_refs: list[dict[str, Any]],
 ) -> list[ContextSection]:
     sections: list[ContextSection] = []
+    if runtime_card_lines:
+        sections.append(_section("runtime_cards", "Persistent runtime cards:", runtime_card_lines, forced=True))
     memory_lines = _memory_lines(memory)
     if memory_lines:
         sections.append(_section("memory", "Long-term memory:", memory_lines, forced=True))

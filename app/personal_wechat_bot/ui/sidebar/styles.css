@@ -143,6 +143,12 @@ h2 {
   font-size: 12px;
 }
 
+.primary.small,
+.danger.small {
+  min-height: 26px;
+  font-size: 12px;
+}
+
 .dock-panel {
   display: flex;
   justify-content: space-between;
@@ -300,7 +306,7 @@ h2 {
 
 .bookmark-tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   border: 1px solid #cbd5e1;
   border-radius: 8px;
   overflow: hidden;
@@ -454,6 +460,140 @@ h2 {
   gap: 8px;
   align-items: flex-start;
   background: #f8fafc;
+}
+
+.runtime-summary {
+  border: 1px solid #d9e2ee;
+  border-radius: 8px;
+  padding: 9px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+  background: #f8fafc;
+}
+
+.runtime-summary > div {
+  min-width: 0;
+}
+
+.runtime-summary strong,
+.runtime-summary p {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.runtime-summary strong {
+  margin-top: 2px;
+  font-size: 13px;
+}
+
+.runtime-summary p {
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.runtime-section {
+  display: grid;
+  gap: 8px;
+}
+
+#runtimePanel {
+  display: grid;
+  gap: 10px;
+}
+
+#runtimePanel[hidden] {
+  display: none;
+}
+
+.card-list {
+  display: grid;
+  gap: 8px;
+}
+
+.runtime-card {
+  border: 1px solid #e4eaf2;
+  border-radius: 8px;
+  padding: 9px;
+  background: #ffffff;
+}
+
+.runtime-card.active {
+  border-color: #0f766e;
+  box-shadow: inset 0 0 0 1px rgba(15, 118, 110, 0.25);
+}
+
+.runtime-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.runtime-card-head > div {
+  min-width: 0;
+}
+
+.runtime-card strong {
+  display: block;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.runtime-card span,
+.card-state {
+  color: #667085;
+  font-size: 11px;
+}
+
+.card-state {
+  white-space: nowrap;
+  border: 1px solid #d9e2ee;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: #f8fafc;
+}
+
+.runtime-card.active .card-state {
+  border-color: #99d9ce;
+  color: #0f766e;
+  background: #e7f6f3;
+}
+
+.runtime-card p {
+  margin: 7px 0 8px;
+  color: #344054;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.card-form {
+  display: grid;
+  gap: 7px;
+  border: 1px solid #d9e2ee;
+  border-radius: 8px;
+  padding: 8px;
+  background: #f8fafc;
+}
+
+.card-form input,
+.card-form textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #182230;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.card-form textarea {
+  resize: vertical;
+  line-height: 1.45;
 }
 
 .bridge-summary > div {

@@ -20,6 +20,7 @@ from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer
 from app.personal_wechat_bot.normalizer.normalizer import MessageNormalizer
 from app.personal_wechat_bot.persona.topic_classifier import AITopicClassifier
+from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
 from app.personal_wechat_bot.reply_gate.gate import ReplyGate
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
@@ -52,6 +53,7 @@ class BotRuntime:
     ledger_store: ConversationLedgerStore
     ledger_context: LedgerContextAssembler
     memory_maintainer: MemoryMaintainer
+    runtime_cards: RuntimeCardStore
     link_annotations: LinkAnnotationService
     file_workspace: FileWorkspace
     active_driver: object | None = None
@@ -63,7 +65,12 @@ def build_runtime(config: BotConfig) -> BotRuntime:
     file_index = FileIndex(data_root / "file_index.sqlite")
     session_store = ConversationSessionStore(data_root)
     ledger_store = ConversationLedgerStore(data_root)
-    ledger_context = LedgerContextAssembler(ledger_store, max_recent_entries=config.context_window_messages + 10)
+    runtime_cards = RuntimeCardStore(data_root)
+    ledger_context = LedgerContextAssembler(
+        ledger_store,
+        max_recent_entries=config.context_window_messages + 10,
+        runtime_cards=runtime_cards,
+    )
     memory_maintainer = MemoryMaintainer(ledger_store)
     file_workspace = FileWorkspace(data_root / "file_workspace")
     model_router = ModelRouter(config.providers)
@@ -115,6 +122,7 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         ledger_store=ledger_store,
         ledger_context=ledger_context,
         memory_maintainer=memory_maintainer,
+        runtime_cards=runtime_cards,
         link_annotations=link_annotations,
         file_workspace=file_workspace,
     )

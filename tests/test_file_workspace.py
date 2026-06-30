@@ -184,6 +184,26 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertTrue(analysis["has_images"])
             self.assertEqual(analysis["blocked_capabilities"], [])
 
+    def test_audio_file_is_marked_as_audio_with_asr_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "voice.m4a"
+            source.write_bytes(b"fake audio")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="audio")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("skipped", "audio", "音频已保存到文件中间层，当前未配置本地 ASR 转写", error="local_asr_not_configured"),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            content = (Path(staged.derived_dir) / "content.md").read_text(encoding="utf-8")
+
+            self.assertEqual(analysis["file_type"], "audio")
+            self.assertTrue(analysis["has_audio"])
+            self.assertEqual(analysis["media"]["audio_count"], 1)
+            self.assertIn("local_asr_not_configured", content)
+
     def test_long_parse_result_is_chunked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "long.txt"

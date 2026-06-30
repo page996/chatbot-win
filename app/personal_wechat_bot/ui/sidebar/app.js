@@ -51,6 +51,7 @@ function render({ forceControls = false } = {}) {
   renderCounts(data);
   renderQueue();
   renderBridge(data.send_bridge || {});
+  renderRuntimeCards(data.runtime_cards || {});
   renderAudit();
   renderProbeJson();
 }
@@ -269,6 +270,75 @@ function renderBridge(bridge) {
   }
 }
 
+function renderRuntimeCards(runtimeCards) {
+  const active = runtimeCards.active || {};
+  const catalog = runtimeCards.catalog || [];
+  const activeSkillIds = new Set((active.skills || []).map((item) => item.card_id));
+  const activeTaskIds = new Set((active.tasks || []).map((item) => item.card_id));
+  const persona = active.persona || {};
+  $("#runtimePolicy").textContent = policyText(runtimeCards.policy || "");
+  $("#runtimeStorage").textContent = runtimeCards.storage || "data/runtime_cards";
+  $("#skillCount").textContent = `${activeSkillIds.size} 启用`;
+  $("#personaName").textContent = persona.name || "未装备";
+  $("#taskCount").textContent = `${activeTaskIds.size} 装备`;
+  renderCardList({
+    root: $("#skillList"),
+    cards: catalog.filter((item) => item.card_type === "skill"),
+    activeIds: activeSkillIds,
+    emptyText: "暂无技能卡",
+    actionFor: (card, activeNow) =>
+      actionButton(activeNow ? "停用" : "启用", activeNow ? "ghost small" : "primary small", () =>
+        runtimeCardAction(activeNow ? "disable-skill" : "enable-skill", { card_id: card.card_id }),
+      ),
+  });
+  renderCardList({
+    root: $("#personaList"),
+    cards: catalog.filter((item) => item.card_type === "persona"),
+    activeIds: new Set(persona.card_id ? [persona.card_id] : []),
+    emptyText: "暂无人物卡",
+    actionFor: (card, activeNow) =>
+      actionButton(activeNow ? "已装备" : "装备", activeNow ? "ghost small" : "primary small", () =>
+        activeNow ? Promise.resolve() : runtimeCardAction("equip-persona", { card_id: card.card_id }),
+      ),
+  });
+  renderCardList({
+    root: $("#taskList"),
+    cards: catalog.filter((item) => item.card_type === "task"),
+    activeIds: activeTaskIds,
+    emptyText: "暂无任务卡",
+    actionFor: (card, activeNow) =>
+      actionButton(activeNow ? "卸载" : "装备", activeNow ? "danger small" : "primary small", () =>
+        runtimeCardAction(activeNow ? "unload-task" : "equip-task", { card_id: card.card_id }),
+      ),
+  });
+}
+
+function renderCardList({ root, cards, activeIds, emptyText, actionFor }) {
+  root.innerHTML = "";
+  if (!cards.length) {
+    root.append(emptyNode(emptyText));
+    return;
+  }
+  for (const card of cards) {
+    const activeNow = activeIds.has(card.card_id);
+    const node = document.createElement("article");
+    node.className = `runtime-card ${activeNow ? "active" : ""}`;
+    node.innerHTML = `
+      <div class="runtime-card-head">
+        <div>
+          <strong>${escapeHtml(card.name || card.card_id)}</strong>
+          <span>${escapeHtml(cardTypeText(card.card_type))} / ${escapeHtml(card.source || "custom")}</span>
+        </div>
+        <span class="card-state">${activeNow ? "生效中" : "未生效"}</span>
+      </div>
+      <p>${escapeHtml(compactText(card.content || "", 220))}</p>
+      <div class="actions"></div>
+    `;
+    node.querySelector(".actions").append(actionFor(card, activeNow));
+    root.append(node);
+  }
+}
+
 function renderAudit() {
   const list = $("#auditList");
   const items = state.data?.audit?.items || [];
@@ -377,6 +447,41 @@ async function ackBridge(bridgeId, status) {
   await refresh({ force: true });
 }
 
+async function runtimeCardAction(action, payload) {
+  await api(`/api/runtime-cards/${action}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  setStatusMessage("技能/人设卡已更新");
+  await refresh({ force: true });
+}
+
+async function savePersonaCard(event) {
+  event.preventDefault();
+  const name = $("#personaCardName").value.trim();
+  const content = $("#personaCardContent").value.trim();
+  if (!content) {
+    setStatusMessage("人物卡内容不能为空");
+    return;
+  }
+  await runtimeCardAction("save-persona", { name, content });
+  $("#personaCardName").value = "";
+  $("#personaCardContent").value = "";
+}
+
+async function saveTaskCard(event) {
+  event.preventDefault();
+  const name = $("#taskCardName").value.trim();
+  const content = $("#taskCardContent").value.trim();
+  if (!content) {
+    setStatusMessage("任务卡内容不能为空");
+    return;
+  }
+  await runtimeCardAction("save-task", { name, content });
+  $("#taskCardName").value = "";
+  $("#taskCardContent").value = "";
+}
+
 async function probeNow() {
   const payload = await api("/api/wechat-probe");
   state.data = { ...(state.data || {}), wechat_window_probe: payload };
@@ -417,6 +522,7 @@ function setActivePanel(panel) {
   });
   $("#queuePanel").hidden = panel !== "queue";
   $("#bridgePanel").hidden = panel !== "bridge";
+  $("#runtimePanel").hidden = panel !== "runtime";
 }
 
 function setMode(mode) {
@@ -548,6 +654,26 @@ function backgroundSendText(value) {
   }[value] || value;
 }
 
+function policyText(value) {
+  return {
+    runtime_cards_survive_context_reset_sidebar_only_changes: "清空上下文不会影响卡片，只有此页会改变装备状态",
+  }[value] || value || "清空上下文不会影响已装备卡片";
+}
+
+function cardTypeText(value) {
+  return {
+    skill: "技能",
+    persona: "人物",
+    task: "任务",
+  }[value] || value || "";
+}
+
+function compactText(value, maxLength) {
+  const text = String(value).replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1).trim()}…`;
+}
+
 function probeStatusText(value) {
   return {
     ok: "已找到微信窗口",
@@ -608,6 +734,31 @@ $("#probeButton").addEventListener("click", () => probeNow().catch((error) => {
   $("#diagnosticDetail").textContent = `探测失败：${error.message}`;
 }));
 $("#bridgeRefreshButton").addEventListener("click", () => refresh({ force: true }));
+$("#runtimeRefreshButton").addEventListener("click", () => refresh({ force: true }));
+$("#personaForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (state.actionInProgress) return;
+  state.actionInProgress = true;
+  savePersonaCard(event)
+    .catch((error) => {
+      $("#readinessLine").textContent = `人物卡保存失败：${error.message}`;
+    })
+    .finally(() => {
+      state.actionInProgress = false;
+    });
+});
+$("#taskForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (state.actionInProgress) return;
+  state.actionInProgress = true;
+  saveTaskCard(event)
+    .catch((error) => {
+      $("#readinessLine").textContent = `任务卡保存失败：${error.message}`;
+    })
+    .finally(() => {
+      state.actionInProgress = false;
+    });
+});
 $("#toggleProbe").addEventListener("click", () => {
   state.probeExpanded = !state.probeExpanded;
   renderProbeJson();
