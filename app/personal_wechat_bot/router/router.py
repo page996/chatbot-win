@@ -6,6 +6,24 @@ from app.personal_wechat_bot.domain.models import NormalizedMessage, RouteDecisi
 from app.personal_wechat_bot.router.deduper import Deduper
 
 
+TRUSTED_CHANNEL_SOURCES = frozenset(
+    {
+        "backend_events_jsonl",
+        "backend_file_watcher",
+        "manual_backend_event",
+    }
+)
+UNTRUSTED_CHANNEL_SOURCES = frozenset(
+    {
+        "windows_snapshot",
+        "ocr_file_card",
+        "wechat_builtin_voice_to_text_ocr",
+        "poll_ocr_window",
+        "ocr_snapshot",
+    }
+)
+
+
 class Router:
     def __init__(
         self,
@@ -21,7 +39,8 @@ class Router:
         if self.deduper.seen(message.message_id):
             return RouteDecision(message.message_id, message.conversation_id, "duplicate", "message already processed")
 
-        channel = self.channel_store.ensure_channel(message) if self.channel_store is not None else None
+        trusted_channel = _trusted_channel_source(message)
+        channel = self.channel_store.ensure_channel(message) if self.channel_store is not None and trusted_channel else None
         channel_reason = "channel auto registered" if channel is not None else "auto accepted conversation"
         if message.conversation_type == "private":
             return RouteDecision(message.message_id, message.conversation_id, "process", channel_reason)
@@ -36,3 +55,14 @@ class Router:
 
     def mark_done(self, message_id: str) -> None:
         self.deduper.mark(message_id)
+
+
+def _trusted_channel_source(message: NormalizedMessage) -> bool:
+    source = str(message.metadata.get("source", "")).strip()
+    if source in TRUSTED_CHANNEL_SOURCES:
+        return True
+    if message.metadata.get("trusted_channel_source") is True:
+        return True
+    if source in UNTRUSTED_CHANNEL_SOURCES:
+        return False
+    return False

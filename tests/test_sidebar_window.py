@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app.personal_wechat_bot.control import sidebar_window
+from app.personal_wechat_bot.wechat_driver.windows_readonly import WindowInfo
 
 
 class SidebarWindowTest(unittest.TestCase):
@@ -33,6 +34,38 @@ class SidebarWindowTest(unittest.TestCase):
             sidebar_window._wechat_anchor = original
 
         self.assertEqual(geometry, {"x": 80, "y": 80, "width": 420, "height": 700})
+
+    def test_sidebar_geometry_places_inside_wechat_when_right_side_has_no_room(self) -> None:
+        original_anchor = sidebar_window._wechat_anchor
+        original_work_area = sidebar_window._work_area
+        sidebar_window._wechat_anchor = lambda: {"left": 100, "top": 80, "right": 1000, "bottom": 780}
+        sidebar_window._work_area = lambda: {"left": 0, "top": 0, "right": 1024, "bottom": 768}
+        try:
+            geometry = sidebar_window._sidebar_geometry(width=420, height=700)
+        finally:
+            sidebar_window._wechat_anchor = original_anchor
+            sidebar_window._work_area = original_work_area
+
+        self.assertEqual(geometry["x"], 572)
+        self.assertEqual(geometry["y"], 68)
+        self.assertEqual(geometry["height"], 700)
+
+    def test_wechat_anchor_filters_offscreen_tray_windows(self) -> None:
+        class _Probe:
+            def find_wechat_windows(self):
+                return [
+                    WindowInfo(hwnd=1, title="微信", width=157, height=25, left=-16000, top=-16000, right=-15843, bottom=-15975, process_name="Weixin.exe"),
+                    WindowInfo(hwnd=2, title="微信", width=1000, height=700, left=100, top=100, right=1100, bottom=800, process_name="Weixin.exe"),
+                ]
+
+        original_probe = sidebar_window.Win32WindowProbe
+        sidebar_window.Win32WindowProbe = lambda include_invisible=False: _Probe()
+        try:
+            anchor = sidebar_window._wechat_anchor()
+        finally:
+            sidebar_window.Win32WindowProbe = original_probe
+
+        self.assertEqual(anchor, {"left": 100, "top": 100, "right": 1100, "bottom": 800})
 
     def test_launch_result_json_is_stable(self) -> None:
         payload = sidebar_window.result_as_json(

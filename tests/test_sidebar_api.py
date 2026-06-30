@@ -10,7 +10,13 @@ from app.personal_wechat_bot.control.sidebar_api import (
     sidebar_queue_action,
     update_sidebar_controls,
 )
+from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
+from app.personal_wechat_bot.domain.models import RawWeChatMessage
+from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.domain.models import ReplyCandidate
+from app.personal_wechat_bot.normalizer.normalizer import MessageNormalizer
+from app.personal_wechat_bot.router.deduper import Deduper
+from app.personal_wechat_bot.router.router import Router
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 
 
@@ -29,6 +35,104 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("readiness", state)
             self.assertIn("driver_probe", state)
             self.assertIn("audit", state)
+
+    def test_sidebar_channel_state_hides_probe_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            normalizer = MessageNormalizer()
+            visible = normalizer.normalize(RawWeChatMessage("1", "PAGE", "PAGE", "hello", driver_meta={"source": "backend_events_jsonl"}))
+            noisy = normalizer.normalize(RawWeChatMessage("2", "+25", "+25", "8/10/16", driver_meta={"source": "backend_events_jsonl"}))
+            assert visible is not None and noisy is not None
+            store.ensure_channel(visible)
+            store.ensure_channel(noisy)
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(state["channels"]["count"], 1)
+            self.assertEqual(state["channels"]["hidden_count"], 1)
+            self.assertEqual(state["channels"]["items"][0]["chat_title"], "PAGE")
+
+    def test_router_does_not_register_windows_snapshot_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            router = Router(config, Deduper(data_dir / "dedupe.sqlite"), channel_store=store)
+            message = MessageNormalizer().normalize(
+                RawWeChatMessage("snapshot-1", "+25", "+25", "8/10/16", driver_meta={"source": "windows_snapshot"})
+            )
+            assert message is not None
+
+            decision = router.decide(message)
+
+            self.assertEqual(decision.action, "process")
+            self.assertEqual(store.list_channels(), [])
+
+    def test_sidebar_hides_untrusted_legacy_channels_but_keeps_trusted_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            trusted = MessageNormalizer().normalize(
+                RawWeChatMessage("1", "PAGE", "PAGE", "hello", driver_meta={"source": "backend_events_jsonl"})
+            )
+            stale = MessageNormalizer().normalize(
+                RawWeChatMessage("2", "PTURE", "PTURE", "fragment", driver_meta={"allow_empty_message": True})
+            )
+            assert trusted is not None and stale is not None
+            store.ensure_channel(trusted)
+            # Simulate a pre-provenance channel left by old snapshot/OCR ingestion.
+            stale_path = data_dir / "conversation_channels" / stale.conversation_id / "channel.json"
+            stale_path.parent.mkdir(parents=True, exist_ok=True)
+            stale_path.write_text(
+                """
+{
+  "conversation_id": "2ce59ad9ab7cc4bdfe59a871",
+  "conversation_type": "private",
+  "chat_title": "PTURE",
+  "status": "active",
+  "key_slots": 1,
+  "api_key_refs": [],
+  "session_scope": "per_conversation_current_session",
+  "backend_dir": "",
+  "context_dir": "",
+  "file_workspace_dir": "",
+  "sender_names": ["PTURE"],
+  "sender_wechat_ids": [],
+  "created_at": "2026-06-30T00:00:00+00:00",
+  "updated_at": "2026-06-30T00:00:00+00:00"
+}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual([item["chat_title"] for item in state["channels"]["items"]], ["PAGE"])
+            self.assertEqual(state["channels"]["hidden_reasons"]["untrusted_legacy_channel"], 1)
 
     def test_sidebar_controls_update_mode_and_send_switch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

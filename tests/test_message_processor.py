@@ -75,6 +75,7 @@ class MessageProcessorTest(unittest.TestCase):
                     sender_wechat_id="wxid_new_friend",
                     text="hello",
                     observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"source": "backend_events_jsonl"},
                 )
             )
             group_result = processor.process(
@@ -86,7 +87,7 @@ class MessageProcessorTest(unittest.TestCase):
                     text="@bot hello",
                     is_group=True,
                     observed_at="2026-06-28T01:01:00+00:00",
-                    driver_meta={"topic_decision": "speak"},
+                    driver_meta={"source": "backend_events_jsonl", "topic_decision": "speak"},
                 )
             )
             channels = runtime.channel_store.list_channels()

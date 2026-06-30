@@ -176,6 +176,23 @@ h2 {
   padding: 10px;
 }
 
+.control-title {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 2px;
+}
+
+.control-title strong {
+  font-size: 13px;
+}
+
+.control-title span,
+.section-copy {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .segmented {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -314,6 +331,7 @@ h2 {
 
 .channel-stats {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin: 8px 0;
   color: #667085;
@@ -338,12 +356,23 @@ h2 {
   background: #ffffff;
 }
 
+.channel-note {
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  padding: 8px;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .channel-main,
 .channel-meta {
   display: flex;
   justify-content: space-between;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .channel-main strong {

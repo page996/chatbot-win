@@ -13,6 +13,7 @@ from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 
 
 CHANNEL_POLICY = "auto_accept_wechat_contacts_and_groups"
+TRUSTED_CHANNEL_SOURCES = frozenset({"backend_events_jsonl", "backend_file_watcher", "manual_backend_event"})
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,8 @@ class ConversationChannel:
     file_workspace_dir: str
     sender_names: list[str]
     sender_wechat_ids: list[str]
+    source_names: list[str]
+    trusted_channel_source: bool
     created_at: str
     updated_at: str
     next_key_index: int = 0
@@ -75,6 +78,11 @@ class ConversationChannelStore:
                 list(existing.get("sender_wechat_ids", [])) if existing else [],
                 message.sender_wechat_id or "",
             )
+            source_name = str(message.metadata.get("source", "")).strip()
+            source_names = _append_unique(list(existing.get("source_names", [])) if existing else [], source_name)
+            trusted_channel_source = bool(existing.get("trusted_channel_source", False)) if existing else False
+            if source_name in TRUSTED_CHANNEL_SOURCES or message.metadata.get("trusted_channel_source") is True:
+                trusted_channel_source = True
             channel_dir = self._channel_dir(message.conversation_id)
             backend_dir = channel_dir / "backend"
             backend_dir.mkdir(parents=True, exist_ok=True)
@@ -91,6 +99,8 @@ class ConversationChannelStore:
                 "file_workspace_dir": str(self.file_workspace_root / _safe_segment(message.conversation_id)),
                 "sender_names": sender_names,
                 "sender_wechat_ids": sender_wechat_ids,
+                "source_names": source_names,
+                "trusted_channel_source": trusted_channel_source,
                 "created_at": existing.get("created_at", now) if existing else now,
                 "updated_at": now,
                 "next_key_index": int(existing.get("next_key_index", 0)) if existing else 0,
@@ -177,6 +187,8 @@ class ConversationChannelStore:
                 "status": payload.get("status", ""),
                 "key_slots": payload.get("key_slots", 0),
                 "api_key_refs": payload.get("api_key_refs", []),
+                "source_names": payload.get("source_names", []),
+                "trusted_channel_source": payload.get("trusted_channel_source", False),
                 "updated_at": payload.get("updated_at", ""),
             }
         )
@@ -204,6 +216,8 @@ def _channel_from_payload(payload: dict[str, Any]) -> ConversationChannel:
         file_workspace_dir=str(payload.get("file_workspace_dir", "")),
         sender_names=[str(item) for item in payload.get("sender_names", [])],
         sender_wechat_ids=[str(item) for item in payload.get("sender_wechat_ids", [])],
+        source_names=[str(item) for item in payload.get("source_names", [])],
+        trusted_channel_source=bool(payload.get("trusted_channel_source", False)),
         created_at=str(payload.get("created_at", "")),
         updated_at=str(payload.get("updated_at", "")),
         next_key_index=int(payload.get("next_key_index", 0)),

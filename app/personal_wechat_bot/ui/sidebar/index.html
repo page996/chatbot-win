@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WeChat Agent Console</title>
-    <link rel="stylesheet" href="/styles.css?v=20260630-2" />
+    <title>微信 Agent 审计面板</title>
+    <link rel="stylesheet" href="/styles.css?v=20260630-3" />
   </head>
   <body>
     <main class="shell">
@@ -12,71 +12,77 @@
         <div class="brand">
           <div class="mark">A</div>
           <div>
-            <h1>Agent Console</h1>
-            <p id="readinessLine">Loading runtime state</p>
+            <h1>微信 Agent 审计面板</h1>
+            <p id="readinessLine">正在读取运行状态</p>
           </div>
         </div>
-        <button id="refreshButton" class="icon-button" title="Refresh" aria-label="Refresh">R</button>
+        <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
       </header>
 
       <section class="dock-panel">
         <div>
-          <span class="eyebrow">Backend Capture</span>
-          <strong id="captureRole">Message source owned by backend</strong>
-          <p id="captureDetail">Sidebar is an audit surface, not a chat capture driver.</p>
+          <span class="eyebrow">输入源</span>
+          <strong id="captureRole">后端消息源负责读取对话</strong>
+          <p id="captureDetail">此浮窗只负责审计、发送控制和窗口诊断。</p>
         </div>
-        <button id="probeButton" class="ghost">Diag</button>
+        <button id="probeButton" class="ghost">探测</button>
       </section>
 
       <section class="channels">
         <div class="section-head">
-          <h2>Conversation Channels</h2>
+          <h2>服务通道</h2>
           <span id="channelCount">0</span>
         </div>
+        <p class="section-copy">每个私聊或群聊拥有独立上下文、记忆、文件中间层和 API key 槽位；明显的旧探测噪声会被隐藏。</p>
         <div class="channel-stats">
-          <span><strong id="privateCount">0</strong> private</span>
-          <span><strong id="groupCount">0</strong> groups</span>
+          <span><strong id="privateCount">0</strong> 私聊</span>
+          <span><strong id="groupCount">0</strong> 群聊</span>
+          <span><strong id="hiddenChannelCount">0</strong> 已隐藏</span>
         </div>
         <div id="channelList" class="channel-list"></div>
       </section>
 
       <section class="controls">
+        <div class="control-title">
+          <strong>发送控制</strong>
+          <span>决定候选回复如何进入微信。</span>
+        </div>
         <div class="segmented" role="radiogroup" aria-label="send mode">
-          <button data-mode="dry_run">Dry</button>
-          <button data-mode="confirm">Confirm</button>
-          <button data-mode="auto">Auto</button>
+          <button data-mode="dry_run">演练</button>
+          <button data-mode="confirm">审核</button>
+          <button data-mode="auto">自动</button>
         </div>
         <label class="switch">
           <input id="sendEnabled" type="checkbox" />
           <span></span>
-          Send
+          允许真实发送
         </label>
         <label class="driver-select">
-          <span>Driver</span>
+          <span>发送驱动</span>
           <select id="driverSelect"></select>
         </label>
-        <button id="saveControls" class="primary">Save</button>
+        <button id="saveControls" class="primary">保存</button>
       </section>
 
       <section class="metrics">
         <button class="metric active" data-status="pending">
-          <span>Pending</span>
+          <span>待审</span>
           <strong id="pendingCount">0</strong>
         </button>
         <button class="metric" data-status="approved">
-          <span>Approved</span>
+          <span>已批</span>
           <strong id="approvedCount">0</strong>
         </button>
         <button class="metric" data-status="rejected">
-          <span>Rejected</span>
+          <span>拒绝</span>
           <strong id="rejectedCount">0</strong>
         </button>
         <button class="metric" data-status="sent">
-          <span>Sent</span>
+          <span>已发</span>
           <strong id="sentCount">0</strong>
         </button>
         <button class="metric" data-status="failed">
-          <span>Failed</span>
+          <span>失败</span>
           <strong id="failedCount">0</strong>
         </button>
       </section>
@@ -85,22 +91,23 @@
 
       <section class="inspector">
         <div class="section-head">
-          <h2>Capture Diagnostics</h2>
-          <button id="toggleProbe" class="ghost small">Details</button>
+          <h2>微信窗口诊断</h2>
+          <button id="toggleProbe" class="ghost small">详情</button>
         </div>
-        <p id="diagnosticDetail" class="diagnostic-copy">Window handles are diagnostic only. They do not select the active conversation.</p>
+        <p id="diagnosticDetail" class="diagnostic-copy">句柄只用于确认当前抓到的是微信窗口，不负责读取聊天内容。</p>
         <div id="handleList" class="handle-list"></div>
         <pre id="probeBox" hidden></pre>
       </section>
 
       <section class="audit">
         <div class="section-head">
-          <h2>Audit</h2>
+          <h2>发送审计</h2>
           <span id="auditCount">0</span>
         </div>
+        <p class="section-copy">记录审核、拒绝、发送尝试和失败原因，方便回看。</p>
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
-    <script src="/app.js?v=20260630-2"></script>
+    <script src="/app.js?v=20260630-3"></script>
   </body>
 </html>

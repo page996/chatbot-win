@@ -34,6 +34,8 @@ class ConversationChannelStoreTest(unittest.TestCase):
 
             self.assertEqual(first.key_slots, 1)
             self.assertEqual(len(first.api_key_refs), 1)
+            self.assertEqual(first.source_names, ["backend_events_jsonl"])
+            self.assertTrue(first.trusted_channel_source)
             self.assertIsNotNone(second)
             self.assertEqual(second.api_key_refs, first.api_key_refs)
             self.assertIn("private-1", first.context_dir)
@@ -124,6 +126,7 @@ def _message(
         is_self=False,
         received_at="2026-06-29T00:00:00+00:00",
         sender_wechat_id=chat_title,
+        metadata={"source": "backend_events_jsonl"},
     )
 
 

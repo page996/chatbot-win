@@ -31,7 +31,7 @@ async function refresh({ forceControls = false, force = false } = {}) {
     state.data = await api("/api/state");
     render({ forceControls });
   } catch (error) {
-    $("#readinessLine").textContent = `Load failed: ${error.message}`;
+    $("#readinessLine").textContent = `加载失败：${error.message}`;
   } finally {
     state.refreshing = false;
   }
@@ -58,16 +58,16 @@ function renderReadiness(data) {
   const summary = readiness.summary || {};
   $("#readinessLine").textContent =
     state.statusMessage ||
-    `${readiness.status || "unknown"} / blockers ${summary.blockers || 0} / warnings ${summary.warnings || 0}`;
+    `${statusText(readiness.status || "unknown")} / 阻断 ${summary.blockers || 0} / 警告 ${summary.warnings || 0}`;
 }
 
 function renderCapture(data) {
   const capture = data.capture || {};
-  $("#captureRole").textContent = capture.owner || "backend_message_sources";
+  $("#captureRole").textContent = sourceRoleText(capture.owner || "backend_message_sources");
   $("#captureDetail").textContent = [
-    capture.sidebar_role || "audit_and_send_controls_only",
-    capture.supports_multi_conversation ? "multi-conversation ready" : "",
-    capture.window_probe_role ? `window probe: ${capture.window_probe_role}` : "",
+    roleText(capture.sidebar_role || "audit_and_send_controls_only"),
+    capture.supports_multi_conversation ? "多会话隔离已开启" : "",
+    capture.window_probe_role ? `窗口探测：${roleText(capture.window_probe_role)}` : "",
   ].filter(Boolean).join(" / ");
 }
 
@@ -103,17 +103,17 @@ function renderWechatProbe(probe) {
   const windows = probe.windows || [];
   const first = windows[0] || {};
   $("#diagnosticDetail").textContent = [
-    active.title || foreground.title || first.title || "No exposed WeChat chat window",
-    active.status || probe.status || "unknown",
+    active.title || foreground.title || first.title || "未发现可用微信聊天窗口",
+    probeStatusText(active.status || probe.status || "unknown"),
     foreground.process_name || first.process_name || "",
-    first.hwnd ? `hwnd ${first.hwnd}` : "diagnostic only",
-    probe.ui_automation?.available ? "UIA ready" : (probe.ui_automation?.reason || "UIA unknown"),
+    first.hwnd ? `hwnd ${first.hwnd}` : "仅诊断",
+    probe.ui_automation?.available ? "UIA 可用" : (probe.ui_automation?.reason || "UIA 未知"),
   ].filter(Boolean).join(" / ");
 
   const list = $("#handleList");
   list.innerHTML = "";
   if (!windows.length) {
-    list.append(emptyNode("No WeChat HWND found"));
+    list.append(emptyNode("没有发现可用的微信窗口句柄"));
     return;
   }
   for (const windowInfo of windows.slice(0, 2)) {
@@ -122,11 +122,11 @@ function renderWechatProbe(probe) {
     const candidates = windowInfo.chat_candidates || [];
     node.innerHTML = `
       <div class="handle-main">
-        <strong>${escapeHtml(windowInfo.title || "(untitled)")}</strong>
-        <span>${escapeHtml(windowInfo.process_name || "")} · hwnd ${escapeHtml(windowInfo.hwnd || "")}</span>
+        <strong>${escapeHtml(windowInfo.title || "(无标题)")}</strong>
+        <span>${escapeHtml(windowInfo.process_name || "")} / hwnd ${escapeHtml(windowInfo.hwnd || "")}</span>
       </div>
       <div class="handle-sub">
-        child ${windowInfo.child_count || 0} · controls ${windowInfo.automation_control_count || 0}
+        子窗口 ${windowInfo.child_count || 0} / 控件 ${windowInfo.automation_control_count || 0}
       </div>
     `;
     if (candidates.length) {
@@ -149,23 +149,31 @@ function renderChannels(data) {
   $("#channelCount").textContent = channels.count || items.length || 0;
   $("#privateCount").textContent = channels.private_count || 0;
   $("#groupCount").textContent = channels.group_count || 0;
+  $("#hiddenChannelCount").textContent = channels.hidden_count || 0;
   const list = $("#channelList");
   list.innerHTML = "";
+  if (channels.hidden_count) {
+    const note = document.createElement("div");
+    note.className = "channel-note";
+    note.textContent = `已隐藏 ${channels.hidden_count} 个旧探测/乱码通道：${reasonSummary(channels.hidden_reasons || {})}`;
+    list.append(note);
+  }
   if (!items.length) {
-    list.append(emptyNode("No backend channels registered yet"));
+    list.append(emptyNode("还没有可信后端服务通道"));
     return;
   }
-  for (const channel of items.slice(0, 5)) {
+  for (const channel of items.slice(0, 8)) {
     const node = document.createElement("article");
     node.className = "channel-item";
     node.innerHTML = `
       <div class="channel-main">
-        <strong>${escapeHtml(channel.chat_title || channel.conversation_id || "(untitled)")}</strong>
-        <span>${escapeHtml(channel.conversation_type || "")}</span>
+        <strong>${escapeHtml(channel.chat_title || channel.conversation_id || "(无标题)")}</strong>
+        <span>${escapeHtml(conversationTypeText(channel.conversation_type || ""))}</span>
       </div>
       <p>${escapeHtml(channel.conversation_id || "")}</p>
       <div class="channel-meta">
-        <span>keys ${escapeHtml((channel.api_key_refs || []).length || channel.key_slots || 0)}</span>
+        <span>key 槽 ${(channel.api_key_refs || []).length || channel.key_slots || 0}</span>
+        <span>${escapeHtml(channel.session_scope || "独立 session")}</span>
         <span>${escapeHtml(shortTime(channel.updated_at || ""))}</span>
       </div>
     `;
@@ -186,7 +194,7 @@ function renderQueue() {
   const queue = state.data?.queues?.[state.activeStatus] || { items: [] };
   list.innerHTML = "";
   if (!queue.items.length) {
-    list.append(emptyNode(`No ${state.activeStatus} messages`));
+    list.append(emptyNode(`${queueStatusText(state.activeStatus)}队列为空`));
     return;
   }
   for (const item of queue.items) {
@@ -195,7 +203,7 @@ function renderQueue() {
     node.className = `queue-item status-${item.status || state.activeStatus}`;
     node.innerHTML = `
       <div class="queue-head">
-        <span>${escapeHtml(item.status || "")}</span>
+        <span>${escapeHtml(queueStatusText(item.status || state.activeStatus))}</span>
         <time>${escapeHtml(shortTime(item.updated_at || reply.created_at || ""))}</time>
       </div>
       <div class="conversation">${escapeHtml(reply.conversation_id || "")}</div>
@@ -204,12 +212,12 @@ function renderQueue() {
     `;
     const actions = node.querySelector(".actions");
     if (item.status === "pending") {
-      actions.append(actionButton("Approve", "primary", () => queueAction(item.queue_id, "approve")));
-      actions.append(actionButton("Reject", "danger", () => queueAction(item.queue_id, "reject")));
+      actions.append(actionButton("通过", "primary", () => queueAction(item.queue_id, "approve")));
+      actions.append(actionButton("拒绝", "danger", () => queueAction(item.queue_id, "reject")));
     }
     if (item.status === "approved") {
-      actions.append(actionButton("Send 3s", "primary", () => delayedQueueAction(item.queue_id, "send-approved")));
-      actions.append(actionButton("Reject", "danger", () => queueAction(item.queue_id, "reject")));
+      actions.append(actionButton("3秒后发送", "primary", () => delayedQueueAction(item.queue_id, "send-approved")));
+      actions.append(actionButton("拒绝", "danger", () => queueAction(item.queue_id, "reject")));
     }
     list.append(node);
   }
@@ -221,15 +229,15 @@ function renderAudit() {
   $("#auditCount").textContent = items.length;
   list.innerHTML = "";
   if (!items.length) {
-    list.append(emptyNode("No audit records"));
+    list.append(emptyNode("暂无发送审计记录"));
     return;
   }
   for (const item of items.slice(-8).reverse()) {
     const node = document.createElement("article");
     node.className = "audit-item";
     node.innerHTML = `
-      <span>${escapeHtml(item.action || "")}</span>
-      <strong>${escapeHtml(item.status || "")}</strong>
+      <span>${escapeHtml(actionText(item.action || ""))}</span>
+      <strong>${escapeHtml(queueStatusText(item.status || ""))}</strong>
       <p>${escapeHtml(item.reason || item.note || item.queue_id || "")}</p>
     `;
     list.append(node);
@@ -263,7 +271,7 @@ async function saveControls() {
       }),
     });
     state.controlsDirty = false;
-    setStatusMessage("controls saved");
+    setStatusMessage("发送控制已保存");
     await refresh({ forceControls: true, force: true });
   } finally {
     state.controlsSaving = false;
@@ -280,13 +288,13 @@ async function queueAction(queueId, action) {
   if (nextStatus && state.data?.queues?.[nextStatus]) {
     setActiveStatus(nextStatus);
   }
-  setStatusMessage(`${action} ok`);
+  setStatusMessage(`${actionText(action)}完成`);
   await refresh({ force: true });
   return payload;
 }
 
 async function delayedQueueAction(queueId, action) {
-  await countdown("Switch to target WeChat chat", 3);
+  await countdown("请切到目标微信聊天窗口", 3);
   await queueAction(queueId, action);
 }
 
@@ -308,7 +316,7 @@ function actionButton(label, className, handler) {
     try {
       await handler();
     } catch (error) {
-      $("#readinessLine").textContent = `Action failed: ${error.message}`;
+      $("#readinessLine").textContent = `操作失败：${error.message}`;
     } finally {
       button.disabled = false;
       state.actionInProgress = false;
@@ -341,7 +349,7 @@ function markControlsDirty() {
 function setDirtyIndicator(status) {
   const button = $("#saveControls");
   button.disabled = status === "saving";
-  button.textContent = status === "saving" ? "Saving" : (status === "dirty" ? "Save *" : "Save");
+  button.textContent = status === "saving" ? "保存中" : (status === "dirty" ? "保存 *" : "保存");
   button.classList.toggle("dirty", status === "dirty");
 }
 
@@ -356,7 +364,7 @@ function setStatusMessage(message) {
 function countdown(prefix, seconds) {
   return new Promise((resolve) => {
     let remaining = seconds;
-    $("#readinessLine").textContent = `${prefix}: ${remaining}s`;
+    $("#readinessLine").textContent = `${prefix}：${remaining}s`;
     const timer = setInterval(() => {
       remaining -= 1;
       if (remaining <= 0) {
@@ -364,7 +372,7 @@ function countdown(prefix, seconds) {
         resolve();
         return;
       }
-      $("#readinessLine").textContent = `${prefix}: ${remaining}s`;
+      $("#readinessLine").textContent = `${prefix}：${remaining}s`;
     }, 1000);
   });
 }
@@ -390,6 +398,77 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function statusText(status) {
+  return {
+    ok: "正常",
+    warn: "警告",
+    error: "错误",
+    unknown: "未知",
+  }[status] || status;
+}
+
+function queueStatusText(status) {
+  return {
+    pending: "待审核",
+    approved: "已通过",
+    rejected: "已拒绝",
+    sent: "已发送",
+    failed: "失败",
+    dry_run: "演练",
+    queued_for_confirm: "待审核",
+    skipped: "跳过",
+  }[status] || status || "";
+}
+
+function conversationTypeText(value) {
+  return value === "group" ? "群聊" : (value === "private" ? "私聊" : value);
+}
+
+function sourceRoleText(value) {
+  return {
+    backend_message_sources: "后端消息源负责读取对话",
+  }[value] || value;
+}
+
+function roleText(value) {
+  return {
+    audit_and_send_controls_only: "浮窗只做审计和发送控制",
+    diagnostic_only: "仅诊断",
+  }[value] || value;
+}
+
+function probeStatusText(value) {
+  return {
+    ok: "已找到微信窗口",
+    not_found: "未找到微信窗口",
+    matched_foreground: "匹配当前前台",
+    foreground_wechat_child_or_popup: "前台是微信子窗口",
+    not_wechat_foreground: "前台不是微信",
+    unknown: "未知",
+  }[value] || value;
+}
+
+function actionText(action) {
+  return {
+    approve: "通过",
+    reject: "拒绝",
+    "send-approved": "发送",
+  }[action] || action;
+}
+
+function reasonSummary(reasons) {
+  const labels = {
+    probe_fragment: "探测碎片",
+    untrusted_legacy_channel: "旧污染通道",
+    mojibake: "乱码标题",
+    tool_window: "工具窗口",
+    empty_title: "空标题",
+  };
+  return Object.entries(reasons)
+    .map(([key, count]) => `${labels[key] || key} ${count}`)
+    .join("，");
+}
+
 document.addEventListener("click", (event) => {
   const metric = event.target.closest(".metric");
   if (metric) {
@@ -407,10 +486,10 @@ $("#sendEnabled").addEventListener("change", markControlsDirty);
 $("#driverSelect").addEventListener("change", markControlsDirty);
 $("#refreshButton").addEventListener("click", () => refresh({ forceControls: !state.controlsDirty, force: true }));
 $("#saveControls").addEventListener("click", () => saveControls().catch((error) => {
-  $("#readinessLine").textContent = `Save failed: ${error.message}`;
+  $("#readinessLine").textContent = `保存失败：${error.message}`;
 }));
 $("#probeButton").addEventListener("click", () => probeNow().catch((error) => {
-  $("#diagnosticDetail").textContent = `Probe failed: ${error.message}`;
+  $("#diagnosticDetail").textContent = `探测失败：${error.message}`;
 }));
 $("#toggleProbe").addEventListener("click", () => {
   state.probeExpanded = !state.probeExpanded;
@@ -420,4 +499,4 @@ $("#toggleProbe").addEventListener("click", () => {
 refresh({ forceControls: true });
 setInterval(() => {
   if (!state.actionInProgress && !state.controlsSaving) refresh();
-}, 1500);
+}, 1800);

@@ -33,7 +33,7 @@ class SidebarServerTest(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertEqual(state["status"], "ok")
-            self.assertIn("WeChat Agent Console", index)
+            self.assertIn("微信 Agent 审计面板", index)
             self.assertIn("wechat_window_probe", state)
 
     def test_sidebar_server_serves_dirty_state_script(self) -> None:
