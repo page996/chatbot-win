@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.personal_wechat_bot.config.loader import load_config
+from app.personal_wechat_bot.config.schema import BotConfig
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.control.commands import (
     accept_contact_channel,
@@ -42,6 +43,7 @@ from app.personal_wechat_bot.replay.runner import ReplayRunner
 from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
+from app.personal_wechat_bot.domain.errors import ConfigError
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
@@ -70,6 +72,11 @@ from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBin
 from app.personal_wechat_bot.wechat_driver.voice_transcription import (
     WeChatVoiceTranscriptionBridge,
     result_payload as voice_bridge_result_payload,
+)
+from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import (
+    WeChatVoiceCacheResolver,
+    default_wechat_voice_roots,
+    voice_cache_capability,
 )
 
 
@@ -291,6 +298,16 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_voice = sub.add_parser("wechat-voice-transcribe")
     wechat_voice.add_argument("--conversation-id", required=True)
 
+    voice_cache = sub.add_parser("wechat-voice-cache-probe")
+    voice_cache.add_argument("--root", action="append", default=[])
+    voice_cache.add_argument("--include-default-roots", action="store_true")
+    voice_cache.add_argument("--chat-title", default="")
+    voice_cache.add_argument("--observed-at", default="")
+    voice_cache.add_argument("--audio-name", default="")
+    voice_cache.add_argument("--message-id", default="")
+    voice_cache.add_argument("--window-seconds", type=int, default=600)
+    voice_cache.add_argument("--max-scan-files", type=int, default=2000)
+
     delete_channel = sub.add_parser("delete-channel")
     delete_channel.add_argument("conversation_id")
 
@@ -366,11 +383,15 @@ def main(argv: list[str] | None = None) -> None:
                         BackendEventJsonlDriver(
                             event_file,
                             runtime.file_index,
-                            allowed_input_roots=resolve_allowed_roots(config.data_dir, config.file_read_roots),
+                            allowed_input_roots=resolve_allowed_roots(
+                                config.data_dir,
+                                config.file_read_roots + config.wechat_voice_roots,
+                            ),
                             allowed_extensions=config.file_allowed_extensions,
                             max_input_bytes=config.file_max_bytes,
                             file_workspace=runtime.file_workspace,
                             session_store=runtime.session_store,
+                            voice_cache_resolver=_voice_cache_resolver(config),
                         ),
                         poll_interval_seconds=0,
                     ),
@@ -545,11 +566,15 @@ def main(argv: list[str] | None = None) -> None:
         driver = BackendEventJsonlDriver(
             event_file,
             runtime.file_index,
-            allowed_input_roots=resolve_allowed_roots(config.data_dir, config.file_read_roots + args.extra_root),
+            allowed_input_roots=resolve_allowed_roots(
+                config.data_dir,
+                config.file_read_roots + config.wechat_voice_roots + args.extra_root,
+            ),
             allowed_extensions=config.file_allowed_extensions,
             max_input_bytes=config.file_max_bytes,
             file_workspace=runtime.file_workspace,
             session_store=runtime.session_store,
+            voice_cache_resolver=_voice_cache_resolver(config, extra_roots=args.extra_root),
         )
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
         result = runner.run_forever(max_loops=args.loops)
@@ -665,6 +690,31 @@ def main(argv: list[str] | None = None) -> None:
         result = bridge.transcribe_selected_voice(args.conversation_id)
         print(json.dumps({"status": result.status, "result": voice_bridge_result_payload(result), "send_enabled": False}, ensure_ascii=False, indent=2))
         return
+    if args.command == "wechat-voice-cache-probe":
+        config = load_config(args.data_dir)
+        roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots + args.root)
+        if args.include_default_roots:
+            roots = [*roots, *default_wechat_voice_roots()]
+        resolver = WeChatVoiceCacheResolver(
+            roots,
+            allowed_extensions=config.file_allowed_extensions,
+            max_bytes=config.file_max_bytes,
+            time_window_seconds=args.window_seconds,
+            max_scan_files=args.max_scan_files,
+        )
+        voice = {
+            "audio_name": args.audio_name,
+            "message_id": args.message_id,
+        }
+        result = resolver.resolve(voice, chat_title=args.chat_title, observed_at=args.observed_at)
+        payload = {
+            "status": result.status,
+            "capability": voice_cache_capability(roots, config.file_allowed_extensions),
+            "result": result.to_dict(),
+            "send_enabled": False,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
     if args.command == "delete-channel":
         result = delete_sidebar_channel(args.data_dir, args.conversation_id)
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -690,15 +740,18 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "capabilities":
+        config = _load_config_or_default(args.data_dir)
         ocr = RapidOcrSubprocessEngine().health()
         office = LibreOfficeRuntime().health()
         asr = LocalAsrSubprocessEngine().health()
         wechat_voice = WeChatVoiceTranscriptionBridge(args.data_dir).health()
+        voice_roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots)
         result = {
             "ocr": ocr.__dict__,
             "libreoffice": office.__dict__,
             "asr": asr.__dict__,
             "wechat_voice_to_text": wechat_voice,
+            "wechat_voice_cache": voice_cache_capability(voice_roots, config.file_allowed_extensions),
             "send_enabled": False,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -790,6 +843,24 @@ def _history_items(value: Any, *, source: str) -> list[dict[str, Any]]:
         cleaned.setdefault("source", source)
         items.append(cleaned)
     return items
+
+
+def _load_config_or_default(data_dir: str) -> BotConfig:
+    try:
+        return load_config(data_dir)
+    except ConfigError:
+        return BotConfig(data_dir=data_dir)
+
+
+def _voice_cache_resolver(config, *, extra_roots: list[str] | None = None) -> WeChatVoiceCacheResolver | None:
+    roots = config.wechat_voice_roots + list(extra_roots or [])
+    if not roots:
+        return None
+    return WeChatVoiceCacheResolver(
+        resolve_allowed_roots(config.data_dir, roots),
+        allowed_extensions=config.file_allowed_extensions,
+        max_bytes=config.file_max_bytes,
+    )
 
 
 def _ocr_parse_payload(parse_result) -> dict[str, object] | None:

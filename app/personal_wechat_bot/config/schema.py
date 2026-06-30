@@ -54,6 +54,7 @@ class BotConfig:
     save_full_chat: bool = True
     save_raw_and_summary: bool = True
     file_read_roots: list[str] = field(default_factory=lambda: ["inbox"])
+    wechat_voice_roots: list[str] = field(default_factory=list)
     file_allowed_extensions: list[str] = field(
         default_factory=lambda: [
             ".txt",

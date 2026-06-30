@@ -76,6 +76,7 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         save_full_chat=bool(raw.get("save_full_chat", True)),
         save_raw_and_summary=bool(raw.get("save_raw_and_summary", True)),
         file_read_roots=list(raw.get("file_read_roots", ["inbox"])),
+        wechat_voice_roots=list(raw.get("wechat_voice_roots", [])),
         file_allowed_extensions=_file_allowed_extensions_from_json(raw),
         file_max_bytes=int(raw.get("file_max_bytes", 20 * 1024 * 1024)),
         search_blocklist=list(blocklist),

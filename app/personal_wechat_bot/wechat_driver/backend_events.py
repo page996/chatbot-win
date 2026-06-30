@@ -12,6 +12,7 @@ from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
 from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionBridge, result_payload
 from app.personal_wechat_bot.workspace.attachment_pipeline import AttachmentPipeline, IncomingAttachment
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -54,6 +55,7 @@ class BackendEventJsonlDriver:
         file_workspace: FileWorkspace | None = None,
         attachment_pipeline: AttachmentPipeline | None = None,
         voice_transcription_bridge: WeChatVoiceTranscriptionBridge | None = None,
+        voice_cache_resolver: WeChatVoiceCacheResolver | None = None,
         session_store: ConversationSessionStore | None = None,
         context_store: ConversationSessionStore | None = None,
     ):
@@ -75,6 +77,7 @@ class BackendEventJsonlDriver:
             embedded_media_asr=self.attachment_parser.asr_engine,
         )
         self.voice_transcription_bridge = voice_transcription_bridge or WeChatVoiceTranscriptionBridge(self.event_path.parent)
+        self.voice_cache_resolver = voice_cache_resolver
         self.session_store = session_store or context_store
         self._seen_event_ids: set[str] = set()
         self._seen_message_raw_ids: set[str] = set()
@@ -182,7 +185,13 @@ class BackendEventJsonlDriver:
         voice = _normalize_voice(meta.get("voice"), allow_pending=True)
         voice_fallback_attachment: dict[str, Any] | None = None
         if meta.get("backend_voice_pending"):
-            voice, voice_fallback_attachment = self._transcribe_pending_voice(conversation_id, session_id, voice)
+            voice, voice_fallback_attachment = self._transcribe_pending_voice(
+                conversation_id,
+                session_id,
+                voice,
+                chat_title=raw.chat_title,
+                observed_at=raw.observed_at,
+            )
             meta["voice"] = voice
             meta["backend_voice_pending"] = False
         attachments_meta = raw.driver_meta.get("attachments", [])
@@ -242,12 +251,21 @@ class BackendEventJsonlDriver:
         conversation_id: str,
         session_id: str,
         voice: dict[str, Any],
+        *,
+        chat_title: str = "",
+        observed_at: str = "",
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if not voice or str(voice.get("text", "")).strip():
             return voice, None
         if self.voice_transcription_bridge is None:
             bridge_payload = {"status": "blocked", "error": "wechat_voice_bridge_not_configured"}
-            fallback_attachment = self._local_asr_voice_fallback(conversation_id, session_id, voice)
+            fallback_attachment = self._local_asr_voice_fallback(
+                conversation_id,
+                session_id,
+                voice,
+                chat_title=chat_title,
+                observed_at=observed_at,
+            )
             return _voice_from_transcription_failure(voice, bridge_payload, fallback_attachment), fallback_attachment
         result = self.voice_transcription_bridge.transcribe_selected_voice(conversation_id)
         payload = result_payload(result)
@@ -263,7 +281,13 @@ class BackendEventJsonlDriver:
                 },
                 allow_pending=True,
             ), None
-        fallback_attachment = self._local_asr_voice_fallback(conversation_id, session_id, voice)
+        fallback_attachment = self._local_asr_voice_fallback(
+            conversation_id,
+            session_id,
+            voice,
+            chat_title=chat_title,
+            observed_at=observed_at,
+        )
         fallback_text = _voice_fallback_text(fallback_attachment)
         if fallback_text:
             return _normalize_voice(
@@ -285,21 +309,41 @@ class BackendEventJsonlDriver:
         conversation_id: str,
         session_id: str,
         voice: dict[str, Any],
+        *,
+        chat_title: str = "",
+        observed_at: str = "",
     ) -> dict[str, Any] | None:
         audio_path = _voice_audio_path(voice)
+        resolver_payload: dict[str, Any] | None = None
+        if not audio_path and self.voice_cache_resolver is not None:
+            result = self.voice_cache_resolver.resolve(voice, chat_title=chat_title, observed_at=observed_at)
+            resolver_payload = result.to_dict()
+            if result.status == "resolved" and result.path:
+                audio_path = result.path
         if not audio_path:
-            return None
+            if resolver_payload is None:
+                return None
+            return {
+                "status": "blocked",
+                "source": "wechat_voice_cache_resolver",
+                "name": _voice_audio_name(voice) or "wechat_voice_cache",
+                "kind": "audio",
+                "reason": resolver_payload.get("reason", "voice_audio_path_missing"),
+                "voice_cache": resolver_payload,
+            }
         fallback = self.attachment_pipeline.process(
             IncomingAttachment(
                 path=audio_path,
                 original_name=_voice_audio_name(voice) or Path(audio_path).name,
                 kind="audio",
-                source="backend_event_voice_audio",
+                source="backend_event_voice_audio" if resolver_payload is None else "wechat_voice_cache_resolver",
             ),
             conversation_id=conversation_id,
             session_id=session_id,
         )
-        fallback["source"] = "backend_event_voice_audio"
+        fallback["source"] = "backend_event_voice_audio" if resolver_payload is None else "wechat_voice_cache_resolver"
+        if resolver_payload is not None:
+            fallback["voice_cache"] = resolver_payload
         return fallback
 
 
@@ -694,11 +738,12 @@ def _voice_fallback_summary(attachment: dict[str, Any] | None) -> dict[str, Any]
         "file_id": attachment.get("file_id", ""),
         "parse_status": parse.get("status", ""),
         "parse_error": parse.get("error", ""),
+        "voice_cache": attachment.get("voice_cache", {}),
     }
 
 
 def _is_voice_fallback_attachment(attachment: dict[str, Any]) -> bool:
-    return str(attachment.get("source", "")).strip() == "backend_event_voice_audio"
+    return str(attachment.get("source", "")).strip() in {"backend_event_voice_audio", "wechat_voice_cache_resolver"}
 
 
 def _voice_from_transcription_failure(

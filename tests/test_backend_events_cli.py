@@ -236,6 +236,32 @@ class BackendEventsCliTest(unittest.TestCase):
             self.assertFalse(snapshot_payload["will_write_ledger"])
             self.assertEqual(list((data_dir / "conversation_ledgers").glob("*/messages.jsonl")), [])
 
+    def test_wechat_voice_cache_probe_cli_resolves_readable_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            voice_root = Path(tmp) / "voice-cache"
+            voice_root.mkdir()
+            audio = voice_root / "msg_12345.m4a"
+            audio.write_bytes(b"fake audio")
+            self._run("--data-dir", str(data_dir), "init")
+
+            payload = json.loads(
+                self._run(
+                    "--data-dir",
+                    str(data_dir),
+                    "wechat-voice-cache-probe",
+                    "--root",
+                    str(voice_root),
+                    "--audio-name",
+                    "msg_12345",
+                )
+            )
+
+            self.assertEqual(payload["status"], "resolved")
+            self.assertEqual(Path(payload["result"]["path"]), audio)
+            self.assertEqual(payload["capability"]["mode"], "readable_file_cache_only")
+            self.assertFalse(payload["send_enabled"])
+
     def _run(self, *args: str) -> str:
         completed = subprocess.run(
             [sys.executable, "-m", "app.personal_wechat_bot.main", *args],

@@ -16,6 +16,7 @@ from app.personal_wechat_bot.wechat_driver.backend_events import (
     append_backend_event,
     append_backend_event_payload,
 )
+from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
 from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionResult
 
 
@@ -242,6 +243,51 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(enriched.driver_meta["voice"]["source"], "local_asr_fallback")
         self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["kind"], "audio")
         self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["raw_text"], "本地 ASR fallback 成功")
+
+    def test_pending_voice_can_resolve_readable_wechat_voice_cache(self) -> None:
+        voice_cache = self.data_dir / "wechat_voice_cache"
+        voice_cache.mkdir()
+        audio = voice_cache / "voice_cache_123.m4a"
+        audio.write_bytes(b"fake audio")
+        bridge = _FakeVoiceBridge(WeChatVoiceTranscriptionResult(status="blocked", error="wechat_builtin_transcript_not_observed"))
+        driver = BackendEventJsonlDriver(
+            self.event_file,
+            FileIndex(self.data_dir / "file_index_voice_cache.sqlite"),
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots + ["wechat_voice_cache"]),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+            attachment_parser=BackendAttachmentParser(
+                ocr_engine=_FakeOcr(""),
+                asr_engine=_FakeAsr("缓存语音 ASR 成功"),
+            ),
+            voice_transcription_bridge=bridge,
+            voice_cache_resolver=WeChatVoiceCacheResolver(
+                [voice_cache],
+                allowed_extensions=self.config.file_allowed_extensions,
+                max_bytes=self.config.file_max_bytes,
+            ),
+        )
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "PAGE",
+                "sender_name": "PAGE",
+                "voice_status": "pending",
+                "voice": {"audio_name": "voice_cache_123"},
+            },
+        )
+
+        messages = driver.read_new_messages()
+        enriched = driver.enrich_message_attachments(
+            messages[0],
+            conversation_id=messages[0].driver_meta["conversation_id_hint"],
+            session_id=messages[0].driver_meta["session_id"],
+        )
+
+        self.assertEqual(enriched.text, "缓存语音 ASR 成功")
+        self.assertEqual(enriched.driver_meta["voice"]["source"], "local_asr_fallback")
+        self.assertEqual(enriched.driver_meta["attachments"][0]["source"], "wechat_voice_cache_resolver")
+        self.assertEqual(enriched.driver_meta["attachments"][0]["voice_cache"]["status"], "resolved")
 
     def test_polling_runner_writes_backend_voice_text_to_ledger(self) -> None:
         append_backend_event(

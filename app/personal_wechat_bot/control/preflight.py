@@ -11,6 +11,7 @@ from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntim
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
+from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import voice_cache_capability
 from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionBridge
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
     implemented_send_drivers,
@@ -33,6 +34,7 @@ def build_preflight_report(
     key_refs = key_pool.refs()
     api_key_present = any(item.available for item in key_refs)
     file_roots = resolve_allowed_roots(config.data_dir, config.file_read_roots)
+    voice_roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots)
     manual_bound_channels = manual_bridge_bindings(config.data_dir)
     warnings = _warnings(config, api_key_present, manual_bound_count=len(manual_bound_channels))
     ocr_health = RapidOcrSubprocessEngine().health()
@@ -135,12 +137,14 @@ def build_preflight_report(
         },
         "files": {
             "read_roots": [str(path) for path in file_roots],
+            "wechat_voice_roots": [str(path) for path in voice_roots],
             "allowed_extensions": list(config.file_allowed_extensions),
             "max_bytes": config.file_max_bytes,
             "multimedia_parse": {
                 "images": "file_layer_ocr_to_workspace_artifacts",
-                "voice_messages": "backend_event_pending_voice_supported; WeChat built-in transcript first, local ASR fallback when audio path is provided",
+                "voice_messages": "backend_event_pending_voice_supported; WeChat built-in transcript first, readable voice cache/local ASR fallback when configured",
                 "voice_main_path": "wechat_builtin_voice_to_text_bridge_for_manually_bound_windows",
+                "voice_cache_fallback": "readable_file_cache_only; WeChat DB decryption is not supported by design",
                 "audio_files": "preserved_and_indexed; local_asr_fallback_when_available",
                 "docx_embedded_images": "extracted_and_ocr_if_ocr_engine_available",
                 "docx_embedded_audio": "extracted_and_local_asr_if_available",
@@ -176,6 +180,7 @@ def build_preflight_report(
                 "install": asr_health.install,
             },
             "wechat_voice_to_text": wechat_voice,
+            "wechat_voice_cache": voice_cache_capability(voice_roots, config.file_allowed_extensions),
         },
         "ocr": {
             "backend": ocr_health.backend,
@@ -195,6 +200,7 @@ def build_preflight_report(
             "detail": asr_health.detail,
             "install": asr_health.install,
         },
+        "wechat_voice_cache": voice_cache_capability(voice_roots, config.file_allowed_extensions),
         "warnings": warnings,
     }
 
