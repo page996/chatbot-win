@@ -60,6 +60,7 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     find_wechat_processes,
     foreground_window_info,
 )
+from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 from app.personal_wechat_bot.wechat_driver.ocr_snapshot_parser import parse_ocr_snapshot
 
 
@@ -235,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     wechat_snapshot.add_argument("--max-nodes", type=int, default=500)
     wechat_snapshot.add_argument("--max-depth", type=int, default=8)
     wechat_snapshot.add_argument("--output", default=None)
+    wechat_snapshot.add_argument("--probe-handles", action="store_true")
 
     capture = sub.add_parser("wechat-capture")
     capture.add_argument("--hwnd", type=int, default=None)
@@ -552,6 +554,9 @@ def main(argv: list[str] | None = None) -> None:
             "line_count": len([line for line in text.splitlines() if line.strip()]),
             "text": text,
             "output": args.output,
+            "window_probe": build_wechat_window_probe(max_controls=args.max_nodes, max_depth=args.max_depth)
+            if args.probe_handles
+            else None,
             "send_enabled": False,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))

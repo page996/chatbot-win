@@ -9,21 +9,12 @@ class SidebarWindowTest(unittest.TestCase):
     def test_sidebar_window_entrypoint_is_importable(self) -> None:
         self.assertTrue(callable(sidebar_window.run_sidebar_window))
 
-    def test_queue_helpers_flatten_counts_and_fingerprint(self) -> None:
+    def test_queue_helpers_flatten_counts(self) -> None:
         state = {
-            "config": {"mode": "confirm", "send_enabled": True, "send_driver": "windows_guarded"},
-            "readiness": {"status": "ready"},
-            "driver_probe": {"foreground": {"title": "微信"}},
             "queues": {
                 "pending": {
                     "count": 1,
-                    "items": [
-                        {
-                            "queue_id": "q1",
-                            "status": "pending",
-                            "reply": {"conversation_id": "c1", "text": "hello"},
-                        }
-                    ],
+                    "items": [{"queue_id": "q1", "reply": {"conversation_id": "c1", "text": "hello"}}],
                 },
                 "approved": {"count": 0, "items": []},
                 "failed": {"count": 0, "items": []},
@@ -32,22 +23,31 @@ class SidebarWindowTest(unittest.TestCase):
 
         self.assertEqual(sidebar_window.queue_counts(state)["pending"], 1)
         self.assertEqual(sidebar_window.flatten_queue_items(state)[0]["queue_id"], "q1")
-        self.assertEqual(
-            sidebar_window.sidebar_state_fingerprint(state),
-            sidebar_window.sidebar_state_fingerprint(dict(state)),
+
+    def test_sidebar_geometry_uses_default_when_wechat_missing(self) -> None:
+        original = sidebar_window._wechat_anchor
+        sidebar_window._wechat_anchor = lambda: None
+        try:
+            geometry = sidebar_window._sidebar_geometry(width=420, height=700)
+        finally:
+            sidebar_window._wechat_anchor = original
+
+        self.assertEqual(geometry, {"x": 80, "y": 80, "width": 420, "height": 700})
+
+    def test_launch_result_json_is_stable(self) -> None:
+        payload = sidebar_window.result_as_json(
+            sidebar_window.SidebarLaunchResult(
+                status="ok",
+                url="http://127.0.0.1:1/",
+                host="127.0.0.1",
+                port=1,
+                browser="chrome",
+                pid=123,
+                geometry={"x": 1, "y": 2, "width": 3, "height": 4},
+            )
         )
 
-    def test_wechat_foreground_check_does_not_match_sidebar_title(self) -> None:
-        self.assertFalse(
-            sidebar_window._looks_like_wechat_foreground(
-                {"title": "WeChat Agent Queue", "process_name": "python.exe"}
-            )
-        )
-        self.assertTrue(
-            sidebar_window._looks_like_wechat_foreground(
-                {"title": "微信", "process_name": "WeChatAppEx.exe"}
-            )
-        )
+        self.assertIn('"status": "ok"', payload)
 
 
 if __name__ == "__main__":

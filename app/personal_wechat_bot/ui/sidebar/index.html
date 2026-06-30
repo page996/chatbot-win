@@ -3,77 +3,83 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WeChat Agent Send Queue</title>
-    <link rel="stylesheet" href="/styles.css?v=20260629-3" />
+    <title>WeChat Agent Console</title>
+    <link rel="stylesheet" href="/styles.css?v=20260630-1" />
   </head>
   <body>
     <main class="shell">
       <header class="topbar">
-        <div>
-          <h1>Send Audit</h1>
-          <p id="readinessLine">Loading...</p>
+        <div class="brand">
+          <div class="mark">A</div>
+          <div>
+            <h1>Agent Console</h1>
+            <p id="readinessLine">Loading runtime state</p>
+          </div>
         </div>
-        <button id="refreshButton" class="icon-button" title="Refresh" aria-label="Refresh">R</button>
+        <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
       </header>
 
+      <section class="dock-panel">
+        <div>
+          <span class="eyebrow">WeChat Target</span>
+          <strong id="wechatTitle">Searching</strong>
+          <p id="wechatDetail">Waiting for a WeChat window handle.</p>
+        </div>
+        <button id="probeButton" class="ghost">Probe</button>
+      </section>
+
       <section class="controls">
-        <label>
-          <span>Mode</span>
-          <select id="modeSelect">
-            <option value="dry_run">dry_run</option>
-            <option value="confirm">confirm</option>
-            <option value="auto">auto</option>
-          </select>
-        </label>
-        <label class="toggle">
+        <div class="segmented" role="radiogroup" aria-label="send mode">
+          <button data-mode="dry_run">Dry</button>
+          <button data-mode="confirm">Confirm</button>
+          <button data-mode="auto">Auto</button>
+        </div>
+        <label class="switch">
           <input id="sendEnabled" type="checkbox" />
-          <span>Send enabled</span>
+          <span></span>
+          Send
         </label>
-        <label>
+        <label class="driver-select">
           <span>Driver</span>
-          <select id="driverSelect">
-            <option value="not_implemented">not_implemented</option>
-            <option value="windows_guarded">windows_guarded</option>
-          </select>
+          <select id="driverSelect"></select>
         </label>
-        <button id="saveControls" class="primary">Save controls</button>
+        <button id="saveControls" class="primary">Save</button>
       </section>
 
-      <section class="status-grid">
-        <div>
-          <span>pending</span>
+      <section class="metrics">
+        <button class="metric active" data-status="pending">
+          <span>Pending</span>
           <strong id="pendingCount">0</strong>
-        </div>
-        <div>
-          <span>approved</span>
+        </button>
+        <button class="metric" data-status="approved">
+          <span>Approved</span>
           <strong id="approvedCount">0</strong>
-        </div>
-        <div>
-          <span>failed</span>
+        </button>
+        <button class="metric" data-status="failed">
+          <span>Failed</span>
           <strong id="failedCount">0</strong>
-        </div>
+        </button>
       </section>
 
-      <nav class="tabs">
-        <button class="tab active" data-status="pending">Pending</button>
-        <button class="tab" data-status="approved">Approved</button>
-        <button class="tab" data-status="failed">Failed</button>
-        <button class="tab" data-status="sent">Sent</button>
-        <button class="tab" data-status="rejected">Rejected</button>
-      </nav>
+      <section id="queueList" class="queue-list" aria-live="polite"></section>
 
-      <section id="queueList" class="queue-list"></section>
+      <section class="inspector">
+        <div class="section-head">
+          <h2>Window Handles</h2>
+          <button id="toggleProbe" class="ghost small">Details</button>
+        </div>
+        <div id="handleList" class="handle-list"></div>
+        <pre id="probeBox" hidden></pre>
+      </section>
 
       <section class="audit">
         <div class="section-head">
-          <h2>Audit Log</h2>
-          <button id="probeButton" class="ghost">Probe after 3s</button>
+          <h2>Audit</h2>
+          <span id="auditCount">0</span>
         </div>
-        <p class="hint">For probe/send, click the button and switch focus to the target WeChat chat before the countdown ends.</p>
-        <pre id="probeBox"></pre>
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
-    <script src="/app.js?v=20260629-3"></script>
+    <script src="/app.js?v=20260630-1"></script>
   </body>
 </html>

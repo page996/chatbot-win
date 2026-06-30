@@ -33,7 +33,8 @@ class SidebarServerTest(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertEqual(state["status"], "ok")
-            self.assertIn("WeChat Agent Send Queue", index)
+            self.assertIn("WeChat Agent Console", index)
+            self.assertIn("wechat_window_probe", state)
 
     def test_sidebar_server_serves_dirty_state_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,6 +59,26 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("force: true", script)
             self.assertIn("setActiveStatus", script)
             self.assertIn("setStatusMessage", script)
+            self.assertIn("probeNow", script)
+
+    def test_sidebar_server_serves_wechat_probe_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                payload = json.loads(urlopen(f"http://{host}:{port}/api/wechat-probe", timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertIn(payload["status"], {"ok", "not_found"})
+            self.assertIn("windows", payload)
+            self.assertIn("ui_automation", payload)
 
     def test_sidebar_queue_action_decodes_encoded_queue_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

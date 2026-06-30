@@ -14,6 +14,7 @@ from app.personal_wechat_bot.control.send_commands import (
     set_send_controls,
 )
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
+from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 
 
 QUEUE_STATUSES = ("pending", "approved", "rejected", "sent", "failed")
@@ -35,8 +36,14 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "queues": queues,
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
+        "wechat_window_probe": build_wechat_window_probe(max_children=80, max_controls=160),
         "audit": list_send_audit(data_dir, limit=30),
     }
+
+
+def build_sidebar_wechat_probe(data_dir: str | Path = "data") -> dict[str, Any]:
+    _ = data_dir
+    return build_wechat_window_probe()
 
 
 def update_sidebar_controls(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:

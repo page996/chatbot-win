@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from app.personal_wechat_bot.control.sidebar_api import (
+    build_sidebar_wechat_probe,
     build_sidebar_state,
     sidebar_queue_action,
     update_sidebar_controls,
@@ -37,6 +38,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
 
                 driver = query.get("driver", [None])[0]
                 self._json(probe_send_controls(data_dir, driver=driver))
+                return
+            if parsed.path == "/api/wechat-probe":
+                self._json(build_sidebar_wechat_probe(data_dir))
                 return
             self._static(parsed.path)
 
