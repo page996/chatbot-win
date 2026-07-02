@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
+from app.personal_wechat_bot.control import sidebar_api
 from app.personal_wechat_bot.control.sidebar_api import (
     ack_sidebar_bridge_item,
     append_sidebar_backend_event,
@@ -322,6 +325,75 @@ class SidebarApiTest(unittest.TestCase):
 
             self.assertEqual(saved["status"], "ok")
             self.assertIn("持续生效的任务约束", "\n".join(item["content"] for item in state["active"]["tasks"]))
+
+
+class WeflowBackgroundLoopTest(unittest.TestCase):
+    def test_background_loop_reuses_one_context_across_ticks(self) -> None:
+        """The puller must be built once and reused so the backend driver keeps
+        its dedup state instead of re-reading the whole backend log each tick."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            build_calls = 0
+            tick_calls = 0
+
+            def fake_build(root, payload):
+                nonlocal build_calls
+                build_calls += 1
+                return {"context_id": build_calls}
+
+            def fake_tick(context):
+                nonlocal tick_calls
+                tick_calls += 1
+                return {"status": "ok", "source": {"status": "ok"}, "context_id": context["context_id"]}
+
+            stop_event = threading.Event()
+
+            def stop_after_two_ticks(_seconds):
+                if tick_calls >= 2:
+                    stop_event.set()
+
+            with mock.patch.object(sidebar_api, "_build_weflow_pull_context", side_effect=fake_build), mock.patch.object(
+                sidebar_api, "_run_weflow_pull_tick", side_effect=fake_tick
+            ), mock.patch.object(stop_event, "wait", side_effect=stop_after_two_ticks):
+                sidebar_api._weflow_background_loop(data_dir, {"interval_seconds": 1}, stop_event)
+
+            self.assertGreaterEqual(tick_calls, 2)
+            self.assertEqual(build_calls, 1)
+
+    def test_background_loop_rebuilds_context_after_total_pull_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            build_calls = 0
+            tick_calls = 0
+
+            def fake_build(root, payload):
+                nonlocal build_calls
+                build_calls += 1
+                return {"context_id": build_calls}
+
+            def fake_tick(context):
+                nonlocal tick_calls
+                tick_calls += 1
+                # First tick reports a total pull failure (WeFlow went away),
+                # so the loop must rebuild before the second tick.
+                status = "error" if tick_calls == 1 else "ok"
+                return {"status": "partial_error", "source": {"status": status}}
+
+            stop_event = threading.Event()
+
+            def stop_after_two_ticks(_seconds):
+                if tick_calls >= 2:
+                    stop_event.set()
+
+            with mock.patch.object(sidebar_api, "_build_weflow_pull_context", side_effect=fake_build), mock.patch.object(
+                sidebar_api, "_run_weflow_pull_tick", side_effect=fake_tick
+            ), mock.patch.object(stop_event, "wait", side_effect=stop_after_two_ticks):
+                sidebar_api._weflow_background_loop(data_dir, {"interval_seconds": 1}, stop_event)
+
+            self.assertEqual(build_calls, 2)
 
 
 def _reply() -> ReplyCandidate:

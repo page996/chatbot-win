@@ -1,13 +1,27 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import asdict, is_dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
-from app.personal_wechat_bot.config.loader import load_config
+from app.personal_wechat_bot.config.loader import load_config, migrate_file_allowed_extensions
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
+from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
+from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
+from app.personal_wechat_bot.runtime.weflow_state_summary import summarize_weflow_bridge_state
+from app.personal_wechat_bot.runtime.weflow_worker_metrics import WeflowWorkerMetrics
+from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     list_confirm_queue,
@@ -20,11 +34,21 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
+from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
 from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state
+from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
+from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
+    WeFlowHttpBridge,
+    require_weflow_ready,
+    weflow_health_status,
+)
+from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
 
 
 QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent", "failed")
+_WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
+_WEFLOW_LOCK = threading.Lock()
 
 
 def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -58,6 +82,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
         "send_bridge": send_bridge,
+        "weflow": build_sidebar_weflow_state(data_dir),
         "wechat_window_probe": build_wechat_window_probe(max_children=80, max_controls=160, data_dir=data_dir),
         "audit": list_send_audit(data_dir, limit=30),
     }
@@ -143,6 +168,154 @@ def build_sidebar_bridge_state(data_dir: str | Path = "data") -> dict[str, Any]:
     return bridge_state(data_dir, limit=50)
 
 
+def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
+    root = Path(data_dir)
+    persisted = _read_json(root / "weflow_sidebar_state.json", {})
+    worker = _weflow_worker_state(root)
+    try:
+        migration = migrate_file_allowed_extensions(root)
+    except Exception as exc:
+        migration = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "status": "ok",
+        "base_url": str(persisted.get("base_url") or "http://127.0.0.1:5031"),
+        "token_env": str(persisted.get("token_env") or "WEFLOW_API_TOKEN"),
+        "hook_event_file": str(root / "hook_events.jsonl"),
+        "backend_event_file": str(root / "backend_events.jsonl"),
+        "weflow_state_file": str(root / "weflow_bridge_state.json"),
+        "security": {
+            "primary_source": "weflow_local_fork",
+            "requires_token_for_pull": True,
+            "requires_local_fork_marker": True,
+            "allows_non_local_by_default": False,
+            "wechatferry_primary": False,
+        },
+        "config_migration": migration,
+        "worker": worker,
+        "bridge_state": summarize_weflow_bridge_state(root / "weflow_bridge_state.json"),
+        "last_health": persisted.get("last_health", {}) if isinstance(persisted, dict) else {},
+        "last_pull": persisted.get("last_pull", {}) if isinstance(persisted, dict) else {},
+        "last_error": persisted.get("last_error", "") if isinstance(persisted, dict) else "",
+        "updated_at": persisted.get("updated_at", "") if isinstance(persisted, dict) else "",
+    }
+
+
+def sidebar_weflow_health(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    params = _weflow_params(data_dir, payload)
+    result = weflow_health_status(
+        params["base_url"],
+        token=params["token"],
+        allow_non_local=params["allow_non_local"],
+        require_token=False,
+        require_fork=True,
+    )
+    _write_weflow_sidebar_state(data_dir, {"last_health": result, **_weflow_public_params(params)})
+    return result
+
+
+def sidebar_weflow_pull_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    result = _run_sidebar_weflow_once(data_dir, payload)
+    _write_weflow_sidebar_state(data_dir, {"last_pull": result, **_weflow_public_params(_weflow_params(data_dir, payload))})
+    return result
+
+
+def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    key = str(root)
+    with _WEFLOW_LOCK:
+        existing = _WEFLOW_WORKERS.get(key)
+        if existing and existing.get("thread") and existing["thread"].is_alive():
+            return {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已经在运行"}
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_weflow_background_loop,
+            args=(root, dict(payload), stop_event),
+            name="sidebar-weflow-pull",
+            daemon=True,
+        )
+        _WEFLOW_WORKERS[key] = {
+            "thread": thread,
+            "stop": stop_event,
+            "started_at": time.time(),
+            "loops": 0,
+            "metrics": WeflowWorkerMetrics(),
+        }
+        thread.start()
+    return {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已启动"}
+
+
+def sidebar_weflow_stop(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    key = str(root)
+    with _WEFLOW_LOCK:
+        worker = _WEFLOW_WORKERS.get(key)
+        if worker and worker.get("stop"):
+            worker["stop"].set()
+    return {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取停止信号已发送"}
+
+
+def sidebar_weflow_dependency_status(data_dir: str | Path = "data") -> dict[str, Any]:
+    modules = {
+        "PyMuPDF": "fitz",
+        "pypdf": "pypdf",
+        "pdfminer.six": "pdfminer",
+        "openpyxl": "openpyxl",
+    }
+    items = [
+        {"package": package, "module": module, "runtime": "main_python", "available": find_spec(module) is not None}
+        for package, module in modules.items()
+    ]
+    rapidocr_python = Path("vendor/ocr-python/Scripts/python.exe")
+    items.append(
+        {
+            "package": "rapidocr-onnxruntime",
+            "module": "rapidocr_onnxruntime",
+            "runtime": str(rapidocr_python),
+            "available": _subprocess_module_available(rapidocr_python, "rapidocr_onnxruntime"),
+        }
+    )
+    return {
+        "status": "ok" if all(item["available"] for item in items) else "missing_optional",
+        "items": items,
+        "requirements": str(Path("requirements-ocr.txt").resolve()),
+    }
+
+
+def _subprocess_module_available(python_executable: Path, module: str) -> bool:
+    if not python_executable.exists():
+        return False
+    completed = subprocess.run(
+        [str(python_executable), "-c", f"import {module}"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def sidebar_weflow_install_deps(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    if not bool(payload.get("confirm_install", False)):
+        raise ValueError("confirm_install=true is required")
+    requirements = Path("requirements-ocr.txt").resolve()
+    completed = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return {
+        "status": "ok" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "stdout_tail": completed.stdout[-4000:],
+        "stderr_tail": completed.stderr[-4000:],
+        "dependencies": sidebar_weflow_dependency_status(data_dir),
+    }
+
+
 def build_sidebar_runtime_cards(data_dir: str | Path = "data") -> dict[str, Any]:
     return RuntimeCardStore(data_dir).state()
 
@@ -180,6 +353,269 @@ def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, paylo
     if action == "send-approved":
         return send_approved_confirm_item(data_dir, queue_id)
     raise ValueError(f"unknown queue action: {action}")
+
+
+def _build_weflow_pull_context(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the reusable runtime/driver/bridge/runner for a WeFlow puller.
+
+    These components are built once and reused across pull ticks so the backend
+    driver keeps its in-memory dedup state (``_seen_event_ids`` /
+    ``_seen_message_raw_ids``) alive. Rebuilding them every tick would make the
+    driver re-read and re-process the entire ``backend_events.jsonl`` on each
+    loop, which grows unbounded and re-triggers link fetches and memory
+    maintenance for already-processed history.
+    """
+
+    params = _weflow_params(data_dir, payload)
+    config = load_config(data_dir)
+    runtime = build_runtime(config)
+    weflow_ready = require_weflow_ready(
+        params["base_url"],
+        token=params["token"],
+        allow_non_local=params["allow_non_local"],
+    )
+    media_roots = _weflow_media_roots(weflow_ready)
+    roots = config.file_read_roots + config.wechat_voice_roots + params["extra_roots"] + media_roots
+    driver = BackendEventJsonlDriver(
+        params["backend_event_file"],
+        runtime.file_index,
+        allowed_input_roots=resolve_allowed_roots(config.data_dir, roots),
+        allowed_extensions=config.file_allowed_extensions,
+        max_input_bytes=config.file_max_bytes,
+        file_workspace=runtime.file_workspace,
+        session_store=runtime.session_store,
+        voice_cache_resolver=_voice_cache_resolver(config, extra_roots=params["extra_roots"] + media_roots),
+    )
+    runtime.active_driver = driver
+    bridge = WeFlowHttpBridge(
+        params["base_url"],
+        token=params["token"],
+        hook_event_file=params["hook_event_file"],
+        state_path=params["weflow_state_file"],
+        allow_non_local=params["allow_non_local"],
+    )
+    runner = HookMessagePullRunner(
+        HookEventJsonlImporter(
+            params["hook_event_file"],
+            params["backend_event_file"],
+            state_path=params["hook_state_file"],
+        ),
+        PollingRunner(runtime, driver, poll_interval_seconds=0),
+        hook_event_file=params["hook_event_file"],
+        backend_event_file=params["backend_event_file"],
+    )
+    return {
+        "params": params,
+        "bridge": bridge,
+        "runner": runner,
+        "weflow_ready": weflow_ready,
+        "media_roots": media_roots,
+    }
+
+
+def _run_weflow_pull_tick(context: dict[str, Any]) -> dict[str, Any]:
+    params = context["params"]
+    bridge: WeFlowHttpBridge = context["bridge"]
+    runner: HookMessagePullRunner = context["runner"]
+    source = bridge.pull_once(
+        talkers=params["talkers"],
+        session_limit=params["session_limit"],
+        message_limit=params["message_limit"],
+        max_pages=params["max_pages"],
+        max_messages=params["max_messages"],
+        since=params["since"],
+        lookback_seconds=params["lookback_seconds"],
+        workers=params["workers"],
+        media=params["media"],
+        context_only=params["context_only"],
+    )
+    pull = runner.run_once()
+    return {
+        "status": "ok" if source.status == "ok" and pull.get("status") == "ok" else "partial_error",
+        "base_url": bridge.base_url,
+        "workers": params["workers"],
+        "hook_event_file": str(params["hook_event_file"]),
+        "backend_event_file": str(params["backend_event_file"]),
+        "weflow_ready": context["weflow_ready"],
+        "source": _jsonable(source),
+        "pull": pull,
+        "media_roots": context["media_roots"],
+        "send_enabled": False,
+    }
+
+
+def _run_sidebar_weflow_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    context = _build_weflow_pull_context(data_dir, payload)
+    return _run_weflow_pull_tick(context)
+
+
+def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
+    interval = max(1.0, float(payload.get("interval_seconds") or 5.0))
+    key = str(root)
+    context: dict[str, Any] | None = None
+    while not stop_event.is_set():
+        tick_started = time.monotonic()
+        try:
+            if context is None:
+                context = _build_weflow_pull_context(root, payload)
+            result = _run_weflow_pull_tick(context)
+            duration = time.monotonic() - tick_started
+            source_status = str(result.get("source", {}).get("status") or "")
+            if source_status == "error":
+                # A total pull failure usually means WeFlow went away. Drop the
+                # context so the next tick rebuilds it and re-runs the health /
+                # fork-marker check before pulling again.
+                context = None
+            with _WEFLOW_LOCK:
+                worker = _WEFLOW_WORKERS.get(key, {})
+                metrics = worker.get("metrics")
+                if isinstance(metrics, WeflowWorkerMetrics):
+                    metrics.record_tick(result, duration)
+                worker["last_status"] = result.get("status", "")
+                worker["last_tick_at"] = time.time()
+                _WEFLOW_WORKERS[key] = worker
+            _write_weflow_sidebar_state(root, {"last_pull": result, "last_error": "", **_weflow_public_params(_weflow_params(root, payload))})
+        except Exception as exc:
+            context = None
+            duration = time.monotonic() - tick_started
+            error = f"{type(exc).__name__}: {exc}"
+            with _WEFLOW_LOCK:
+                worker = _WEFLOW_WORKERS.get(key, {})
+                metrics = worker.get("metrics")
+                if isinstance(metrics, WeflowWorkerMetrics):
+                    metrics.record_error(error, duration)
+                worker["last_status"] = "error"
+                worker["last_error"] = error
+                worker["last_tick_at"] = time.time()
+                _WEFLOW_WORKERS[key] = worker
+            _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
+        stop_event.wait(interval)
+
+
+def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir)
+    token_env = str(payload.get("token_env") or payload.get("tokenEnv") or "WEFLOW_API_TOKEN").strip()
+    token = str(payload.get("token") or "").strip() or os.environ.get(token_env, "") or os.environ.get("WEFLOW_API_TOKEN", "")
+    since_value = payload.get("since")
+    since = int(since_value) if since_value not in (None, "") else None
+    return {
+        "base_url": str(payload.get("base_url") or payload.get("baseUrl") or "http://127.0.0.1:5031").strip(),
+        "token": token,
+        "token_env": token_env,
+        "allow_non_local": bool(payload.get("allow_non_local") or payload.get("allowNonLocal") or False),
+        "hook_event_file": str(root / "hook_events.jsonl"),
+        "backend_event_file": str(root / "backend_events.jsonl"),
+        "hook_state_file": str(root / "hook_events_state.json"),
+        "weflow_state_file": str(root / "weflow_bridge_state.json"),
+        "talkers": _string_list(payload.get("talkers") or payload.get("talker") or []),
+        "session_limit": _bounded_int(payload.get("session_limit"), 100, 1, 10000),
+        "message_limit": _bounded_int(payload.get("message_limit"), 100, 1, 10000),
+        "max_pages": _bounded_int(payload.get("max_pages"), 1, 0, 10000),
+        "max_messages": _bounded_int(payload.get("max_messages"), 0, 0, 1000000),
+        "since": since,
+        "lookback_seconds": _bounded_int(payload.get("lookback_seconds"), 300, 0, 30 * 24 * 3600),
+        "workers": _bounded_int(payload.get("workers"), 2, 1, 16),
+        "media": not bool(payload.get("no_media") or payload.get("noMedia") or False),
+        "context_only": bool(payload.get("context_only") or payload.get("contextOnly") or (since is not None and since <= 0)),
+        "extra_roots": _string_list(payload.get("extra_roots") or payload.get("extraRoots") or []),
+    }
+
+
+def _weflow_public_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "base_url": params.get("base_url", ""),
+        "token_env": params.get("token_env", "WEFLOW_API_TOKEN"),
+        "token_present": bool(params.get("token")),
+        "allow_non_local": bool(params.get("allow_non_local")),
+    }
+
+
+def _weflow_media_roots(weflow_ready: dict[str, Any]) -> list[str]:
+    health = weflow_ready.get("health") if isinstance(weflow_ready.get("health"), dict) else {}
+    media_path = str(health.get("mediaExportPath") or health.get("media_export_path") or "").strip()
+    return [media_path] if media_path else []
+
+
+def _voice_cache_resolver(config: Any, *, extra_roots: list[str] | None = None) -> WeChatVoiceCacheResolver | None:
+    roots = config.wechat_voice_roots + list(extra_roots or [])
+    if not roots:
+        return None
+    return WeChatVoiceCacheResolver(
+        resolve_allowed_roots(config.data_dir, roots),
+        allowed_extensions=config.file_allowed_extensions,
+        max_bytes=config.file_max_bytes,
+    )
+
+
+def _weflow_worker_state(root: Path) -> dict[str, Any]:
+    key = str(root.resolve())
+    with _WEFLOW_LOCK:
+        worker = _WEFLOW_WORKERS.get(key, {})
+        thread = worker.get("thread")
+        running = bool(thread and thread.is_alive())
+        metrics = worker.get("metrics")
+        state = {
+            "running": running,
+            "started_at": worker.get("started_at", 0),
+            "loops": int(worker.get("loops", 0) or 0),
+            "last_status": str(worker.get("last_status", "")),
+            "last_error": str(worker.get("last_error", "")),
+            "last_tick_at": worker.get("last_tick_at", 0),
+        }
+        if isinstance(metrics, WeflowWorkerMetrics):
+            snapshot = metrics.snapshot(running=running)
+            state["loops"] = snapshot["loops"]
+            state["metrics"] = snapshot
+    return state
+
+
+def _write_weflow_sidebar_state(data_dir: str | Path, update: dict[str, Any]) -> None:
+    path = Path(data_dir) / "weflow_sidebar_state.json"
+    current = _read_json(path, {})
+    payload = current if isinstance(current, dict) else {}
+    payload.update(update)
+    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _write_json(path, payload)
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _jsonable(value: Any) -> dict[str, Any]:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [item.strip() for item in value.split(",")]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _bounded_int(value: Any, default: int, lower: int, upper: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return min(max(parsed, lower), upper)
 
 
 def _cleanup_note(cleanup: dict[str, Any]) -> str:

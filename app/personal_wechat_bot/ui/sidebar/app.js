@@ -52,6 +52,7 @@ function render({ forceControls = false } = {}) {
   renderQueue();
   renderBridge(data.send_bridge || {});
   renderRuntimeCards(data.runtime_cards || {});
+  renderWeFlow(data.weflow || {});
   renderAudit();
   renderProbeJson();
 }
@@ -313,6 +314,52 @@ function renderRuntimeCards(runtimeCards) {
   });
 }
 
+function renderWeFlow(weflow) {
+  const worker = weflow.worker || {};
+  const metrics = worker.metrics || {};
+  const bridgeState = weflow.bridge_state || {};
+  $("#weflowStatus").textContent = worker.running
+    ? `后台运行中 / ${worker.loops || 0} 轮`
+    : (weflow.last_pull?.status || weflow.last_health?.status || "未运行");
+  $("#weflowDetail").textContent = [
+    weflow.security?.primary_source || "weflow_local_fork",
+    weflow.security?.requires_token_for_pull ? "正式拉取需要 token" : "",
+    weflow.security?.requires_local_fork_marker ? "需要本地 fork marker" : "",
+    weflow.config_migration?.status === "updated" ? "扩展配置已迁移" : "",
+    metrics.stalled ? "⚠ 后台疑似停滞（长时间无成功拉取）" : "",
+    metrics.slow_ticks ? `慢 tick ${metrics.slow_ticks} 次` : "",
+    bridgeState.session_count ? `会话游标 ${bridgeState.session_count} / 去重 ${bridgeState.seen_raw_id_count || 0}` : "",
+    worker.last_error ? `后台错误：${worker.last_error}` : "",
+  ].filter(Boolean).join(" / ");
+  if (!$("#weflowBaseUrl").dataset.touched) $("#weflowBaseUrl").value = weflow.base_url || "http://127.0.0.1:5031";
+  if (!$("#weflowTokenEnv").dataset.touched) $("#weflowTokenEnv").value = weflow.token_env || "WEFLOW_API_TOKEN";
+  const statusPayload = {
+    worker,
+    stability: {
+      running: worker.running || false,
+      stalled: metrics.stalled || false,
+      loops: metrics.loops || 0,
+      error_ticks: metrics.error_ticks || 0,
+      slow_ticks: metrics.slow_ticks || 0,
+      totals: metrics.totals || {},
+      seconds_since_success: metrics.seconds_since_success ?? null,
+      seconds_since_progress: metrics.seconds_since_progress ?? null,
+      max_tick_duration_seconds: metrics.max_tick_duration_seconds || 0,
+      recent_ticks: metrics.recent_ticks || [],
+    },
+    bridge_state: bridgeState,
+    last_health: weflow.last_health || {},
+    last_pull: compactPayload(weflow.last_pull || {}, 1800),
+    files: {
+      hook_event_file: weflow.hook_event_file,
+      backend_event_file: weflow.backend_event_file,
+      weflow_state_file: weflow.weflow_state_file,
+    },
+    config_migration: weflow.config_migration || {},
+  };
+  $("#weflowStatusBox").textContent = JSON.stringify(statusPayload, null, 2);
+}
+
 function renderCardList({ root, cards, activeIds, emptyText, actionFor }) {
   root.innerHTML = "";
   if (!cards.length) {
@@ -489,6 +536,59 @@ async function probeNow() {
   renderProbeJson();
 }
 
+function weflowPayload(extra = {}) {
+  return {
+    base_url: $("#weflowBaseUrl").value.trim() || "http://127.0.0.1:5031",
+    token_env: $("#weflowTokenEnv").value.trim() || "WEFLOW_API_TOKEN",
+    token: $("#weflowToken").value.trim(),
+    talkers: splitComma($("#weflowTalkers").value),
+    workers: Number($("#weflowWorkers").value || 2),
+    message_limit: Number($("#weflowMessageLimit").value || 100),
+    max_pages: Number($("#weflowMaxPages").value || 1),
+    lookback_seconds: Number($("#weflowLookback").value || 300),
+    interval_seconds: Number($("#weflowInterval").value || 5),
+    context_only: $("#weflowContextOnly").checked,
+    ...extra,
+  };
+}
+
+async function weflowAction(action, extra = {}) {
+  const payload = await api(`/api/weflow/${action}`, {
+    method: "POST",
+    body: JSON.stringify(weflowPayload(extra)),
+  });
+  $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 5000), null, 2);
+  setStatusMessage(`WeFlow ${action} 完成`);
+  await refresh({ force: true });
+  return payload;
+}
+
+async function weflowDependencies() {
+  const payload = await api("/api/weflow/dependencies", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  $("#weflowStatusBox").textContent = JSON.stringify(payload, null, 2);
+  setStatusMessage("WeFlow 依赖检查完成");
+}
+
+async function weflowInstallDeps() {
+  if (!window.confirm("将使用当前 Python 执行 pip install -r requirements-ocr.txt")) return;
+  const payload = await api("/api/weflow/install-deps", {
+    method: "POST",
+    body: JSON.stringify({ confirm_install: true }),
+  });
+  $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 6000), null, 2);
+  setStatusMessage("WeFlow 依赖安装完成");
+}
+
+function splitComma(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function actionButton(label, className, handler) {
   const button = document.createElement("button");
   button.className = className;
@@ -523,6 +623,7 @@ function setActivePanel(panel) {
   $("#queuePanel").hidden = panel !== "queue";
   $("#bridgePanel").hidden = panel !== "bridge";
   $("#runtimePanel").hidden = panel !== "runtime";
+  $("#weflowPanel").hidden = panel !== "weflow";
 }
 
 function setMode(mode) {
@@ -674,6 +775,15 @@ function compactText(value, maxLength) {
   return `${text.slice(0, maxLength - 1).trim()}…`;
 }
 
+function compactPayload(value, maxLength) {
+  const text = JSON.stringify(value || {}, null, 2);
+  if (text.length <= maxLength) return value;
+  return {
+    compacted: true,
+    preview: text.slice(0, maxLength - 1).trim() + "…",
+  };
+}
+
 function probeStatusText(value) {
   return {
     ok: "已找到微信窗口",
@@ -735,6 +845,30 @@ $("#probeButton").addEventListener("click", () => probeNow().catch((error) => {
 }));
 $("#bridgeRefreshButton").addEventListener("click", () => refresh({ force: true }));
 $("#runtimeRefreshButton").addEventListener("click", () => refresh({ force: true }));
+$("#weflowRefreshButton").addEventListener("click", () => refresh({ force: true }));
+$("#weflowHealthButton").addEventListener("click", () => weflowAction("health").catch((error) => {
+  $("#weflowStatusBox").textContent = `WeFlow health 失败：${error.message}`;
+}));
+$("#weflowPullButton").addEventListener("click", () => weflowAction("pull-once").catch((error) => {
+  $("#weflowStatusBox").textContent = `WeFlow 拉取失败：${error.message}`;
+}));
+$("#weflowStartButton").addEventListener("click", () => weflowAction("start").catch((error) => {
+  $("#weflowStatusBox").textContent = `WeFlow 启动失败：${error.message}`;
+}));
+$("#weflowStopButton").addEventListener("click", () => weflowAction("stop").catch((error) => {
+  $("#weflowStatusBox").textContent = `WeFlow 停止失败：${error.message}`;
+}));
+$("#weflowDepsButton").addEventListener("click", () => weflowDependencies().catch((error) => {
+  $("#weflowStatusBox").textContent = `依赖检查失败：${error.message}`;
+}));
+$("#weflowInstallButton").addEventListener("click", () => weflowInstallDeps().catch((error) => {
+  $("#weflowStatusBox").textContent = `依赖安装失败：${error.message}`;
+}));
+["#weflowBaseUrl", "#weflowTokenEnv"].forEach((selector) => {
+  $(selector).addEventListener("input", (event) => {
+    event.target.dataset.touched = "1";
+  });
+});
 $("#personaForm").addEventListener("submit", (event) => {
   event.preventDefault();
   if (state.actionInProgress) return;
