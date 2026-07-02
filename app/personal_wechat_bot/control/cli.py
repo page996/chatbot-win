@@ -272,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     pull_hook.add_argument("--interval", type=float, default=1.0)
     pull_hook.add_argument("--verbose", action="store_true")
     pull_hook.add_argument("--extra-root", action="append", default=[])
+    pull_hook.add_argument("--allow-concurrent-consumer", action="store_true", help="skip the single-instance lock (unsafe: two consumers race the import offset)")
 
     append_hook_source = sub.add_parser("append-hook-source-event")
     append_hook_source.add_argument("--hook-event-file", default=None)
@@ -309,6 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     pull_weflow.add_argument("--interval", type=float, default=1.0)
     pull_weflow.add_argument("--verbose", action="store_true")
     pull_weflow.add_argument("--extra-root", action="append", default=[])
+    pull_weflow.add_argument("--allow-concurrent-consumer", action="store_true", help="skip the single-instance lock (unsafe: two consumers race the import offset)")
     pull_weflow.add_argument("--allow-non-local", action="store_true")
 
     listen_weflow = sub.add_parser("listen-weflow-sse")
@@ -708,22 +710,23 @@ def main(argv: list[str] | None = None) -> None:
             hook_event_file=hook_event_file,
             backend_event_file=backend_event_file,
         )
-        result = _run_weflow_pull_loop(
-            bridge,
-            runner,
-            talkers=args.talker,
-            session_limit=args.session_limit,
-            message_limit=args.message_limit,
-            max_pages=args.max_pages,
-            max_messages=args.max_messages,
-            since=args.since,
-            lookback_seconds=args.lookback_seconds,
-            workers=args.workers,
-            media=not args.no_media,
-            context_only=args.context_only or (args.since is not None and args.since <= 0),
-            max_loops=None if args.forever else args.loops,
-            interval=args.interval,
-        )
+        with runner.single_instance(enabled=not args.allow_concurrent_consumer, label="cli:pull-weflow-messages"):
+            result = _run_weflow_pull_loop(
+                bridge,
+                runner,
+                talkers=args.talker,
+                session_limit=args.session_limit,
+                message_limit=args.message_limit,
+                max_pages=args.max_pages,
+                max_messages=args.max_messages,
+                since=args.since,
+                lookback_seconds=args.lookback_seconds,
+                workers=args.workers,
+                media=not args.no_media,
+                context_only=args.context_only or (args.since is not None and args.since <= 0),
+                max_loops=None if args.forever else args.loops,
+                interval=args.interval,
+            )
         if not args.verbose:
             result.pop("processed", None)
         result["weflow_ready"] = weflow_ready
@@ -772,7 +775,8 @@ def main(argv: list[str] | None = None) -> None:
             hook_event_file=hook_event_file,
             backend_event_file=backend_event_file,
         )
-        result = runner.run_forever(max_loops=None if args.forever else args.loops)
+        with runner.single_instance(enabled=not args.allow_concurrent_consumer, label="cli:pull-hook-messages"):
+            result = runner.run_forever(max_loops=None if args.forever else args.loops)
         if not args.verbose:
             result.pop("processed", None)
         print(json.dumps(result, ensure_ascii=False, indent=2))

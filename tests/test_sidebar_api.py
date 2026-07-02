@@ -395,6 +395,35 @@ class WeflowBackgroundLoopTest(unittest.TestCase):
 
             self.assertEqual(build_calls, 2)
 
+    def test_background_loop_fails_fast_when_consumer_lock_held(self) -> None:
+        from app.personal_wechat_bot.runtime.process_lock import ProcessLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            # Simulate another consumer already holding the lock.
+            other = ProcessLock(data_dir / "hook_events_state.json.consumer.lock", label="other-consumer")
+            other.acquire()
+            build_calls = 0
+
+            def fake_build(root, payload):
+                nonlocal build_calls
+                build_calls += 1
+                return {"context_id": build_calls}
+
+            stop_event = threading.Event()
+            try:
+                with mock.patch.object(sidebar_api, "_build_weflow_pull_context", side_effect=fake_build):
+                    sidebar_api._weflow_background_loop(data_dir, {"interval_seconds": 1}, stop_event)
+            finally:
+                other.release()
+
+            # The loop must refuse to run (no context built) and record the error.
+            self.assertEqual(build_calls, 0)
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+            self.assertIn("already running", state["worker"]["last_error"])
+
 
 def _reply() -> ReplyCandidate:
     return ReplyCandidate(

@@ -19,6 +19,7 @@ from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
+from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError
 from app.personal_wechat_bot.runtime.weflow_state_summary import summarize_weflow_bridge_state
 from app.personal_wechat_bot.runtime.weflow_worker_metrics import WeflowWorkerMetrics
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
@@ -452,44 +453,66 @@ def _run_sidebar_weflow_once(data_dir: str | Path, payload: dict[str, Any]) -> d
 def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
     interval = max(1.0, float(payload.get("interval_seconds") or 5.0))
     key = str(root)
+    # Single-instance guard: refuse to run if another consumer (a CLI puller or
+    # a second worker) already holds the hook consumer lock, so two loops never
+    # race the shared import offset. Lock path matches HookMessagePullRunner.
+    lock_path = Path(root) / "hook_events_state.json.consumer.lock"
+    consumer_lock = ProcessLock(lock_path, label="sidebar_weflow_worker", stale_after_seconds=max(30.0, interval * 4))
+    try:
+        consumer_lock.acquire()
+    except ProcessLockError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        with _WEFLOW_LOCK:
+            worker = _WEFLOW_WORKERS.get(key, {})
+            worker["last_status"] = "error"
+            worker["last_error"] = error
+            worker["last_tick_at"] = time.time()
+            _WEFLOW_WORKERS[key] = worker
+        _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
+        return
     context: dict[str, Any] | None = None
-    while not stop_event.is_set():
-        tick_started = time.monotonic()
-        try:
-            if context is None:
-                context = _build_weflow_pull_context(root, payload)
-            result = _run_weflow_pull_tick(context)
-            duration = time.monotonic() - tick_started
-            source_status = str(result.get("source", {}).get("status") or "")
-            if source_status == "error":
-                # A total pull failure usually means WeFlow went away. Drop the
-                # context so the next tick rebuilds it and re-runs the health /
-                # fork-marker check before pulling again.
+    try:
+        while not stop_event.is_set():
+            tick_started = time.monotonic()
+            try:
+                if context is None:
+                    context = _build_weflow_pull_context(root, payload)
+                result = _run_weflow_pull_tick(context)
+                duration = time.monotonic() - tick_started
+                source_status = str(result.get("source", {}).get("status") or "")
+                if source_status == "error":
+                    # A total pull failure usually means WeFlow went away. Drop the
+                    # context so the next tick rebuilds it and re-runs the health /
+                    # fork-marker check before pulling again.
+                    context = None
+                consumer_lock.heartbeat()
+                with _WEFLOW_LOCK:
+                    worker = _WEFLOW_WORKERS.get(key, {})
+                    metrics = worker.get("metrics")
+                    if isinstance(metrics, WeflowWorkerMetrics):
+                        metrics.record_tick(result, duration)
+                    worker["last_status"] = result.get("status", "")
+                    worker["last_tick_at"] = time.time()
+                    _WEFLOW_WORKERS[key] = worker
+                _write_weflow_sidebar_state(root, {"last_pull": result, "last_error": "", **_weflow_public_params(_weflow_params(root, payload))})
+            except Exception as exc:
                 context = None
-            with _WEFLOW_LOCK:
-                worker = _WEFLOW_WORKERS.get(key, {})
-                metrics = worker.get("metrics")
-                if isinstance(metrics, WeflowWorkerMetrics):
-                    metrics.record_tick(result, duration)
-                worker["last_status"] = result.get("status", "")
-                worker["last_tick_at"] = time.time()
-                _WEFLOW_WORKERS[key] = worker
-            _write_weflow_sidebar_state(root, {"last_pull": result, "last_error": "", **_weflow_public_params(_weflow_params(root, payload))})
-        except Exception as exc:
-            context = None
-            duration = time.monotonic() - tick_started
-            error = f"{type(exc).__name__}: {exc}"
-            with _WEFLOW_LOCK:
-                worker = _WEFLOW_WORKERS.get(key, {})
-                metrics = worker.get("metrics")
-                if isinstance(metrics, WeflowWorkerMetrics):
-                    metrics.record_error(error, duration)
-                worker["last_status"] = "error"
-                worker["last_error"] = error
-                worker["last_tick_at"] = time.time()
-                _WEFLOW_WORKERS[key] = worker
-            _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
-        stop_event.wait(interval)
+                duration = time.monotonic() - tick_started
+                error = f"{type(exc).__name__}: {exc}"
+                consumer_lock.heartbeat()
+                with _WEFLOW_LOCK:
+                    worker = _WEFLOW_WORKERS.get(key, {})
+                    metrics = worker.get("metrics")
+                    if isinstance(metrics, WeflowWorkerMetrics):
+                        metrics.record_error(error, duration)
+                    worker["last_status"] = "error"
+                    worker["last_error"] = error
+                    worker["last_tick_at"] = time.time()
+                    _WEFLOW_WORKERS[key] = worker
+                _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
+            stop_event.wait(interval)
+    finally:
+        consumer_lock.release()
 
 
 def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:

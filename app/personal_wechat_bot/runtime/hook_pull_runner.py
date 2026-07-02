@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
+from app.personal_wechat_bot.runtime.process_lock import ProcessLock, process_lock
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter, HookImportResult
 
 
@@ -25,8 +27,39 @@ class HookMessagePullRunner:
         self.backend_event_file = Path(backend_event_file)
         self.backend_event_file.parent.mkdir(parents=True, exist_ok=True)
         self.backend_event_file.touch(exist_ok=True)
+        self._lock: ProcessLock | None = None
+
+    def lock_path(self) -> Path:
+        """Single-instance lock file guarding this hook/backend consumer pair."""
+
+        return self.importer.state_path.with_suffix(self.importer.state_path.suffix + ".consumer.lock")
+
+    @contextmanager
+    def single_instance(self, *, enabled: bool = True, label: str = "hook_pull_runner", stale_after_seconds: float = 60.0) -> Iterator[None]:
+        """Hold a single-instance lock for the lifetime of a long-running loop.
+
+        Two runners consuming the same hook JSONL would race the shared import
+        offset in ``hook_events_state.json`` and double-import or skip events.
+        This lock makes the second runner fail fast instead. The heartbeat is
+        refreshed every tick by :meth:`run_forever`; a crashed holder's lock
+        goes stale and can be taken over.
+        """
+
+        with process_lock(
+            self.lock_path(),
+            label=label,
+            stale_after_seconds=stale_after_seconds,
+            enabled=enabled,
+        ) as lock:
+            self._lock = lock
+            try:
+                yield
+            finally:
+                self._lock = None
 
     def run_once(self) -> dict[str, Any]:
+        if self._lock is not None:
+            self._lock.heartbeat()
         imported = self.importer.import_new()
         poll_result = self.polling_runner.run_once()
         processed = poll_result.get("processed", [])
