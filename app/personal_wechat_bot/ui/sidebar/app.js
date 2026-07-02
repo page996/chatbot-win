@@ -350,6 +350,7 @@ function renderWeFlow(weflow) {
     bridge_state: bridgeState,
     last_health: weflow.last_health || {},
     last_pull: compactPayload(weflow.last_pull || {}, 1800),
+    last_backfill: compactPayload(weflow.last_backfill || {}, 1800),
     files: {
       hook_event_file: weflow.hook_event_file,
       backend_event_file: weflow.backend_event_file,
@@ -559,6 +560,24 @@ async function weflowAction(action, extra = {}) {
   });
   $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 5000), null, 2);
   setStatusMessage(`WeFlow ${action} 完成`);
+  await refresh({ force: true });
+  return payload;
+}
+
+async function weflowBackfill() {
+  const talkers = splitComma($("#weflowTalkers").value);
+  if (!talkers.length) {
+    $("#weflowStatusBox").textContent = "回填历史需要在 Talkers 填写要初始化的会话 id（不能为空）。";
+    setStatusMessage("回填历史需要指定 Talkers");
+    return;
+  }
+  if (!window.confirm(`将从头拉取以下会话的历史消息作为上下文（不会回复旧消息）：\n${talkers.join(", ")}`)) return;
+  const payload = await api("/api/weflow/backfill", {
+    method: "POST",
+    body: JSON.stringify(weflowPayload({ talkers })),
+  });
+  $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 5000), null, 2);
+  setStatusMessage(`WeFlow 回填历史完成（${(payload.backfilled_talkers || []).length} 个会话）`);
   await refresh({ force: true });
   return payload;
 }
@@ -851,6 +870,9 @@ $("#weflowHealthButton").addEventListener("click", () => weflowAction("health").
 }));
 $("#weflowPullButton").addEventListener("click", () => weflowAction("pull-once").catch((error) => {
   $("#weflowStatusBox").textContent = `WeFlow 拉取失败：${error.message}`;
+}));
+$("#weflowBackfillButton").addEventListener("click", () => weflowBackfill().catch((error) => {
+  $("#weflowStatusBox").textContent = `WeFlow 回填历史失败：${error.message}`;
 }));
 $("#weflowStartButton").addEventListener("click", () => weflowAction("start").catch((error) => {
   $("#weflowStatusBox").textContent = `WeFlow 启动失败：${error.message}`;

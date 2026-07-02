@@ -210,6 +210,33 @@ class SidebarServerTest(unittest.TestCase):
             self.assertEqual(saved["status"], "ok")
             self.assertIn("通过 HTTP 装备", saved["runtime_cards"]["active"]["tasks"][0]["content"])
 
+    def test_sidebar_server_routes_weflow_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                # A system account short-circuits before touching WeFlow, so this
+                # proves the route reaches sidebar_weflow_backfill without needing
+                # a live bridge.
+                request = Request(
+                    f"http://{host}:{port}/api/weflow/backfill",
+                    data=json.dumps({"talkers": ["filehelper"]}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "error")
+            self.assertEqual(payload["backfilled_talkers"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

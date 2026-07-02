@@ -197,6 +197,7 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "bridge_state": summarize_weflow_bridge_state(root / "weflow_bridge_state.json"),
         "last_health": persisted.get("last_health", {}) if isinstance(persisted, dict) else {},
         "last_pull": persisted.get("last_pull", {}) if isinstance(persisted, dict) else {},
+        "last_backfill": persisted.get("last_backfill", {}) if isinstance(persisted, dict) else {},
         "last_error": persisted.get("last_error", "") if isinstance(persisted, dict) else "",
         "updated_at": persisted.get("updated_at", "") if isinstance(persisted, dict) else "",
     }

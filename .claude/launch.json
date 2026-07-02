@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sidebar",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "app.personal_wechat_bot.main", "--data-dir", "data", "send-sidebar", "--port", "3000"],
+      "cwd": ".",
+      "url": "http://127.0.0.1:3000"
+    }
+  ]
+}

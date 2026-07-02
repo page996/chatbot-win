@@ -5,3 +5,4 @@ data/
 API key.md
 API keys.md
 vendor/
+.claude/settings.local.json
