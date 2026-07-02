@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from dataclasses import asdict, is_dataclass
@@ -27,7 +28,7 @@ from app.personal_wechat_bot.control.audit import (
     build_plan_audit,
 )
 from app.personal_wechat_bot.control.preflight import build_preflight_report
-from app.personal_wechat_bot.control.sidebar_api import cleanup_sidebar_channels, delete_sidebar_channel
+from app.personal_wechat_bot.control.sidebar_api import cleanup_sidebar_channels, delete_sidebar_channel, sidebar_weflow_backfill
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
 from app.personal_wechat_bot.control.sidebar_window import run_sidebar_window
@@ -43,6 +44,11 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
+from app.personal_wechat_bot.runtime.conversation_migration import (
+    ConversationMigration,
+    load_migration_map,
+    migrate_conversations,
+)
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
@@ -313,6 +319,22 @@ def build_parser() -> argparse.ArgumentParser:
     pull_weflow.add_argument("--allow-concurrent-consumer", action="store_true", help="skip the single-instance lock (unsafe: two consumers race the import offset)")
     pull_weflow.add_argument("--allow-non-local", action="store_true")
 
+    backfill_weflow = sub.add_parser(
+        "backfill-weflow-history",
+        help="pull a conversation's full history as context-only (no replies) to initialize its ledger",
+    )
+    backfill_weflow.add_argument("--base-url", default="http://127.0.0.1:5031")
+    backfill_weflow.add_argument("--token", default="")
+    backfill_weflow.add_argument("--token-env", default="")
+    backfill_weflow.add_argument("--talker", action="append", default=[], required=True, help="talker id(s) to backfill; repeatable")
+    backfill_weflow.add_argument("--message-limit", type=int, default=100)
+    backfill_weflow.add_argument("--max-pages", type=int, default=0, help="0 = walk all pages")
+    backfill_weflow.add_argument("--max-messages", type=int, default=0, help="0 = no cap")
+    backfill_weflow.add_argument("--workers", type=int, default=1)
+    backfill_weflow.add_argument("--no-media", action="store_true")
+    backfill_weflow.add_argument("--verbose", action="store_true")
+    backfill_weflow.add_argument("--allow-non-local", action="store_true")
+
     listen_weflow = sub.add_parser("listen-weflow-sse")
     listen_weflow.add_argument("--base-url", default="http://127.0.0.1:5031")
     listen_weflow.add_argument("--token", default="")
@@ -329,6 +351,12 @@ def build_parser() -> argparse.ArgumentParser:
     wcf_sink.add_argument("--host", default="127.0.0.1")
     wcf_sink.add_argument("--port", type=int, default=8791)
     wcf_sink.add_argument("--path", default="/callback")
+
+    migrate_conv = sub.add_parser("migrate-conversations")
+    migrate_conv.add_argument("--map", required=True, help="path to migration map JSON")
+    migrate_conv.add_argument("--apply", action="store_true", help="apply changes (default is dry-run preview)")
+    migrate_conv.add_argument("--backup", action="store_true", help="copy data-dir to a timestamped backup before applying")
+    migrate_conv.add_argument("--verbose", action="store_true")
 
     poll_backend = sub.add_parser("poll-backend-events")
     poll_backend.add_argument("--event-file", default=None)
@@ -732,6 +760,26 @@ def main(argv: list[str] | None = None) -> None:
         result["weflow_ready"] = weflow_ready
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command == "backfill-weflow-history":
+        result = sidebar_weflow_backfill(
+            args.data_dir,
+            {
+                "base_url": args.base_url,
+                "token": args.token,
+                "token_env": args.token_env,
+                "talkers": args.talker,
+                "message_limit": args.message_limit,
+                "max_pages": args.max_pages,
+                "max_messages": args.max_messages,
+                "workers": args.workers,
+                "no_media": args.no_media,
+                "allow_non_local": args.allow_non_local,
+            },
+        )
+        if not args.verbose:
+            result.pop("processed", None)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "listen-weflow-sse":
         hook_event_file = args.hook_event_file or str(Path(args.data_dir) / "hook_events.jsonl")
         token = _token_arg(args.token, args.token_env)
@@ -759,6 +807,10 @@ def main(argv: list[str] | None = None) -> None:
                 path=args.path,
             )
         )
+        return
+    if args.command == "migrate-conversations":
+        result = _run_migrate_conversations(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "pull-hook-messages":
         config = load_config(args.data_dir)
@@ -1173,6 +1225,70 @@ def _jsonable_dataclass(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
     return {}
+
+
+def _run_migrate_conversations(args) -> dict[str, Any]:
+    from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
+
+    data_dir = Path(args.data_dir)
+    migrations = _resolve_migrations(args.map, conversation_id_for)
+    backup_path = ""
+    if args.apply and args.backup:
+        backup_path = _backup_data_dir(data_dir)
+    report = migrate_conversations(data_dir, migrations, dry_run=not args.apply)
+    payload = report.to_dict()
+    payload["applied"] = bool(args.apply)
+    payload["backup_path"] = backup_path
+    if not args.apply:
+        payload["hint"] = "dry-run only; re-run with --apply (and --backup) to execute"
+    if not args.verbose:
+        for item in payload.get("items", []):
+            item.pop("moved_dirs", None)
+    return payload
+
+
+def _resolve_migrations(map_path: str, conversation_id_for) -> list[ConversationMigration]:
+    """Load a migration map, deriving new_id from talker_id when omitted.
+
+    Map entries may provide new_id directly, or provide talker_id (+ optional
+    conversation_type, default 'private'/'group' inferred from '@chatroom') so
+    the new conversation_id is computed the same way the pipeline would.
+    """
+
+    raw = json.loads(Path(map_path).read_text(encoding="utf-8"))
+    items = raw.get("migrations") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        raise SystemExit("migration map must contain a 'migrations' list")
+    resolved: list[ConversationMigration] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        old_id = str(item.get("old_id") or "").strip()
+        if not old_id:
+            continue
+        new_id = str(item.get("new_id") or "").strip()
+        talker_id = str(item.get("talker_id") or "").strip()
+        chat_title = str(item.get("chat_title") or "").strip()
+        if not new_id and talker_id:
+            ctype = str(item.get("conversation_type") or "").strip()
+            if not ctype:
+                ctype = "group" if talker_id.endswith("@chatroom") else "private"
+            new_id = conversation_id_for(ctype, talker_id)
+        if not new_id:
+            raise SystemExit(f"migration entry for old_id={old_id} needs new_id or talker_id")
+        resolved.append(
+            ConversationMigration(old_id=old_id, new_id=new_id, chat_title=chat_title, talker_id=talker_id)
+        )
+    if not resolved:
+        raise SystemExit("no usable migration entries found")
+    return resolved
+
+
+def _backup_data_dir(data_dir: Path) -> str:
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    backup = data_dir.parent / f"{data_dir.name}_backup_{stamp}"
+    shutil.copytree(data_dir, backup)
+    return str(backup)
 
 
 def _load_config_or_default(data_dir: str) -> BotConfig:

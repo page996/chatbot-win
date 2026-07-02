@@ -39,6 +39,7 @@ from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJso
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
 from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
+from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
     WeFlowHttpBridge,
     require_weflow_ready,
@@ -217,6 +218,48 @@ def sidebar_weflow_health(data_dir: str | Path, payload: dict[str, Any]) -> dict
 def sidebar_weflow_pull_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     result = _run_sidebar_weflow_once(data_dir, payload)
     _write_weflow_sidebar_state(data_dir, {"last_pull": result, **_weflow_public_params(_weflow_params(data_dir, payload))})
+    return result
+
+
+def sidebar_weflow_backfill(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Backfill a conversation's history so a newly added talker starts with
+    context instead of an empty ledger.
+
+    Pulls from the beginning of the conversation (``since=0``) as context-only
+    messages (recorded in the ledger but never replied to), walking every page
+    up to an optional ``max_messages`` cap. This lets the agent join a chat that
+    already has a long history without the user re-stating anything.
+
+    Requires an explicit ``talkers`` list: backfill targets a specific
+    conversation the user is adding, not every discovered session. The bridge
+    dedup + max(previous_since, since) state merge make this safe to run even
+    after incremental pulls have advanced the cursor.
+    """
+
+    talkers = _string_list(payload.get("talkers") or payload.get("talker") or [])
+    talkers = [talker for talker in talkers if not is_system_account(talker)]
+    if not talkers:
+        return {
+            "status": "error",
+            "error": "backfill requires an explicit talkers list (non-system account)",
+            "backfilled_talkers": [],
+        }
+    backfill_payload = {
+        **payload,
+        "talkers": talkers,
+        "since": 0,
+        "context_only": True,
+        # Walk all pages by default so the whole history is captured; callers can
+        # still cap the total with max_messages.
+        "max_pages": _bounded_int(payload.get("max_pages"), 0, 0, 10000),
+        "max_messages": _bounded_int(payload.get("max_messages"), 0, 0, 1000000),
+    }
+    result = _run_sidebar_weflow_once(data_dir, backfill_payload)
+    result = {**result, "backfill": True, "backfilled_talkers": talkers}
+    _write_weflow_sidebar_state(
+        data_dir,
+        {"last_backfill": result, **_weflow_public_params(_weflow_params(data_dir, backfill_payload))},
+    )
     return result
 
 
