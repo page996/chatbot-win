@@ -2,3 +2,7 @@ rapidocr-onnxruntime
 onnxruntime-gpu
 Pillow
 numpy
+PyMuPDF
+pypdf
+pdfminer.six
+openpyxl

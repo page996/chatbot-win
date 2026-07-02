@@ -13,8 +13,12 @@ from app.personal_wechat_bot.vision.ocr import OcrEngine
 from app.personal_wechat_bot.voice.asr import AsrEngine, LocalAsrSubprocessEngine
 
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".amr", ".silk"}
+PRESENTATION_SUFFIXES = {".ppt", ".pptx"}
+ARCHIVE_SUFFIXES = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz"}
+APPLICATION_SUFFIXES = {".exe", ".msi", ".apk", ".app", ".dmg", ".bat", ".cmd", ".ps1", ".scr"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v"}
 
 
 @dataclass(frozen=True)
@@ -51,11 +55,24 @@ class BackendAttachmentParser:
                 return self._parse_worker(file_path, "pdf")
             if suffix in {".xlsx", ".xlsm", ".csv"}:
                 return self._parse_worker(file_path, "spreadsheet")
+            if suffix in PRESENTATION_SUFFIXES:
+                return _unsupported_placeholder(file_path, "presentation", "幻灯片")
+            if suffix in ARCHIVE_SUFFIXES:
+                return _unsupported_placeholder(file_path, "archive", "压缩文件")
+            if suffix in APPLICATION_SUFFIXES:
+                return _unsupported_placeholder(file_path, "application", "应用程序")
+            if suffix in VIDEO_SUFFIXES:
+                return _unsupported_placeholder(file_path, "video", "视频")
             if suffix in IMAGE_SUFFIXES:
                 return self._parse_image(file_path)
             if suffix in AUDIO_SUFFIXES:
                 return self._parse_audio(file_path)
-            return AttachmentParseResult("skipped", "file", f"暂不解析此类附件：{suffix or 'unknown'}")
+            return AttachmentParseResult(
+                "skipped",
+                "file",
+                f"暂不解析此类附件：{suffix or 'unknown'}",
+                _unsupported_text(file_path, "file", "暂不支持的文件"),
+            )
         except Exception as exc:
             return AttachmentParseResult(
                 "failed",
@@ -80,11 +97,11 @@ class BackendAttachmentParser:
 
     def _parse_image(self, path: Path) -> AttachmentParseResult:
         if self.ocr_engine is None:
-            return AttachmentParseResult("skipped", "image", "图片已登记，OCR 引擎未启用")
+            return _image_placeholder(path, "OCR 引擎未启用")
         text = self.ocr_engine.read_text(path)
         preview = _preview(text, self.max_preview_chars)
         if not preview:
-            return AttachmentParseResult("empty", "image", "图片 OCR 未识别到文本")
+            return _image_placeholder(path, "OCR 未识别到有效文本", status="empty")
         return AttachmentParseResult("parsed", "image", "已完成图片 OCR 预览", preview)
 
     def _parse_audio(self, path: Path) -> AttachmentParseResult:
@@ -170,7 +187,41 @@ def _preview(text: str, max_chars: int) -> str:
         return ""
     if len(normalized) <= max_chars:
         return normalized
-    return normalized[: max_chars - 1].rstrip() + "…"
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _unsupported_placeholder(path: Path, kind: str, label: str) -> AttachmentParseResult:
+    return AttachmentParseResult(
+        "skipped",
+        kind,
+        f"{label}已登记到本地文件中间层；出于稳定性和安全性，当前不会解析、解压或执行此类文件。",
+        _unsupported_text(path, kind, label),
+    )
+
+
+def _image_placeholder(path: Path, reason: str, *, status: str = "skipped") -> AttachmentParseResult:
+    label = "图片/表情"
+    return AttachmentParseResult(
+        status,
+        "image",
+        f"{label}已登记到本地文件中间层；{reason}，当前以占位符进入对话上下文。",
+        _unsupported_text(path, "image", label, reason=reason),
+    )
+
+
+def _unsupported_text(path: Path, kind: str, label: str, *, reason: str = "") -> str:
+    size = path.stat().st_size if path.exists() else 0
+    reason_line = f"\n- 原因: {reason}" if reason else ""
+    return (
+        "[附件占位符]\n"
+        f"- 类型: {label}\n"
+        f"- kind: {kind}\n"
+        f"- 文件名: {path.name}\n"
+        f"- 本地路径: {path}\n"
+        f"- 字节数: {size}"
+        f"{reason_line}\n"
+        "- 说明: agent 当前不会读取、解析、解压或执行该文件；如需处理，请用户提供可解析格式或明确授权新的本地解析策略。"
+    )
 
 
 def _kind_for_suffix(suffix: str) -> str:
@@ -182,6 +233,14 @@ def _kind_for_suffix(suffix: str) -> str:
         return "pdf"
     if suffix in {".xlsx", ".xlsm", ".csv"}:
         return "spreadsheet"
+    if suffix in PRESENTATION_SUFFIXES:
+        return "presentation"
+    if suffix in ARCHIVE_SUFFIXES:
+        return "archive"
+    if suffix in APPLICATION_SUFFIXES:
+        return "application"
+    if suffix in VIDEO_SUFFIXES:
+        return "video"
     if suffix in IMAGE_SUFFIXES:
         return "image"
     if suffix in AUDIO_SUFFIXES:

@@ -29,7 +29,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             result = BackendAttachmentParser(max_preview_chars=4).parse(path)
 
-            self.assertEqual(result.text, "abc…")
+            self.assertEqual(result.text, "a...")
 
     def test_text_attachment_preview_strips_utf8_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,6 +63,36 @@ class BackendAttachmentParserTest(unittest.TestCase):
             self.assertEqual(result.kind, "image")
             self.assertEqual(result.summary, "已完成图片 OCR 预览")
             self.assertEqual(result.text, "图片里的任务信息")
+
+    def test_image_attachment_uses_placeholder_when_ocr_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sticker.gif"
+            path.write_bytes(b"fake gif")
+
+            result = BackendAttachmentParser(ocr_engine=_FakeOcr(""), max_preview_chars=200).parse(path)
+
+            self.assertEqual(result.status, "empty")
+            self.assertEqual(result.kind, "image")
+            self.assertIn("[附件占位符]", result.text)
+            self.assertIn("图片/表情", result.text)
+
+    def test_unsupported_binary_families_are_visible_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, kind in {
+                "slides.pptx": "presentation",
+                "archive.zip": "archive",
+                "installer.exe": "application",
+                "clip.mp4": "video",
+            }.items():
+                path = Path(tmp) / name
+                path.write_bytes(b"placeholder")
+
+                result = BackendAttachmentParser(max_preview_chars=200).parse(path)
+
+                self.assertEqual(result.status, "skipped")
+                self.assertEqual(result.kind, kind)
+                self.assertIn("[附件占位符]", result.text)
+                self.assertIn(name, result.text)
 
     def test_pdf_is_registered_when_worker_python_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

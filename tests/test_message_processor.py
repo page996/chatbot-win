@@ -59,6 +59,10 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result["route"]["action"], "process")
             self.assertEqual(result["send"]["status"], "skipped")
+            entries = runtime.ledger_store.read_entries(result["message"]["conversation_id"])
+            self.assertEqual(entries[-1].role, "assistant")
+            self.assertEqual(entries[-1].send["status"], "skipped")
+            self.assertEqual(entries[-1].send["reason"], "dry_run")
 
     def test_processor_auto_registers_unknown_private_and_group_channels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

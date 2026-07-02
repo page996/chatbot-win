@@ -36,7 +36,9 @@ class AttachmentPipelineTest(unittest.TestCase):
             )
 
             self.assertEqual(result["status"], "indexed")
-            self.assertEqual(result["parse"]["text"], "parsed text")
+            self.assertTrue(result["parse"]["text"].startswith("parsed text"))
+            self.assertIn("[file_artifacts]", result["parse"]["text"])
+            self.assertIn("content_path=", result["parse"]["text"])
             self.assertEqual(result["artifacts"]["chunk_count"], 1)
             self.assertTrue(Path(result["workspace"]["staged_path"]).exists())
             self.assertTrue((Path(result["workspace"]["derived_dir"]) / "content.md").exists())
@@ -128,6 +130,8 @@ class AttachmentPipelineTest(unittest.TestCase):
             self.assertEqual(result["artifacts"]["media_extract_count"], 1)
             self.assertEqual(result["artifacts"]["media_ocr_status"], "completed")
             self.assertEqual(result["artifacts"]["media_ocr_count"], 1)
+            self.assertTrue(Path(result["artifacts"]["media_ocr_index_path"]).exists())
+            self.assertIn("[media_ocr_preview]", result["parse"]["text"])
             self.assertTrue(Path(result["artifacts"]["media_images"][0]["ocr_path"]).exists())
 
     def test_process_blocks_disallowed_file_without_copying(self) -> None:

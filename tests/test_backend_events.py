@@ -154,6 +154,18 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(messages[0].driver_meta["voice"]["text"], "这是微信自带转文字")
         self.assertEqual(messages[0].driver_meta["voice"]["source"], "wechat_builtin_voice_to_text")
 
+    def test_plain_backend_message_does_not_create_recall_metadata(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="plain",
+        )
+
+        messages = self.driver.read_new_messages()
+
+        self.assertEqual(messages[0].driver_meta["recall"], {})
+
     def test_backend_event_payload_accepts_pending_voice_without_text(self) -> None:
         append_backend_event_payload(
             self.event_file,

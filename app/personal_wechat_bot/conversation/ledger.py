@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
-from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, utc_now_iso
+from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, utc_now_iso
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ class LedgerEntry:
     links: list[dict[str, Any]]
     source: str
     role: str = "user"
+    send: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
 
@@ -50,35 +54,37 @@ class ConversationLedgerStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def append_message(self, message: NormalizedMessage) -> LedgerEntry:
-        conversation_dir = self._conversation_dir(message.conversation_id)
-        entries = self._read_entries(message.conversation_id)
-        existing = _find_entry_by_message_id(entries, message.message_id)
-        if existing is not None:
-            return _entry_from_payload(existing)
-        entry = LedgerEntry(
-            entry_id=_entry_id(message.message_id, message.conversation_id),
-            message_id=message.message_id,
-            conversation_id=message.conversation_id,
-            session_id=_session_id_from_metadata(message.metadata),
-            conversation_type=message.conversation_type,
-            chat_title=message.chat_title,
-            sender_name=message.sender_name,
-            sender_wechat_id=message.sender_wechat_id,
-            is_self=message.is_self,
-            received_at=message.received_at,
-            sequence=self._next_sequence(entries),
-            status="active",
-            text_blocks=_text_blocks_from_message(message),
-            quote=_quote_from_metadata(message.metadata),
-            attachments=_attachments_from_metadata(message.metadata),
-            links=_links_from_text(message.text),
-            source=str(message.metadata.get("source", "")),
-            role="self" if message.is_self else "user",
-        )
-        self._append_entry(conversation_dir, entry)
-        self._write_state(message.conversation_id, entry)
-        self._render_conversation(message.conversation_id)
-        return entry
+        with self._conversation_lock(message.conversation_id):
+            conversation_dir = self._conversation_dir(message.conversation_id)
+            entries = self._read_entries(message.conversation_id)
+            existing = _find_entry_by_message_id(entries, message.message_id)
+            if existing is not None:
+                return _entry_from_payload(existing)
+            entry = LedgerEntry(
+                entry_id=_entry_id(message.message_id, message.conversation_id),
+                message_id=message.message_id,
+                conversation_id=message.conversation_id,
+                session_id=_session_id_from_metadata(message.metadata),
+                conversation_type=message.conversation_type,
+                chat_title=message.chat_title,
+                sender_name=message.sender_name,
+                sender_wechat_id=message.sender_wechat_id,
+                is_self=message.is_self,
+                received_at=message.received_at,
+                sequence=self._next_sequence(entries),
+                status="active",
+                text_blocks=_text_blocks_from_message(message),
+                quote=_quote_from_metadata(message.metadata),
+                attachments=_attachments_from_metadata(message.metadata),
+                links=_links_from_text(message.text),
+                source=str(message.metadata.get("source", "")),
+                role="self" if message.is_self else "user",
+                send={},
+            )
+            self._append_entry(conversation_dir, entry)
+            self._write_state(message.conversation_id, entry)
+            self._render_conversation(message.conversation_id)
+            return entry
 
     def annotate_link(
         self,
@@ -135,34 +141,66 @@ class ConversationLedgerStore:
         conversation_type: str = "private",
         session_id: str = DEFAULT_SESSION_ID,
     ) -> LedgerEntry:
-        entries = self._read_entries(reply.conversation_id)
-        entry = LedgerEntry(
-            entry_id=_entry_id(f"reply:{reply.message_id}:{reply.created_at}", reply.conversation_id),
-            message_id=reply.message_id,
-            conversation_id=reply.conversation_id,
-            session_id=session_id or DEFAULT_SESSION_ID,
-            conversation_type=conversation_type,
-            chat_title=chat_title,
-            sender_name=sender_name,
-            sender_wechat_id=None,
-            is_self=True,
-            received_at=reply.created_at,
-            sequence=self._next_sequence(entries),
-            status="active",
-            text_blocks=[asdict(LedgerTextBlock(kind="reply", text=reply.text, token_estimate=_estimate_tokens(reply.text)))],
-            quote={},
-            attachments=[],
-            links=_links_from_text(reply.text),
-            source="reply_candidate",
-            role="assistant",
-            created_at=reply.created_at,
-            updated_at=reply.created_at,
-        )
-        conversation_dir = self._conversation_dir(reply.conversation_id)
-        self._append_entry(conversation_dir, entry)
-        self._write_state(reply.conversation_id, entry)
-        self._render_conversation(reply.conversation_id)
-        return entry
+        with self._conversation_lock(reply.conversation_id):
+            entries = self._read_entries(reply.conversation_id)
+            entry = LedgerEntry(
+                entry_id=_entry_id(f"reply:{reply.message_id}:{reply.created_at}", reply.conversation_id),
+                message_id=reply.message_id,
+                conversation_id=reply.conversation_id,
+                session_id=session_id or DEFAULT_SESSION_ID,
+                conversation_type=conversation_type,
+                chat_title=chat_title,
+                sender_name=sender_name,
+                sender_wechat_id=None,
+                is_self=True,
+                received_at=reply.created_at,
+                sequence=self._next_sequence(entries),
+                status="active",
+                text_blocks=[asdict(LedgerTextBlock(kind="reply", text=reply.text, token_estimate=_estimate_tokens(reply.text)))],
+                quote={},
+                attachments=_reply_attachments(reply),
+                links=_links_from_text(reply.text),
+                source="reply_candidate",
+                role="assistant",
+                send=_reply_send_payload(reply),
+                created_at=reply.created_at,
+                updated_at=reply.created_at,
+            )
+            conversation_dir = self._conversation_dir(reply.conversation_id)
+            self._append_entry(conversation_dir, entry)
+            self._write_state(reply.conversation_id, entry)
+            self._render_conversation(reply.conversation_id)
+            return entry
+
+    def update_reply_send_result(self, conversation_id: str, entry_id: str, send_result: SendResult | dict[str, Any]) -> bool:
+        entries = self._read_entries(conversation_id)
+        payload = asdict(send_result) if isinstance(send_result, SendResult) else dict(send_result)
+        changed = False
+        updated: list[dict[str, Any]] = []
+        now = utc_now_iso()
+        for item in entries:
+            if item.get("entry_id") != entry_id:
+                updated.append(item)
+                continue
+            item = dict(item)
+            send = item.get("send") if isinstance(item.get("send"), dict) else {}
+            item["send"] = {
+                **send,
+                "status": str(payload.get("status") or ""),
+                "reason": str(payload.get("reason") or ""),
+                "message_id": str(payload.get("message_id") or item.get("message_id") or ""),
+                "conversation_id": str(payload.get("conversation_id") or conversation_id),
+                "sent_at": str(payload.get("sent_at") or ""),
+                "updated_at": now,
+            }
+            item["updated_at"] = now
+            updated.append(item)
+            changed = True
+        if not changed:
+            return False
+        self._rewrite_entries(conversation_id, updated)
+        self._render_conversation(conversation_id)
+        return True
 
     def mark_recalled(self, conversation_id: str, message_id: str, *, reason: str = "wechat_recall") -> bool:
         entries = self._read_entries(conversation_id)
@@ -230,6 +268,36 @@ class ConversationLedgerStore:
 
     def _state_path(self, conversation_id: str) -> Path:
         return self._conversation_dir(conversation_id) / "state.json"
+
+    @contextmanager
+    def _conversation_lock(self, conversation_id: str) -> Iterator[None]:
+        lock_path = self._conversation_dir(conversation_id) / ".ledger.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 30.0
+        fd: int | None = None
+        while fd is None:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if _stale_lock(lock_path):
+                    try:
+                        lock_path.unlink()
+                        continue
+                    except OSError:
+                        pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for conversation ledger lock: {lock_path}")
+                time.sleep(0.025)
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _read_entries(self, conversation_id: str) -> list[dict[str, Any]]:
         path = self._messages_path(conversation_id)
@@ -432,6 +500,73 @@ def _attachments_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]
     return attachments
 
 
+def _reply_attachments(reply: ReplyCandidate) -> list[dict[str, Any]]:
+    attachments = [_normalize_reply_attachment(item, source="reply_candidate") for item in reply.attachments]
+    if reply.tool_result is not None:
+        for index, ref in enumerate(reply.tool_result.output_refs):
+            text = str(ref).strip()
+            if not text:
+                continue
+            attachments.append(
+                _normalize_reply_attachment(
+                    {
+                        "path": text,
+                        "name": Path(text).name,
+                        "kind": "tool_output",
+                        "tool_name": reply.tool_result.tool_name,
+                        "call_id": reply.tool_result.call_id,
+                        "output_index": index,
+                    },
+                    source="tool_result",
+                )
+            )
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in attachments:
+        key = (str(item.get("path", "")), str(item.get("name", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _normalize_reply_attachment(item: Any, *, source: str) -> dict[str, Any]:
+    if isinstance(item, str):
+        payload: dict[str, Any] = {"path": item, "name": Path(item).name}
+    elif isinstance(item, dict):
+        payload = dict(item)
+    else:
+        payload = {}
+    path = str(payload.get("path") or payload.get("source_ref") or payload.get("output_ref") or "").strip()
+    name = str(payload.get("name") or payload.get("filename") or Path(path).name).strip()
+    kind = str(payload.get("kind") or payload.get("type") or "file").strip()
+    result = {
+        "status": str(payload.get("status") or "outgoing").strip(),
+        "source": str(payload.get("source") or source).strip(),
+        "path": path,
+        "name": name,
+        "kind": kind,
+    }
+    for key in ("file_id", "tool_name", "call_id", "output_index", "mime_type", "size", "md5"):
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            result[key] = value
+    return {key: value for key, value in result.items() if value not in ("", None)}
+
+
+def _reply_send_payload(reply: ReplyCandidate) -> dict[str, Any]:
+    payload = {
+        "status": "candidate",
+        "mode": reply.send_mode,
+        "model": reply.model,
+        "policy_hits": list(reply.policy_hits),
+    }
+    if reply.send_metadata:
+        payload["metadata"] = dict(reply.send_metadata)
+    return payload
+
+
 def _attach_parse_artifact_refs(attachment: dict[str, Any]) -> None:
     workspace = attachment.get("workspace") if isinstance(attachment.get("workspace"), dict) else {}
     parse = attachment.get("parse") if isinstance(attachment.get("parse"), dict) else {}
@@ -454,6 +589,7 @@ def _attach_parse_artifact_refs(attachment: dict[str, Any]) -> None:
         "media_extract_count": artifacts.get("media_extract_count", 0),
         "media_ocr_status": artifacts.get("media_ocr_status", ""),
         "media_ocr_dir": artifacts.get("media_ocr_dir", str(Path(derived_dir) / "media" / "ocr")),
+        "media_ocr_index_path": artifacts.get("media_ocr_index_path", ""),
         "media_ocr_count": artifacts.get("media_ocr_count", 0),
         "media_ocr_error_count": artifacts.get("media_ocr_error_count", 0),
         "media_asr_status": artifacts.get("media_asr_status", ""),
@@ -584,6 +720,14 @@ def _render_entry_markdown(item: dict[str, Any]) -> list[str]:
     lines = [f"## {sequence:06d} {received_at} {sender}", ""]
     session_id = str(item.get("session_id") or DEFAULT_SESSION_ID)
     lines.append(f"[session:{session_id}]")
+    send = item.get("send") if isinstance(item.get("send"), dict) else {}
+    if send:
+        send_status = str(send.get("status", "")).strip()
+        mode = str(send.get("mode", "")).strip()
+        reason = str(send.get("reason", "")).strip()
+        send_note = " ".join(part for part in (f"status={send_status}" if send_status else "", f"mode={mode}" if mode else "", f"reason={reason}" if reason else "") if part)
+        if send_note:
+            lines.append(f"[send:{send_note}]")
     lines.append("")
     if status != "active":
         lines.append(f"[{status}] message_id={item.get('message_id', '')}")
@@ -611,9 +755,14 @@ def _render_entry_markdown(item: dict[str, Any]) -> list[str]:
             continue
         name = str(attachment.get("name", ""))
         file_id = str(attachment.get("file_id", ""))
+        path = str(attachment.get("path", ""))
+        source = str(attachment.get("source", ""))
         workspace = attachment.get("workspace") if isinstance(attachment.get("workspace"), dict) else {}
         manifest = str(workspace.get("manifest_path", ""))
-        lines.append(f"[file:{file_id} name={name} manifest={manifest}]")
+        if file_id or manifest:
+            lines.append(f"[file:{file_id} name={name} manifest={manifest}]")
+        else:
+            lines.append(f"[file:outgoing name={name} path={path} source={source}]")
     if item.get("attachments"):
         lines.append("")
     for link in item.get("links", []):
@@ -677,6 +826,7 @@ def _entry_from_payload(payload: dict[str, Any]) -> LedgerEntry:
         links=[dict(item) for item in payload.get("links", []) if isinstance(item, dict)],
         source=str(payload.get("source", "")),
         role=str(payload.get("role", "user")),
+        send=dict(payload.get("send", {})) if isinstance(payload.get("send"), dict) else {},
         created_at=str(payload.get("created_at", "")),
         updated_at=str(payload.get("updated_at", "")),
     )
@@ -714,6 +864,13 @@ def _write_json(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _stale_lock(path: Path, *, max_age_seconds: float = 60.0) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime > max_age_seconds
+    except OSError:
+        return False
 
 
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)

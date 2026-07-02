@@ -147,5 +147,13 @@ def _reply_from_queue_item(item: dict[str, Any]) -> ReplyCandidate:
         plan=str(raw.get("plan", "")),
         monitor=str(raw.get("monitor", "")),
         summary=str(raw.get("summary", "")),
+        attachments=_reply_attachments(raw.get("attachments", [])),
+        send_metadata=dict(raw.get("send_metadata", {})) if isinstance(raw.get("send_metadata"), dict) else {},
         created_at=str(raw.get("created_at", "")),
     )
+
+
+def _reply_attachments(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]

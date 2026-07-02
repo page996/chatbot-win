@@ -89,6 +89,31 @@ class WindowsGuardedSendDriverTest(unittest.TestCase):
             self.assertEqual(result.status, "sent")
             self.assertEqual(controller.sent, ["hello"])
 
+    def test_send_accepts_manually_bound_foreground_hwnd_when_title_is_generic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_channel(data_dir, "conv-1", "PAGE")
+            _write_binding(data_dir, "conv-1", hwnd=10, title="微信")
+            controller = _InputController()
+            driver = WindowsGuardedSendDriver(
+                send_enabled=True,
+                data_dir=data_dir,
+                window_probe=_Probe([_wechat_window(10, "微信")]),
+                input_controller=controller,
+                foreground_provider=lambda: {
+                    "hwnd": 10,
+                    "title": "微信",
+                    "process_name": "Weixin.exe",
+                    "class_name": "Qt51514QWindowIcon",
+                },
+                process_provider=lambda: [],
+            )
+
+            result = driver.send_message("conv-1", "hello")
+
+            self.assertEqual(result.status, "sent")
+            self.assertEqual(controller.sent, ["hello"])
+
     def test_send_blocks_when_channel_is_missing(self) -> None:
         controller = _InputController()
         driver = WindowsGuardedSendDriver(
@@ -130,6 +155,38 @@ def _write_channel(data_dir: Path, conversation_id: str, chat_title: str) -> Non
     path = data_dir / "conversation_channels" / conversation_id / "channel.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"conversation_id": conversation_id, "chat_title": chat_title}), encoding="utf-8")
+
+
+def _write_binding(data_dir: Path, conversation_id: str, *, hwnd: int, title: str) -> None:
+    path = data_dir / "window_bindings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "conversation_id": conversation_id,
+                        "conversation_type": "private",
+                        "chat_title": "PAGE",
+                        "hwnd": hwnd,
+                        "title": title,
+                        "process_id": 100,
+                        "process_name": "Weixin.exe",
+                        "class_name": "Qt51514QWindowIcon",
+                        "width": 1000,
+                        "height": 700,
+                        "left": 100,
+                        "top": 100,
+                        "right": 1100,
+                        "bottom": 800,
+                        "bound_at": "2026-07-01T00:00:00+00:00",
+                        "last_seen_at": "2026-07-01T00:00:00+00:00",
+                        "status": "active",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class _Probe(Win32WindowProbe):

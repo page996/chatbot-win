@@ -58,10 +58,10 @@ class ToolPermissionTest(unittest.TestCase):
         self.assertIn("outside allowed roots", result.error or "")
 
     def test_disallowed_extension_is_blocked(self) -> None:
-        source = self.inbox / "script.exe"
+        source = self.inbox / "library.dll"
         source.write_text("nope", encoding="utf-8")
 
-        result = self.tool.run(self.request("script.exe"))
+        result = self.tool.run(self.request("library.dll"))
 
         self.assertEqual(result.status, "blocked")
         self.assertIn("extension not allowed", result.error or "")

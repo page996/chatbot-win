@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,7 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
+from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
 from app.personal_wechat_bot.domain.errors import ConfigError
@@ -79,6 +82,14 @@ from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import (
     voice_cache_capability,
 )
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
+from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
+    WcfCallbackServerConfig,
+    WeFlowHttpBridge,
+    append_hook_source_event,
+    require_weflow_ready,
+    run_wcf_callback_server,
+    weflow_health_status,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -218,6 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     poll_fake.add_argument("fixture")
     poll_fake.add_argument("--mode", default=None)
     poll_fake.add_argument("--loops", type=int, default=1)
+    poll_fake.add_argument("--forever", action="store_true")
     poll_fake.add_argument("--interval", type=float, default=1.0)
     poll_fake.add_argument("--verbose", action="store_true")
 
@@ -249,6 +261,72 @@ def build_parser() -> argparse.ArgumentParser:
     import_hook.add_argument("--hook-event-file", required=True)
     import_hook.add_argument("--backend-event-file", default=None)
     import_hook.add_argument("--state-file", default=None)
+
+    pull_hook = sub.add_parser("pull-hook-messages")
+    pull_hook.add_argument("--hook-event-file", required=True)
+    pull_hook.add_argument("--backend-event-file", default=None)
+    pull_hook.add_argument("--state-file", default=None)
+    pull_hook.add_argument("--mode", default=None)
+    pull_hook.add_argument("--loops", type=int, default=1)
+    pull_hook.add_argument("--forever", action="store_true")
+    pull_hook.add_argument("--interval", type=float, default=1.0)
+    pull_hook.add_argument("--verbose", action="store_true")
+    pull_hook.add_argument("--extra-root", action="append", default=[])
+
+    append_hook_source = sub.add_parser("append-hook-source-event")
+    append_hook_source.add_argument("--hook-event-file", default=None)
+    append_hook_source.add_argument("--source", choices=["raw", "weflow-push", "weflow-message", "wcf-callback"], default="raw")
+    append_hook_source.add_argument("--payload-json", default="")
+    append_hook_source.add_argument("--payload-file", default="")
+
+    weflow_health = sub.add_parser("weflow-health")
+    weflow_health.add_argument("--base-url", default="http://127.0.0.1:5031")
+    weflow_health.add_argument("--token", default="")
+    weflow_health.add_argument("--token-env", default="")
+    weflow_health.add_argument("--allow-non-local", action="store_true")
+
+    pull_weflow = sub.add_parser("pull-weflow-messages")
+    pull_weflow.add_argument("--base-url", default="http://127.0.0.1:5031")
+    pull_weflow.add_argument("--token", default="")
+    pull_weflow.add_argument("--token-env", default="")
+    pull_weflow.add_argument("--hook-event-file", default=None)
+    pull_weflow.add_argument("--backend-event-file", default=None)
+    pull_weflow.add_argument("--state-file", default=None)
+    pull_weflow.add_argument("--weflow-state-file", default=None)
+    pull_weflow.add_argument("--talker", action="append", default=[])
+    pull_weflow.add_argument("--session-limit", type=int, default=100)
+    pull_weflow.add_argument("--message-limit", type=int, default=100)
+    pull_weflow.add_argument("--max-pages", type=int, default=1)
+    pull_weflow.add_argument("--max-messages", type=int, default=0)
+    pull_weflow.add_argument("--since", type=int, default=None)
+    pull_weflow.add_argument("--lookback-seconds", type=int, default=300)
+    pull_weflow.add_argument("--workers", type=int, default=1)
+    pull_weflow.add_argument("--no-media", action="store_true")
+    pull_weflow.add_argument("--context-only", action="store_true")
+    pull_weflow.add_argument("--mode", default=None)
+    pull_weflow.add_argument("--loops", type=int, default=1)
+    pull_weflow.add_argument("--forever", action="store_true")
+    pull_weflow.add_argument("--interval", type=float, default=1.0)
+    pull_weflow.add_argument("--verbose", action="store_true")
+    pull_weflow.add_argument("--extra-root", action="append", default=[])
+    pull_weflow.add_argument("--allow-non-local", action="store_true")
+
+    listen_weflow = sub.add_parser("listen-weflow-sse")
+    listen_weflow.add_argument("--base-url", default="http://127.0.0.1:5031")
+    listen_weflow.add_argument("--token", default="")
+    listen_weflow.add_argument("--token-env", default="")
+    listen_weflow.add_argument("--hook-event-file", default=None)
+    listen_weflow.add_argument("--weflow-state-file", default=None)
+    listen_weflow.add_argument("--max-events", type=int, default=1)
+    listen_weflow.add_argument("--max-seconds", type=float, default=None)
+    listen_weflow.add_argument("--forever", action="store_true")
+    listen_weflow.add_argument("--allow-non-local", action="store_true")
+
+    wcf_sink = sub.add_parser("wcf-callback-sink")
+    wcf_sink.add_argument("--hook-event-file", default=None)
+    wcf_sink.add_argument("--host", default="127.0.0.1")
+    wcf_sink.add_argument("--port", type=int, default=8791)
+    wcf_sink.add_argument("--path", default="/callback")
 
     poll_backend = sub.add_parser("poll-backend-events")
     poll_backend.add_argument("--event-file", default=None)
@@ -386,33 +464,37 @@ def main(argv: list[str] | None = None) -> None:
         if not args.no_backend_events:
             event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
             if args.hook_event_file:
-                HookEventJsonlImporter(
-                    args.hook_event_file,
-                    event_file,
-                    state_path=args.hook_state_file or Path(args.data_dir) / "hook_events_state.json",
-                ).import_new()
-            runners.append(
-                (
-                    "backend-events",
-                    PollingRunner(
-                        runtime,
-                        BackendEventJsonlDriver(
-                            event_file,
-                            runtime.file_index,
-                            allowed_input_roots=resolve_allowed_roots(
-                                config.data_dir,
-                                config.file_read_roots + config.wechat_voice_roots,
-                            ),
-                            allowed_extensions=config.file_allowed_extensions,
-                            max_input_bytes=config.file_max_bytes,
-                            file_workspace=runtime.file_workspace,
-                            session_store=runtime.session_store,
-                            voice_cache_resolver=_voice_cache_resolver(config),
-                        ),
-                        poll_interval_seconds=0,
-                    ),
+                poller = PollingRunner(
+                    runtime,
+                    _backend_event_driver(config, runtime, event_file),
+                    poll_interval_seconds=0,
                 )
-            )
+                runners.append(
+                    (
+                        "hook-messages",
+                        HookMessagePullRunner(
+                            HookEventJsonlImporter(
+                                args.hook_event_file,
+                                event_file,
+                                state_path=args.hook_state_file or Path(args.data_dir) / "hook_events_state.json",
+                            ),
+                            poller,
+                            hook_event_file=args.hook_event_file,
+                            backend_event_file=event_file,
+                        ),
+                    )
+                )
+            else:
+                runners.append(
+                    (
+                        "backend-events",
+                        PollingRunner(
+                            runtime,
+                            _backend_event_driver(config, runtime, event_file),
+                            poll_interval_seconds=0,
+                        ),
+                    )
+                )
         if not runners:
             raise SystemExit("run-agent requires at least one input source")
         result = AgentRunner(runners, poll_interval_seconds=args.interval).run_forever(max_loops=args.loops)
@@ -550,7 +632,7 @@ def main(argv: list[str] | None = None) -> None:
         runtime = build_runtime(config)
         driver = FakeWeChatDriver(args.fixture)
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
-        result = runner.run_forever(max_loops=args.loops)
+        result = runner.run_forever(max_loops=None if args.forever else args.loops)
         if not args.verbose:
             result.pop("processed", None)
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -585,25 +667,123 @@ def main(argv: list[str] | None = None) -> None:
         result = importer.import_new()
         print(json.dumps({**result.__dict__, "send_enabled": False}, ensure_ascii=False, indent=2))
         return
+    if args.command == "append-hook-source-event":
+        hook_event_file = args.hook_event_file or str(Path(args.data_dir) / "hook_events.jsonl")
+        payload = _json_payload_arg(args.payload_json, args.payload_file)
+        result = append_hook_source_event(hook_event_file, payload, source=args.source)
+        print(json.dumps({**result.__dict__, "send_enabled": False}, ensure_ascii=False, indent=2))
+        return
+    if args.command == "weflow-health":
+        result = weflow_health_status(
+            args.base_url,
+            token=_token_arg(args.token, args.token_env),
+            allow_non_local=args.allow_non_local,
+            require_token=False,
+            require_fork=False,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "pull-weflow-messages":
+        config = load_config(args.data_dir)
+        if args.mode:
+            config.mode = args.mode
+        runtime = build_runtime(config)
+        hook_event_file = args.hook_event_file or str(Path(args.data_dir) / "hook_events.jsonl")
+        backend_event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
+        state_file = args.state_file or Path(args.data_dir) / "hook_events_state.json"
+        token = _token_arg(args.token, args.token_env)
+        weflow_ready = require_weflow_ready(args.base_url, token=token, allow_non_local=args.allow_non_local)
+        bridge = WeFlowHttpBridge(
+            args.base_url,
+            token=token,
+            hook_event_file=hook_event_file,
+            state_path=args.weflow_state_file,
+            allow_non_local=args.allow_non_local,
+        )
+        weflow_extra_roots = [*args.extra_root, *_weflow_media_roots(weflow_ready)]
+        driver = _backend_event_driver(config, runtime, backend_event_file, extra_roots=weflow_extra_roots)
+        runner = HookMessagePullRunner(
+            HookEventJsonlImporter(hook_event_file, backend_event_file, state_path=state_file),
+            PollingRunner(runtime, driver, poll_interval_seconds=args.interval),
+            hook_event_file=hook_event_file,
+            backend_event_file=backend_event_file,
+        )
+        result = _run_weflow_pull_loop(
+            bridge,
+            runner,
+            talkers=args.talker,
+            session_limit=args.session_limit,
+            message_limit=args.message_limit,
+            max_pages=args.max_pages,
+            max_messages=args.max_messages,
+            since=args.since,
+            lookback_seconds=args.lookback_seconds,
+            workers=args.workers,
+            media=not args.no_media,
+            context_only=args.context_only or (args.since is not None and args.since <= 0),
+            max_loops=None if args.forever else args.loops,
+            interval=args.interval,
+        )
+        if not args.verbose:
+            result.pop("processed", None)
+        result["weflow_ready"] = weflow_ready
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "listen-weflow-sse":
+        hook_event_file = args.hook_event_file or str(Path(args.data_dir) / "hook_events.jsonl")
+        token = _token_arg(args.token, args.token_env)
+        weflow_ready = require_weflow_ready(args.base_url, token=token, allow_non_local=args.allow_non_local)
+        bridge = WeFlowHttpBridge(
+            args.base_url,
+            token=token,
+            hook_event_file=hook_event_file,
+            state_path=args.weflow_state_file,
+            allow_non_local=args.allow_non_local,
+        )
+        result = bridge.listen_sse(
+            max_events=None if args.forever else args.max_events,
+            max_seconds=args.max_seconds,
+        )
+        print(json.dumps({**result.__dict__, "weflow_ready": weflow_ready, "send_enabled": False}, ensure_ascii=False, indent=2))
+        return
+    if args.command == "wcf-callback-sink":
+        hook_event_file = args.hook_event_file or str(Path(args.data_dir) / "hook_events.jsonl")
+        run_wcf_callback_server(
+            WcfCallbackServerConfig(
+                hook_event_file=hook_event_file,
+                host=args.host,
+                port=args.port,
+                path=args.path,
+            )
+        )
+        return
+    if args.command == "pull-hook-messages":
+        config = load_config(args.data_dir)
+        if args.mode:
+            config.mode = args.mode
+        runtime = build_runtime(config)
+        hook_event_file = args.hook_event_file
+        backend_event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
+        state_file = args.state_file or Path(args.data_dir) / "hook_events_state.json"
+        driver = _backend_event_driver(config, runtime, backend_event_file, extra_roots=args.extra_root)
+        runner = HookMessagePullRunner(
+            HookEventJsonlImporter(hook_event_file, backend_event_file, state_path=state_file),
+            PollingRunner(runtime, driver, poll_interval_seconds=args.interval),
+            hook_event_file=hook_event_file,
+            backend_event_file=backend_event_file,
+        )
+        result = runner.run_forever(max_loops=None if args.forever else args.loops)
+        if not args.verbose:
+            result.pop("processed", None)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "poll-backend-events":
         config = load_config(args.data_dir)
         if args.mode:
             config.mode = args.mode
         runtime = build_runtime(config)
         event_file = args.event_file or str(Path(args.data_dir) / "backend_events.jsonl")
-        driver = BackendEventJsonlDriver(
-            event_file,
-            runtime.file_index,
-            allowed_input_roots=resolve_allowed_roots(
-                config.data_dir,
-                config.file_read_roots + config.wechat_voice_roots + args.extra_root,
-            ),
-            allowed_extensions=config.file_allowed_extensions,
-            max_input_bytes=config.file_max_bytes,
-            file_workspace=runtime.file_workspace,
-            session_store=runtime.session_store,
-            voice_cache_resolver=_voice_cache_resolver(config, extra_roots=args.extra_root),
-        )
+        driver = _backend_event_driver(config, runtime, event_file, extra_roots=args.extra_root)
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
         result = runner.run_forever(max_loops=args.loops)
         result["event_file"] = event_file
@@ -883,6 +1063,114 @@ def _history_items(value: Any, *, source: str) -> list[dict[str, Any]]:
     return items
 
 
+def _json_payload_arg(payload_json: str, payload_file: str) -> dict[str, Any]:
+    if payload_json and payload_file:
+        raise SystemExit("--payload-json and --payload-file cannot both be used")
+    if payload_file:
+        payload = json.loads(Path(payload_file).read_text(encoding="utf-8"))
+    elif payload_json:
+        payload = json.loads(payload_json)
+    else:
+        payload = json.loads(sys.stdin.read() or "{}")
+    if not isinstance(payload, dict):
+        raise SystemExit("payload must be a JSON object")
+    return payload
+
+
+def _token_arg(token: str, token_env: str) -> str:
+    if token:
+        return token
+    if token_env:
+        return os.environ.get(token_env, "")
+    return os.environ.get("WEFLOW_API_TOKEN", "")
+
+
+def _weflow_media_roots(weflow_ready: dict[str, Any]) -> list[str]:
+    health = weflow_ready.get("health") if isinstance(weflow_ready.get("health"), dict) else {}
+    media_path = str(health.get("mediaExportPath") or health.get("media_export_path") or "").strip()
+    return [media_path] if media_path else []
+
+
+def _run_weflow_pull_loop(
+    bridge: WeFlowHttpBridge,
+    runner: HookMessagePullRunner,
+    *,
+    talkers: list[str],
+    session_limit: int,
+    message_limit: int,
+    max_pages: int,
+    max_messages: int,
+    since: int | None,
+    lookback_seconds: int,
+    workers: int,
+    media: bool,
+    context_only: bool,
+    max_loops: int | None,
+    interval: float,
+) -> dict[str, Any]:
+    loops = 0
+    source_scanned = 0
+    source_appended = 0
+    imported_count = 0
+    processed_count = 0
+    processed: list[dict[str, Any]] = []
+    last_source: dict[str, Any] = {}
+    last_pull: dict[str, Any] = {}
+    while max_loops is None or loops < max_loops:
+        source = bridge.pull_once(
+            talkers=talkers,
+            session_limit=session_limit,
+            message_limit=message_limit,
+            max_pages=max_pages,
+            max_messages=max_messages,
+            since=since,
+            lookback_seconds=lookback_seconds,
+            workers=workers,
+            media=media,
+            context_only=context_only,
+        )
+        last_source = _jsonable_dataclass(source)
+        source_scanned += source.scanned_count
+        source_appended += source.appended_count
+        pull = runner.run_once()
+        last_pull = pull
+        loops += 1
+        imported_count += int(pull.get("import", {}).get("appended_count", 0) or 0)
+        processed_count += int(pull.get("processed_count", 0) or 0)
+        processed.extend([item for item in pull.get("processed", []) if isinstance(item, dict)])
+        if max_loops is None or loops < max_loops:
+            time.sleep(interval)
+    status = "stopped"
+    if last_source.get("status") not in {None, "", "ok"}:
+        status = "stopped_with_source_errors"
+    return {
+        "status": status,
+        "loops": loops,
+        "base_url": bridge.base_url,
+        "workers": max(1, int(workers or 1)),
+        "hook_event_file": str(bridge.writer.path),
+        "backend_event_file": str(runner.backend_event_file),
+        "source_scanned_count": source_scanned,
+        "source_appended_count": source_appended,
+        "imported_count": imported_count,
+        "processed_count": processed_count,
+        "last_source": last_source,
+        "queue": last_pull.get("queue", {}) if last_pull else runner.queue_status(None),
+        "last_import": last_pull.get("import", {}) if last_pull else {},
+        "last_poll": last_pull.get("poll", {}) if last_pull else {},
+        "processed": processed,
+        "send_enabled": False,
+    }
+
+
+def _jsonable_dataclass(value: Any) -> dict[str, Any]:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
 def _load_config_or_default(data_dir: str) -> BotConfig:
     try:
         return load_config(data_dir)
@@ -898,6 +1186,26 @@ def _voice_cache_resolver(config, *, extra_roots: list[str] | None = None) -> We
         resolve_allowed_roots(config.data_dir, roots),
         allowed_extensions=config.file_allowed_extensions,
         max_bytes=config.file_max_bytes,
+    )
+
+
+def _backend_event_driver(
+    config: BotConfig,
+    runtime,
+    event_file: str | Path,
+    *,
+    extra_roots: list[str] | None = None,
+) -> BackendEventJsonlDriver:
+    roots = config.file_read_roots + config.wechat_voice_roots + list(extra_roots or [])
+    return BackendEventJsonlDriver(
+        event_file,
+        runtime.file_index,
+        allowed_input_roots=resolve_allowed_roots(config.data_dir, roots),
+        allowed_extensions=config.file_allowed_extensions,
+        max_input_bytes=config.file_max_bytes,
+        file_workspace=runtime.file_workspace,
+        session_store=runtime.session_store,
+        voice_cache_resolver=_voice_cache_resolver(config, extra_roots=extra_roots),
     )
 
 

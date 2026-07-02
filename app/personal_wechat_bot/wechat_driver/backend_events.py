@@ -12,6 +12,7 @@ from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
 from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionBridge, result_payload
 from app.personal_wechat_bot.workspace.attachment_pipeline import AttachmentPipeline, IncomingAttachment
@@ -152,9 +153,14 @@ class BackendEventJsonlDriver:
         if not isinstance(meta_source, dict):
             meta_source = {}
         allow_empty = event.event_type == "recall"
-        context_only = context_only or event.event_type == "recall"
+        context_only = context_only or event.event_type == "recall" or _truthy(meta_source.get("context_only") or meta_source.get("contextOnly"))
         source_name = str(meta_source.get("source") or meta_source.get("adapter") or "backend_events_jsonl")
         hook_meta = meta_source.get("hook") if isinstance(meta_source.get("hook"), dict) else {}
+        source_line_no = _safe_int(meta_source.get("source_line_no") or meta_source.get("sourceLineNo"), 0)
+        source_offset = _safe_int(meta_source.get("source_offset") or meta_source.get("sourceOffset"), 0)
+        batch_index = _safe_int(meta_source.get("batch_index") or meta_source.get("batchIndex"), 0)
+        batch_count = _safe_int(meta_source.get("batch_count") or meta_source.get("batchCount"), 1)
+        import_sequence = _safe_int(meta_source.get("import_sequence") or meta_source.get("importSequence"), 0)
         recall = event.recall or {}
         if event.event_type == "recall" and not recall:
             recall = {
@@ -181,6 +187,12 @@ class BackendEventJsonlDriver:
                 "conversation_key": str(meta_source.get("conversation_key") or meta_source.get("talker_id") or meta_source.get("talker") or event.chat_title),
                 "event_path": str(self.event_path),
                 "line_no": line_no,
+                "source_path": str(meta_source.get("source_path") or meta_source.get("sourcePath") or ""),
+                "source_line_no": source_line_no,
+                "source_offset": source_offset,
+                "source_batch_index": batch_index,
+                "source_batch_count": batch_count,
+                "import_sequence": import_sequence,
                 "history_index": history_index,
                 "conversation_id_hint": conversation_id,
                 "session_id": session_id,
@@ -193,6 +205,15 @@ class BackendEventJsonlDriver:
                 "quote": event.quote or {},
                 "recall": recall,
                 "hook": hook_meta,
+                "ordering": _ordering_metadata(
+                    event,
+                    meta_source,
+                    line_no=line_no,
+                    source_line_no=source_line_no,
+                    source_offset=source_offset,
+                    batch_index=batch_index,
+                    import_sequence=import_sequence,
+                ),
                 "source_payload": meta_source,
                 "context_only": context_only,
                 "allow_empty_message": allow_empty,
@@ -420,10 +441,7 @@ def append_backend_event(
         payload["source_payload"] = source_payload
     raw_id = raw_id.strip() or _event_raw_id(payload)
     payload["raw_id"] = raw_id
-    path = Path(event_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    append_jsonl(event_path, payload)
     return raw_id
 
 
@@ -633,21 +651,25 @@ def _parse_quote(value: Any) -> dict[str, Any] | None:
 def _parse_recall(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
+    target_raw_id = str(
+        value.get("target_raw_id")
+        or value.get("targetRawId")
+        or value.get("recalled_raw_id")
+        or value.get("recalledRawId")
+        or ""
+    ).strip()
+    target_message_id = str(
+        value.get("target_message_id")
+        or value.get("targetMessageId")
+        or value.get("recalled_message_id")
+        or value.get("recalledMessageId")
+        or ""
+    ).strip()
+    if not target_raw_id and not target_message_id:
+        return None
     recall = {
-        "target_raw_id": str(
-            value.get("target_raw_id")
-            or value.get("targetRawId")
-            or value.get("recalled_raw_id")
-            or value.get("recalledRawId")
-            or ""
-        ).strip(),
-        "target_message_id": str(
-            value.get("target_message_id")
-            or value.get("targetMessageId")
-            or value.get("recalled_message_id")
-            or value.get("recalledMessageId")
-            or ""
-        ).strip(),
+        "target_raw_id": target_raw_id,
+        "target_message_id": target_message_id,
         "reason": str(value.get("reason") or "wechat_recall").strip(),
         "sender_name": str(value.get("sender_name") or value.get("senderName") or "").strip(),
         "sender_wechat_id": str(value.get("sender_wechat_id") or value.get("senderWechatId") or "").strip(),
@@ -662,6 +684,58 @@ def _source_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(source_payload, dict):
         return dict(source_payload)
     return {}
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _ordering_metadata(
+    event: BackendMessageEvent,
+    source_payload: dict[str, Any],
+    *,
+    line_no: int,
+    source_line_no: int,
+    source_offset: int,
+    batch_index: int,
+    import_sequence: int,
+) -> dict[str, Any]:
+    hook = source_payload.get("hook") if isinstance(source_payload.get("hook"), dict) else {}
+    ordering = hook.get("ordering") if isinstance(hook.get("ordering"), dict) else {}
+    return {
+        key: value
+        for key, value in {
+            "observed_at": event.observed_at,
+            "conversation_key": source_payload.get("conversation_key") or source_payload.get("talker_id") or event.chat_title,
+            "message_type": source_payload.get("message_type"),
+            "sort_key": source_payload.get("sort_key") or hook.get("sort_key") or ordering.get("sort_key"),
+            "server_id": source_payload.get("server_id") or hook.get("server_id") or ordering.get("server_id"),
+            "local_id": source_payload.get("local_id") or hook.get("local_id") or ordering.get("local_id"),
+            "message_key": source_payload.get("message_key") or hook.get("message_key") or ordering.get("message_key"),
+            "create_time": source_payload.get("create_time") or hook.get("create_time") or ordering.get("create_time"),
+            "local_type": source_payload.get("local_type") or hook.get("local_type") or ordering.get("local_type"),
+            "msg_id": source_payload.get("msg_id") or hook.get("msg_id") or ordering.get("msg_id"),
+            "backend_line_no": line_no,
+            "source_line_no": source_line_no,
+            "source_offset": source_offset,
+            "batch_index": batch_index,
+            "import_sequence": import_sequence,
+        }.items()
+        if value not in {"", None}
+    }
 
 
 def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:

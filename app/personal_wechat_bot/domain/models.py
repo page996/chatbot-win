@@ -98,6 +98,8 @@ class ReplyCandidate:
     plan: str = ""
     monitor: str = ""
     summary: str = ""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    send_metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now_iso)
 
 

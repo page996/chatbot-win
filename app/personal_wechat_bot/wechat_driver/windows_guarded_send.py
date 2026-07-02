@@ -14,6 +14,7 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     find_wechat_processes,
     foreground_window_info,
 )
+from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.window_introspection import filter_wechat_chat_windows
 
 
@@ -125,9 +126,26 @@ class WindowsGuardedSendDriver:
             blockers.append("conversation_channel_not_found")
             return blockers
         foreground = self.foreground_provider()
-        if self.require_title_match and not _foreground_matches_conversation(foreground, title, conversation_id):
+        if self.require_title_match and not self._foreground_matches_allowed_target(foreground, title, conversation_id):
             blockers.append("foreground_conversation_mismatch")
         return blockers
+
+    def _foreground_matches_allowed_target(self, foreground: dict[str, Any], chat_title: str, conversation_id: str) -> bool:
+        if _foreground_matches_conversation(foreground, chat_title, conversation_id):
+            return True
+        try:
+            binding = WeChatWindowBindingStore(self.data_dir, window_probe=self.window_probe).get_binding(conversation_id)
+        except Exception:
+            binding = None
+        if binding is None:
+            return False
+        foreground_hwnd = int(foreground.get("hwnd", 0) or 0)
+        foreground_pid = int(foreground.get("process_id", 0) or 0)
+        if foreground_hwnd and foreground_hwnd == binding.hwnd:
+            return True
+        if foreground_pid and foreground_pid == binding.process_id and str(foreground.get("title", "")) == binding.title:
+            return True
+        return False
 
     def _conversation_title(self, conversation_id: str) -> str:
         path = self.data_dir / "conversation_channels" / conversation_id / "channel.json"

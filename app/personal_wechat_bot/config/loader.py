@@ -94,6 +94,29 @@ def save_config(config: BotConfig) -> None:
     _write_json(root / "search_blocklist.json", config.search_blocklist)
 
 
+def migrate_file_allowed_extensions(data_dir: str | Path = "data") -> dict[str, Any]:
+    """Persist newly supported attachment suffixes into an existing config."""
+
+    root = Path(data_dir)
+    raw = _read_json(root / "config.json", None)
+    if not isinstance(raw, dict):
+        raise ConfigError(f"missing config: {root / 'config.json'}; run init first")
+    default_extensions = BotConfig().file_allowed_extensions
+    configured = raw.get("file_allowed_extensions", [])
+    values = configured if isinstance(configured, list) else []
+    normalized = {_normalize_extension(item) for item in values}
+    normalized.discard("")
+    missing = [item for item in default_extensions if item not in normalized]
+    config = load_config(root)
+    if missing:
+        save_config(config)
+    return {
+        "status": "updated" if missing else "ok",
+        "added_extensions": missing,
+        "file_allowed_extensions": config.file_allowed_extensions,
+    }
+
+
 def accept_contact(data_dir: str | Path, wechat_id: str) -> None:
     config = load_config(data_dir)
     config.accepted_contacts.add(wechat_id)
@@ -213,16 +236,23 @@ def _file_allowed_extensions_from_json(raw: dict[str, Any]) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
     for item in [*values, *default_extensions]:
-        suffix = str(item).strip().lower()
+        suffix = _normalize_extension(item)
         if not suffix:
             continue
-        if not suffix.startswith("."):
-            suffix = "." + suffix
         if suffix in seen:
             continue
         seen.add(suffix)
         normalized.append(suffix)
     return normalized
+
+
+def _normalize_extension(value: Any) -> str:
+    suffix = str(value).strip().lower()
+    if not suffix:
+        return ""
+    if not suffix.startswith("."):
+        suffix = "." + suffix
+    return suffix
 
 
 def _provider_from_json(name: str, raw: dict[str, Any]) -> ProviderConfig:

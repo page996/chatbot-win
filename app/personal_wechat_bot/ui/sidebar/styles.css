@@ -306,7 +306,7 @@ h2 {
 
 .bookmark-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border: 1px solid #cbd5e1;
   border-radius: 8px;
   overflow: hidden;
@@ -451,7 +451,8 @@ h2 {
   border-left-width: 4px;
 }
 
-.bridge-summary {
+.bridge-summary,
+.weflow-summary {
   border: 1px solid #d9e2ee;
   border-radius: 8px;
   padding: 9px;
@@ -506,6 +507,80 @@ h2 {
 
 #runtimePanel[hidden] {
   display: none;
+}
+
+#weflowPanel {
+  display: grid;
+  gap: 10px;
+}
+
+#weflowPanel[hidden] {
+  display: none;
+}
+
+.weflow-summary > div {
+  min-width: 0;
+}
+
+.weflow-summary strong,
+.weflow-summary p {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.weflow-summary strong {
+  margin-top: 2px;
+  font-size: 13px;
+}
+
+.weflow-summary p {
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.weflow-form {
+  display: grid;
+  gap: 8px;
+}
+
+.weflow-form label {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.weflow-form input {
+  min-height: 31px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  padding: 0 8px;
+  min-width: 0;
+  color: #182230;
+}
+
+.switch.compact {
+  display: grid;
+  grid-template-columns: 38px 1fr;
+  justify-items: start;
+}
+
+.status-box {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid #d9e2ee;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .card-list {

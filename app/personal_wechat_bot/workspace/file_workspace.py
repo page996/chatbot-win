@@ -21,7 +21,7 @@ from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import (
 from app.personal_wechat_bot.workspace.table_artifacts import SPREADSHEET_SUFFIXES, write_table_artifacts
 
 
-CHUNK_TOKEN_TARGET = 1600
+CHUNK_TOKEN_TARGET = 4000
 CHUNK_CHAR_TARGET = CHUNK_TOKEN_TARGET * 4
 
 
@@ -347,6 +347,7 @@ class FileWorkspace:
             "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
             "media_ocr_status": str(media_artifacts.get("ocr_status", "")),
             "media_ocr_dir": str(media_artifacts.get("ocr_dir", "")),
+            "media_ocr_index_path": str(media_artifacts.get("ocr_index_path", "")),
             "media_ocr_count": int(media_artifacts.get("ocr_count", 0) or 0),
             "media_ocr_error_count": int(media_artifacts.get("ocr_error_count", 0) or 0),
             "media_asr_status": str(media_artifacts.get("asr_status", "")),
@@ -415,10 +416,11 @@ def _analysis_payload(
         "media_dir": str(media_artifacts.get("media_dir", "")),
         "media_index_path": str(media_artifacts.get("index_path", "")),
         "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
-        "media_ocr_status": str(media_artifacts.get("ocr_status", "")),
-        "media_ocr_dir": str(media_artifacts.get("ocr_dir", "")),
-        "media_ocr_count": int(media_artifacts.get("ocr_count", 0) or 0),
-        "media_ocr_error_count": int(media_artifacts.get("ocr_error_count", 0) or 0),
+            "media_ocr_status": str(media_artifacts.get("ocr_status", "")),
+            "media_ocr_dir": str(media_artifacts.get("ocr_dir", "")),
+            "media_ocr_index_path": str(media_artifacts.get("ocr_index_path", "")),
+            "media_ocr_count": int(media_artifacts.get("ocr_count", 0) or 0),
+            "media_ocr_error_count": int(media_artifacts.get("ocr_error_count", 0) or 0),
         "media_asr_status": str(media_artifacts.get("asr_status", "")),
         "media_asr_dir": str(media_artifacts.get("asr_dir", "")),
         "media_asr_count": int(media_artifacts.get("asr_count", 0) or 0),
@@ -528,6 +530,7 @@ def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
         f"- ocr_status: {analysis.get('media_ocr_status', '')}",
         f"- ocr_count: {analysis.get('media_ocr_count', 0)}",
         f"- ocr_dir: {analysis.get('media_ocr_dir', '')}",
+        f"- ocr_index: {analysis.get('media_ocr_index_path', '')}",
         f"- asr_status: {analysis.get('media_asr_status', '')}",
         f"- asr_count: {analysis.get('media_asr_count', 0)}",
         f"- asr_dir: {analysis.get('media_asr_dir', '')}",
@@ -650,6 +653,7 @@ def _extract_docx_media(
         "audio": asr_payload["audio"],
         "ocr_status": ocr_payload["status"],
         "ocr_dir": ocr_payload["ocr_dir"],
+        "ocr_index_path": ocr_payload["ocr_index_path"],
         "ocr_count": ocr_payload["ocr_count"],
         "ocr_error_count": ocr_payload["error_count"],
         "asr_status": asr_payload["status"],
@@ -703,6 +707,7 @@ def _extract_pdf_media(
         "audio": [],
         "ocr_status": ocr_payload["status"],
         "ocr_dir": ocr_payload["ocr_dir"],
+        "ocr_index_path": ocr_payload["ocr_index_path"],
         "ocr_count": ocr_payload["ocr_count"],
         "ocr_error_count": ocr_payload["error_count"],
         "asr_status": "not_needed",
@@ -712,6 +717,8 @@ def _extract_pdf_media(
         "page_render_status": render_payload.get("status", ""),
         "page_render_dir": render_payload.get("render_dir", ""),
         "page_render_count": render_payload.get("render_count", 0),
+        "page_render_page_count": render_payload.get("page_count", 0),
+        "page_render_scope": render_payload.get("render_scope", ""),
         "error": "; ".join(errors + ([str(render_payload.get("error", ""))] if render_payload.get("error") else [])),
     }
     _write_json(media_dir / "index.json", payload)
@@ -726,6 +733,8 @@ def _render_pdf_pages(path: Path, render_dir: Path) -> dict[str, Any]:
             "status": "skipped_missing_pymupdf",
             "render_dir": "",
             "render_count": 0,
+            "page_count": 0,
+            "render_scope": "unavailable",
             "images": [],
             "error": "PyMuPDF is not installed; install it in vendor/ocr-python for scanned PDF page rendering",
         }
@@ -733,7 +742,8 @@ def _render_pdf_pages(path: Path, render_dir: Path) -> dict[str, Any]:
         document = fitz.open(str(path))
         render_dir.mkdir(parents=True, exist_ok=True)
         images: list[dict[str, Any]] = []
-        for page_index in range(min(len(document), 20)):
+        page_count = len(document)
+        for page_index in range(page_count):
             page = document[page_index]
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
             output = render_dir / f"page_{page_index + 1:04d}.png"
@@ -743,6 +753,8 @@ def _render_pdf_pages(path: Path, render_dir: Path) -> dict[str, Any]:
             "status": "completed",
             "render_dir": str(render_dir),
             "render_count": len(images),
+            "page_count": page_count,
+            "render_scope": "all_pages",
             "images": images,
             "error": "",
         }
@@ -751,6 +763,8 @@ def _render_pdf_pages(path: Path, render_dir: Path) -> dict[str, Any]:
             "status": "failed",
             "render_dir": str(render_dir),
             "render_count": 0,
+            "page_count": 0,
+            "render_scope": "failed",
             "images": [],
             "error": f"{type(exc).__name__}: {exc}",
         }
@@ -789,6 +803,7 @@ def _write_standalone_audio_artifacts(
         "audio": asr_payload["audio"],
         "ocr_status": "not_needed",
         "ocr_dir": "",
+        "ocr_index_path": "",
         "ocr_count": 0,
         "ocr_error_count": 0,
         "asr_status": asr_payload["status"],
@@ -875,9 +890,10 @@ def _write_media_ocr_artifacts(
     embedded_media_ocr: OcrEngine | None,
 ) -> dict[str, Any]:
     if not images:
-        return {"status": "not_needed", "ocr_dir": "", "ocr_count": 0, "error_count": 0, "images": images}
+        return {"status": "not_needed", "ocr_dir": "", "ocr_index_path": "", "ocr_count": 0, "error_count": 0, "images": images}
     if embedded_media_ocr is None:
-        return {"status": "skipped_no_ocr_engine", "ocr_dir": "", "ocr_count": 0, "error_count": 0, "images": images}
+        updated = [dict(item, ocr_status="skipped_no_ocr_engine") for item in images]
+        return {"status": "skipped_no_ocr_engine", "ocr_dir": "", "ocr_index_path": "", "ocr_count": 0, "error_count": 0, "images": updated}
     ocr_dir.mkdir(parents=True, exist_ok=True)
     updated: list[dict[str, Any]] = []
     ocr_count = 0
@@ -889,6 +905,8 @@ def _write_media_ocr_artifacts(
         try:
             text = embedded_media_ocr.read_text(image_path)
             status = "parsed" if text.strip() else "empty"
+            if not text.strip():
+                text = _image_ocr_placeholder_text(current, "OCR 未识别到有效文本")
             output_path.write_text(_media_ocr_markdown(current, status, text=text), encoding="utf-8")
             current.update(
                 {
@@ -911,13 +929,49 @@ def _write_media_ocr_artifacts(
         status = "failed"
     else:
         status = "completed"
+    index_path = ocr_dir / "index.md"
+    index_path.write_text(_media_ocr_index_markdown(updated), encoding="utf-8")
     return {
         "status": status,
         "ocr_dir": str(ocr_dir),
+        "ocr_index_path": str(index_path),
         "ocr_count": ocr_count,
         "error_count": error_count,
         "images": updated,
     }
+
+
+def _image_ocr_placeholder_text(item: dict[str, Any], reason: str) -> str:
+    return (
+        "[图片 OCR 占位符]\n"
+        f"- 文件名: {item.get('name', '')}\n"
+        f"- 本地路径: {item.get('path', '')}\n"
+        f"- 原因: {reason}\n"
+        "- 说明: 该图片已进入文件中间层，但没有可用文字内容。"
+    )
+
+
+def _media_ocr_index_markdown(images: list[dict[str, Any]]) -> str:
+    lines = ["# Embedded Image OCR Index", ""]
+    for index, item in enumerate(images, start=1):
+        lines.extend(
+            [
+                f"## Image {index}: {item.get('name', '')}",
+                "",
+                f"- source_name: {item.get('source_name', '')}",
+                f"- image_path: {item.get('path', '')}",
+                f"- ocr_path: {item.get('ocr_path', '')}",
+                f"- status: {item.get('ocr_status', '')}",
+                "",
+            ]
+        )
+        text = str(item.get("ocr_text", "")).strip()
+        error = str(item.get("ocr_error", "")).strip()
+        if text:
+            lines.extend(["### Text", "", text, ""])
+        if error:
+            lines.extend(["### Error", "", error, ""])
+    return "\n".join(lines)
 
 
 def _media_ocr_markdown(item: dict[str, Any], status: str, *, text: str = "", error: str = "") -> str:
@@ -960,15 +1014,29 @@ def _needs_media_artifact_refresh(
     index = _read_json(Path(staged.derived_dir) / "media" / "index.json", None)
     if not isinstance(index, dict):
         return True
+    if suffix == ".pdf" and _pdf_media_cache_is_stale(index):
+        return True
     images = index.get("images", [])
     if not isinstance(images, list):
         return True
-    if embedded_media_ocr is not None and any(isinstance(item, dict) and not item.get("ocr_status") for item in images):
+    if embedded_media_ocr is not None and (
+        not str(index.get("ocr_index_path", "")).strip()
+        or any(isinstance(item, dict) and not item.get("ocr_status") for item in images)
+    ):
         return True
     audio = index.get("audio", [])
     if embedded_media_asr is not None and isinstance(audio, list):
         return any(isinstance(item, dict) and not item.get("asr_status") for item in audio)
     return False
+
+
+def _pdf_media_cache_is_stale(index: dict[str, Any]) -> bool:
+    render_status = str(index.get("page_render_status", "")).strip()
+    if render_status == "completed" and str(index.get("page_render_scope", "")) != "all_pages":
+        return True
+    page_count = int(index.get("page_render_page_count", 0) or 0)
+    render_count = int(index.get("page_render_count", 0) or 0)
+    return page_count > 0 and render_count < page_count
 
 
 def _document_media_analysis(path: Path, suffix: str, media_artifacts: dict[str, Any] | None = None) -> dict[str, Any]:

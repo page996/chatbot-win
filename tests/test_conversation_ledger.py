@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import LedgerContextAssembler
-from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate
+from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, ToolCallResult
 
 
 class ConversationLedgerStoreTest(unittest.TestCase):
@@ -37,6 +38,38 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(entry.session_id, "session_new")
             self.assertEqual(entries[0].session_id, "session_new")
             self.assertIn("[session:session_new]", markdown)
+
+    def test_concurrent_appends_keep_per_conversation_sequence_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            errors: list[BaseException] = []
+
+            def append_many(conversation_id: str, prefix: str) -> None:
+                try:
+                    for index in range(20):
+                        store.append_message(_message(f"{prefix}-{index}", f"{prefix} text {index}", conversation_id=conversation_id))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=append_many, args=("conv1", "a")),
+                threading.Thread(target=append_many, args=("conv1", "b")),
+                threading.Thread(target=append_many, args=("conv2", "c")),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            if errors:
+                raise errors[0]
+            conv1 = store.read_entries("conv1")
+            conv2 = store.read_entries("conv2")
+
+            self.assertEqual(len(conv1), 40)
+            self.assertEqual(len(conv2), 20)
+            self.assertEqual([entry.sequence for entry in conv1], list(range(1, 41)))
+            self.assertEqual([entry.sequence for entry in conv2], list(range(1, 21)))
 
     def test_records_self_message_without_losing_role(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +262,43 @@ class ConversationLedgerStoreTest(unittest.TestCase):
 
             self.assertEqual(entry.session_id, "session_new")
 
+    def test_append_reply_records_outgoing_attachments_tool_outputs_and_send_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            reply = ReplyCandidate(
+                message_id="m1",
+                conversation_id="conv1",
+                text="reply with file",
+                send_mode="confirm",
+                model="fake",
+                attachments=[{"path": "out/report.pdf", "name": "report.pdf", "kind": "document"}],
+                tool_result=ToolCallResult(
+                    call_id="call1",
+                    tool_name="document.translate",
+                    status="completed",
+                    summary="done",
+                    output_refs=["out/translated.docx"],
+                ),
+            )
+
+            entry = store.append_reply(reply)
+            changed = store.update_reply_send_result(
+                "conv1",
+                entry.entry_id,
+                SendResult(message_id="m1", conversation_id="conv1", status="queued_for_confirm", reason="confirm_required:q1"),
+            )
+            updated = store.read_entries("conv1")[0]
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+
+            self.assertTrue(changed)
+            self.assertEqual(len(updated.attachments), 2)
+            self.assertEqual(updated.attachments[0]["source"], "reply_candidate")
+            self.assertEqual(updated.attachments[1]["source"], "tool_result")
+            self.assertEqual(updated.attachments[1]["tool_name"], "document.translate")
+            self.assertEqual(updated.send["status"], "queued_for_confirm")
+            self.assertIn("[send:status=queued_for_confirm", markdown)
+            self.assertIn("[file:outgoing name=translated.docx", markdown)
+
 
 class LedgerContextAssemblerTest(unittest.TestCase):
     def test_build_snapshot_uses_active_entries_quote_window_and_files(self) -> None:
@@ -377,10 +447,11 @@ def _message(
     metadata: dict | None = None,
     is_self: bool = False,
     sender_name: str = "PAGE",
+    conversation_id: str = "conv1",
 ) -> NormalizedMessage:
     return NormalizedMessage(
         message_id=message_id,
-        conversation_id="conv1",
+        conversation_id=conversation_id,
         conversation_type="private",
         chat_title="PAGE",
         sender_name=sender_name,

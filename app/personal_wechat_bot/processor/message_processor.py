@@ -92,7 +92,7 @@ class MessageProcessor:
             self._mark_done(original_message_id, message.message_id)
             return item
 
-        self.runtime.ledger_store.append_reply(
+        reply_entry = self.runtime.ledger_store.append_reply(
             reply,
             chat_title=message.chat_title,
             conversation_type=message.conversation_type,
@@ -103,6 +103,7 @@ class MessageProcessor:
             item["memory_after_reply"] = memory
         self.runtime.event_logger.log("reply.candidate", reply, message_id=message.message_id)
         send = self.runtime.reply_gate.handle(reply)
+        self.runtime.ledger_store.update_reply_send_result(message.conversation_id, reply_entry.entry_id, send)
         self.runtime.event_logger.log("send.result", send, message_id=message.message_id)
         item["reply"] = asdict(reply)
         item["send"] = asdict(send)

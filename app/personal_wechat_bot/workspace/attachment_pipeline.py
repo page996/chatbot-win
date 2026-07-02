@@ -149,6 +149,7 @@ def _artifact_refs(staged) -> dict[str, Any]:
         "media_extract_count": int(analysis.get("media_extract_count", 0) or 0) if isinstance(analysis, dict) else 0,
         "media_ocr_status": str(analysis.get("media_ocr_status", "")) if isinstance(analysis, dict) else "",
         "media_ocr_dir": str(analysis.get("media_ocr_dir", "")) if isinstance(analysis, dict) else "",
+        "media_ocr_index_path": str(analysis.get("media_ocr_index_path", "")) if isinstance(analysis, dict) else "",
         "media_ocr_count": int(analysis.get("media_ocr_count", 0) or 0) if isinstance(analysis, dict) else 0,
         "media_ocr_error_count": int(analysis.get("media_ocr_error_count", 0) or 0) if isinstance(analysis, dict) else 0,
         "media_asr_status": str(analysis.get("media_asr_status", "")) if isinstance(analysis, dict) else "",
@@ -174,14 +175,14 @@ def _artifact_refs(staged) -> dict[str, Any]:
 
 def _conversation_parse_text(raw_text: str, kind: str, artifacts: dict[str, Any]) -> str:
     if kind != "spreadsheet":
-        return raw_text
+        return _with_artifact_context(raw_text, artifacts)
     table_chunks = artifacts.get("table_chunks", [])
     first_chunk = table_chunks[0] if isinstance(table_chunks, list) and table_chunks else {}
     if not isinstance(first_chunk, dict):
-        return raw_text
+        return _with_artifact_context(raw_text, artifacts)
     chunk_path_raw = str(first_chunk.get("path", "")).strip()
     if not chunk_path_raw:
-        return raw_text
+        return _with_artifact_context(raw_text, artifacts)
     chunk_path = Path(chunk_path_raw)
     chunk_payload = _read_json(chunk_path, {})
     rows = chunk_payload.get("rows", []) if isinstance(chunk_payload, dict) else []
@@ -197,7 +198,59 @@ def _conversation_parse_text(raw_text: str, kind: str, artifacts: dict[str, Any]
     ]
     if raw_text.strip():
         lines.extend(["", "[spreadsheet_text_preview]", _compact(raw_text, 1200)])
+    return _with_artifact_context("\n".join(lines).strip(), artifacts)
+
+
+def _with_artifact_context(raw_text: str, artifacts: dict[str, Any]) -> str:
+    lines = [raw_text.strip()] if raw_text.strip() else []
+    refs = _artifact_reference_lines(artifacts)
+    if refs:
+        if lines:
+            lines.append("")
+        lines.extend(["[file_artifacts]", *refs])
+    ocr_preview = _media_ocr_preview(artifacts)
+    if ocr_preview:
+        lines.extend(["", "[media_ocr_preview]", ocr_preview])
     return "\n".join(lines).strip()
+
+
+def _artifact_reference_lines(artifacts: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    for key in ("content_path", "analysis_path", "parse_result_path"):
+        value = str(artifacts.get(key, "")).strip()
+        if value:
+            refs.append(f"{key}={value}")
+    chunk_count = int(artifacts.get("chunk_count", 0) or 0)
+    if chunk_count:
+        refs.append(f"chunks_dir={artifacts.get('chunks_dir', '')}")
+        refs.append(f"chunk_count={chunk_count}")
+    table_chunk_count = int(artifacts.get("table_chunk_count", 0) or 0)
+    if table_chunk_count:
+        refs.append(f"table_index_path={artifacts.get('table_index_path', '')}")
+        refs.append(f"table_chunk_count={table_chunk_count}")
+    media_extract_count = int(artifacts.get("media_extract_count", 0) or 0)
+    if media_extract_count:
+        refs.append(f"media_index_path={artifacts.get('media_index_path', '')}")
+        refs.append(f"media_extract_count={media_extract_count}")
+    ocr_index = str(artifacts.get("media_ocr_index_path", "")).strip()
+    if ocr_index:
+        refs.append(f"media_ocr_index_path={ocr_index}")
+        refs.append(f"media_ocr_count={artifacts.get('media_ocr_count', 0)}")
+    asr_count = int(artifacts.get("media_asr_count", 0) or 0)
+    if asr_count:
+        refs.append(f"media_asr_dir={artifacts.get('media_asr_dir', '')}")
+        refs.append(f"media_asr_count={asr_count}")
+    return refs
+
+
+def _media_ocr_preview(artifacts: dict[str, Any]) -> str:
+    index_path_raw = str(artifacts.get("media_ocr_index_path", "")).strip()
+    if not index_path_raw:
+        return ""
+    index_path = Path(index_path_raw)
+    if not index_path.is_file():
+        return ""
+    return _compact(index_path.read_text(encoding="utf-8", errors="replace"), 8000)
 
 
 def _compact(text: str, max_chars: int) -> str:

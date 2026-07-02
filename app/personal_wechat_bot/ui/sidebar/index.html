@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 审计面板</title>
-    <link rel="stylesheet" href="/styles.css?v=20260630-6" />
+    <link rel="stylesheet" href="/styles.css?v=20260701-weflow" />
   </head>
   <body>
     <main class="shell">
@@ -69,6 +69,7 @@
           <button class="active" data-panel="queue">发送审核</button>
           <button data-panel="bridge">非前台桥</button>
           <button data-panel="runtime">技能/人设</button>
+          <button data-panel="weflow">WeFlow</button>
         </div>
         <div id="queuePanel">
           <section class="metrics">
@@ -155,6 +156,68 @@
             </form>
           </section>
         </div>
+        <div id="weflowPanel" hidden>
+          <div class="weflow-summary">
+            <div>
+              <span class="eyebrow">WeFlow Local Fork</span>
+              <strong id="weflowStatus">未检查</strong>
+              <p id="weflowDetail">本地 token 与 fork marker 校验后才会正式拉取。</p>
+            </div>
+            <button id="weflowRefreshButton" class="ghost small">刷新</button>
+          </div>
+          <div class="weflow-form">
+            <label>
+              <span>Base URL</span>
+              <input id="weflowBaseUrl" type="text" value="http://127.0.0.1:5031" />
+            </label>
+            <label>
+              <span>Token Env</span>
+              <input id="weflowTokenEnv" type="text" value="WEFLOW_API_TOKEN" />
+            </label>
+            <label>
+              <span>Token</span>
+              <input id="weflowToken" type="password" placeholder="可留空，优先读取环境变量" />
+            </label>
+            <label>
+              <span>Talkers</span>
+              <input id="weflowTalkers" type="text" placeholder="空=会话列表；多个用逗号分隔" />
+            </label>
+            <label>
+              <span>Workers</span>
+              <input id="weflowWorkers" type="number" min="1" max="16" value="2" />
+            </label>
+            <label>
+              <span>Message Limit</span>
+              <input id="weflowMessageLimit" type="number" min="1" max="10000" value="100" />
+            </label>
+            <label>
+              <span>Max Pages</span>
+              <input id="weflowMaxPages" type="number" min="0" max="10000" value="1" />
+            </label>
+            <label>
+              <span>Lookback Seconds</span>
+              <input id="weflowLookback" type="number" min="0" value="300" />
+            </label>
+            <label>
+              <span>Interval</span>
+              <input id="weflowInterval" type="number" min="1" value="5" />
+            </label>
+            <label class="switch compact">
+              <input id="weflowContextOnly" type="checkbox" />
+              <span></span>
+              只回填上下文
+            </label>
+          </div>
+          <div class="actions">
+            <button id="weflowHealthButton" class="ghost small">Health</button>
+            <button id="weflowPullButton" class="primary small">拉取一次</button>
+            <button id="weflowStartButton" class="primary small">后台启动</button>
+            <button id="weflowStopButton" class="danger small">停止</button>
+            <button id="weflowDepsButton" class="ghost small">依赖检查</button>
+            <button id="weflowInstallButton" class="ghost small">安装依赖</button>
+          </div>
+          <pre id="weflowStatusBox" class="status-box"></pre>
+        </div>
       </section>
 
       <section class="inspector">
@@ -176,6 +239,6 @@
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
-    <script src="/app.js?v=20260630-6"></script>
+    <script src="/app.js?v=20260701-weflow"></script>
   </body>
 </html>
