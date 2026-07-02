@@ -134,7 +134,11 @@ class BackendEventJsonlDriver:
         context_only: bool = False,
     ) -> RawWeChatMessage | None:
         conversation_type = "group" if event.is_group else "private"
-        conversation_id = conversation_id_for(conversation_type, event.chat_title)
+        meta_source = event.source_payload or {}
+        if not isinstance(meta_source, dict):
+            meta_source = {}
+        conversation_key = _conversation_key(meta_source, event.chat_title)
+        conversation_id = conversation_id_for(conversation_type, conversation_key)
         session_id = (
             self.session_store.current_session_id(conversation_id)
             if self.session_store is not None
@@ -149,9 +153,6 @@ class BackendEventJsonlDriver:
                 text = ""
             else:
                 return None
-        meta_source = event.source_payload or {}
-        if not isinstance(meta_source, dict):
-            meta_source = {}
         allow_empty = event.event_type == "recall"
         context_only = context_only or event.event_type == "recall" or _truthy(meta_source.get("context_only") or meta_source.get("contextOnly"))
         source_name = str(meta_source.get("source") or meta_source.get("adapter") or "backend_events_jsonl")
@@ -184,7 +185,7 @@ class BackendEventJsonlDriver:
                 "source": "backend_events_jsonl",
                 "backend_event_source": source_name,
                 "event_type": event.event_type,
-                "conversation_key": str(meta_source.get("conversation_key") or meta_source.get("talker_id") or meta_source.get("talker") or event.chat_title),
+                "conversation_key": conversation_key,
                 "event_path": str(self.event_path),
                 "line_no": line_no,
                 "source_path": str(meta_source.get("source_path") or meta_source.get("sourcePath") or ""),
@@ -684,6 +685,28 @@ def _source_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(source_payload, dict):
         return dict(source_payload)
     return {}
+
+
+def _conversation_key(meta_source: dict[str, Any], chat_title: str) -> str:
+    """Stable conversation identity used to derive conversation_id.
+
+    Prefer the upstream talker id (wxid / roomid) so two contacts that share a
+    display name never collapse into the same conversation, and so the driver
+    and the normalizer derive the exact same conversation_id. Falls back to the
+    chat title only when no talker id is available (e.g. manual backend events).
+    """
+
+    return (
+        str(
+            meta_source.get("conversation_key")
+            or meta_source.get("conversationKey")
+            or meta_source.get("talker_id")
+            or meta_source.get("talkerId")
+            or meta_source.get("talker")
+            or chat_title
+        ).strip()
+        or chat_title
+    )
 
 
 def _safe_int(value: Any, default: int = 0) -> int:

@@ -522,6 +522,69 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertNotEqual(session_id, "session_default")
 
 
+class ConversationIsolationTest(unittest.TestCase):
+    """conversation_id must come from the talker id, consistently across layers."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.tmp.name) / "data"
+        create_default_config(self.data_dir)
+        self.config = load_config(self.data_dir)
+        self.event_file = self.data_dir / "backend_events.jsonl"
+        self.driver = BackendEventJsonlDriver(
+            self.event_file,
+            FileIndex(self.data_dir / "file_index.sqlite"),
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_driver_and_normalizer_agree_on_conversation_id_from_talker(self) -> None:
+        from app.personal_wechat_bot.normalizer.normalizer import MessageNormalizer
+
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "display-name",
+                "sender_name": "display-name",
+                "text": "hi",
+                "raw_id": "weflow:message:wxid_abc:1",
+                "source_payload": {"conversation_key": "wxid_abc", "talker_id": "wxid_abc"},
+            },
+        )
+        messages = self.driver.read_new_messages()
+        self.assertEqual(len(messages), 1)
+        raw = messages[0]
+        normalized = MessageNormalizer().normalize(raw)
+        assert normalized is not None
+
+        # Driver hint and normalizer conversation_id must match, and both must
+        # derive from the talker id, not the display name.
+        self.assertEqual(raw.driver_meta["conversation_id_hint"], normalized.conversation_id)
+        self.assertEqual(raw.driver_meta["conversation_key"], "wxid_abc")
+
+    def test_same_display_name_different_talker_stays_isolated(self) -> None:
+        for index, talker in enumerate(("wxid_alice", "wxid_bob"), start=1):
+            append_backend_event_payload(
+                self.event_file,
+                {
+                    "chat_title": "same-name",
+                    "sender_name": "same-name",
+                    "text": f"msg-{index}",
+                    "raw_id": f"weflow:message:{talker}:{index}",
+                    "source_payload": {"conversation_key": talker, "talker_id": talker},
+                },
+            )
+        messages = self.driver.read_new_messages()
+        hints = {msg.driver_meta["conversation_id_hint"] for msg in messages}
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(len(hints), 2)  # two distinct conversations, no cross-mixing
+
+
 class _FakeOcr:
     def __init__(self, text: str):
         self.text = text
