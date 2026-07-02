@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
 from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl
+from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 
 
 WEFLOW_LOCAL_BUILD_FLAVOR = "chatbot-win-local-fork"
@@ -209,6 +210,15 @@ class WeFlowHttpBridge:
                     state_path=str(self.state_path),
                     media_export_paths=(),
                 )
+
+        # Drop WeChat system/service accounts (filehelper, official accounts,
+        # etc.): they are not real conversations, so we never pull, backfill, or
+        # reply to them.
+        sessions = [
+            session
+            for session in sessions
+            if not is_system_account(_session_id_from_meta(session))
+        ]
 
         worker_count = max(1, int(workers or 1))
         results: list[_WeFlowSessionPullResult] = []

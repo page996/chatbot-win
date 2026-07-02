@@ -10,6 +10,7 @@ from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_I
 from app.personal_wechat_bot.domain.models import RawWeChatMessage, SendResult, utc_now_iso
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
+from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl
@@ -138,6 +139,10 @@ class BackendEventJsonlDriver:
         if not isinstance(meta_source, dict):
             meta_source = {}
         conversation_key = _conversation_key(meta_source, event.chat_title)
+        # Defensive backstop: never surface WeChat system accounts (filehelper,
+        # official accounts, ...) even if one slips past the pull-source filter.
+        if is_system_account(conversation_key):
+            return None
         conversation_id = conversation_id_for(conversation_type, conversation_key)
         session_id = (
             self.session_store.current_session_id(conversation_id)

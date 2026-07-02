@@ -584,6 +584,32 @@ class ConversationIsolationTest(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertEqual(len(hints), 2)  # two distinct conversations, no cross-mixing
 
+    def test_filehelper_messages_are_dropped(self) -> None:
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "文件传输助手",
+                "sender_name": "文件传输助手",
+                "text": "self note",
+                "raw_id": "weflow:message:filehelper:1",
+                "source_payload": {"conversation_key": "filehelper", "talker_id": "filehelper"},
+            },
+        )
+        append_backend_event_payload(
+            self.event_file,
+            {
+                "chat_title": "real",
+                "sender_name": "real",
+                "text": "hi",
+                "raw_id": "weflow:message:wxid_real:1",
+                "source_payload": {"conversation_key": "wxid_real", "talker_id": "wxid_real"},
+            },
+        )
+        messages = self.driver.read_new_messages()
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].driver_meta["conversation_key"], "wxid_real")
+
 
 class _FakeOcr:
     def __init__(self, text: str):
