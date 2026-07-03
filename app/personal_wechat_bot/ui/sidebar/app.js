@@ -565,6 +565,7 @@ async function weflowAction(action, extra = {}) {
 }
 
 async function weflowBackfill() {
+  if (state.actionInProgress) return;
   const talkers = splitComma($("#weflowTalkers").value);
   if (!talkers.length) {
     $("#weflowStatusBox").textContent = "回填历史需要在 Talkers 填写要初始化的会话 id（不能为空）。";
@@ -572,14 +573,25 @@ async function weflowBackfill() {
     return;
   }
   if (!window.confirm(`将从头拉取以下会话的历史消息作为上下文（不会回复旧消息）：\n${talkers.join(", ")}`)) return;
-  const payload = await api("/api/weflow/backfill", {
-    method: "POST",
-    body: JSON.stringify(weflowPayload({ talkers })),
-  });
-  $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 5000), null, 2);
-  setStatusMessage(`WeFlow 回填历史完成（${(payload.backfilled_talkers || []).length} 个会话）`);
-  await refresh({ force: true });
-  return payload;
+  state.actionInProgress = true;
+  const btn = $("#weflowBackfillButton");
+  btn.disabled = true;
+  try {
+    const payload = await api("/api/weflow/backfill", {
+      method: "POST",
+      body: JSON.stringify(weflowPayload({ talkers })),
+    });
+    $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 5000), null, 2);
+    setStatusMessage(`WeFlow 回填历史完成（${(payload.backfilled_talkers || []).length} 个会话）`);
+    await refresh({ force: true });
+    return payload;
+  } catch (error) {
+    $("#weflowStatusBox").textContent = `WeFlow 回填历史失败：${error.message}`;
+    setStatusMessage(`WeFlow 回填历史失败：${error.message}`);
+  } finally {
+    state.actionInProgress = false;
+    btn.disabled = false;
+  }
 }
 
 async function weflowDependencies() {
@@ -871,9 +883,7 @@ $("#weflowHealthButton").addEventListener("click", () => weflowAction("health").
 $("#weflowPullButton").addEventListener("click", () => weflowAction("pull-once").catch((error) => {
   $("#weflowStatusBox").textContent = `WeFlow 拉取失败：${error.message}`;
 }));
-$("#weflowBackfillButton").addEventListener("click", () => weflowBackfill().catch((error) => {
-  $("#weflowStatusBox").textContent = `WeFlow 回填历史失败：${error.message}`;
-}));
+$("#weflowBackfillButton").addEventListener("click", () => weflowBackfill());
 $("#weflowStartButton").addEventListener("click", () => weflowAction("start").catch((error) => {
   $("#weflowStatusBox").textContent = `WeFlow 启动失败：${error.message}`;
 }));
