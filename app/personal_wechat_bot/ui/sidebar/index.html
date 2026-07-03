@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 审计面板</title>
-    <link rel="stylesheet" href="/styles.css?v=20260702-backfill3" />
+    <link rel="stylesheet" href="/styles.css?v=20260702-discover" />
   </head>
   <body>
     <main class="shell">
@@ -209,6 +209,7 @@
             </label>
           </div>
           <div class="actions">
+            <button id="weflowDiscoverButton" class="ghost small">发现会话</button>
             <button id="weflowHealthButton" class="ghost small">Health</button>
             <button id="weflowPullButton" class="primary small">拉取一次</button>
             <button id="weflowBackfillButton" class="primary small">回填历史</button>
@@ -217,7 +218,15 @@
             <button id="weflowDepsButton" class="ghost small">依赖检查</button>
             <button id="weflowInstallButton" class="ghost small">安装依赖</button>
           </div>
+          <div id="weflowSessionList" class="session-list" hidden></div>
           <pre id="weflowStatusBox" class="status-box"></pre>
+          <div id="weflowHistoryBox" class="history-box" hidden>
+            <div class="history-header">
+              <span>操作历史</span>
+              <button id="weflowClearHistoryButton" class="ghost mini">清空</button>
+            </div>
+            <div id="weflowHistoryContent" class="history-content"></div>
+          </div>
         </div>
       </section>
 
@@ -240,6 +249,6 @@
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
-    <script src="/app.js?v=20260702-backfill3"></script>
+    <script src="/app.js?v=20260702-discover"></script>
   </body>
 </html>

@@ -21,6 +21,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     sidebar_runtime_card_action,
     sidebar_weflow_dependency_status,
     sidebar_weflow_backfill,
+    sidebar_weflow_discover_sessions,
     sidebar_weflow_health,
     sidebar_weflow_install_deps,
     sidebar_weflow_pull_once,
@@ -89,6 +90,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/weflow/backfill":
                     self._json(sidebar_weflow_backfill(data_dir, payload))
+                    return
+                if parsed.path == "/api/weflow/discover-sessions":
+                    self._json(sidebar_weflow_discover_sessions(data_dir, payload))
                     return
                 if parsed.path == "/api/weflow/start":
                     self._json(sidebar_weflow_start(data_dir, payload))

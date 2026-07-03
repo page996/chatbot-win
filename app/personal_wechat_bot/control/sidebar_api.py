@@ -216,6 +216,32 @@ def sidebar_weflow_health(data_dir: str | Path, payload: dict[str, Any]) -> dict
     return result
 
 
+def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """List available WeFlow sessions (conversations) for the user to pick from.
+
+    Returns {status, sessions: [{id, name, unread_count?, last_message_time?}]}.
+    """
+    from app.personal_wechat_bot.wechat_driver.hook_source_bridge import WeFlowHttpBridge
+
+    params = _weflow_params(data_dir, payload)
+    limit = _bounded_int(payload.get("limit"), 100, 1, 1000)
+    try:
+        bridge = WeFlowHttpBridge(
+            params["base_url"],
+            token=params["token"],
+            allow_non_local=params["allow_non_local"],
+            require_token=True,
+            require_fork=True,
+        )
+        sessions = bridge.list_sessions(limit=limit)
+        # Filter out system accounts before returning to the user
+        from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
+        sessions = [s for s in sessions if not is_system_account(s.get("id"))]
+        return {"status": "ok", "sessions": sessions, "count": len(sessions)}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "sessions": []}
+
+
 def sidebar_weflow_pull_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     result = _run_sidebar_weflow_once(data_dir, payload)
     _write_weflow_sidebar_state(data_dir, {"last_pull": result, **_weflow_public_params(_weflow_params(data_dir, payload))})

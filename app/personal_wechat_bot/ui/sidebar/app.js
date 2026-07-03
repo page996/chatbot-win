@@ -559,9 +559,93 @@ async function weflowAction(action, extra = {}) {
     body: JSON.stringify(weflowPayload(extra)),
   });
   $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 5000), null, 2);
+  addHistoryEntry(action, payload);
   setStatusMessage(`WeFlow ${action} 完成`);
   await refresh({ force: true });
   return payload;
+}
+
+async function weflowDiscoverSessions() {
+  if (state.actionInProgress) return;
+  state.actionInProgress = true;
+  const btn = $("#weflowDiscoverButton");
+  btn.disabled = true;
+  try {
+    const payload = await api("/api/weflow/discover-sessions", {
+      method: "POST",
+      body: JSON.stringify(weflowPayload({ limit: 100 })),
+    });
+    if (payload.status === "ok" && payload.sessions) {
+      renderSessionList(payload.sessions);
+      setStatusMessage(`发现 ${payload.count} 个会话`);
+    } else {
+      $("#weflowStatusBox").textContent = `会话发现失败：${payload.message || "未知错误"}`;
+      setStatusMessage("会话发现失败");
+    }
+  } catch (error) {
+    $("#weflowStatusBox").textContent = `会话发现失败：${error.message}`;
+    setStatusMessage(`会话发现失败：${error.message}`);
+  } finally {
+    state.actionInProgress = false;
+    btn.disabled = false;
+  }
+}
+
+function renderSessionList(sessions) {
+  const list = $("#weflowSessionList");
+  if (!sessions || !sessions.length) {
+    list.hidden = true;
+    return;
+  }
+  list.hidden = false;
+  list.innerHTML = sessions
+    .map(
+      (s) => `
+    <div class="session-item" data-session-id="${s.id || ""}">
+      <div>
+        <div class="session-item-name">${s.name || s.id || "（无名称）"}</div>
+        <div class="session-item-id">${s.id || ""}</div>
+      </div>
+    </div>
+  `
+    )
+    .join("");
+  list.querySelectorAll(".session-item").forEach((item) => {
+    item.addEventListener("click", () => {
+      const sessionId = item.dataset.sessionId;
+      if (sessionId) {
+        const talkersInput = $("#weflowTalkers");
+        const current = talkersInput.value.trim();
+        const ids = current ? current.split(",").map((x) => x.trim()).filter(Boolean) : [];
+        if (!ids.includes(sessionId)) {
+          ids.push(sessionId);
+        }
+        talkersInput.value = ids.join(", ");
+        list.hidden = true;
+        setStatusMessage(`已添加会话：${sessionId}`);
+      }
+    });
+  });
+}
+
+function addHistoryEntry(action, payload) {
+  const box = $("#weflowHistoryBox");
+  const content = $("#weflowHistoryContent");
+  box.hidden = false;
+  const entry = document.createElement("div");
+  entry.className = "history-entry";
+  const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const summary = JSON.stringify(compactPayload(payload, 200));
+  entry.innerHTML = `
+    <div class="history-entry-time">${time}</div>
+    <div class="history-entry-action">${action}</div>
+    <div class="history-entry-result">${summary}</div>
+  `;
+  content.insertBefore(entry, content.firstChild);
+  // Keep last 50 entries
+  while (content.children.length > 50) {
+    content.removeChild(content.lastChild);
+  }
 }
 
 async function weflowBackfill() {
@@ -582,6 +666,7 @@ async function weflowBackfill() {
       body: JSON.stringify(weflowPayload({ talkers })),
     });
     $("#weflowStatusBox").textContent = JSON.stringify(compactPayload(payload, 5000), null, 2);
+    addHistoryEntry("backfill", payload);
     setStatusMessage(`WeFlow 回填历史完成（${(payload.backfilled_talkers || []).length} 个会话）`);
     await refresh({ force: true });
     return payload;
@@ -880,6 +965,11 @@ $("#weflowRefreshButton").addEventListener("click", () => refresh({ force: true 
 $("#weflowHealthButton").addEventListener("click", () => weflowAction("health").catch((error) => {
   $("#weflowStatusBox").textContent = `WeFlow health 失败：${error.message}`;
 }));
+$("#weflowDiscoverButton").addEventListener("click", () => weflowDiscoverSessions());
+$("#weflowClearHistoryButton").addEventListener("click", () => {
+  $("#weflowHistoryContent").innerHTML = "";
+  setStatusMessage("操作历史已清空");
+});
 $("#weflowPullButton").addEventListener("click", () => weflowAction("pull-once").catch((error) => {
   $("#weflowStatusBox").textContent = `WeFlow 拉取失败：${error.message}`;
 }));
