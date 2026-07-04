@@ -32,8 +32,8 @@ _PLAN_RESIDUAL_RULES = [
         "manual_reply_before_send_module",
         "\u5728\u53d1\u9001\u6a21\u5757\u5b9e\u73b0\u524d\uff0c\u9700\u8981\u4eba\u5de5\u590d\u5236\u5019\u9009\u56de\u590d\u5230\u5fae\u4fe1",
         "superseded_historical_note",
-        "windows_guarded real send driver is implemented; current runtime truth is reported by preflight/send-readiness",
-        "keep as history; use confirm queue and guarded foreground checks for real-send rollout",
+        "bridge_outbox real send driver is implemented; current runtime truth is reported by preflight/send-readiness",
+        "keep as history; use confirm queue and the WeChatFerry send bridge for real-send rollout",
     ),
     PlanResidualRule(
         "uia_empty_window_bridge",
@@ -326,8 +326,8 @@ def _real_send_action(current_truth: dict[str, Any]) -> str:
     if current_truth.get("send_enabled") and current_truth.get("real_send_implemented") and not current_truth.get("wechat_read_only"):
         return "continue guarded confirm-mode tests; keep auto mode disabled until send audit logs are clean"
     if current_truth.get("real_send_implemented"):
-        return "enable only after confirm-mode controls, foreground guard, and target chat probe are ready"
-    return "implement a guarded send driver before real-send rollout"
+        return "enable only after confirm-mode controls and the WeChatFerry send bridge are ready"
+    return "configure the bridge_outbox send driver and its WeChatFerry bridge before real-send rollout"
 
 
 def _project_root() -> Path:

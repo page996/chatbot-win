@@ -8,7 +8,6 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     Win32WindowProbe,
     WindowInfo,
     find_wechat_processes,
-    foreground_window_info,
 )
 from app.personal_wechat_bot.wechat_driver.snapshot_provider import StaticSnapshotProvider
 
@@ -99,9 +98,6 @@ class WindowsWeChatReadOnlyDriverTest(unittest.TestCase):
 
     def test_find_wechat_processes_returns_list(self) -> None:
         self.assertIsInstance(find_wechat_processes(), list)
-
-    def test_foreground_window_info_returns_dict(self) -> None:
-        self.assertIsInstance(foreground_window_info(), dict)
 
 
 class _Probe(Win32WindowProbe):

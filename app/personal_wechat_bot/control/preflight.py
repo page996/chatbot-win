@@ -12,7 +12,6 @@ from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
 from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import voice_cache_capability
-from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionBridge
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
     implemented_send_drivers,
     is_real_send_driver_implemented,
@@ -39,7 +38,6 @@ def build_preflight_report(
     warnings = _warnings(config, api_key_present, manual_bound_count=len(manual_bound_channels))
     ocr_health = RapidOcrSubprocessEngine().health()
     asr_health = LocalAsrSubprocessEngine().health()
-    wechat_voice = WeChatVoiceTranscriptionBridge(config.data_dir).health()
     office_health = LibreOfficeRuntime().health()
     real_send_implemented = is_real_send_driver_implemented(config.send_driver)
     write_access_configured = config.send_enabled and real_send_implemented
@@ -142,8 +140,8 @@ def build_preflight_report(
             "max_bytes": config.file_max_bytes,
             "multimedia_parse": {
                 "images": "file_layer_ocr_to_workspace_artifacts",
-                "voice_messages": "backend_event_pending_voice_supported; WeChat built-in transcript first, readable voice cache/local ASR fallback when configured",
-                "voice_main_path": "wechat_builtin_voice_to_text_bridge_for_manually_bound_windows",
+                "voice_messages": "backend_event_pending_voice_supported; readable voice cache/local ASR fallback when configured",
+                "voice_main_path": "local_asr_over_readable_voice_cache",
                 "voice_cache_fallback": "readable_file_cache_only; WeChat DB decryption is not supported by design",
                 "audio_files": "preserved_and_indexed; local_asr_fallback_when_available",
                 "docx_embedded_images": "extracted_and_ocr_if_ocr_engine_available",
@@ -179,7 +177,6 @@ def build_preflight_report(
                 "detail": asr_health.detail,
                 "install": asr_health.install,
             },
-            "wechat_voice_to_text": wechat_voice,
             "wechat_voice_cache": voice_cache_capability(voice_roots, config.file_allowed_extensions),
         },
         "ocr": {
@@ -213,8 +210,6 @@ def _warnings(config: BotConfig, api_key_present: bool, *, manual_bound_count: i
         warnings.append("send_enabled is true but send_driver is not implemented")
     if config.send_enabled and config.mode != "confirm" and config.send_confirm_required:
         warnings.append("send is enabled but mode is not confirm while send_confirm_required is true")
-    if config.send_enabled and config.send_driver == "bridge_outbox" and manual_bound_count <= 0:
-        warnings.append("bridge_outbox requires at least one manually captured WeChat channel binding")
     if not config.accepted_contacts and not config.accepted_groups:
         warnings.append("no accepted contacts or groups recorded yet; new WeChat conversations will auto-register channels")
     chat_provider = config.providers.get("chat", config.llm)

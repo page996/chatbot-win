@@ -61,6 +61,9 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         data_dir=str(root),
         send_enabled=bool(raw.get("send_enabled", False)),
         send_driver=str(raw.get("send_driver", "not_implemented")),
+        send_backend=str(raw.get("send_backend", "dry_run")),
+        wcf_host=str(raw.get("wcf_host", "127.0.0.1")),
+        wcf_port=int(raw.get("wcf_port", 10086)),
         send_confirm_required=bool(raw.get("send_confirm_required", True)),
         send_max_chars=int(raw.get("send_max_chars", 800)),
         send_min_interval_seconds=int(raw.get("send_min_interval_seconds", 5)),
@@ -79,6 +82,8 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         wechat_voice_roots=list(raw.get("wechat_voice_roots", [])),
         file_allowed_extensions=_file_allowed_extensions_from_json(raw),
         file_max_bytes=int(raw.get("file_max_bytes", 20 * 1024 * 1024)),
+        outgoing_file_allowed_extensions=_outgoing_extensions_from_json(raw),
+        outgoing_file_max_bytes=int(raw.get("outgoing_file_max_bytes", 200 * 1024 * 1024)),
         search_blocklist=list(blocklist),
     )
 
@@ -246,6 +251,28 @@ def _file_allowed_extensions_from_json(raw: dict[str, Any]) -> list[str]:
     return normalized
 
 
+def _outgoing_extensions_from_json(raw: dict[str, Any]) -> list[str]:
+    """Outgoing (agent-produced) file extension allow-list.
+
+    Unlike inbound files, this list is NOT merged with the built-in defaults: an
+    empty list means "allow any extension" (the extension gate is disabled), so
+    agent-generated artifacts are never blocked by type. Only an explicit,
+    non-empty configured list restricts outgoing types.
+    """
+
+    configured = raw.get("outgoing_file_allowed_extensions", [])
+    values = configured if isinstance(configured, list) else []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        suffix = _normalize_extension(item)
+        if not suffix or suffix in seen:
+            continue
+        seen.add(suffix)
+        normalized.append(suffix)
+    return normalized
+
+
 def _normalize_extension(value: Any) -> str:
     suffix = str(value).strip().lower()
     if not suffix:
@@ -256,6 +283,20 @@ def _normalize_extension(value: Any) -> str:
 
 
 def _provider_from_json(name: str, raw: dict[str, Any]) -> ProviderConfig:
+    return ProviderConfig(
+        provider_id=raw.get("provider_id", name),
+        provider=raw.get("provider", "deepseek"),
+        model=raw.get("model", "deepseek-v4-flash"),
+        base_url=raw.get("base_url", ""),
+        api_key_env=raw.get("api_key_env", "DEEPSEEK_API_KEY"),
+        api_key_env_pool=list(raw.get("api_key_env_pool", [])),
+        api_key_file=raw.get("api_key_file", ""),
+        stream=bool(raw.get("stream", False)),
+        max_wait_seconds=raw.get("max_wait_seconds"),
+        capabilities=list(raw.get("capabilities", ["chat", "planning", "summarization", "relevance_filter"])),
+        max_concurrency=int(raw.get("max_concurrency", 2)),
+        cooldown_seconds=int(raw.get("cooldown_seconds", 0)),
+    )
     return ProviderConfig(
         provider_id=raw.get("provider_id", name),
         provider=raw.get("provider", "deepseek"),

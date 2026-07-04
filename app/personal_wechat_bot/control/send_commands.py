@@ -4,7 +4,8 @@ from pathlib import Path
 from typing import Any
 
 from app.personal_wechat_bot.config.loader import load_config, save_config
-from app.personal_wechat_bot.domain.models import ReplyCandidate, ToolCallResult
+from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
+from app.personal_wechat_bot.domain.models import ReplyCandidate, ToolCallResult, utc_now_iso
 from app.personal_wechat_bot.reply_gate.send_audit import SendAuditLog
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
@@ -26,6 +27,8 @@ def set_send_controls(
         if mode not in {"dry_run", "confirm", "auto"}:
             raise ValueError("mode must be dry_run, confirm, or auto")
         config.mode = mode
+        if confirm_required is None:
+            config.send_confirm_required = mode != "auto"
     if enabled is not None:
         config.send_enabled = enabled
     if driver is not None:
@@ -49,12 +52,14 @@ def list_confirm_queue(data_dir: str | Path, status: str = "pending") -> dict[st
 def approve_confirm_item(data_dir: str | Path, queue_id: str, *, reviewer: str, note: str = "") -> dict[str, Any]:
     item = _queue(data_dir).approve(queue_id, reviewer=reviewer, note=note)
     _audit(data_dir).append("confirm_approve", queue_id=queue_id, status=item["status"], reviewer=reviewer, note=note)
+    _safe_sync_queue_item_to_ledger(data_dir, item, status="approved", reason=note or "confirm_approved")
     return {"status": "ok", "item": item}
 
 
 def reject_confirm_item(data_dir: str | Path, queue_id: str, *, reviewer: str, note: str = "") -> dict[str, Any]:
     item = _queue(data_dir).reject(queue_id, reviewer=reviewer, note=note)
     _audit(data_dir).append("confirm_reject", queue_id=queue_id, status=item["status"], reviewer=reviewer, note=note)
+    _safe_sync_queue_item_to_ledger(data_dir, item, status="rejected", reason=note or "confirm_rejected")
     return {"status": "ok", "item": item}
 
 
@@ -84,7 +89,74 @@ def send_approved_confirm_item(data_dir: str | Path, queue_id: str, driver: Any 
         reason=result.reason,
         payload={"conversation_id": reply.conversation_id, "message_id": reply.message_id},
     )
-    return {"status": final_status, "send_result": result.__dict__, "item": updated}
+    # The message is already sent and the queue is already marked above. A failure
+    # while syncing the ledger must not mask a successful send, so swallow it here
+    # (recording it to the audit log) and still return the real send status.
+    ledger_sync_error = _safe_sync_queue_item_to_ledger(
+        data_dir, updated, status=final_status, reason=result.reason, send_result=result.__dict__
+    )
+    return {
+        "status": final_status,
+        "send_result": result.__dict__,
+        "item": updated,
+        "ledger_sync_error": ledger_sync_error,
+    }
+
+
+def sync_bridge_ack_to_send_state(
+    data_dir: str | Path,
+    bridge_id: str,
+    *,
+    status: str,
+    reason: str = "",
+    external_message_id: str = "",
+) -> dict[str, Any]:
+    bridge_id = str(bridge_id or "").strip()
+    if not bridge_id:
+        return {"status": "skipped", "reason": "bridge_id_empty"}
+    queue = _queue(data_dir)
+    queue_item = queue.find_by_bridge_id(bridge_id)
+    queue_updated: dict[str, Any] = {}
+    queue_error = ""
+    mapped_queue_status = "sent" if status == "sent" else "failed"
+    if queue_item is not None:
+        try:
+            queue_updated = queue.mark_send_result(
+                str(queue_item.get("queue_id", "")),
+                mapped_queue_status,
+                reason or f"bridge_ack:{status}",
+            )
+            _sync_queue_item_to_ledger(
+                data_dir,
+                queue_updated,
+                status=mapped_queue_status,
+                reason=reason or f"bridge_ack:{status}",
+                send_result={
+                    "message_id": bridge_id,
+                    "status": mapped_queue_status,
+                    "reason": reason or f"bridge_ack:{status}",
+                    "sent_at": utc_now_iso() if mapped_queue_status == "sent" else "",
+                    "external_message_id": external_message_id,
+                },
+            )
+        except Exception as exc:
+            queue_error = f"{type(exc).__name__}: {exc}"
+
+    ledger_updates = _sync_bridge_ack_to_ledgers(
+        data_dir,
+        bridge_id,
+        status=status,
+        reason=reason or f"bridge_ack:{status}",
+        external_message_id=external_message_id,
+    )
+    return {
+        "status": "ok",
+        "bridge_id": bridge_id,
+        "queue_item_found": queue_item is not None,
+        "queue_item": queue_updated,
+        "queue_error": queue_error,
+        "ledger_updates": ledger_updates,
+    }
 
 
 def list_send_audit(data_dir: str | Path, *, limit: int = 20, status: str | None = None) -> dict[str, Any]:
@@ -106,6 +178,91 @@ def _queue(data_dir: str | Path) -> ConfirmQueue:
 
 def _audit(data_dir: str | Path) -> SendAuditLog:
     return SendAuditLog(Path(data_dir) / "send_audit.jsonl")
+
+
+def _ledger(data_dir: str | Path) -> ConversationLedgerStore:
+    return ConversationLedgerStore(Path(data_dir))
+
+
+def _sync_queue_item_to_ledger(
+    data_dir: str | Path,
+    item: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    send_result: dict[str, Any] | None = None,
+) -> bool:
+    try:
+        reply = _reply_from_queue_item(item)
+    except Exception:
+        return False
+    payload = {
+        "message_id": reply.message_id,
+        "conversation_id": reply.conversation_id,
+        "status": status,
+        "reason": reason,
+        **(send_result or {}),
+    }
+    if status == "sent" and not payload.get("sent_at"):
+        payload["sent_at"] = utc_now_iso()
+    return _ledger(data_dir).update_reply_send_result_for_candidate(reply, payload)
+
+
+def _safe_sync_queue_item_to_ledger(
+    data_dir: str | Path,
+    item: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    send_result: dict[str, Any] | None = None,
+) -> str:
+    """Sync to the ledger, swallowing failures so a queue transition that already
+    succeeded is never masked by a ledger write error. Returns "" on success or a
+    short error string (also written to the audit log) on failure."""
+    try:
+        _sync_queue_item_to_ledger(data_dir, item, status=status, reason=reason, send_result=send_result)
+        return ""
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        _audit(data_dir).append(
+            "ledger_sync_failed",
+            queue_id=str(item.get("queue_id", "")),
+            status=status,
+            reason=error,
+        )
+        return error
+
+
+def _sync_bridge_ack_to_ledgers(
+    data_dir: str | Path,
+    bridge_id: str,
+    *,
+    status: str,
+    reason: str,
+    external_message_id: str = "",
+) -> list[str]:
+    root = Path(data_dir) / "conversation_ledgers"
+    if not root.exists():
+        return []
+    changed: list[str] = []
+    store = _ledger(data_dir)
+    for messages_path in root.glob("*/messages.jsonl"):
+        conversation_id = messages_path.parent.name
+        try:
+            updated = store.update_bridge_send_result(
+                conversation_id,
+                bridge_id,
+                status=status,
+                reason=reason,
+                external_message_id=external_message_id,
+            )
+        except Exception:
+            # A single conversation's ledger failing to update must not abort the
+            # whole ack fan-out; skip it and keep syncing the rest.
+            continue
+        if updated:
+            changed.append(conversation_id)
+    return changed
 
 
 def _send_config_payload(config: Any) -> dict[str, Any]:

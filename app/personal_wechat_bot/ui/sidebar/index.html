@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 审计面板</title>
-    <link rel="stylesheet" href="/styles.css?v=20260702-discover" />
+    <link rel="stylesheet" href="/styles.css?v=20260703-task-queue" />
   </head>
   <body>
     <main class="shell">
@@ -19,151 +19,165 @@
         <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
       </header>
 
-      <section class="dock-panel">
-        <div>
-          <span class="eyebrow">输入源</span>
-          <strong id="captureRole">后端消息源负责读取对话</strong>
-          <p id="captureDetail">此浮窗只负责审计、发送控制和窗口诊断。</p>
-        </div>
-        <button id="probeButton" class="ghost">探测</button>
-      </section>
+      <nav class="page-tabs" role="tablist" aria-label="主页面">
+        <button class="active" data-page="overview">概览</button>
+        <button data-page="send">发送</button>
+        <button data-page="weflow">WeFlow</button>
+        <button data-page="tasks">任务/历史</button>
+        <button data-page="diagnostics">诊断</button>
+      </nav>
 
-      <section class="channels">
-        <div class="section-head">
-          <h2>服务通道</h2>
-          <span id="channelCount">0</span>
-        </div>
-        <p class="section-copy">每个私聊或群聊拥有独立上下文、记忆、文件中间层和 API key 槽位；明显的旧探测噪声会被隐藏。</p>
-        <div class="channel-stats">
-          <span><strong id="privateCount">0</strong> 私聊</span>
-          <span><strong id="groupCount">0</strong> 群聊</span>
-          <span><strong id="hiddenChannelCount">0</strong> 已隐藏</span>
-        </div>
-        <div id="channelList" class="channel-list"></div>
-      </section>
-
-      <section class="controls">
-        <div class="control-title">
-          <strong>发送控制</strong>
-          <span>决定候选回复如何进入微信。</span>
-        </div>
-        <div class="segmented" role="radiogroup" aria-label="send mode">
-          <button data-mode="dry_run">演练</button>
-          <button data-mode="confirm">审核</button>
-          <button data-mode="auto">自动</button>
-        </div>
-        <label class="switch">
-          <input id="sendEnabled" type="checkbox" />
-          <span></span>
-          允许真实发送
-        </label>
-        <label class="driver-select">
-          <span>发送驱动</span>
-          <select id="driverSelect"></select>
-        </label>
-        <button id="saveControls" class="primary">保存</button>
-      </section>
-
-      <section class="send-console">
-        <div class="bookmark-tabs" role="tablist" aria-label="send console">
-          <button class="active" data-panel="queue">发送审核</button>
-          <button data-panel="bridge">非前台桥</button>
-          <button data-panel="runtime">技能/人设</button>
-          <button data-panel="weflow">WeFlow</button>
-        </div>
-        <div id="queuePanel">
-          <section class="metrics">
-            <button class="metric active" data-status="pending">
-              <span>待审</span>
-              <strong id="pendingCount">0</strong>
-            </button>
-            <button class="metric" data-status="approved">
-              <span>已批</span>
-              <strong id="approvedCount">0</strong>
-            </button>
-            <button class="metric" data-status="queued_to_bridge">
-              <span>入桥</span>
-              <strong id="bridgeQueuedCount">0</strong>
-            </button>
-            <button class="metric" data-status="rejected">
-              <span>拒绝</span>
-              <strong id="rejectedCount">0</strong>
-            </button>
-            <button class="metric" data-status="sent">
-              <span>已发</span>
-              <strong id="sentCount">0</strong>
-            </button>
-            <button class="metric" data-status="failed">
-              <span>失败</span>
-              <strong id="failedCount">0</strong>
-            </button>
-          </section>
-
-          <section id="queueList" class="queue-list" aria-live="polite"></section>
-        </div>
-        <div id="bridgePanel" hidden>
-          <div class="bridge-summary">
-            <div>
-              <span class="eyebrow">Bridge Outbox</span>
-              <strong id="bridgePendingCount">0 待消费</strong>
-              <p id="bridgePath">仅手动抓取并绑定过的微信通道可进入非前台桥</p>
-            </div>
-            <button id="bridgeRefreshButton" class="ghost small">刷新</button>
+      <section id="overviewPage" class="page-panel">
+        <section class="dock-panel">
+          <div>
+            <span class="eyebrow">输入源</span>
+            <strong id="captureRole">后端消息源负责读取对话</strong>
+            <p id="captureDetail">此浮窗只负责审计、发送控制和窗口诊断。</p>
           </div>
-          <div id="bridgeList" class="bridge-list"></div>
-        </div>
-        <div id="runtimePanel" hidden>
-          <div class="runtime-summary">
-            <div>
-              <span class="eyebrow">长效注入</span>
-              <strong id="runtimePolicy">清空上下文不会影响已装备卡片</strong>
-              <p id="runtimeStorage">保存位置读取中</p>
-            </div>
-            <button id="runtimeRefreshButton" class="ghost small">刷新</button>
+          <button id="probeButton" class="ghost">探测</button>
+        </section>
+
+        <section class="channels">
+          <div class="section-head">
+            <h2>服务通道</h2>
+            <span id="channelCount">0</span>
           </div>
+          <p class="section-copy">每个私聊或群聊拥有独立上下文、记忆、文件中间层和 API key 槽位；明显的旧探测噪声会被隐藏。</p>
+          <div class="channel-stats">
+            <span><strong id="privateCount">0</strong> 私聊</span>
+            <span><strong id="groupCount">0</strong> 群聊</span>
+            <span><strong id="hiddenChannelCount">0</strong> 已隐藏</span>
+          </div>
+          <div id="channelList" class="channel-list"></div>
+        </section>
 
-          <section class="runtime-section">
-            <div class="section-head">
-              <h2>技能入口</h2>
-              <span id="skillCount">0</span>
-            </div>
-            <div id="skillList" class="card-list"></div>
-          </section>
+        <section class="controls">
+          <div class="control-title">
+            <strong>发送控制</strong>
+            <span>决定候选回复如何进入微信。</span>
+          </div>
+          <div class="segmented" role="radiogroup" aria-label="send mode">
+            <button data-mode="dry_run">演练</button>
+            <button data-mode="confirm">审核</button>
+            <button data-mode="auto">自动</button>
+          </div>
+          <label class="switch">
+            <input id="sendEnabled" type="checkbox" />
+            <span></span>
+            允许真实发送
+          </label>
+          <label class="driver-select">
+            <span>发送驱动</span>
+            <select id="driverSelect"></select>
+          </label>
+          <button id="saveControls" class="primary">保存</button>
+        </section>
+      </section>
 
-          <section class="runtime-section">
-            <div class="section-head">
-              <h2>人物卡</h2>
-              <span id="personaName">未装备</span>
-            </div>
-            <div id="personaList" class="card-list"></div>
-            <form id="personaForm" class="card-form">
-              <input id="personaCardName" type="text" placeholder="新人物卡名称" />
-              <textarea id="personaCardContent" rows="5" placeholder="人物设定、语气、边界、示例说话风格"></textarea>
-              <button class="primary" type="submit">保存并装备人物卡</button>
-            </form>
-          </section>
+      <section id="sendPage" class="page-panel" hidden>
+        <section class="send-console">
+          <div class="bookmark-tabs" role="tablist" aria-label="send console">
+            <button class="active" data-panel="queue">发送审核</button>
+            <button data-panel="bridge">非前台桥</button>
+            <button data-panel="runtime">技能/人设</button>
+          </div>
+          <div id="queuePanel">
+            <section class="metrics">
+              <button class="metric active" data-status="pending">
+                <span>待审</span>
+                <strong id="pendingCount">0</strong>
+              </button>
+              <button class="metric" data-status="approved">
+                <span>已批</span>
+                <strong id="approvedCount">0</strong>
+              </button>
+              <button class="metric" data-status="queued_to_bridge">
+                <span>入桥</span>
+                <strong id="bridgeQueuedCount">0</strong>
+              </button>
+              <button class="metric" data-status="rejected">
+                <span>拒绝</span>
+                <strong id="rejectedCount">0</strong>
+              </button>
+              <button class="metric" data-status="sent">
+                <span>已发</span>
+                <strong id="sentCount">0</strong>
+              </button>
+              <button class="metric" data-status="failed">
+                <span>失败</span>
+                <strong id="failedCount">0</strong>
+              </button>
+            </section>
 
-          <section class="runtime-section">
-            <div class="section-head">
-              <h2>任务卡</h2>
-              <span id="taskCount">0</span>
+            <section id="queueList" class="queue-list" aria-live="polite"></section>
+          </div>
+          <div id="bridgePanel" hidden>
+            <div class="bridge-summary">
+              <div>
+                <span class="eyebrow">Bridge Outbox</span>
+                <strong id="bridgePendingCount">0 待消费</strong>
+                <p id="bridgePath">仅手动抓取并绑定过的微信通道可进入非前台桥</p>
+              </div>
+              <button id="bridgeRefreshButton" class="ghost small">刷新</button>
             </div>
-            <div id="taskList" class="card-list"></div>
-            <form id="taskForm" class="card-form">
-              <input id="taskCardName" type="text" placeholder="新任务卡名称" />
-              <textarea id="taskCardContent" rows="5" placeholder="长期任务目标、流程、约束和输出格式"></textarea>
-              <button class="primary" type="submit">保存并装备任务卡</button>
-            </form>
-          </section>
-        </div>
-        <div id="weflowPanel" hidden>
+            <div id="bridgeList" class="bridge-list"></div>
+            <p class="bridge-help">说明：非前台桥是“桥接发送队列”，用于把已批准的回复交给后台/外部桥接器处理；仅手动抓取并绑定过的微信通道会进入这里。</p>
+          </div>
+          <div id="runtimePanel" hidden>
+            <div class="runtime-summary">
+              <div>
+                <span class="eyebrow">长效注入</span>
+                <strong id="runtimePolicy">清空上下文不会影响已装备卡片</strong>
+                <p id="runtimeStorage">保存位置读取中</p>
+              </div>
+              <button id="runtimeRefreshButton" class="ghost small">刷新</button>
+            </div>
+
+            <section class="runtime-section">
+              <div class="section-head">
+                <h2>技能入口</h2>
+                <span id="skillCount">0</span>
+              </div>
+              <div id="skillList" class="card-list"></div>
+            </section>
+
+            <section class="runtime-section">
+              <div class="section-head">
+                <h2>人物卡</h2>
+                <span id="personaName">未装备</span>
+              </div>
+              <div id="personaList" class="card-list"></div>
+              <form id="personaForm" class="card-form">
+                <input id="personaCardName" type="text" placeholder="新人物卡名称" />
+                <textarea id="personaCardContent" rows="5" placeholder="人物设定、语气、边界、示例说话风格"></textarea>
+                <button class="primary" type="submit">保存并装备人物卡</button>
+              </form>
+            </section>
+
+            <section class="runtime-section">
+              <div class="section-head">
+                <h2>任务卡</h2>
+                <span id="taskCount">0</span>
+              </div>
+              <div id="taskList" class="card-list"></div>
+              <form id="taskForm" class="card-form">
+                <input id="taskCardName" type="text" placeholder="新任务卡名称" />
+                <textarea id="taskCardContent" rows="5" placeholder="长期任务目标、流程、约束和输出格式"></textarea>
+                <button class="primary" type="submit">保存并装备任务卡</button>
+              </form>
+            </section>
+          </div>
+        </section>
+      </section>
+
+      <section id="weflowPage" class="page-panel" hidden>
+        <section id="weflowPanel">
           <div class="weflow-summary">
             <div>
               <span class="eyebrow">WeFlow Local Fork</span>
               <strong id="weflowStatus">未检查</strong>
               <p id="weflowDetail">本地 token 与 fork marker 校验后才会正式拉取。</p>
             </div>
-            <button id="weflowRefreshButton" class="ghost small">刷新</button>
           </div>
           <div class="weflow-form">
             <label>
@@ -208,47 +222,92 @@
               只回填上下文
             </label>
           </div>
-          <div class="actions">
-            <button id="weflowDiscoverButton" class="ghost small">发现会话</button>
-            <button id="weflowHealthButton" class="ghost small">Health</button>
-            <button id="weflowPullButton" class="primary small">拉取一次</button>
-            <button id="weflowBackfillButton" class="primary small">回填历史</button>
-            <button id="weflowStartButton" class="primary small">后台启动</button>
-            <button id="weflowStopButton" class="danger small">停止</button>
-            <button id="weflowDepsButton" class="ghost small">依赖检查</button>
-            <button id="weflowInstallButton" class="ghost small">安装依赖</button>
+
+          <div class="weflow-action-grid">
+            <section class="action-group">
+              <span>连接与发现</span>
+              <div class="action-row">
+                <button id="weflowRefreshButton" class="ghost small" data-tooltip="重新读取 WeFlow 状态、后台任务、游标和操作历史。">刷新状态</button>
+                <button id="weflowHealthButton" class="ghost small" data-tooltip="检查本地 WeFlow 服务、token 与 fork marker 是否可用。">Health</button>
+                <button id="weflowDiscoverButton" class="ghost small" data-tooltip="拉取当前可用会话列表，点击会话会填入 Talkers。">发现会话</button>
+              </div>
+              <div id="weflowSessionList" class="session-list" hidden></div>
+            </section>
+            <section class="action-group">
+              <span>拉取与回填</span>
+              <div class="action-row">
+                <button id="weflowPullButton" class="primary small" data-tooltip="按当前参数拉取一次新消息，并交给后端处理。">拉取一次</button>
+                <button id="weflowBackfillButton" class="primary small" data-tooltip="从头拉取 Talkers 中会话的历史，只写上下文，不回复旧消息。">回填历史</button>
+                <button id="weflowCancelBackfillButton" class="danger small" data-tooltip="请求取消正在运行的历史回填任务。" disabled>取消回填</button>
+              </div>
+            </section>
+            <section class="action-group">
+              <span>后台服务</span>
+              <div class="action-row">
+                <button id="weflowStartButton" class="primary small" data-tooltip="启动后台循环拉取，按 Interval 定时抓取新消息。">后台启动</button>
+                <button id="weflowStopButton" class="danger small" data-tooltip="发送后台停止信号，正在进行的单次处理会先收尾。">停止</button>
+              </div>
+            </section>
+            <section class="action-group">
+              <span>环境</span>
+              <div class="action-row">
+                <button id="weflowDepsButton" class="ghost small" data-tooltip="检查 OCR、PDF、表格等可选依赖是否可用。">依赖检查</button>
+                <button id="weflowInstallButton" class="ghost small" data-tooltip="执行 pip install -r requirements-ocr.txt 安装可选依赖。">安装依赖</button>
+              </div>
+            </section>
           </div>
-          <div id="weflowSessionList" class="session-list" hidden></div>
+
           <pre id="weflowStatusBox" class="status-box"></pre>
           <div id="weflowHistoryBox" class="history-box" hidden>
             <div class="history-header">
-              <span>操作历史</span>
+              <span>WeFlow 操作历史</span>
               <button id="weflowClearHistoryButton" class="ghost mini">清空</button>
             </div>
             <div id="weflowHistoryContent" class="history-content"></div>
           </div>
-        </div>
+        </section>
       </section>
 
-      <section class="inspector">
-        <div class="section-head">
-          <h2>微信窗口诊断</h2>
-          <button id="toggleProbe" class="ghost small">详情</button>
-        </div>
-        <p id="diagnosticDetail" class="diagnostic-copy">句柄只用于确认当前抓到的是微信窗口，不负责读取聊天内容。</p>
-        <div id="handleList" class="handle-list"></div>
-        <pre id="probeBox" hidden></pre>
+      <section id="tasksPage" class="page-panel" hidden>
+        <section class="task-queue-panel">
+          <div class="section-head">
+            <h2>任务队列</h2>
+            <span id="taskActiveCount">0</span>
+          </div>
+          <p class="section-copy">同一会话内的操作按顺序排队；不同会话可并行。WeFlow 拉取和历史回填共享消费锁，避免游标和去重状态互相踩踏。</p>
+          <div id="taskQueueList" class="task-list"></div>
+        </section>
+
+        <section class="history-box task-history-box">
+          <div class="history-header">
+            <span>操作历史</span>
+            <span id="operationHistoryCount">0</span>
+          </div>
+          <div id="operationHistoryList" class="history-content"></div>
+        </section>
+
+        <section class="audit">
+          <div class="section-head">
+            <h2>发送审计</h2>
+            <span id="auditCount">0</span>
+          </div>
+          <p class="section-copy">记录审核、拒绝、发送尝试和失败原因，方便回看。</p>
+          <div id="auditList" class="audit-list"></div>
+        </section>
       </section>
 
-      <section class="audit">
-        <div class="section-head">
-          <h2>发送审计</h2>
-          <span id="auditCount">0</span>
-        </div>
-        <p class="section-copy">记录审核、拒绝、发送尝试和失败原因，方便回看。</p>
-        <div id="auditList" class="audit-list"></div>
+      <section id="diagnosticsPage" class="page-panel" hidden>
+        <section class="inspector">
+          <div class="section-head">
+            <h2>微信窗口诊断</h2>
+            <button id="toggleProbe" class="ghost small">详情</button>
+          </div>
+          <p id="diagnosticDetail" class="diagnostic-copy">句柄只用于确认当前抓到的是微信窗口，不负责读取聊天内容。</p>
+          <div id="handleList" class="handle-list"></div>
+          <pre id="probeBox" hidden></pre>
+        </section>
       </section>
     </main>
-    <script src="/app.js?v=20260702-discover"></script>
+    <script src="/app.js?v=20260703-task-queue"></script>
   </body>
 </html>

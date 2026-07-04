@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
-from app.personal_wechat_bot.runtime.process_lock import ProcessLock, process_lock
+from app.personal_wechat_bot.runtime.process_lock import ProcessLock, blocking_process_lock, process_lock
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter, HookImportResult
 
 
@@ -20,6 +20,9 @@ class HookMessagePullRunner:
         *,
         hook_event_file: str | Path,
         backend_event_file: str | Path,
+        consume_lock_enabled: bool = False,
+        consume_lock_stale_after_seconds: float = 120.0,
+        consume_lock_wait_seconds: float = 120.0,
     ):
         self.importer = importer
         self.polling_runner = polling_runner
@@ -28,11 +31,25 @@ class HookMessagePullRunner:
         self.backend_event_file.parent.mkdir(parents=True, exist_ok=True)
         self.backend_event_file.touch(exist_ok=True)
         self._lock: ProcessLock | None = None
+        # Per-tick cross-process consume lock. Distinct from the long-held
+        # loop-ownership lock (:meth:`single_instance`): this one is grabbed and
+        # released around each :meth:`run_once` so a background consumer loop, a
+        # CLI puller, and an ad-hoc backfill in *separate processes* take turns
+        # over the shared hook offset + message deduper instead of overlapping
+        # (the deduper's seen()/mark() is a TOCTOU under concurrency).
+        self.consume_lock_enabled = consume_lock_enabled
+        self.consume_lock_stale_after_seconds = consume_lock_stale_after_seconds
+        self.consume_lock_wait_seconds = consume_lock_wait_seconds
 
     def lock_path(self) -> Path:
         """Single-instance lock file guarding this hook/backend consumer pair."""
 
         return self.importer.state_path.with_suffix(self.importer.state_path.suffix + ".consumer.lock")
+
+    def consume_lock_path(self) -> Path:
+        """Per-tick lock serializing the consume step across processes."""
+
+        return self.importer.state_path.with_suffix(self.importer.state_path.suffix + ".consume.lock")
 
     @contextmanager
     def single_instance(self, *, enabled: bool = True, label: str = "hook_pull_runner", stale_after_seconds: float = 60.0) -> Iterator[None]:
@@ -60,6 +77,22 @@ class HookMessagePullRunner:
     def run_once(self) -> dict[str, Any]:
         if self._lock is not None:
             self._lock.heartbeat()
+        if not self.consume_lock_enabled:
+            return self._run_once_locked()
+        with blocking_process_lock(
+            self.consume_lock_path(),
+            label="hook_consume_tick",
+            stale_after_seconds=self.consume_lock_stale_after_seconds,
+            wait_timeout_seconds=self.consume_lock_wait_seconds,
+        ):
+            # Refresh the loop-ownership heartbeat again: waiting for the consume
+            # lock may have taken a while, and we must not let our own ownership
+            # lock go stale while we blocked.
+            if self._lock is not None:
+                self._lock.heartbeat()
+            return self._run_once_locked()
+
+    def _run_once_locked(self) -> dict[str, Any]:
         imported = self.importer.import_new()
         poll_result = self.polling_runner.run_once()
         processed = poll_result.get("processed", [])

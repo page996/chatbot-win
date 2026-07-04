@@ -120,6 +120,22 @@ class HookSourceBridgeTest(unittest.TestCase):
         self.assertTrue(event.is_self)
         self.assertEqual(event.voice["audio_name"], "voice_20.wav")
 
+    def test_weflow_message_recognizes_from_me_self_alias(self) -> None:
+        normalized = normalize_weflow_message(
+            {
+                "platformMessageId": "wf-self-1",
+                "senderUsername": "wxid_me",
+                "accountName": "Me",
+                "content": "agent sent this",
+                "fromMe": True,
+            },
+            session_id="wxid_page",
+            session_meta={"name": "PAGE", "type": "private"},
+        )
+
+        self.assertTrue(normalized["is_self"])
+        self.assertTrue(hook_event_from_payload(normalized).is_self)
+
     def test_weflow_raw_pull_uses_messages_endpoint_and_keeps_talker_order_isolated(self) -> None:
         with _FakeWeFlowRawServer() as server:
             bridge = WeFlowHttpBridge(

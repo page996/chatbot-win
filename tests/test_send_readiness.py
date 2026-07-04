@@ -59,26 +59,7 @@ class SendReadinessTest(unittest.TestCase):
             self.assertEqual(payload["status"], "blocked")
             self.assertFalse(payload["send_policy"]["send_enabled"])
 
-    def test_guarded_driver_removes_send_driver_blockers_when_enabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = Path(tmp) / "data"
-            create_default_config(data_dir)
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="windows_guarded")
-
-            report = build_send_readiness_report(data_dir)
-            blockers = {item["id"] for item in report["checks"] if item["status"] == "blocker"}
-
-            self.assertNotIn("real_send_driver", blockers)
-            self.assertNotIn("send_enabled", blockers)
-            self.assertNotIn("wechat_write_access", blockers)
-            self.assertNotIn("send_driver_name", blockers)
-            self.assertIn("keep confirm mode active", " ".join(report["recommended_rollout"]))
-            self.assertNotIn("implement a real send driver", " ".join(report["recommended_rollout"]))
-            rollout = next(item for item in report["checks"] if item["id"] == "rollout_mode")
-            self.assertEqual(rollout["status"], "warn")
-            self.assertIn("confirm mode is active", rollout["detail"])
-
-    def test_bridge_outbox_readiness_blocks_without_manual_binding(self) -> None:
+    def test_bridge_outbox_driver_removes_send_driver_blockers_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -87,8 +68,16 @@ class SendReadinessTest(unittest.TestCase):
             report = build_send_readiness_report(data_dir)
             blockers = {item["id"] for item in report["checks"] if item["status"] == "blocker"}
 
-            self.assertIn("manual_bridge_channels", blockers)
-            self.assertIn("manually bind", " ".join(report["required_next_steps"]))
+            self.assertNotIn("real_send_driver", blockers)
+            self.assertNotIn("send_enabled", blockers)
+            self.assertNotIn("wechat_write_access", blockers)
+            self.assertNotIn("send_driver_name", blockers)
+            # bridge_outbox no longer requires a manual foreground binding (wcf delivers by wxid).
+            self.assertNotIn("manual_bridge_channels", blockers)
+            self.assertIn("keep confirm mode active", " ".join(report["recommended_rollout"]))
+            rollout = next(item for item in report["checks"] if item["id"] == "rollout_mode")
+            self.assertEqual(rollout["status"], "warn")
+            self.assertIn("confirm mode is active", rollout["detail"])
 
 
 if __name__ == "__main__":

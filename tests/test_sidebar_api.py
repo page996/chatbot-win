@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
+from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.control import sidebar_api
+from app.personal_wechat_bot.control.send_commands import set_send_controls
 from app.personal_wechat_bot.control.sidebar_api import (
     ack_sidebar_bridge_item,
     append_sidebar_backend_event,
@@ -16,6 +19,8 @@ from app.personal_wechat_bot.control.sidebar_api import (
     build_sidebar_state,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
+    sidebar_weflow_backfill,
+    sidebar_weflow_cancel_backfill,
     sidebar_queue_action,
     sidebar_runtime_card_action,
     update_sidebar_controls,
@@ -48,8 +53,7 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("send_bridge", state)
             self.assertIn("runtime_cards", state)
             self.assertIn("queued_to_bridge", state["queues"])
-            self.assertEqual(state["send_bridge"]["manual_bound_count"], 0)
-            self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_manual_capture_only_available")
+            self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_available")
             self.assertIn("skill.file_workspace_agent", [item["card_id"] for item in state["runtime_cards"]["active"]["skills"]])
 
     def test_sidebar_channel_state_hides_probe_fragments(self) -> None:
@@ -252,6 +256,136 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(result["deleted_count"], 1)
             self.assertIsNone(store.get_channel(message.conversation_id))
 
+    def test_weflow_backfill_returns_async_job_and_can_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            with mock.patch.object(sidebar_api, "_run_sidebar_weflow_once", return_value={"status": "ok", "source": {"scanned_count": 1, "appended_count": 1}, "pull": {"processed_count": 1}}):
+                result = sidebar_weflow_backfill(data_dir, {"talkers": ["wxid_user"], "max_messages": 1})
+                self.assertEqual(result["status"], "started")
+                job_id = result["backfill_job"]["job_id"]
+                self.assertTrue(job_id)
+
+                deadline = threading.Event()
+                for _ in range(20):
+                    state = sidebar_api.build_sidebar_weflow_state(data_dir)
+                    if state["backfill_job"].get("status") == "completed":
+                        break
+                    deadline.wait(0.05)
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+            self.assertEqual(state["backfill_job"]["status"], "completed")
+            self.assertEqual(state["last_backfill"]["status"], "ok")
+
+    def test_weflow_backfill_cancel_sets_stop_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            started = threading.Event()
+
+            def fake_run(*args, **kwargs):
+                started.set()
+                cancel_event = kwargs["cancel_event"]
+                cancel_event.wait(2)
+                return {"status": "cancelled", "source": {"scanned_count": 0, "appended_count": 0}, "pull": {"processed_count": 0}}
+
+            with mock.patch.object(sidebar_api, "_run_sidebar_weflow_once", side_effect=fake_run):
+                result = sidebar_weflow_backfill(data_dir, {"talkers": ["wxid_user"], "max_messages": 1})
+                self.assertEqual(result["status"], "started")
+                self.assertTrue(started.wait(1))
+                cancel = sidebar_weflow_cancel_backfill(data_dir, {})
+                deadline = threading.Event()
+                for _ in range(20):
+                    state = sidebar_api.build_sidebar_weflow_state(data_dir)
+                    if state["backfill_job"].get("status") == "cancelled":
+                        break
+                    deadline.wait(0.05)
+
+            self.assertEqual(cancel["status"], "cancel_requested")
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+            self.assertEqual(state["backfill_job"]["status"], "cancelled")
+
+    def test_weflow_persisted_running_job_reported_interrupted_after_restart(self) -> None:
+        # A snapshot persisted with running=True but no live in-memory thread
+        # (server restarted mid-backfill) must never be reported as still
+        # running, or the UI keeps the Backfill button disabled forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            sidebar_api._write_weflow_sidebar_state(
+                data_dir,
+                {
+                    "backfill_job": {
+                        "job_id": "backfill-stale",
+                        "status": "running",
+                        "running": True,
+                        "talkers": ["wxid_user"],
+                    }
+                },
+            )
+            # No in-memory job registered -> falls back to the persisted snapshot.
+            with mock.patch.dict(sidebar_api._WEFLOW_BACKFILL_JOBS, {}, clear=True):
+                state = sidebar_api.build_sidebar_weflow_state(data_dir)
+            job = state["backfill_job"]
+            self.assertFalse(job["running"])
+            self.assertEqual(job["status"], "interrupted")
+
+    def test_weflow_consume_step_is_serialized_across_concurrent_ticks(self) -> None:
+        # Two consume steps (e.g. background worker tick + pull-once) must not
+        # run runner.run_once() at the same time, or they race the shared hook
+        # offset and message deduper.
+        overlap = {"max": 0, "active": 0}
+        lock = threading.Lock()
+
+        class FakeRunner:
+            def run_once(self_inner) -> dict:
+                with lock:
+                    overlap["active"] += 1
+                    overlap["max"] = max(overlap["max"], overlap["active"])
+                time.sleep(0.05)
+                with lock:
+                    overlap["active"] -= 1
+                return {"status": "ok", "processed_count": 0, "processed": []}
+
+        class FakeSource:
+            status = "ok"
+
+        def fake_pull_once(*args, **kwargs):
+            return FakeSource()
+
+        fake_bridge = mock.Mock()
+        fake_bridge.base_url = "http://127.0.0.1:5031"
+        fake_bridge.pull_once.side_effect = fake_pull_once
+        context = {
+            "params": {
+                "talkers": [],
+                "session_limit": 100,
+                "message_limit": 100,
+                "max_pages": 1,
+                "max_messages": 0,
+                "since": None,
+                "lookback_seconds": 300,
+                "workers": 1,
+                "media": True,
+                "context_only": False,
+                "hook_event_file": "hook.jsonl",
+                "backend_event_file": "backend.jsonl",
+            },
+            "bridge": fake_bridge,
+            "runner": FakeRunner(),
+            "weflow_ready": {},
+            "media_roots": [],
+        }
+        threads = [
+            threading.Thread(target=sidebar_api._run_weflow_pull_tick, args=(context,))
+            for _ in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(overlap["max"], 1)
+
     def test_backend_event_ingest_rejects_event_file_outside_data_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -276,14 +410,14 @@ class SidebarApiTest(unittest.TestCase):
 
             result = update_sidebar_controls(
                 data_dir,
-                {"mode": "confirm", "send_enabled": True, "send_driver": "windows_guarded"},
+                {"mode": "confirm", "send_enabled": True, "send_driver": "bridge_outbox"},
             )
             config = load_config(data_dir)
 
             self.assertEqual(result["status"], "ok")
             self.assertEqual(config.mode, "confirm")
             self.assertTrue(config.send_enabled)
-            self.assertEqual(config.send_driver, "windows_guarded")
+            self.assertEqual(config.send_driver, "bridge_outbox")
 
     def test_sidebar_queue_action_approves_and_rejects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -423,6 +557,40 @@ class WeflowBackgroundLoopTest(unittest.TestCase):
             self.assertEqual(build_calls, 0)
             state = sidebar_api.build_sidebar_weflow_state(data_dir)
             self.assertIn("already running", state["worker"]["last_error"])
+
+    def test_refresh_send_controls_picks_up_config_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="dry_run", enabled=False, driver="not_implemented")
+            runtime = build_runtime(load_config(data_dir))
+            context = {
+                "runtime": runtime,
+                "config_path": data_dir / "config.json",
+                "config_mtime": sidebar_api._config_mtime(data_dir),
+            }
+
+            # No change yet -> refresh is a no-op.
+            self.assertFalse(sidebar_api._refresh_weflow_send_controls(context))
+            self.assertEqual(runtime.reply_gate.mode, "dry_run")
+
+            # Change the send controls on disk (as the sidebar would).
+            set_send_controls(data_dir, mode="auto", enabled=True, driver="bridge_outbox")
+            # Force a distinct mtime in case the clock resolution is coarse.
+            import os
+
+            os.utime(data_dir / "config.json", None)
+
+            self.assertTrue(sidebar_api._refresh_weflow_send_controls(context))
+            self.assertEqual(runtime.reply_gate.mode, "auto")
+            self.assertTrue(runtime.reply_gate.auto_executor.config.send_enabled)
+            self.assertEqual(runtime.reply_gate.auto_executor.config.send_driver, "bridge_outbox")
+            self.assertEqual(runtime.config.mode, "auto")
+
+    def test_refresh_send_controls_noop_without_runtime(self) -> None:
+        # The loop tests mock _build_weflow_pull_context to return a context with
+        # no runtime; refresh must handle that gracefully.
+        self.assertFalse(sidebar_api._refresh_weflow_send_controls({"context_id": 1}))
 
 
 def _reply() -> ReplyCandidate:

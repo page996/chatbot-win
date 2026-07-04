@@ -6,8 +6,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
+from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     list_confirm_queue,
@@ -20,7 +22,6 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.domain.models import ReplyCandidate, SendResult
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_state
-from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +48,17 @@ class SendCommandsTest(unittest.TestCase):
             self.assertFalse(config.send_confirm_required)
             self.assertEqual(config.send_max_chars, 64)
             self.assertEqual(config.send_min_interval_seconds, 2)
+
+    def test_set_send_controls_auto_mode_disables_confirm_gate_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            set_send_controls(data_dir, mode="auto", enabled=True, driver="fake")
+            config = load_config(data_dir)
+
+            self.assertEqual(config.mode, "auto")
+            self.assertFalse(config.send_confirm_required)
 
     def test_confirm_helpers_approve_reject_and_send_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,6 +101,54 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(driver.sent_texts, ["hello"])
             self.assertEqual(queue.get(queue_id)["status"], "sent")
 
+    def test_send_approved_confirm_item_updates_reply_ledger_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, enabled=True, driver="fake")
+            reply = _reply("message-1", "hello")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_reply(reply)
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(reply)
+            queue.approve(queue_id, reviewer="tester")
+
+            result = send_approved_confirm_item(data_dir, queue_id, driver=_SendingDriver())
+            updated = ledger.read_entries("private-1")[0]
+
+            self.assertEqual(result["status"], "sent")
+            self.assertEqual(updated.send["status"], "sent")
+            self.assertEqual(updated.send["reason"], "fake_sent")
+            self.assertEqual(updated.send["message_id"], "sent-id")
+
+    def test_send_approved_confirm_item_survives_ledger_sync_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, enabled=True, driver="fake")
+            reply = _reply("message-1", "hello")
+            ConversationLedgerStore(data_dir).append_reply(reply)
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(reply)
+            queue.approve(queue_id, reviewer="tester")
+
+            with mock.patch.object(
+                ConversationLedgerStore,
+                "update_reply_send_result_for_candidate",
+                side_effect=OSError("ledger locked"),
+            ):
+                result = send_approved_confirm_item(data_dir, queue_id, driver=_SendingDriver())
+
+            # The send succeeded even though the ledger sync raised.
+            self.assertEqual(result["status"], "sent")
+            self.assertIn("OSError", result["ledger_sync_error"])
+            self.assertEqual(queue.get(queue_id)["status"], "sent")
+            audit = list_send_audit(data_dir)
+            self.assertTrue(
+                any(item.get("action") == "ledger_sync_failed" for item in audit["items"]),
+                msg=f"expected ledger_sync_failed audit entry, got {audit['items']}",
+            )
+
     def test_send_approved_confirm_item_blocks_pending_items(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -122,7 +182,6 @@ class SendCommandsTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
-            _write_manual_binding(data_dir, "private-1")
             queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
             queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
             queue.approve(queue_id, reviewer="tester")
@@ -136,7 +195,9 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(bridge["pending_count"], 1)
             self.assertEqual(bridge["items"][0]["text"], "hello bridge")
 
-    def test_send_approved_confirm_item_blocks_bridge_for_unbound_channel(self) -> None:
+    def test_send_approved_confirm_item_bridge_queues_without_manual_binding(self) -> None:
+        # wcf delivers by wxid/roomid, so the bridge no longer requires a manual
+        # foreground window binding; an unbound channel now queues successfully.
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -148,21 +209,21 @@ class SendCommandsTest(unittest.TestCase):
             result = send_approved_confirm_item(data_dir, queue_id)
             bridge = bridge_state(data_dir, limit=10)
 
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["send_result"]["reason"], "bridge_requires_manual_captured_channel")
-            self.assertEqual(queue.get(queue_id)["status"], "failed")
-            self.assertEqual(bridge["count"], 0)
+            self.assertEqual(result["status"], "queued_to_bridge")
+            self.assertEqual(queue.get(queue_id)["status"], "queued_to_bridge")
+            self.assertEqual(bridge["pending_count"], 1)
+            self.assertEqual(bridge["items"][0]["text"], "hello bridge")
 
     def test_probe_send_controls_reports_configured_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, enabled=False, driver="windows_guarded")
+            set_send_controls(data_dir, enabled=False, driver="bridge_outbox")
 
             result = probe_send_controls(data_dir)
 
             self.assertEqual(result["status"], "ok")
-            self.assertEqual(result["probe"]["normalized_driver"], "windows_guarded")
+            self.assertEqual(result["probe"]["normalized_driver"], "bridge_outbox")
             self.assertTrue(result["probe"]["registered"])
             self.assertTrue(result["probe"]["real_send_implemented"])
 
@@ -171,10 +232,10 @@ class SendCommandsTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
 
-            result = probe_send_controls(data_dir, driver="windows_guarded")
+            result = probe_send_controls(data_dir, driver="bridge_outbox")
             config = load_config(data_dir)
 
-            self.assertEqual(result["probe"]["normalized_driver"], "windows_guarded")
+            self.assertEqual(result["probe"]["normalized_driver"], "bridge_outbox")
             self.assertEqual(config.send_driver, "not_implemented")
 
     def test_set_send_controls_cli_updates_config(self) -> None:
@@ -228,8 +289,6 @@ class SendCommandsTest(unittest.TestCase):
                     str(data_dir),
                     "confirm-send-approved",
                     first_id,
-                    "--delay-seconds",
-                    "0",
                 )
             )
             failed = json.loads(self._run("--data-dir", str(data_dir), "confirm-list", "--status", "failed"))
@@ -247,14 +306,14 @@ class SendCommandsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             self._run("--data-dir", str(data_dir), "init")
-            self._run("--data-dir", str(data_dir), "set-send-controls", "--driver", "windows_guarded")
+            self._run("--data-dir", str(data_dir), "set-send-controls", "--driver", "bridge_outbox")
 
             payload = json.loads(
-                self._run("--data-dir", str(data_dir), "send-driver-probe", "--delay-seconds", "0")
+                self._run("--data-dir", str(data_dir), "send-driver-probe")
             )
 
             self.assertEqual(payload["status"], "ok")
-            self.assertEqual(payload["probe"]["normalized_driver"], "windows_guarded")
+            self.assertEqual(payload["probe"]["normalized_driver"], "bridge_outbox")
             self.assertTrue(payload["probe"]["registered"])
 
     def test_send_driver_probe_cli_can_override_driver_without_persisting(self) -> None:
@@ -263,11 +322,11 @@ class SendCommandsTest(unittest.TestCase):
             self._run("--data-dir", str(data_dir), "init")
 
             payload = json.loads(
-                self._run("--data-dir", str(data_dir), "send-driver-probe", "--driver", "windows_guarded")
+                self._run("--data-dir", str(data_dir), "send-driver-probe", "--driver", "bridge_outbox")
             )
             config = load_config(data_dir)
 
-            self.assertEqual(payload["probe"]["normalized_driver"], "windows_guarded")
+            self.assertEqual(payload["probe"]["normalized_driver"], "bridge_outbox")
             self.assertEqual(config.send_driver, "not_implemented")
 
     def test_send_bridge_cli_returns_state_and_accepts_ack(self) -> None:
@@ -326,35 +385,8 @@ class _SendingDriver:
         return SendResult(message_id="sent-id", conversation_id=conversation_id, status="sent", reason="fake_sent")
 
 
-def _write_manual_binding(data_dir: Path, conversation_id: str) -> None:
-    store = WeChatWindowBindingStore(data_dir)
-    now = "2026-06-30T00:00:00+00:00"
-    store._write(
-        {
-            "bindings": [
-                {
-                    "conversation_id": conversation_id,
-                    "conversation_type": "private",
-                    "chat_title": "PAGE",
-                    "hwnd": 100,
-                    "title": "微信",
-                    "process_id": 200,
-                    "process_name": "Weixin.exe",
-                    "class_name": "WeChatMainWndForPC",
-                    "width": 1000,
-                    "height": 700,
-                    "left": 100,
-                    "top": 100,
-                    "right": 1100,
-                    "bottom": 800,
-                    "bound_at": now,
-                    "last_seen_at": now,
-                    "status": "active",
-                }
-            ],
-            "updated_at": now,
-        }
-    )
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

@@ -73,6 +73,21 @@ class ProcessLock:
         self._acquired = True
         self._write_payload()
 
+    def try_acquire(self) -> bool:
+        """Attempt to acquire without raising. Returns True on success.
+
+        Unlike :meth:`acquire`, a live (non-stale) holder yields ``False``
+        instead of :class:`ProcessLockError`, so callers can poll/back off and
+        retry — used by :func:`blocking_process_lock` to wait for a cross-process
+        consume holder rather than failing fast.
+        """
+
+        try:
+            self.acquire()
+        except ProcessLockError:
+            return False
+        return True
+
     def heartbeat(self) -> None:
         if not self._acquired:
             return
@@ -86,11 +101,26 @@ class ProcessLock:
                 pass
             self._fd = None
         if self._acquired:
+            self._unlink_with_retry()
+            self._acquired = False
+
+    def _unlink_with_retry(self, *, attempts: int = 20, delay_seconds: float = 0.02) -> None:
+        # On Windows the lock file can transiently be un-deletable if a scanner
+        # (AV / search indexer) or a racing acquirer has it briefly open. Retry
+        # for a short window so the file is actually removed and does not get
+        # orphaned with a fresh heartbeat (which would block waiters until it
+        # goes stale). If it still fails, leave it: the next acquirer takes it
+        # over once its heartbeat ages out.
+        for attempt in range(max(1, attempts)):
             try:
                 self.path.unlink()
+                return
             except FileNotFoundError:
-                pass
-            self._acquired = False
+                return
+            except OSError:
+                if attempt >= attempts - 1:
+                    return
+                time.sleep(delay_seconds)
 
     def _write_payload(self) -> None:
         if self._fd is None:
@@ -161,6 +191,49 @@ def process_lock(
         return
     lock = ProcessLock(path, label=label, stale_after_seconds=stale_after_seconds)
     lock.acquire()
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
+@contextmanager
+def blocking_process_lock(
+    path: str | Path,
+    *,
+    label: str = "",
+    stale_after_seconds: float = 60.0,
+    wait_timeout_seconds: float = 120.0,
+    poll_interval_seconds: float = 0.05,
+    enabled: bool = True,
+) -> Iterator[ProcessLock | None]:
+    """Acquire a short-lived cross-process lock, waiting for a live holder.
+
+    Unlike :func:`process_lock` (which fails fast when another instance holds
+    the lock, for long-lived *loop ownership*), this waits up to
+    ``wait_timeout_seconds`` for the current holder to release. It is meant for
+    the *per-operation* consume step: any number of consumers may take turns,
+    but never overlap. A crashed holder's lock still goes stale and is taken
+    over via :meth:`ProcessLock.try_acquire`.
+
+    When ``enabled`` is False, yields None and performs no locking.
+    """
+
+    if not enabled:
+        yield None
+        return
+    lock = ProcessLock(path, label=label, stale_after_seconds=stale_after_seconds)
+    deadline = time.monotonic() + max(0.0, wait_timeout_seconds)
+    interval = max(0.005, poll_interval_seconds)
+    while not lock.try_acquire():
+        if time.monotonic() >= deadline:
+            holder = lock._read_holder()
+            raise ProcessLockError(
+                f"timed out after {wait_timeout_seconds}s waiting for consume lock "
+                f"(held by {ProcessLock._describe(holder)}): {lock.path}",
+                holder=holder,
+            )
+        time.sleep(interval)
     try:
         yield lock
     finally:

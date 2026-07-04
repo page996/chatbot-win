@@ -79,6 +79,48 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertTrue(entry.is_self)
             self.assertEqual(entry.role, "self")
 
+    def test_pulled_back_self_echo_dedups_against_assistant_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("user1", "在吗"))
+            reply = ReplyCandidate(
+                message_id="user1",
+                conversation_id="conv1",
+                text="你好，我在的",
+                send_mode="auto",
+                model="fake",
+            )
+            store.append_reply(reply)
+
+            # WeChat echoes the agent's own reply back through the pull with a
+            # fresh message_id and is_self=True.
+            echo = store.append_message(
+                _message("weflow-echo-xyz", "你好，我在的", is_self=True, sender_name="Me")
+            )
+
+            entries = store.read_entries("conv1")
+            assistant_entries = [e for e in entries if e.role == "assistant"]
+            self_entries = [e for e in entries if e.role == "self"]
+
+            # Exactly one assistant entry, and NO duplicate self entry for the echo.
+            self.assertEqual(len(assistant_entries), 1)
+            self.assertEqual(len(self_entries), 0)
+            # The echo confirmed delivery on the assistant entry.
+            self.assertEqual(echo.role, "assistant")
+            self.assertEqual(assistant_entries[0].send.get("status"), "sent")
+            self.assertEqual(assistant_entries[0].send.get("echo_message_id"), "weflow-echo-xyz")
+
+    def test_pulled_back_self_message_without_match_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            # A genuine self message the user typed on their own phone (no matching
+            # assistant reply) must still be recorded as role=self.
+            entry = store.append_message(
+                _message("phone-self", "我自己手机上发的", is_self=True, sender_name="Me")
+            )
+            self.assertEqual(entry.role, "self")
+            self.assertEqual(len(store.read_entries("conv1")), 1)
+
     def test_quote_lookup_by_message_id_and_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
@@ -298,6 +340,37 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(updated.send["status"], "queued_for_confirm")
             self.assertIn("[send:status=queued_for_confirm", markdown)
             self.assertIn("[file:outgoing name=translated.docx", markdown)
+
+    def test_append_reply_writes_parsed_outgoing_attachment_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            reply = ReplyCandidate(
+                message_id="m1",
+                conversation_id="conv1",
+                text="reply with parsed file",
+                send_mode="confirm",
+                model="fake",
+                attachments=[
+                    {
+                        "status": "indexed",
+                        "source": "tool_result",
+                        "path": "out/result.md",
+                        "name": "result.md",
+                        "kind": "tool_output",
+                        "file_id": "file123",
+                        "workspace": {"manifest_path": "workspace/file123/manifest.json"},
+                        "parse": {"kind": "text", "text": "agent generated file body"},
+                    }
+                ],
+            )
+
+            store.append_reply(reply)
+            entry = store.read_entries("conv1")[0]
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+
+            self.assertEqual(entry.text_blocks[1]["kind"], "attachment:text")
+            self.assertEqual(entry.text_blocks[1]["text"], "agent generated file body")
+            self.assertIn("agent generated file body", markdown)
 
 
 class LedgerContextAssemblerTest(unittest.TestCase):

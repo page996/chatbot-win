@@ -98,31 +98,6 @@ def find_wechat_processes() -> list[dict[str, object]]:
     return sorted(by_pid.values(), key=lambda item: str(item.get("ProcessName", "")))
 
 
-def foreground_window_info() -> dict[str, object]:
-    if sys.platform != "win32":
-        return {}
-    user32 = ctypes.windll.user32
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
-        return {}
-    pid = _window_process_id(hwnd)
-    rect = _window_rect(hwnd)
-    return {
-        "hwnd": int(hwnd),
-        "title": _window_title(hwnd),
-        "process_id": pid,
-        "process_name": _process_name(pid),
-        "class_name": _window_class_name(hwnd),
-        "visible": bool(user32.IsWindowVisible(hwnd)),
-        "left": rect.left,
-        "top": rect.top,
-        "right": rect.right,
-        "bottom": rect.bottom,
-        "width": rect.right - rect.left,
-        "height": rect.bottom - rect.top,
-    }
-
-
 def _window_title(hwnd: int) -> str:
     user32 = ctypes.windll.user32
     length = user32.GetWindowTextLengthW(hwnd)

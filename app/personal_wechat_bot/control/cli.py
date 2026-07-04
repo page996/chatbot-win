@@ -28,7 +28,7 @@ from app.personal_wechat_bot.control.audit import (
     build_plan_audit,
 )
 from app.personal_wechat_bot.control.preflight import build_preflight_report
-from app.personal_wechat_bot.control.sidebar_api import cleanup_sidebar_channels, delete_sidebar_channel, sidebar_weflow_backfill
+from app.personal_wechat_bot.control.sidebar_api import cleanup_sidebar_channels, delete_sidebar_channel, run_weflow_backfill_sync
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
 from app.personal_wechat_bot.control.sidebar_window import run_sidebar_window
@@ -67,21 +67,14 @@ from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge
 from app.personal_wechat_bot.wechat_driver.backend_file_watcher import BackendFileWatcher
 from app.personal_wechat_bot.wechat_driver.snapshot_provider import (
     FileSnapshotProvider,
-    WindowsClipboardSnapshotProvider,
     WindowsUIAutomationSnapshotProvider,
 )
 from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     WindowsWeChatReadOnlyDriver,
     Win32WindowProbe,
     find_wechat_processes,
-    foreground_window_info,
 )
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
-from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
-from app.personal_wechat_bot.wechat_driver.voice_transcription import (
-    WeChatVoiceTranscriptionBridge,
-    result_payload as voice_bridge_result_payload,
-)
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import (
     WeChatVoiceCacheResolver,
     default_wechat_voice_roots,
@@ -136,12 +129,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     send_driver_probe = sub.add_parser("send-driver-probe")
     send_driver_probe.add_argument("--driver", default=None)
-    send_driver_probe.add_argument(
-        "--delay-seconds",
-        type=float,
-        default=0.0,
-        help="wait before probing so you can switch focus to the target WeChat chat window",
-    )
 
     send_controls = sub.add_parser("set-send-controls")
     send_controls.add_argument("--mode", choices=["dry_run", "confirm", "auto"], default=None)
@@ -180,12 +167,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     confirm_send = sub.add_parser("confirm-send-approved")
     confirm_send.add_argument("queue_id")
-    confirm_send.add_argument(
-        "--delay-seconds",
-        type=float,
-        default=0.0,
-        help="wait before sending so you can switch focus to the target WeChat chat window",
-    )
 
     audit_plan = sub.add_parser("audit-plan")
     audit_plan.add_argument("--plan-path", default=None)
@@ -387,34 +368,12 @@ def build_parser() -> argparse.ArgumentParser:
     poll_snapshot.add_argument("--interval", type=float, default=1.0)
     poll_snapshot.add_argument("--verbose", action="store_true")
 
-    poll_clipboard = sub.add_parser("poll-clipboard")
-    poll_clipboard.add_argument("--mode", default=None)
-    poll_clipboard.add_argument("--loops", type=int, default=1)
-    poll_clipboard.add_argument("--interval", type=float, default=1.0)
-    poll_clipboard.add_argument("--verbose", action="store_true")
-
     wechat_snapshot = sub.add_parser("wechat-snapshot")
     wechat_snapshot.add_argument("--title-keyword", action="append", default=None)
     wechat_snapshot.add_argument("--max-nodes", type=int, default=500)
     wechat_snapshot.add_argument("--max-depth", type=int, default=8)
     wechat_snapshot.add_argument("--output", default=None)
     wechat_snapshot.add_argument("--probe-handles", action="store_true")
-
-    bind_window = sub.add_parser("bind-wechat-window")
-    bind_window.add_argument("--chat-title", required=True)
-    bind_window.add_argument("--group", action="store_true")
-    bind_window.add_argument("--conversation-id", default="")
-    bind_window.add_argument(
-        "--delay-seconds",
-        type=float,
-        default=0.0,
-        help="wait before binding so you can switch focus to the target WeChat chat window",
-    )
-
-    sub.add_parser("wechat-window-bindings")
-
-    wechat_voice = sub.add_parser("wechat-voice-transcribe")
-    wechat_voice.add_argument("--conversation-id", required=True)
 
     voice_cache = sub.add_parser("wechat-voice-cache-probe")
     voice_cache.add_argument("--root", action="append", default=[])
@@ -544,7 +503,6 @@ def main(argv: list[str] | None = None) -> None:
         run_sidebar_window(args.data_dir, poll_interval_ms=args.interval_ms)
         return
     if args.command == "send-driver-probe":
-        _delay_for_foreground_switch(args.delay_seconds)
         result = probe_send_controls(args.data_dir, driver=args.driver)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -598,7 +556,6 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "confirm-send-approved":
-        _delay_for_foreground_switch(args.delay_seconds)
         result = send_approved_confirm_item(args.data_dir, args.queue_id)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -737,6 +694,7 @@ def main(argv: list[str] | None = None) -> None:
             PollingRunner(runtime, driver, poll_interval_seconds=args.interval),
             hook_event_file=hook_event_file,
             backend_event_file=backend_event_file,
+            consume_lock_enabled=not args.allow_concurrent_consumer,
         )
         with runner.single_instance(enabled=not args.allow_concurrent_consumer, label="cli:pull-weflow-messages"):
             result = _run_weflow_pull_loop(
@@ -761,7 +719,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "backfill-weflow-history":
-        result = sidebar_weflow_backfill(
+        result = run_weflow_backfill_sync(
             args.data_dir,
             {
                 "base_url": args.base_url,
@@ -826,6 +784,7 @@ def main(argv: list[str] | None = None) -> None:
             PollingRunner(runtime, driver, poll_interval_seconds=args.interval),
             hook_event_file=hook_event_file,
             backend_event_file=backend_event_file,
+            consume_lock_enabled=not args.allow_concurrent_consumer,
         )
         with runner.single_instance(enabled=not args.allow_concurrent_consumer, label="cli:pull-hook-messages"):
             result = runner.run_forever(max_loops=None if args.forever else args.loops)
@@ -877,13 +836,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "wechat-health":
         windows = Win32WindowProbe(include_invisible=True).find_wechat_windows()
         processes = find_wechat_processes()
-        foreground = foreground_window_info()
         status = "ok" if windows else ("process_only" if processes else "not_found")
         result = {
             "status": status,
             "windows": [item.__dict__ for item in windows],
             "processes": processes,
-            "foreground": foreground,
             "send_enabled": False,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -894,18 +851,6 @@ def main(argv: list[str] | None = None) -> None:
             config.mode = args.mode
         runtime = build_runtime(config)
         driver = WindowsWeChatReadOnlyDriver(snapshot_provider=FileSnapshotProvider(args.snapshot))
-        runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
-        result = runner.run_forever(max_loops=args.loops)
-        if not args.verbose:
-            result.pop("processed", None)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-    if args.command == "poll-clipboard":
-        config = load_config(args.data_dir)
-        if args.mode:
-            config.mode = args.mode
-        runtime = build_runtime(config)
-        driver = WindowsWeChatReadOnlyDriver(snapshot_provider=WindowsClipboardSnapshotProvider())
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
         result = runner.run_forever(max_loops=args.loops)
         if not args.verbose:
@@ -933,26 +878,6 @@ def main(argv: list[str] | None = None) -> None:
             "send_enabled": False,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-    if args.command == "bind-wechat-window":
-        _delay_for_foreground_switch(args.delay_seconds)
-        store = WeChatWindowBindingStore(args.data_dir)
-        result = store.bind_foreground(
-            chat_title=args.chat_title,
-            conversation_type="group" if args.group else "private",
-            conversation_id=args.conversation_id,
-        )
-        result["send_enabled"] = False
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-    if args.command == "wechat-window-bindings":
-        store = WeChatWindowBindingStore(args.data_dir)
-        print(json.dumps({"status": "ok", "bindings": store.list_bindings(), "send_enabled": False}, ensure_ascii=False, indent=2))
-        return
-    if args.command == "wechat-voice-transcribe":
-        bridge = WeChatVoiceTranscriptionBridge(args.data_dir)
-        result = bridge.transcribe_selected_voice(args.conversation_id)
-        print(json.dumps({"status": result.status, "result": voice_bridge_result_payload(result), "send_enabled": False}, ensure_ascii=False, indent=2))
         return
     if args.command == "wechat-voice-cache-probe":
         config = load_config(args.data_dir)
@@ -1008,13 +933,11 @@ def main(argv: list[str] | None = None) -> None:
         ocr = RapidOcrSubprocessEngine().health()
         office = LibreOfficeRuntime().health()
         asr = LocalAsrSubprocessEngine().health()
-        wechat_voice = WeChatVoiceTranscriptionBridge(args.data_dir).health()
         voice_roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots)
         result = {
             "ocr": ocr.__dict__,
             "libreoffice": office.__dict__,
             "asr": asr.__dict__,
-            "wechat_voice_to_text": wechat_voice,
             "wechat_voice_cache": voice_cache_capability(voice_roots, config.file_allowed_extensions),
             "send_enabled": False,
         }
@@ -1352,17 +1275,5 @@ def _deprecated_page_ocr_payload(command: str) -> dict[str, object]:
     }
 
 
-def _delay_for_foreground_switch(seconds: float) -> None:
-    if seconds <= 0:
-        return
-    whole_seconds = int(seconds)
-    fractional_seconds = seconds - whole_seconds
-    for remaining in range(whole_seconds, 0, -1):
-        print(
-            f"Switch focus to the target WeChat chat window: {remaining}s",
-            file=sys.stderr,
-            flush=True,
-        )
-        time.sleep(1)
-    if fractional_seconds > 0:
-        time.sleep(fractional_seconds)
+if __name__ == "__main__":
+    main()

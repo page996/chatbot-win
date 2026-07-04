@@ -141,22 +141,7 @@ class PreflightTest(unittest.TestCase):
             self.assertFalse(report["send_policy"]["real_send_implemented"])
             self.assertIn("send_enabled is true but send_driver is not implemented", report["warnings"])
 
-    def test_preflight_reports_write_access_when_guarded_driver_is_enabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = Path(tmp) / "data"
-            create_default_config(data_dir)
-            config = load_config(data_dir)
-            config.mode = "confirm"
-            config.send_enabled = True
-            config.send_driver = "windows_guarded"
-
-            report = build_preflight_report(config)
-
-            self.assertTrue(report["send_policy"]["real_send_implemented"])
-            self.assertFalse(report["wechat_access"]["read_only"])
-            self.assertTrue(report["wechat_access"]["write_access_configured"])
-
-    def test_preflight_warns_bridge_outbox_needs_manual_binding(self) -> None:
+    def test_preflight_reports_write_access_when_send_driver_is_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -167,9 +152,26 @@ class PreflightTest(unittest.TestCase):
 
             report = build_preflight_report(config)
 
-            self.assertEqual(report["status"], "warn")
-            self.assertEqual(report["wechat_access"]["manual_bound_channels"]["count"], 0)
-            self.assertIn("bridge_outbox requires at least one manually captured WeChat channel binding", report["warnings"])
+            self.assertTrue(report["send_policy"]["real_send_implemented"])
+            self.assertFalse(report["wechat_access"]["read_only"])
+            self.assertTrue(report["wechat_access"]["write_access_configured"])
+
+    def test_preflight_bridge_outbox_does_not_require_manual_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            config.mode = "confirm"
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+
+            report = build_preflight_report(config)
+
+            # wcf delivers by wxid/roomid, so no manual foreground binding is required.
+            self.assertNotIn(
+                "bridge_outbox requires at least one manually captured WeChat channel binding",
+                report["warnings"],
+            )
 
 
 if __name__ == "__main__":

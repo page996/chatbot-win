@@ -9,6 +9,7 @@ from pathlib import Path
 from app.personal_wechat_bot.runtime.process_lock import (
     ProcessLock,
     ProcessLockError,
+    blocking_process_lock,
     process_lock,
 )
 
@@ -138,6 +139,114 @@ class HookRunnerSingleInstanceTest(unittest.TestCase):
         with runner_a.single_instance(enabled=False):
             with runner_b.single_instance(enabled=False):
                 self.assertFalse(runner_a.lock_path().exists())
+
+    def test_consume_lock_path_differs_from_loop_ownership_lock(self) -> None:
+        runner = self._runner()
+        self.assertNotEqual(runner.consume_lock_path(), runner.lock_path())
+        self.assertTrue(str(runner.consume_lock_path()).endswith(".consume.lock"))
+        self.assertTrue(str(runner.lock_path()).endswith(".consumer.lock"))
+
+    def test_consume_lock_serializes_run_once_across_runners(self) -> None:
+        # Two runners sharing the same state path must not run their consume
+        # step at the same time when consume_lock_enabled=True.
+        import threading
+
+        overlap = {"max": 0, "active": 0}
+        guard = threading.Lock()
+
+        def make_runner():
+            from unittest import mock
+            from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
+
+            importer = mock.Mock()
+            importer.state_path = self.root / "hook_events_state.json"
+
+            def import_new():
+                with guard:
+                    overlap["active"] += 1
+                    overlap["max"] = max(overlap["max"], overlap["active"])
+                time.sleep(0.05)
+                with guard:
+                    overlap["active"] -= 1
+                return mock.Mock(
+                    status="ok",
+                    error_count=0,
+                    source_offset=0,
+                    backend_event_count=0,
+                    scanned_count=0,
+                    appended_count=0,
+                    skipped_count=0,
+                    source_path="hook_events.jsonl",
+                    backend_event_path="backend_events.jsonl",
+                    appended_raw_ids=[],
+                    errors=[],
+                )
+
+            importer.import_new.side_effect = import_new
+            polling = mock.Mock()
+            polling.run_once.return_value = {"status": "ok", "processed": []}
+            polling.driver = mock.Mock(_seen_event_ids=set(), _seen_message_raw_ids=set())
+            return HookMessagePullRunner(
+                importer,
+                polling,
+                hook_event_file=self.root / "hook_events.jsonl",
+                backend_event_file=self.root / "backend_events.jsonl",
+                consume_lock_enabled=True,
+                consume_lock_wait_seconds=5.0,
+            )
+
+        threads = [threading.Thread(target=lambda: make_runner().run_once()) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(overlap["max"], 1)
+
+
+class BlockingProcessLockTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "consume.lock"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_waits_for_holder_then_acquires(self) -> None:
+        import threading
+
+        order: list[str] = []
+        release_holder = threading.Event()
+
+        def holder():
+            with blocking_process_lock(self.path, label="holder", wait_timeout_seconds=2):
+                order.append("holder-in")
+                release_holder.wait(1)
+                order.append("holder-out")
+
+        t = threading.Thread(target=holder)
+        t.start()
+        # Wait until the holder is inside the lock.
+        while "holder-in" not in order:
+            time.sleep(0.01)
+        release_holder.set()
+        with blocking_process_lock(self.path, label="waiter", wait_timeout_seconds=2):
+            order.append("waiter-in")
+        t.join()
+        # The waiter must only enter after the holder has left.
+        self.assertEqual(order, ["holder-in", "holder-out", "waiter-in"])
+
+    def test_times_out_when_holder_never_releases(self) -> None:
+        with process_lock(self.path, label="holder", stale_after_seconds=60):
+            with self.assertRaises(ProcessLockError):
+                with blocking_process_lock(
+                    self.path, label="waiter", stale_after_seconds=60, wait_timeout_seconds=0.2
+                ):
+                    pass
+
+    def test_disabled_is_noop(self) -> None:
+        with blocking_process_lock(self.path, enabled=False) as lock:
+            self.assertIsNone(lock)
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":

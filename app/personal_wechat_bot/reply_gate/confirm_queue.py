@@ -54,6 +54,16 @@ class ConfirmQueue:
                 return item
         return None
 
+    def find_by_bridge_id(self, bridge_id: str) -> dict[str, Any] | None:
+        bridge_id = str(bridge_id or "").strip()
+        if not bridge_id:
+            return None
+        for item in reversed(self._read_all()):
+            note = str(item.get("note", ""))
+            if bridge_id in note:
+                return item
+        return None
+
     def approve(self, queue_id: str, *, reviewer: str = "local_user", note: str = "") -> dict[str, Any]:
         return self._transition(queue_id, "approved", reviewer=reviewer, note=note)
 

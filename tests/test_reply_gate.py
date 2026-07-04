@@ -102,6 +102,67 @@ class ReplyGateTest(unittest.TestCase):
         self.assertEqual(result.reason, "confirm_required")
         self.assertEqual(driver.sent_texts, [])
 
+    def test_executor_sends_reply_files_after_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.pdf"
+            target.write_bytes(b"%PDF-1.4")
+            driver = _FileSendingDriver()
+            config = BotConfig(send_enabled=True, send_driver="fake")
+            executor = GuardedSendExecutor(config, driver)
+            reply = ReplyCandidate(
+                message_id="m-1",
+                conversation_id="private-1",
+                text="see attached",
+                send_mode="confirm",
+                model="fake",
+                attachments=[{"path": str(target), "name": "report.pdf", "status": "indexed"}],
+            )
+
+            result = executor.execute_confirmed(reply)
+
+            self.assertEqual(result.status, "sent")
+            self.assertEqual(driver.sent_texts, ["see attached"])
+            self.assertEqual(driver.sent_files, [(str(target))])
+
+    def test_executor_can_send_file_only_reply_with_empty_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "photo.png"
+            target.write_bytes(b"\x89PNG")
+            driver = _FileSendingDriver()
+            config = BotConfig(send_enabled=True, send_driver="fake")
+            executor = GuardedSendExecutor(config, driver)
+            reply = ReplyCandidate(
+                message_id="m-2",
+                conversation_id="private-1",
+                text="",
+                send_mode="confirm",
+                model="fake",
+                attachments=[{"path": str(target), "name": "photo.png"}],
+            )
+
+            result = executor.execute_confirmed(reply)
+
+            self.assertNotEqual(result.reason, "empty_reply")
+            self.assertEqual(driver.sent_files, [str(target)])
+
+    def test_executor_skips_files_for_driver_without_send_file(self) -> None:
+        driver = _SendingDriver()  # no send_file method
+        config = BotConfig(send_enabled=True, send_driver="fake")
+        executor = GuardedSendExecutor(config, driver)
+        reply = ReplyCandidate(
+            message_id="m-3",
+            conversation_id="private-1",
+            text="hi",
+            send_mode="confirm",
+            model="fake",
+            attachments=[{"path": "/nonexistent/x.pdf", "name": "x.pdf"}],
+        )
+
+        result = executor.execute_confirmed(reply)
+
+        self.assertEqual(result.status, "sent")
+        self.assertEqual(driver.sent_texts, ["hi"])
+
 
 def _reply(message_id: str, text: str) -> ReplyCandidate:
     return ReplyCandidate(
@@ -120,6 +181,16 @@ class _SendingDriver:
     def send_message(self, conversation_id: str, text: str) -> SendResult:
         self.sent_texts.append(text)
         return SendResult(message_id="sent-id", conversation_id=conversation_id, status="sent", reason="fake_sent")
+
+
+class _FileSendingDriver(_SendingDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent_files: list[str] = []
+
+    def send_file(self, conversation_id: str, path: str, caption: str = "") -> SendResult:
+        self.sent_files.append(path)
+        return SendResult(message_id="file-id", conversation_id=conversation_id, status="sent", reason="fake_file_sent")
 
 
 if __name__ == "__main__":

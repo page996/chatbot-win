@@ -27,33 +27,6 @@ class StaticSnapshotProvider:
         return self.text
 
 
-class WindowsClipboardSnapshotProvider:
-    CF_UNICODETEXT = 13
-
-    def read_text(self) -> str:
-        if sys.platform != "win32":
-            return ""
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        if not user32.IsClipboardFormatAvailable(self.CF_UNICODETEXT):
-            return ""
-        if not user32.OpenClipboard(None):
-            return ""
-        try:
-            handle = user32.GetClipboardData(self.CF_UNICODETEXT)
-            if not handle:
-                return ""
-            pointer = kernel32.GlobalLock(handle)
-            if not pointer:
-                return ""
-            try:
-                return ctypes.wstring_at(pointer)
-            finally:
-                kernel32.GlobalUnlock(handle)
-        finally:
-            user32.CloseClipboard()
-
-
 @dataclass(frozen=True)
 class AutomationTextNode:
     name: str

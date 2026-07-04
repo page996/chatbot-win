@@ -3,19 +3,14 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
-from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.wechat_driver.window_introspection import filter_wechat_chat_windows
 from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     Win32WindowProbe,
     WindowInfo,
-    foreground_window_info,
 )
-
-
-ForegroundProvider = Callable[[], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -40,59 +35,23 @@ class WeChatWindowBinding:
 
 
 class WeChatWindowBindingStore:
+    """Read-only store of legacy manual window bindings.
+
+    Foreground binding creation has been removed (wcf delivers by wxid/roomid, so
+    a bound foreground window is no longer needed). This store now only reads
+    existing ``window_bindings.json`` entries and reconciles their liveness, which
+    the bridge uses as optional metadata.
+    """
+
     def __init__(
         self,
         data_dir: str | Path,
         *,
         window_probe: Win32WindowProbe | None = None,
-        foreground_provider: ForegroundProvider = foreground_window_info,
     ):
         self.root = Path(data_dir)
         self.path = self.root / "window_bindings.json"
         self.window_probe = window_probe or Win32WindowProbe(include_invisible=False)
-        self.foreground_provider = foreground_provider
-
-    def bind_foreground(
-        self,
-        *,
-        chat_title: str,
-        conversation_type: str = "private",
-        conversation_id: str = "",
-    ) -> dict[str, Any]:
-        foreground = self.foreground_provider()
-        window = _window_from_foreground(foreground)
-        blockers = _binding_blockers(window)
-        if blockers:
-            return {"status": "blocked", "blockers": blockers, "foreground": foreground}
-        resolved_id = conversation_id or conversation_id_for(conversation_type, chat_title)
-        now = utc_now_iso()
-        binding = WeChatWindowBinding(
-            conversation_id=resolved_id,
-            conversation_type=conversation_type,
-            chat_title=chat_title,
-            hwnd=window.hwnd,
-            title=window.title,
-            process_id=window.process_id,
-            process_name=window.process_name,
-            class_name=window.class_name,
-            width=window.width,
-            height=window.height,
-            left=window.left,
-            top=window.top,
-            right=window.right,
-            bottom=window.bottom,
-            bound_at=now,
-            last_seen_at=now,
-        )
-        payload = self._read()
-        bindings = [
-            item
-            for item in payload.get("bindings", [])
-            if isinstance(item, dict) and item.get("conversation_id") != resolved_id
-        ]
-        bindings.append(asdict(binding))
-        self._write({"bindings": sorted(bindings, key=lambda item: str(item.get("chat_title", ""))), "updated_at": now})
-        return {"status": "ok", "binding": asdict(binding)}
 
     def resolve_window(self, conversation_id: str) -> WindowInfo | None:
         result = self.resolve_status(conversation_id)
@@ -189,32 +148,6 @@ class WeChatWindowBindingStore:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
-
-
-def _window_from_foreground(foreground: dict[str, Any]) -> WindowInfo:
-    return WindowInfo(
-        hwnd=int(foreground.get("hwnd", 0) or 0),
-        title=str(foreground.get("title", "")),
-        width=int(foreground.get("width", 0) or 0),
-        height=int(foreground.get("height", 0) or 0),
-        left=int(foreground.get("left", 0) or 0),
-        top=int(foreground.get("top", 0) or 0),
-        right=int(foreground.get("right", 0) or 0),
-        bottom=int(foreground.get("bottom", 0) or 0),
-        process_id=int(foreground.get("process_id", 0) or 0),
-        process_name=str(foreground.get("process_name", "")),
-        class_name=str(foreground.get("class_name", "")),
-        visible=bool(foreground.get("visible", True)),
-    )
-
-
-def _binding_blockers(window: WindowInfo) -> list[str]:
-    blockers: list[str] = []
-    if not window.hwnd:
-        blockers.append("foreground_window_missing")
-    if not filter_wechat_chat_windows([window]):
-        blockers.append("foreground_not_wechat_chat_window")
-    return blockers
 
 
 def _same_physical_window(binding: WeChatWindowBinding, windows: list[WindowInfo]) -> WindowInfo | None:

@@ -48,11 +48,36 @@ class BridgeOutboxStore:
         record = {
             "bridge_id": bridge_id,
             "conversation_id": conversation_id,
+            "kind": "text",
             "text": text,
             "status": "queued",
             "created_at": utc_now_iso(),
-            "transport": "external_bridge_required",
-            "manual_capture_required": True,
+            "transport": "wcf_bridge",
+            "manual_binding": _manual_binding_payload(manual_binding),
+        }
+        self._append(self.outbox_path, record)
+        return record
+
+    def enqueue_file(
+        self,
+        conversation_id: str,
+        path: str,
+        *,
+        name: str = "",
+        caption: str = "",
+        manual_binding: WeChatWindowBinding | None = None,
+    ) -> dict[str, Any]:
+        bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
+        record = {
+            "bridge_id": bridge_id,
+            "conversation_id": conversation_id,
+            "kind": "file",
+            "path": str(path),
+            "name": name or Path(path).name,
+            "caption": caption,
+            "status": "queued",
+            "created_at": utc_now_iso(),
+            "transport": "wcf_bridge",
             "manual_binding": _manual_binding_payload(manual_binding),
         }
         self._append(self.outbox_path, record)
@@ -107,9 +132,9 @@ class BridgeOutboxStore:
             ],
             "items": items,
             "contract": {
-                "producer": "agent writes outbox.jsonl",
-                "authorization": "only manually captured WeChat channels in window_bindings.json may enter this bridge",
-                "consumer": "external non-foreground bridge sends to WeChat and writes acks.jsonl or POSTs ack API",
+                "producer": "agent writes outbox.jsonl (text + file records)",
+                "authorization": "conversation whitelist enforced upstream by the router",
+                "consumer": "send_bridge_worker delivers via WeChatFerry (no foreground) and writes acks.jsonl",
                 "delivery_claim": "queued_to_bridge_not_confirmed_sent_until_ack",
             },
         }
@@ -156,8 +181,6 @@ class BridgeOutboxSendDriver:
         state = self.store.state(limit=1)
         manual_bound_count = int(state.get("manual_bound_count", 0) or 0)
         blockers = [] if self.send_enabled else ["send_enabled_false"]
-        if manual_bound_count <= 0:
-            blockers.append("no_manual_captured_channels")
         return BridgeSendProbe(
             driver=BRIDGE_OUTBOX_SEND_DRIVER,
             implemented=True,
@@ -168,7 +191,7 @@ class BridgeOutboxSendDriver:
             pending_count=int(state.get("pending_count", 0) or 0),
             ack_count=int(state.get("ack_count", 0) or 0),
             manual_bound_count=manual_bound_count,
-            authorization="manual_captured_channels_only",
+            authorization="conversation_whitelist",
             blockers=blockers,
         )
 
@@ -177,20 +200,30 @@ class BridgeOutboxSendDriver:
             return SendResult("bridge-outbox-send", conversation_id, "failed", "send_enabled_false")
         if not text.strip():
             return SendResult("bridge-outbox-send", conversation_id, "failed", "empty_reply")
+        # wcf delivers by wxid/roomid, so a manual foreground window binding is no
+        # longer required. Whitelist authorization is enforced upstream by the
+        # router; attach the binding as metadata when present, but never block on it.
         manual_binding = self._manual_binding_for(conversation_id)
-        if manual_binding is None:
-            return SendResult(
-                "bridge-outbox-send",
-                conversation_id,
-                "failed",
-                "bridge_requires_manual_captured_channel",
-            )
         record = self.store.enqueue(conversation_id, text, manual_binding=manual_binding)
         return SendResult(
             message_id=str(record["bridge_id"]),
             conversation_id=conversation_id,
             status="queued_to_bridge",
             reason=f"queued_to_non_foreground_bridge:{record['bridge_id']}",
+        )
+
+    def send_file(self, conversation_id: str, path: str, caption: str = "") -> SendResult:
+        if not self.send_enabled:
+            return SendResult("bridge-outbox-send", conversation_id, "failed", "send_enabled_false")
+        if not str(path).strip():
+            return SendResult("bridge-outbox-send", conversation_id, "failed", "empty_file_path")
+        manual_binding = self._manual_binding_for(conversation_id)
+        record = self.store.enqueue_file(conversation_id, path, caption=caption, manual_binding=manual_binding)
+        return SendResult(
+            message_id=str(record["bridge_id"]),
+            conversation_id=conversation_id,
+            status="queued_to_bridge",
+            reason=f"queued_file_to_non_foreground_bridge:{record['bridge_id']}",
         )
 
     def _manual_binding_for(self, conversation_id: str) -> WeChatWindowBinding | None:

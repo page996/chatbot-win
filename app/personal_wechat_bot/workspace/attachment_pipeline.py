@@ -87,6 +87,8 @@ class AttachmentPipeline:
             parse_text = _conversation_parse_text(parse_result.text, parse_result.kind, artifacts)
             return {
                 "status": "indexed",
+                "source": attachment.source,
+                "path": attachment.path,
                 "file_id": file_id,
                 "name": attachment.original_name or safe_path.name,
                 "kind": attachment.kind,
@@ -114,6 +116,8 @@ class AttachmentPipeline:
         except (FileNotFoundError, PermissionError) as exc:
             return {
                 "status": "blocked",
+                "source": attachment.source,
+                "path": attachment.path,
                 "name": attachment.original_name or Path(attachment.path).name,
                 "kind": attachment.kind,
                 "reason": f"{type(exc).__name__}: {exc}",

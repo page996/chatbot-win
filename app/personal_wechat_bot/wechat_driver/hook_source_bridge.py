@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator
+from threading import Event
+from typing import Any, Callable, Iterator
 from urllib.parse import urlencode, urlparse, quote
 from urllib.request import Request, urlopen
 
@@ -21,6 +22,11 @@ from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_acco
 
 
 WEFLOW_LOCAL_BUILD_FLAVOR = "chatbot-win-local-fork"
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class WeFlowPullCancelled(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -189,10 +195,13 @@ class WeFlowHttpBridge:
         media: bool = True,
         context_only: bool | None = None,
         workers: int = 1,
+        cancel_event: Event | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> WeFlowPullResult:
         sessions: list[dict[str, Any]]
         errors: list[dict[str, str]] = []
         media_export_paths: set[str] = set()
+        _raise_if_cancelled(cancel_event)
         if talkers:
             sessions = [{"id": item, "name": item, "type": "group" if item.endswith("@chatroom") else "private"} for item in talkers]
         else:
@@ -219,11 +228,13 @@ class WeFlowHttpBridge:
             for session in sessions
             if not is_system_account(_session_id_from_meta(session))
         ]
+        _emit_progress(progress_callback, event="sessions", session_count=len(sessions), scanned_count=0, appended_count=0)
 
         worker_count = max(1, int(workers or 1))
         results: list[_WeFlowSessionPullResult] = []
         if worker_count <= 1 or len(sessions) <= 1:
             for session in sessions:
+                _raise_if_cancelled(cancel_event)
                 results.append(
                     self._pull_session_once(
                         session,
@@ -234,6 +245,8 @@ class WeFlowHttpBridge:
                         max_messages=max_messages,
                         media=media,
                         context_only=context_only,
+                        cancel_event=cancel_event,
+                        progress_callback=progress_callback,
                     )
                 )
         else:
@@ -250,12 +263,20 @@ class WeFlowHttpBridge:
                         max_messages=max_messages,
                         media=media,
                         context_only=context_only,
+                        cancel_event=cancel_event,
+                        progress_callback=progress_callback,
                     ): session
                     for session in sessions
                 }
                 for future in as_completed(futures):
+                    if cancel_event is not None and cancel_event.is_set():
+                        for pending in futures:
+                            pending.cancel()
                     try:
                         results.append(future.result())
+                    except WeFlowPullCancelled:
+                        session_id = _session_id_from_meta(futures[future])
+                        errors.append({"session": session_id, "type": "cancelled", "message": "WeFlow pull cancelled"})
                     except Exception as exc:
                         session_id = _session_id_from_meta(futures[future])
                         errors.append({"session": session_id, "type": type(exc).__name__, "message": str(exc)})
@@ -265,8 +286,9 @@ class WeFlowHttpBridge:
         for item in results:
             errors.extend(item.errors)
             media_export_paths.update(item.media_export_paths)
+        cancelled = bool(cancel_event is not None and cancel_event.is_set())
         return WeFlowPullResult(
-            status="ok" if not errors else "partial_error",
+            status="cancelled" if cancelled else ("ok" if not errors else "partial_error"),
             base_url=self.base_url,
             hook_event_file=str(self.writer.path),
             session_count=len(sessions),
@@ -288,6 +310,8 @@ class WeFlowHttpBridge:
         max_messages: int,
         media: bool,
         context_only: bool | None,
+        cancel_event: Event | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> _WeFlowSessionPullResult:
         session_id = _session_id_from_meta(session)
         if not session_id:
@@ -300,6 +324,7 @@ class WeFlowHttpBridge:
         now_since = int(time.time()) - max(0, lookback_seconds)
         history_context_only = context_only if context_only is not None else (since is not None and since <= 0)
         with _path_lock(_talker_lock_path(self.state_path, session_id), timeout_seconds=self.timeout_seconds):
+            _raise_if_cancelled(cancel_event)
             state_snapshot = _read_weflow_state_locked(self.state_path, timeout_seconds=self.timeout_seconds)
             seen = set(_string_list(state_snapshot.get("seen_raw_ids")))
             sessions_state = state_snapshot.get("sessions")
@@ -318,7 +343,12 @@ class WeFlowHttpBridge:
                     max_pages=max_pages,
                     max_messages=max_messages,
                     media=media,
+                    cancel_event=cancel_event,
+                    progress_callback=progress_callback,
                 )
+            except WeFlowPullCancelled:
+                errors.append({"session": session_id, "type": "cancelled", "message": "WeFlow pull cancelled"})
+                return _WeFlowSessionPullResult(session_id, scanned, appended, tuple(errors))
             except Exception as exc:
                 errors.append({"session": session_id, "type": type(exc).__name__, "message": str(exc)})
                 return _WeFlowSessionPullResult(session_id, 0, 0, tuple(errors))
@@ -345,6 +375,7 @@ class WeFlowHttpBridge:
             meta = {**session, **merged_api_meta}
             max_timestamp = session_since
             for message in messages:
+                _raise_if_cancelled(cancel_event)
                 scanned += 1
                 normalized = normalize_weflow_message(
                     message,
@@ -361,6 +392,14 @@ class WeFlowHttpBridge:
                     seen.add(raw_id)
                     appended_raw_ids.append(raw_id)
                 max_timestamp = max(max_timestamp, _epoch_seconds(message.get("timestamp") or message.get("createTime"), max_timestamp))
+                _emit_progress(
+                    progress_callback,
+                    event="message",
+                    session_id=session_id,
+                    scanned_count=scanned,
+                    appended_count=appended,
+                    last_raw_id=raw_id,
+                )
             _merge_weflow_state(
                 self.state_path,
                 session_id=session_id,
@@ -539,6 +578,8 @@ class WeFlowHttpBridge:
         max_pages: int = 1,
         max_messages: int = 0,
         media: bool = True,
+        cancel_event: Event | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> list[dict[str, Any]]:
         page_limit = max(1, min(10000, int(limit or 100)))
         pages: list[dict[str, Any]] = []
@@ -547,6 +588,7 @@ class WeFlowHttpBridge:
         total_messages = 0
         unlimited_pages = max_pages <= 0
         while unlimited_pages or page_count < max_pages:
+            _raise_if_cancelled(cancel_event)
             remaining = max_messages - total_messages if max_messages > 0 else page_limit
             if max_messages > 0 and remaining <= 0:
                 break
@@ -563,6 +605,15 @@ class WeFlowHttpBridge:
             messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
             count = len(messages)
             total_messages += count
+            _emit_progress(
+                progress_callback,
+                event="page",
+                session_id=talker,
+                page_count=page_count,
+                page_messages=count,
+                total_messages=total_messages,
+                has_more=bool(payload.get("hasMore") is True),
+            )
             if count <= 0 or payload.get("hasMore") is not True:
                 break
             offset += count
@@ -650,6 +701,7 @@ def normalize_weflow_push_event(payload: dict[str, Any]) -> dict[str, Any]:
         "raw_id": f"weflow:{'recall' if is_recall else 'message'}:{session_id}:{raw_id_suffix}",
         "text": _first_text(payload, "content", "text"),
         "timestamp": timestamp,
+        "is_self": _weflow_is_self(payload),
         "is_group": _session_type_is_group(payload, session_id),
         "raw": payload,
     }
@@ -711,7 +763,7 @@ def normalize_weflow_message(
         "message_type": message_type,
         "text": text,
         "timestamp": timestamp,
-        "is_self": _truthy(message.get("isSend")),
+        "is_self": _weflow_is_self(message),
         "is_group": _session_type_is_group(meta, talker),
         "attachments": attachments,
         "media_export_path": media_export_path,
@@ -880,6 +932,17 @@ def _weflow_voice(message: dict[str, Any], attachments: list[dict[str, Any]]) ->
         }.items()
         if value
     }
+
+
+def _weflow_is_self(message: dict[str, Any]) -> bool:
+    return _truthy(
+        message.get("isSend")
+        or message.get("is_send")
+        or message.get("isSelf")
+        or message.get("fromMe")
+        or message.get("from_me")
+        or message.get("self")
+    )
 
 
 def _weflow_quote(message: dict[str, Any]) -> dict[str, str]:
@@ -1053,6 +1116,17 @@ def _weflow_message_raw_id(session_id: str, message_id: str) -> str:
 
 def _wcf_media_kind(message_type: str) -> str:
     return {"3": "image", "34": "audio", "43": "video", "49": "file"}.get(str(message_type), "file")
+
+
+def _raise_if_cancelled(cancel_event: Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise WeFlowPullCancelled("WeFlow pull cancelled")
+
+
+def _emit_progress(callback: ProgressCallback | None, **payload: Any) -> None:
+    if callback is None:
+        return
+    callback({key: value for key, value in payload.items() if value not in ("", None)})
 
 
 def _sorted_payload(value: Any) -> Any:

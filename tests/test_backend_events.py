@@ -17,7 +17,6 @@ from app.personal_wechat_bot.wechat_driver.backend_events import (
     append_backend_event_payload,
 )
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
-from app.personal_wechat_bot.wechat_driver.voice_transcription import WeChatVoiceTranscriptionResult
 
 
 class BackendEventJsonlDriverTest(unittest.TestCase):
@@ -96,6 +95,30 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         )
 
         self.assertIn("[后台附件已阻止] outside.txt", enriched.text)
+        self.assertEqual(enriched.driver_meta["attachments"][0]["status"], "blocked")
+
+    def test_metadata_only_self_attachment_is_kept_in_conversation_flow(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="Agent",
+            text="我发了一个文件",
+            is_self=True,
+            attachments=[{"original_name": "agent-output.pdf", "kind": "file"}],
+        )
+
+        messages = self.driver.read_new_messages()
+
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(messages[0].is_self)
+        self.assertIn("[后台附件待处理] agent-output.pdf", messages[0].text)
+        enriched = self.driver.enrich_message_attachments(
+            messages[0],
+            conversation_id=messages[0].driver_meta["conversation_id_hint"],
+            session_id=messages[0].driver_meta["session_id"],
+        )
+
+        self.assertIn("[后台附件已阻止] agent-output.pdf", enriched.text)
         self.assertEqual(enriched.driver_meta["attachments"][0]["status"], "blocked")
 
     def test_image_extension_is_allowed_by_default_for_backend_ingest(self) -> None:
@@ -183,45 +206,9 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertIn("[微信语音待转文字]", messages[0].text)
         self.assertTrue(messages[0].driver_meta["backend_voice_pending"])
 
-    def test_pending_voice_uses_wechat_builtin_bridge_before_ledger(self) -> None:
-        bridge = _FakeVoiceBridge(WeChatVoiceTranscriptionResult(status="transcribed", text="微信主路径转写成功", method="fake"))
-        driver = BackendEventJsonlDriver(
-            self.event_file,
-            FileIndex(self.data_dir / "file_index_voice.sqlite"),
-            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
-            allowed_extensions=self.config.file_allowed_extensions,
-            max_input_bytes=self.config.file_max_bytes,
-            attachment_parser=BackendAttachmentParser(
-                ocr_engine=_FakeOcr(""),
-                asr_engine=_FakeAsr("", status="blocked", error="local_asr_not_configured"),
-            ),
-            voice_transcription_bridge=bridge,
-        )
-        append_backend_event_payload(
-            self.event_file,
-            {
-                "chat_title": "PAGE",
-                "sender_name": "PAGE",
-                "voice_status": "pending",
-            },
-        )
-
-        messages = driver.read_new_messages()
-        enriched = driver.enrich_message_attachments(
-            messages[0],
-            conversation_id=messages[0].driver_meta["conversation_id_hint"],
-            session_id=messages[0].driver_meta["session_id"],
-        )
-
-        self.assertEqual(enriched.text, "微信主路径转写成功")
-        self.assertEqual(enriched.driver_meta["voice"]["source"], "wechat_builtin_voice_to_text")
-        self.assertEqual(enriched.driver_meta["backend_voice_pending"], False)
-        self.assertEqual(bridge.calls, 1)
-
     def test_pending_voice_falls_back_to_local_asr_when_audio_path_exists(self) -> None:
         audio = self.inbox / "voice.m4a"
         audio.write_bytes(b"fake audio")
-        bridge = _FakeVoiceBridge(WeChatVoiceTranscriptionResult(status="blocked", error="wechat_builtin_transcript_not_observed"))
         driver = BackendEventJsonlDriver(
             self.event_file,
             FileIndex(self.data_dir / "file_index_voice_asr.sqlite"),
@@ -232,7 +219,6 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
                 ocr_engine=_FakeOcr(""),
                 asr_engine=_FakeAsr("本地 ASR fallback 成功"),
             ),
-            voice_transcription_bridge=bridge,
         )
         append_backend_event_payload(
             self.event_file,
@@ -261,7 +247,6 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         voice_cache.mkdir()
         audio = voice_cache / "voice_cache_123.m4a"
         audio.write_bytes(b"fake audio")
-        bridge = _FakeVoiceBridge(WeChatVoiceTranscriptionResult(status="blocked", error="wechat_builtin_transcript_not_observed"))
         driver = BackendEventJsonlDriver(
             self.event_file,
             FileIndex(self.data_dir / "file_index_voice_cache.sqlite"),
@@ -272,7 +257,6 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
                 ocr_engine=_FakeOcr(""),
                 asr_engine=_FakeAsr("缓存语音 ASR 成功"),
             ),
-            voice_transcription_bridge=bridge,
             voice_cache_resolver=WeChatVoiceCacheResolver(
                 [voice_cache],
                 allowed_extensions=self.config.file_allowed_extensions,
@@ -326,12 +310,15 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(entry.text_blocks[0]["text"], "语音里安排一个任务")
 
     def test_polling_runner_enriches_pending_voice_before_writing_ledger(self) -> None:
+        audio = self.inbox / "task_voice.m4a"
+        audio.write_bytes(b"fake audio")
         append_backend_event_payload(
             self.event_file,
             {
                 "chat_title": "PAGE",
                 "sender_name": "PAGE",
                 "voice_status": "pending",
+                "voice_audio_path": "task_voice.m4a",
             },
         )
         runtime = build_runtime(self.config)
@@ -341,11 +328,12 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
             allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
             allowed_extensions=self.config.file_allowed_extensions,
             max_input_bytes=self.config.file_max_bytes,
+            attachment_parser=BackendAttachmentParser(
+                ocr_engine=_FakeOcr(""),
+                asr_engine=_FakeAsr("主路径语音进入对话文件"),
+            ),
             file_workspace=runtime.file_workspace,
             session_store=runtime.session_store,
-            voice_transcription_bridge=_FakeVoiceBridge(
-                WeChatVoiceTranscriptionResult(status="transcribed", text="主路径语音进入对话文件", method="fake")
-            ),
         )
 
         result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_forever(max_loops=1)
@@ -633,16 +621,6 @@ class _FakeAsr:
 
     def transcribe(self, audio_path: str | Path) -> AsrTranscript:
         return AsrTranscript(self.status, self.text, backend="fake_asr", model="fake", source_path=str(audio_path), error=self.error)
-
-
-class _FakeVoiceBridge:
-    def __init__(self, result: WeChatVoiceTranscriptionResult):
-        self.result = result
-        self.calls = 0
-
-    def transcribe_selected_voice(self, conversation_id: str) -> WeChatVoiceTranscriptionResult:
-        self.calls += 1
-        return self.result
 
 
 if __name__ == "__main__":

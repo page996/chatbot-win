@@ -9,7 +9,6 @@ from app.personal_wechat_bot.wechat_driver.snapshot_provider import (
     AutomationTextNode,
     FileSnapshotProvider,
     StaticSnapshotProvider,
-    WindowsClipboardSnapshotProvider,
     WindowsUIAutomationSnapshotProvider,
     format_automation_text_nodes,
 )
@@ -33,10 +32,6 @@ class SnapshotProviderTest(unittest.TestCase):
 
     def test_static_snapshot_provider_returns_text(self) -> None:
         self.assertEqual(StaticSnapshotProvider("hello").read_text(), "hello")
-
-    @unittest.skipIf(sys.platform == "win32", "non-Windows behavior only")
-    def test_windows_clipboard_provider_returns_empty_off_windows(self) -> None:
-        self.assertEqual(WindowsClipboardSnapshotProvider().read_text(), "")
 
     def test_format_automation_text_nodes_dedupes_and_normalizes_whitespace(self) -> None:
         text = format_automation_text_nodes(

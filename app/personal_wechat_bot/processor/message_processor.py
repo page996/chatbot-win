@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import Any
 
 from app.personal_wechat_bot.bootstrap import BotRuntime
-from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage, SpeakDecision
+from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage, ReplyCandidate, SpeakDecision
+from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
+from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.workspace.attachment_pipeline import AttachmentPipeline, IncomingAttachment
 
 
 class MessageProcessor:
     def __init__(self, runtime: BotRuntime):
         self.runtime = runtime
+        self._outgoing_attachment_pipeline: AttachmentPipeline | None = None
 
     def process(self, raw: RawWeChatMessage) -> dict[str, Any] | None:
         self.runtime.event_logger.log("message.raw", asdict(raw))
@@ -92,6 +99,7 @@ class MessageProcessor:
             self._mark_done(original_message_id, message.message_id)
             return item
 
+        reply = self._enrich_reply_attachments(reply, session_id)
         reply_entry = self.runtime.ledger_store.append_reply(
             reply,
             chat_title=message.chat_title,
@@ -241,3 +249,159 @@ class MessageProcessor:
         metadata = dict(message.metadata)
         metadata["session_id"] = session_id
         return replace(message, metadata=metadata)
+
+    def _enrich_reply_attachments(self, reply: ReplyCandidate, session_id: str) -> ReplyCandidate:
+        candidates = self._reply_attachment_candidates(reply)
+        if not candidates:
+            return reply
+        # Parse outgoing attachments in parallel (OCR/ASR are subprocess/IO bound),
+        # but preserve candidate order and dedup deterministically afterward. A
+        # single attachment stays on the calling thread to avoid pool overhead.
+        if len(candidates) == 1:
+            processed_list = [self._process_outgoing_attachment(candidates[0], reply.conversation_id, session_id)]
+        else:
+            processed_list = [None] * len(candidates)
+            max_workers = min(4, len(candidates))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_index = {
+                    pool.submit(
+                        self._process_outgoing_attachment, attachment, reply.conversation_id, session_id
+                    ): index
+                    for index, attachment in enumerate(candidates)
+                }
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        processed_list[index] = future.result()
+                    except Exception as exc:
+                        # A parse failure must not drop the file: keep it as a
+                        # blocked attachment so it can still be sent (integrity first).
+                        candidate = candidates[index]
+                        processed_list[index] = {
+                            **candidate,
+                            "status": "blocked",
+                            "reason": f"outgoing_parse_error:{type(exc).__name__}",
+                        }
+        enriched: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for processed in processed_list:
+            if processed is None:
+                continue
+            key = (
+                str(processed.get("path", "")),
+                str(processed.get("name", "")),
+                str(processed.get("source", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            enriched.append(processed)
+        return replace(reply, attachments=enriched)
+
+    def _reply_attachment_candidates(self, reply: ReplyCandidate) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for item in reply.attachments:
+            normalized = _attachment_candidate(item, source="reply_candidate")
+            if normalized:
+                candidates.append(normalized)
+        if reply.tool_result is not None:
+            for index, ref in enumerate(reply.tool_result.output_refs):
+                normalized = _attachment_candidate(
+                    {
+                        "path": str(ref),
+                        "name": Path(str(ref)).name,
+                        "kind": "tool_output",
+                        "tool_name": reply.tool_result.tool_name,
+                        "call_id": reply.tool_result.call_id,
+                        "output_index": index,
+                    },
+                    source="tool_result",
+                )
+                if normalized:
+                    candidates.append(normalized)
+        return candidates
+
+    def _process_outgoing_attachment(
+        self,
+        attachment: dict[str, Any],
+        conversation_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        if attachment.get("status") == "indexed" and isinstance(attachment.get("parse"), dict):
+            return attachment
+        path = str(attachment.get("path", "")).strip()
+        name = str(attachment.get("name") or Path(path).name).strip()
+        kind = str(attachment.get("kind") or "file").strip()
+        source = str(attachment.get("source") or "reply_candidate").strip()
+        if not path:
+            return {
+                **attachment,
+                "status": "blocked",
+                "source": source,
+                "name": name,
+                "kind": kind,
+                "reason": "outgoing_attachment_path_missing",
+            }
+        processed = self._outgoing_pipeline().process(
+            IncomingAttachment(
+                path=path,
+                original_name=name or Path(path).name,
+                kind=kind,
+                source=source,
+            ),
+            conversation_id=conversation_id,
+            session_id=session_id,
+        )
+        return {
+            **attachment,
+            **processed,
+            "path": path,
+            "source": source,
+            "tool_name": attachment.get("tool_name", ""),
+            "call_id": attachment.get("call_id", ""),
+            "output_index": attachment.get("output_index", ""),
+        }
+
+    def _outgoing_pipeline(self) -> AttachmentPipeline:
+        if self._outgoing_attachment_pipeline is None:
+            config = self.runtime.config
+            data_root = Path(config.data_dir)
+            roots = [
+                *config.file_read_roots,
+                str(data_root / "tool_outputs"),
+                str(data_root / "file_workspace"),
+            ]
+            self._outgoing_attachment_pipeline = AttachmentPipeline(
+                file_index=self.runtime.file_index,
+                file_workspace=self.runtime.file_workspace,
+                attachment_parser=BackendAttachmentParser(RapidOcrSubprocessEngine()),
+                allowed_input_roots=resolve_allowed_roots(config.data_dir, roots),
+                # Agent-produced files are trusted artifacts: use the relaxed
+                # outgoing limits (empty extension list = allow any type) so the
+                # agent's own output is never blocked by the inbound guard.
+                allowed_extensions=config.outgoing_file_allowed_extensions,
+                max_input_bytes=config.outgoing_file_max_bytes,
+            )
+        return self._outgoing_attachment_pipeline
+
+
+def _attachment_candidate(value: Any, *, source: str) -> dict[str, Any]:
+    if isinstance(value, str):
+        path = value.strip()
+        if not path:
+            return {}
+        return {"path": path, "name": Path(path).name, "kind": "file", "source": source}
+    if not isinstance(value, dict):
+        return {}
+    path = str(value.get("path") or value.get("source_ref") or value.get("output_ref") or "").strip()
+    name = str(value.get("name") or value.get("filename") or Path(path).name).strip()
+    if not path and not name:
+        return {}
+    kind = str(value.get("kind") or value.get("type") or "file").strip()
+    return {
+        **value,
+        "path": path,
+        "name": name,
+        "kind": kind,
+        "source": str(value.get("source") or source).strip(),
+    }

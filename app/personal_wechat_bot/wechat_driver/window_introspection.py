@@ -11,7 +11,6 @@ from ctypes import wintypes
 from app.personal_wechat_bot.wechat_driver.windows_readonly import (
     Win32WindowProbe,
     WindowInfo,
-    foreground_window_info,
 )
 
 
@@ -86,10 +85,9 @@ def build_wechat_window_probe(
 ) -> dict[str, Any]:
     raw_windows = Win32WindowProbe(include_invisible=False).find_wechat_windows()
     windows = filter_wechat_chat_windows(raw_windows)
-    foreground = foreground_window_info()
     targets = [_window_payload(item, max_children=max_children, max_controls=max_controls, max_depth=max_depth) for item in windows]
     bindings = _active_bindings(data_dir) if data_dir is not None else []
-    active = _active_target(targets, foreground, bindings)
+    active = _active_target(targets, bindings)
     dependency = _uia_dependency_status()
     return {
         "status": "ok" if windows else "not_found",
@@ -98,7 +96,6 @@ def build_wechat_window_probe(
             "WeChat DevTools targets Mini Program/WebView debugging; native PC WeChat chat HWND/control "
             "discovery uses Win32 window handles plus UI Automation instead."
         ),
-        "foreground": foreground,
         "active": active,
         "active_source": active.get("source", ""),
         "bindings": bindings,
@@ -132,7 +129,7 @@ def _active_bindings(data_dir: str | Path | None) -> list[dict[str, Any]]:
         return []
 
 
-def _active_target(targets: list[dict[str, Any]], foreground: dict[str, Any], bindings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _active_target(targets: list[dict[str, Any]], bindings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     bindings = bindings or []
     active_binding_ids = {
         int(item.get("hwnd", 0) or 0): item
@@ -157,14 +154,7 @@ def _active_target(targets: list[dict[str, Any]], foreground: dict[str, Any], bi
             "hwnd": first.get("hwnd", 0),
             "title": first.get("title", ""),
         }
-    foreground_hwnd = int(foreground.get("hwnd", 0) or 0)
-    for target in targets:
-        if int(target.get("hwnd", 0) or 0) == foreground_hwnd:
-            return {"status": "matched_foreground", "source": "foreground", "hwnd": foreground_hwnd, "title": target.get("title", "")}
-    process = str(foreground.get("process_name", "")).lower()
-    if process in {"wechat.exe", "weixin.exe", "wechatappex.exe"}:
-        return {"status": "foreground_wechat_child_or_popup", "source": "foreground", "hwnd": foreground_hwnd, "title": foreground.get("title", "")}
-    return {"status": "not_wechat_foreground", "source": "foreground", "hwnd": foreground_hwnd, "title": foreground.get("title", "")}
+    return {"status": "no_wechat_window", "source": "none", "hwnd": 0, "title": ""}
 
 
 def _is_candidate_chat_window(window: WindowInfo) -> bool:

@@ -60,6 +60,15 @@ class ConversationLedgerStore:
             existing = _find_entry_by_message_id(entries, message.message_id)
             if existing is not None:
                 return _entry_from_payload(existing)
+            # A pulled-back self message is WeChat echoing the agent's own reply.
+            # If it matches a recent role=assistant entry (recorded when the reply
+            # was generated), don't append a duplicate role=self line — instead
+            # confirm delivery on the existing assistant entry.
+            if message.is_self:
+                echoed = _find_assistant_entry_for_self_echo(entries, message.text)
+                if echoed is not None:
+                    self._confirm_self_echo(message, echoed, entries, conversation_dir)
+                    return _entry_from_payload(echoed)
             entry = LedgerEntry(
                 entry_id=_entry_id(message.message_id, message.conversation_id),
                 message_id=message.message_id,
@@ -85,6 +94,40 @@ class ConversationLedgerStore:
             self._write_state(message.conversation_id, entry)
             self._render_conversation(message.conversation_id)
             return entry
+
+    def _confirm_self_echo(
+        self,
+        message: NormalizedMessage,
+        echoed: dict[str, Any],
+        entries: list[dict[str, Any]],
+        conversation_dir: Path,
+    ) -> None:
+        """Record that WeChat echoed back the agent's own reply on the matching
+        role=assistant entry, instead of appending a duplicate role=self line."""
+        now = utc_now_iso()
+        updated: list[dict[str, Any]] = []
+        for item in entries:
+            if item.get("entry_id") != echoed.get("entry_id"):
+                updated.append(item)
+                continue
+            item = dict(item)
+            send = item.get("send") if isinstance(item.get("send"), dict) else {}
+            # A self-echo is positive delivery confirmation; only upgrade toward
+            # "sent", never downgrade a status the send path already recorded.
+            new_send = {**send}
+            if str(send.get("status", "")) not in {"sent"}:
+                new_send["status"] = "sent"
+                if not new_send.get("sent_at"):
+                    new_send["sent_at"] = message.received_at or now
+            new_send["echo_confirmed_at"] = now
+            new_send["echo_message_id"] = message.message_id
+            item["send"] = new_send
+            item["updated_at"] = now
+            echoed.clear()
+            echoed.update(item)
+            updated.append(item)
+        self._rewrite_entries(message.conversation_id, updated)
+        self._render_conversation(message.conversation_id)
 
     def annotate_link(
         self,
@@ -143,6 +186,7 @@ class ConversationLedgerStore:
     ) -> LedgerEntry:
         with self._conversation_lock(reply.conversation_id):
             entries = self._read_entries(reply.conversation_id)
+            attachments = _reply_attachments(reply)
             entry = LedgerEntry(
                 entry_id=_entry_id(f"reply:{reply.message_id}:{reply.created_at}", reply.conversation_id),
                 message_id=reply.message_id,
@@ -156,9 +200,9 @@ class ConversationLedgerStore:
                 received_at=reply.created_at,
                 sequence=self._next_sequence(entries),
                 status="active",
-                text_blocks=[asdict(LedgerTextBlock(kind="reply", text=reply.text, token_estimate=_estimate_tokens(reply.text)))],
+                text_blocks=_text_blocks_from_reply(reply, attachments),
                 quote={},
-                attachments=_reply_attachments(reply),
+                attachments=attachments,
                 links=_links_from_text(reply.text),
                 source="reply_candidate",
                 role="assistant",
@@ -196,6 +240,71 @@ class ConversationLedgerStore:
             item["updated_at"] = now
             updated.append(item)
             changed = True
+        if not changed:
+            return False
+        self._rewrite_entries(conversation_id, updated)
+        self._render_conversation(conversation_id)
+        return True
+
+    def update_reply_send_result_for_candidate(self, reply: ReplyCandidate, send_result: SendResult | dict[str, Any]) -> bool:
+        entries = self._read_entries(reply.conversation_id)
+        matches = [
+            item
+            for item in entries
+            if item.get("role") == "assistant"
+            and item.get("message_id") == reply.message_id
+            and (not reply.created_at or item.get("created_at") == reply.created_at)
+        ]
+        if not matches:
+            matches = [
+                item
+                for item in entries
+                if item.get("role") == "assistant" and item.get("message_id") == reply.message_id
+            ]
+        if not matches:
+            return False
+        return self.update_reply_send_result(
+            reply.conversation_id,
+            str(matches[-1].get("entry_id", "")),
+            send_result,
+        )
+
+    def update_bridge_send_result(
+        self,
+        conversation_id: str,
+        bridge_id: str,
+        *,
+        status: str,
+        reason: str = "",
+        external_message_id: str = "",
+    ) -> bool:
+        bridge_id = str(bridge_id or "").strip()
+        if not bridge_id:
+            return False
+        entries = self._read_entries(conversation_id)
+        changed = False
+        updated: list[dict[str, Any]] = []
+        now = utc_now_iso()
+        for item in entries:
+            send = item.get("send") if isinstance(item.get("send"), dict) else {}
+            send_reason = str(send.get("reason", ""))
+            send_message_id = str(send.get("message_id", ""))
+            if item.get("role") == "assistant" and (bridge_id == send_message_id or bridge_id in send_reason):
+                item = dict(item)
+                next_send = {
+                    **send,
+                    "status": status,
+                    "reason": reason or f"bridge_ack:{status}",
+                    "updated_at": now,
+                }
+                if external_message_id:
+                    next_send["external_message_id"] = external_message_id
+                if status == "sent":
+                    next_send["sent_at"] = now
+                item["send"] = next_send
+                item["updated_at"] = now
+                changed = True
+            updated.append(item)
         if not changed:
             return False
         self._rewrite_entries(conversation_id, updated)
@@ -440,6 +549,41 @@ def _text_blocks_from_message(message: NormalizedMessage) -> list[dict[str, Any]
     return blocks
 
 
+def _text_blocks_from_reply(reply: ReplyCandidate, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocks = [
+        asdict(
+            LedgerTextBlock(
+                kind="reply",
+                text=reply.text,
+                token_estimate=_estimate_tokens(reply.text),
+                metadata={"visible_in_context": True},
+            )
+        )
+    ]
+    for attachment in attachments:
+        parse = attachment.get("parse") if isinstance(attachment.get("parse"), dict) else {}
+        parsed_text = str(parse.get("text", "")).strip()
+        if not parsed_text:
+            continue
+        blocks.append(
+            asdict(
+                LedgerTextBlock(
+                    kind=f"attachment:{parse.get('kind', attachment.get('kind', 'file'))}",
+                    text=parsed_text,
+                    source_ref=str(_attachment_source_ref(attachment)),
+                    token_estimate=_estimate_tokens(parsed_text),
+                    metadata={
+                        "file_id": attachment.get("file_id", ""),
+                        "name": attachment.get("name", ""),
+                        "source": attachment.get("source", ""),
+                        "direction": "outgoing",
+                    },
+                )
+            )
+        )
+    return blocks
+
+
 def _primary_message_text(message: NormalizedMessage) -> str:
     original = message.metadata.get("original_text")
     if isinstance(original, str):
@@ -548,10 +692,14 @@ def _normalize_reply_attachment(item: Any, *, source: str) -> dict[str, Any]:
         "name": name,
         "kind": kind,
     }
-    for key in ("file_id", "tool_name", "call_id", "output_index", "mime_type", "size", "md5"):
+    for key in ("file_id", "tool_name", "call_id", "output_index", "mime_type", "size", "md5", "suffix", "reason"):
         value = payload.get(key)
         if value not in (None, "", [], {}):
             result[key] = value
+    for key in ("workspace", "parse", "artifacts"):
+        value = payload.get(key)
+        if isinstance(value, dict) and value:
+            result[key] = dict(value)
     return {key: value for key, value in result.items() if value not in ("", None)}
 
 
@@ -857,6 +1005,50 @@ def _safe_segment(value: str) -> str:
 
 def _normalize_for_match(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def _entry_primary_text(entry: dict[str, Any]) -> str:
+    """Best-effort plain text of a ledger entry for content-based matching."""
+    blocks = entry.get("text_blocks")
+    if not isinstance(blocks, list):
+        return ""
+    parts: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        kind = str(block.get("kind", ""))
+        # Only compare authored message text, not derived annotations/attachments.
+        if kind.startswith("annotation") or kind.startswith("attachment"):
+            continue
+        text = str(block.get("text", "")).strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _find_assistant_entry_for_self_echo(
+    entries: list[dict[str, Any]],
+    text: str,
+    *,
+    lookback: int = 40,
+) -> dict[str, Any] | None:
+    """Find a recent role=assistant entry whose text matches a pulled-back self message.
+
+    When the agent sends a reply, it is recorded as ``role=assistant`` keyed on the
+    incoming user's message_id. WeChat later echoes that same text back through the
+    pull with a fresh weflow message_id and ``is_self=True``; without this match it
+    would be appended a second time as ``role=self`` and the LLM context would show
+    the assistant's line twice. Match on normalized text within a recent window.
+    """
+    normalized = _normalize_for_match(text)
+    if not normalized:
+        return None
+    for item in reversed(entries[-max(1, lookback):]):
+        if str(item.get("role", "")) != "assistant":
+            continue
+        if _normalize_for_match(_entry_primary_text(item)) == normalized:
+            return item
+    return None
 
 
 def _write_json(path: Path, payload: Any) -> None:

@@ -95,7 +95,7 @@ class AuditCleanupTest(unittest.TestCase):
             root = Path(tmp)
             data_dir = root / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="windows_guarded")
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
             plan = root / "plan.md"
             plan.write_text("在发送模块实现前，需要人工复制候选回复到微信。", encoding="utf-8")
 

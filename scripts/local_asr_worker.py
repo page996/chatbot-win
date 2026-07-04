@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,9 +21,26 @@ def main() -> int:
     if whisper_payload.get("ok") or not _should_fallback_to_pocketsphinx(str(whisper_payload.get("error", ""))):
         payload = whisper_payload
     else:
-        payload = _try_windows_sapi(path, args.model, whisper_error=str(whisper_payload.get("error", "")))
-        if not payload.get("ok") and language in {"en", "en-us", "english"}:
-            payload = _try_pocketsphinx(path, args.model, whisper_error=str(whisper_payload.get("error", "")), sapi_error=str(payload.get("error", "")))
+        if language in {"en", "en-us", "english"}:
+            payload = _try_pocketsphinx(
+                path,
+                args.model,
+                whisper_error=str(whisper_payload.get("error", "")),
+                sapi_error="windows_sapi_not_used",
+            )
+        elif _env_enabled("CHATBOT_WIN_ENABLE_WINDOWS_SAPI_ASR"):
+            payload = _try_windows_sapi(path, args.model, whisper_error=str(whisper_payload.get("error", "")))
+        else:
+            payload = {
+                "ok": False,
+                "backend": "windows_sapi",
+                "model": "installed_recognizer",
+                "language": "",
+                "fallback_from": "faster_whisper",
+                "fallback_error": str(whisper_payload.get("error", "")),
+                "error": "windows_sapi_fallback_disabled",
+                "text_b64": "",
+            }
     print("LOCAL_ASR_JSON:" + json.dumps(payload, ensure_ascii=True))
     return 0
 
@@ -50,6 +68,10 @@ def _try_faster_whisper(path: Path, model: str, *, language: str) -> dict[str, o
             "error": f"{type(exc).__name__}: {exc}",
             "text_b64": "",
         }
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _try_windows_sapi(path: Path, model: str, *, whisper_error: str) -> dict[str, object]:

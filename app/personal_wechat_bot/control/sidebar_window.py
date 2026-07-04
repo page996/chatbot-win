@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from app.personal_wechat_bot.control.sidebar_server import _handler_factory
-from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.window_introspection import filter_wechat_chat_windows
 from app.personal_wechat_bot.wechat_driver.windows_readonly import Win32WindowProbe
 
@@ -109,33 +108,11 @@ def _sidebar_geometry(*, width: int, height: int, data_dir: str | Path | None = 
 
 
 def _wechat_anchor(data_dir: str | Path | None = None) -> dict[str, int] | None:
-    bound = _bound_wechat_anchor(data_dir)
-    if bound is not None:
-        return bound
     windows = filter_wechat_chat_windows(Win32WindowProbe(include_invisible=False).find_wechat_windows())
     if not windows:
         return None
     window = windows[0]
     return {"left": window.left, "top": window.top, "right": window.right, "bottom": window.bottom}
-
-
-def _bound_wechat_anchor(data_dir: str | Path | None) -> dict[str, int] | None:
-    if data_dir is None:
-        return None
-    try:
-        store = WeChatWindowBindingStore(data_dir)
-        for binding in store.list_bindings():
-            conversation_id = str(binding.get("conversation_id", "")).strip()
-            if not conversation_id or str(binding.get("status", "active")) != "active":
-                continue
-            status = store.resolve_status(conversation_id)
-            window = status.get("window")
-            if window is None:
-                continue
-            return {"left": window.left, "top": window.top, "right": window.right, "bottom": window.bottom}
-    except Exception:
-        return None
-    return None
 
 
 def _geometry_next_to_anchor(anchor: dict[str, int], *, width: int, height: int) -> dict[str, int]:

@@ -11,10 +11,13 @@ from dataclasses import asdict, is_dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.config.loader import load_config, migrate_file_allowed_extensions
+from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
+from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
@@ -31,6 +34,7 @@ from app.personal_wechat_bot.control.send_commands import (
     reject_confirm_item,
     send_approved_confirm_item,
     set_send_controls,
+    sync_bridge_ack_to_send_state,
 )
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
@@ -50,7 +54,19 @@ from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoi
 
 QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent", "failed")
 _WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
+_WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
 _WEFLOW_LOCK = threading.Lock()
+_WEFLOW_STATE_FILE_LOCK = threading.RLock()
+# Serializes the hook *consume* step (import + backend replay + scheduler)
+# across threads *within this process*. It fronts the cross-process file lock
+# (HookMessagePullRunner.consume_lock_path) so at most one sidebar thread polls
+# that file at a time instead of N threads spin-waiting on it. The file lock is
+# the authoritative cross-process guard (background worker tick, pull-once,
+# backfill, and any separate CLI consumer take turns over the shared offset +
+# deduper); this in-process lock is the fast front door. Always acquired before
+# the file lock, so the two never deadlock. See _WEFLOW consume-lock wiring in
+# _build_weflow_pull_context.
+_WEFLOW_CONSUMER_LOCK = threading.Lock()
 
 
 def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -66,7 +82,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "sidebar_role": "audit_and_send_controls_only",
             "window_probe_role": "diagnostic_only",
             "supports_multi_conversation": True,
-            "send_driver_boundary": "windows_guarded requires foreground WeChat for output; backend events can receive multiple conversations without page OCR",
+            "send_driver_boundary": "bridge_outbox queues replies for the WeChatFerry send bridge (non-foreground, delivered by wxid/roomid); backend events can receive multiple conversations without page OCR",
             "input_pipeline": "POST /api/backend-events or append-backend-event -> backend_events.jsonl -> run-agent/poll-backend-events -> conversation_ledgers",
             "background_send_status": _background_send_status(config, send_bridge),
         },
@@ -182,6 +198,7 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "status": "ok",
         "base_url": str(persisted.get("base_url") or "http://127.0.0.1:5031"),
         "token_env": str(persisted.get("token_env") or "WEFLOW_API_TOKEN"),
+        "token_present": bool(persisted.get("token_present")),
         "hook_event_file": str(root / "hook_events.jsonl"),
         "backend_event_file": str(root / "backend_events.jsonl"),
         "weflow_state_file": str(root / "weflow_bridge_state.json"),
@@ -194,10 +211,13 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         },
         "config_migration": migration,
         "worker": worker,
+        "backfill_job": _weflow_backfill_job_state(root, persisted),
         "bridge_state": summarize_weflow_bridge_state(root / "weflow_bridge_state.json"),
         "last_health": persisted.get("last_health", {}) if isinstance(persisted, dict) else {},
+        "last_discover": persisted.get("last_discover", {}) if isinstance(persisted, dict) else {},
         "last_pull": persisted.get("last_pull", {}) if isinstance(persisted, dict) else {},
         "last_backfill": persisted.get("last_backfill", {}) if isinstance(persisted, dict) else {},
+        "operation_history": persisted.get("operation_history", []) if isinstance(persisted, dict) else [],
         "last_error": persisted.get("last_error", "") if isinstance(persisted, dict) else "",
         "updated_at": persisted.get("updated_at", "") if isinstance(persisted, dict) else "",
     }
@@ -213,6 +233,7 @@ def sidebar_weflow_health(data_dir: str | Path, payload: dict[str, Any]) -> dict
         require_fork=True,
     )
     _write_weflow_sidebar_state(data_dir, {"last_health": result, **_weflow_public_params(params)})
+    _append_weflow_operation_history(data_dir, "health", result)
     return result
 
 
@@ -221,30 +242,108 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
 
     Returns {status, sessions: [{id, name, unread_count?, last_message_time?}]}.
     """
-    from app.personal_wechat_bot.wechat_driver.hook_source_bridge import WeFlowHttpBridge
-
     params = _weflow_params(data_dir, payload)
     limit = _bounded_int(payload.get("limit"), 100, 1, 1000)
     try:
-        bridge = WeFlowHttpBridge(
+        weflow_ready = require_weflow_ready(
             params["base_url"],
             token=params["token"],
             allow_non_local=params["allow_non_local"],
-            require_token=True,
-            require_fork=True,
         )
-        sessions = bridge.list_sessions(limit=limit)
-        # Filter out system accounts before returning to the user
-        from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
-        sessions = [s for s in sessions if not is_system_account(s.get("id"))]
-        return {"status": "ok", "sessions": sessions, "count": len(sessions)}
-    except Exception as e:
-        return {"status": "error", "message": str(e), "sessions": []}
+        bridge = WeFlowHttpBridge(
+            params["base_url"],
+            token=params["token"],
+            hook_event_file=params["hook_event_file"],
+            state_path=params["weflow_state_file"],
+            allow_non_local=params["allow_non_local"],
+        )
+        sessions = [
+            session
+            for session in (_normalize_weflow_session(item) for item in bridge.list_sessions(limit=limit))
+            if session.get("id") and not is_system_account(session.get("id"))
+        ]
+        result = {
+            "status": "ok",
+            "sessions": sessions,
+            "count": len(sessions),
+            "weflow_ready": weflow_ready,
+        }
+        _write_weflow_sidebar_state(
+            data_dir,
+            {"last_discover": result, "last_error": "", **_weflow_public_params(params)},
+        )
+        _append_weflow_operation_history(data_dir, "discover-sessions", result)
+        return result
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "message": str(exc),
+            "type": type(exc).__name__,
+            "sessions": [],
+        }
+        _write_weflow_sidebar_state(
+            data_dir,
+            {"last_discover": result, "last_error": f"{type(exc).__name__}: {exc}", **_weflow_public_params(params)},
+        )
+        _append_weflow_operation_history(data_dir, "discover-sessions", result)
+        return result
 
 
 def sidebar_weflow_pull_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     result = _run_sidebar_weflow_once(data_dir, payload)
     _write_weflow_sidebar_state(data_dir, {"last_pull": result, **_weflow_public_params(_weflow_params(data_dir, payload))})
+    _append_weflow_operation_history(data_dir, "pull-once", result)
+    return result
+
+
+def _backfill_payload(payload: dict[str, Any], talkers: list[str]) -> dict[str, Any]:
+    """Normalize a caller payload into the forced backfill shape.
+
+    since=0 -> the bridge marks messages context_only (recorded but never
+    replied to); max_pages=0 walks every page so the whole history is captured.
+    Shared by the async job and the synchronous CLI path so both behave identically.
+    """
+
+    return {
+        **payload,
+        "talkers": talkers,
+        "since": 0,
+        "context_only": True,
+        "max_pages": _bounded_int(payload.get("max_pages"), 0, 0, 10000),
+        "max_messages": _bounded_int(payload.get("max_messages"), 0, 0, 1000000),
+    }
+
+
+def run_weflow_backfill_sync(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run a history backfill synchronously and return the final result.
+
+    The sidebar UI uses the async :func:`sidebar_weflow_backfill` (returns
+    immediately with a job it polls). A short-lived CLI process cannot poll a
+    daemon thread — it would exit before the thread ran — so the CLI calls this
+    blocking variant instead. Same forced since=0 / context_only / all-pages
+    semantics and system-account filtering.
+    """
+
+    talkers = _string_list(payload.get("talkers") or payload.get("talker") or [])
+    talkers = [talker for talker in talkers if not is_system_account(talker)]
+    if not talkers:
+        return {
+            "status": "error",
+            "error": "backfill requires an explicit talkers list (non-system account)",
+            "backfilled_talkers": [],
+        }
+    backfill_payload = _backfill_payload(payload, talkers)
+    result = _run_sidebar_weflow_once(data_dir, backfill_payload)
+    result = {**result, "backfill": True, "backfilled_talkers": talkers}
+    _write_weflow_sidebar_state(
+        data_dir,
+        {
+            "last_backfill": result,
+            "last_error": "" if result.get("status") != "error" else str(result.get("error") or ""),
+            **_weflow_public_params(_weflow_params(data_dir, backfill_payload)),
+        },
+    )
+    _append_weflow_operation_history(data_dir, "backfill", result)
     return result
 
 
@@ -271,22 +370,90 @@ def sidebar_weflow_backfill(data_dir: str | Path, payload: dict[str, Any]) -> di
             "error": "backfill requires an explicit talkers list (non-system account)",
             "backfilled_talkers": [],
         }
-    backfill_payload = {
-        **payload,
-        "talkers": talkers,
-        "since": 0,
-        "context_only": True,
-        # Walk all pages by default so the whole history is captured; callers can
-        # still cap the total with max_messages.
-        "max_pages": _bounded_int(payload.get("max_pages"), 0, 0, 10000),
-        "max_messages": _bounded_int(payload.get("max_messages"), 0, 0, 1000000),
+    root = Path(data_dir).resolve()
+    key = str(root)
+    with _WEFLOW_LOCK:
+        existing = _WEFLOW_BACKFILL_JOBS.get(key)
+        if existing and _thread_alive(existing.get("thread")):
+            result = {
+                "status": "running",
+                "message": "WeFlow backfill is already running",
+                "backfill_job": _public_backfill_job(existing),
+                "backfilled_talkers": existing.get("talkers", []),
+            }
+            _append_weflow_operation_history(data_dir, "backfill-already-running", result)
+            return result
+
+        stop_event = threading.Event()
+        job_id = f"backfill-{uuid4().hex[:12]}"
+        backfill_payload = _backfill_payload(payload, talkers)
+        job: dict[str, Any] = {
+            "job_id": job_id,
+            "status": "running",
+            "talkers": talkers,
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "cancel_requested": False,
+            "progress": {
+                "session_count": len(talkers),
+                "page_count": 0,
+                "scanned_count": 0,
+                "appended_count": 0,
+                "processed_count": 0,
+                "current_session_id": "",
+                "last_raw_id": "",
+            },
+            "result": {},
+            "last_error": "",
+            "stop": stop_event,
+        }
+        thread = threading.Thread(
+            target=_weflow_backfill_job_loop,
+            args=(root, backfill_payload, job_id, stop_event),
+            name="sidebar-weflow-backfill",
+            daemon=True,
+        )
+        job["thread"] = thread
+        _WEFLOW_BACKFILL_JOBS[key] = job
+        job_snapshot = _public_backfill_job(job)
+
+    result = {
+        "status": "started",
+        "message": "WeFlow history backfill started",
+        "backfill_job": job_snapshot,
+        "backfilled_talkers": talkers,
     }
-    result = _run_sidebar_weflow_once(data_dir, backfill_payload)
-    result = {**result, "backfill": True, "backfilled_talkers": talkers}
     _write_weflow_sidebar_state(
         data_dir,
-        {"last_backfill": result, **_weflow_public_params(_weflow_params(data_dir, backfill_payload))},
+        {"last_backfill": result, "backfill_job": result["backfill_job"], **_weflow_public_params(_weflow_params(data_dir, backfill_payload))},
     )
+    _append_weflow_operation_history(data_dir, "backfill-start", result)
+    thread.start()
+    return result
+
+
+def sidebar_weflow_cancel_backfill(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    key = str(root)
+    job_id = str((payload or {}).get("job_id") or (payload or {}).get("jobId") or "").strip()
+    with _WEFLOW_LOCK:
+        job = _WEFLOW_BACKFILL_JOBS.get(key)
+        if job_id and job and str(job.get("job_id")) != job_id:
+            job = None
+        if not job:
+            result = {"status": "idle", "message": "No active WeFlow backfill job", "backfill_job": _weflow_backfill_job_state(root)}
+            _append_weflow_operation_history(data_dir, "backfill-cancel", result)
+            return result
+        stop = job.get("stop")
+        if isinstance(stop, threading.Event):
+            stop.set()
+        job["cancel_requested"] = True
+        job["status"] = "cancel_requested" if _thread_alive(job.get("thread")) else str(job.get("status") or "stopped")
+        job["updated_at"] = time.time()
+        snapshot = _public_backfill_job(job)
+    _write_weflow_sidebar_state(data_dir, {"backfill_job": snapshot})
+    result = {"status": "cancel_requested", "message": "WeFlow backfill cancel signal sent", "backfill_job": snapshot}
+    _append_weflow_operation_history(data_dir, "backfill-cancel", result)
     return result
 
 
@@ -296,7 +463,9 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
     with _WEFLOW_LOCK:
         existing = _WEFLOW_WORKERS.get(key)
         if existing and existing.get("thread") and existing["thread"].is_alive():
-            return {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已经在运行"}
+            result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已经在运行"}
+            _append_weflow_operation_history(data_dir, "start", result)
+            return result
         stop_event = threading.Event()
         thread = threading.Thread(
             target=_weflow_background_loop,
@@ -312,7 +481,9 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
             "metrics": WeflowWorkerMetrics(),
         }
         thread.start()
-    return {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已启动"}
+    result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已启动"}
+    _append_weflow_operation_history(data_dir, "start", result)
+    return result
 
 
 def sidebar_weflow_stop(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -322,10 +493,17 @@ def sidebar_weflow_stop(data_dir: str | Path, payload: dict[str, Any]) -> dict[s
         worker = _WEFLOW_WORKERS.get(key)
         if worker and worker.get("stop"):
             worker["stop"].set()
-    return {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取停止信号已发送"}
+    result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取停止信号已发送"}
+    _append_weflow_operation_history(data_dir, "stop", result)
+    return result
 
 
-def sidebar_weflow_dependency_status(data_dir: str | Path = "data") -> dict[str, Any]:
+def sidebar_weflow_clear_history(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    _write_weflow_sidebar_state(data_dir, {"operation_history": []})
+    return {"status": "ok", "operation_history": []}
+
+
+def sidebar_weflow_dependency_status(data_dir: str | Path = "data", *, record_history: bool = True) -> dict[str, Any]:
     modules = {
         "PyMuPDF": "fitz",
         "pypdf": "pypdf",
@@ -345,11 +523,14 @@ def sidebar_weflow_dependency_status(data_dir: str | Path = "data") -> dict[str,
             "available": _subprocess_module_available(rapidocr_python, "rapidocr_onnxruntime"),
         }
     )
-    return {
+    result = {
         "status": "ok" if all(item["available"] for item in items) else "missing_optional",
         "items": items,
         "requirements": str(Path("requirements-ocr.txt").resolve()),
     }
+    if record_history:
+        _append_weflow_operation_history(data_dir, "dependencies", result)
+    return result
 
 
 def _subprocess_module_available(python_executable: Path, module: str) -> bool:
@@ -378,13 +559,15 @@ def sidebar_weflow_install_deps(data_dir: str | Path, payload: dict[str, Any]) -
         encoding="utf-8",
         errors="replace",
     )
-    return {
+    result = {
         "status": "ok" if completed.returncode == 0 else "failed",
         "returncode": completed.returncode,
         "stdout_tail": completed.stdout[-4000:],
         "stderr_tail": completed.stderr[-4000:],
-        "dependencies": sidebar_weflow_dependency_status(data_dir),
+        "dependencies": sidebar_weflow_dependency_status(data_dir, record_history=False),
     }
+    _append_weflow_operation_history(data_dir, "install-deps", result)
+    return result
 
 
 def build_sidebar_runtime_cards(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -404,7 +587,7 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
     reason = str(payload.get("reason", "")).strip()
     external_message_id = str(payload.get("external_message_id") or payload.get("externalMessageId") or "").strip()
     extra = payload.get("payload")
-    return bridge_ack(
+    result = bridge_ack(
         data_dir,
         bridge_id,
         status=status,
@@ -412,6 +595,14 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
         external_message_id=external_message_id,
         payload=extra if isinstance(extra, dict) else {},
     )
+    result["send_sync"] = sync_bridge_ack_to_send_state(
+        data_dir,
+        bridge_id,
+        status=status,
+        reason=reason,
+        external_message_id=external_message_id,
+    )
+    return result
 
 
 def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -474,17 +665,67 @@ def _build_weflow_pull_context(data_dir: str | Path, payload: dict[str, Any]) ->
         PollingRunner(runtime, driver, poll_interval_seconds=0),
         hook_event_file=params["hook_event_file"],
         backend_event_file=params["backend_event_file"],
+        # Serialize the consume step across processes (background worker tick,
+        # ad-hoc pull-once, async backfill, and any CLI consumer) so they take
+        # turns over the shared hook offset + deduper instead of overlapping.
+        consume_lock_enabled=True,
     )
     return {
         "params": params,
         "bridge": bridge,
         "runner": runner,
+        "runtime": runtime,
+        "config_path": Path(config.data_dir) / "config.json",
+        "config_mtime": _config_mtime(Path(config.data_dir)),
         "weflow_ready": weflow_ready,
         "media_roots": media_roots,
     }
 
 
-def _run_weflow_pull_tick(context: dict[str, Any]) -> dict[str, Any]:
+def _config_mtime(data_dir: Path) -> float:
+    try:
+        return (Path(data_dir) / "config.json").stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _refresh_weflow_send_controls(context: dict[str, Any]) -> bool:
+    """Pick up live send-control changes without tearing down the pull context.
+
+    The pull driver's in-memory dedup state must survive across ticks, so we do
+    NOT rebuild the whole context. Instead, when ``config.json`` changes on disk,
+    we re-read it and refresh only the send side of the runtime (send backend
+    driver + executor + reply-gate mode). ``GuardedSendExecutor`` reads config
+    live off its ``config`` attribute, so swapping it is enough for
+    ``send_enabled`` / ``send_driver`` / ``send_confirm_required`` changes to
+    take effect on the next reply.
+    """
+
+    runtime = context.get("runtime")
+    if runtime is None:
+        return False
+    data_dir = Path(getattr(runtime.config, "data_dir", context.get("config_path", Path("data")).parent))
+    current_mtime = _config_mtime(data_dir)
+    if current_mtime == context.get("config_mtime"):
+        return False
+    context["config_mtime"] = current_mtime
+    try:
+        new_config = load_config(data_dir)
+    except Exception:
+        return False
+    runtime.config = new_config
+    send_driver = build_send_driver(new_config)
+    runtime.reply_gate.mode = new_config.mode
+    runtime.reply_gate.auto_executor = GuardedSendExecutor(new_config, send_driver)
+    return True
+
+
+def _run_weflow_pull_tick(
+    context: dict[str, Any],
+    *,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Any = None,
+) -> dict[str, Any]:
     params = context["params"]
     bridge: WeFlowHttpBridge = context["bridge"]
     runner: HookMessagePullRunner = context["runner"]
@@ -499,10 +740,28 @@ def _run_weflow_pull_tick(context: dict[str, Any]) -> dict[str, Any]:
         workers=params["workers"],
         media=params["media"],
         context_only=params["context_only"],
+        cancel_event=cancel_event,
+        progress_callback=progress_callback,
     )
-    pull = runner.run_once()
+    if cancel_event is not None and cancel_event.is_set():
+        pull = {
+            "status": "cancelled",
+            "hook_event_file": str(params["hook_event_file"]),
+            "backend_event_file": str(params["backend_event_file"]),
+            "processed_count": 0,
+            "processed": [],
+            "send_enabled": False,
+        }
+    else:
+        # Single-instance the consume step so a concurrent worker tick / backfill
+        # / pull-once never race the shared hook offset and message deduper.
+        with _WEFLOW_CONSUMER_LOCK:
+            pull = runner.run_once()
+    status = "ok" if source.status == "ok" and pull.get("status") == "ok" else "partial_error"
+    if source.status == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+        status = "cancelled"
     return {
-        "status": "ok" if source.status == "ok" and pull.get("status") == "ok" else "partial_error",
+        "status": status,
         "base_url": bridge.base_url,
         "workers": params["workers"],
         "hook_event_file": str(params["hook_event_file"]),
@@ -515,9 +774,15 @@ def _run_weflow_pull_tick(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_sidebar_weflow_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+def _run_sidebar_weflow_once(
+    data_dir: str | Path,
+    payload: dict[str, Any],
+    *,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Any = None,
+) -> dict[str, Any]:
     context = _build_weflow_pull_context(data_dir, payload)
-    return _run_weflow_pull_tick(context)
+    return _run_weflow_pull_tick(context, cancel_event=cancel_event, progress_callback=progress_callback)
 
 
 def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
@@ -547,6 +812,11 @@ def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: thr
             try:
                 if context is None:
                     context = _build_weflow_pull_context(root, payload)
+                else:
+                    # Pick up live send-control edits (mode / send_enabled /
+                    # send_driver / send_backend) without rebuilding the pull
+                    # context, so the driver's dedup state survives.
+                    _refresh_weflow_send_controls(context)
                 result = _run_weflow_pull_tick(context)
                 duration = time.monotonic() - tick_started
                 source_status = str(result.get("source", {}).get("status") or "")
@@ -588,7 +858,7 @@ def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: thr
 def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(data_dir)
     token_env = str(payload.get("token_env") or payload.get("tokenEnv") or "WEFLOW_API_TOKEN").strip()
-    token = str(payload.get("token") or "").strip() or os.environ.get(token_env, "") or os.environ.get("WEFLOW_API_TOKEN", "")
+    token = str(payload.get("token") or "").strip() or _env_value(token_env) or _env_value("WEFLOW_API_TOKEN")
     since_value = payload.get("since")
     since = int(since_value) if since_value not in (None, "") else None
     return {
@@ -611,6 +881,63 @@ def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
         "media": not bool(payload.get("no_media") or payload.get("noMedia") or False),
         "context_only": bool(payload.get("context_only") or payload.get("contextOnly") or (since is not None and since <= 0)),
         "extra_roots": _string_list(payload.get("extra_roots") or payload.get("extraRoots") or []),
+    }
+
+
+def _env_value(name: str) -> str:
+    key = str(name or "").strip()
+    if not key:
+        return ""
+    value = os.environ.get(key, "")
+    if value:
+        return value
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as env_key:
+            raw, _ = winreg.QueryValueEx(env_key, key)
+    except Exception:
+        return ""
+    return str(raw or "").strip()
+
+
+def _normalize_weflow_session(session: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(session, dict):
+        return {}
+    session_id = str(
+        session.get("id")
+        or session.get("username")
+        or session.get("talker")
+        or session.get("sessionId")
+        or session.get("session_id")
+        or ""
+    ).strip()
+    name = str(
+        session.get("name")
+        or session.get("displayName")
+        or session.get("display_name")
+        or session.get("remark")
+        or session.get("nickName")
+        or session.get("nickname")
+        or session.get("groupName")
+        or session.get("group_name")
+        or session_id
+    ).strip()
+    session_type = str(session.get("type") or session.get("sessionType") or session.get("session_type") or "").strip()
+    if not session_type:
+        session_type = "group" if session_id.endswith("@chatroom") else "private"
+    return {
+        **session,
+        "id": session_id,
+        "name": name or session_id,
+        "type": session_type,
+        "unread_count": session.get("unread_count", session.get("unreadCount", session.get("unread"))),
+        "last_message_time": session.get(
+            "last_message_time",
+            session.get("lastMessageTime", session.get("lastActiveTime", session.get("updateTime"))),
+        ),
     }
 
 
@@ -640,6 +967,149 @@ def _voice_cache_resolver(config: Any, *, extra_roots: list[str] | None = None) 
     )
 
 
+def _weflow_backfill_job_loop(root: Path, payload: dict[str, Any], job_id: str, stop_event: threading.Event) -> None:
+    def progress(update: dict[str, Any]) -> None:
+        _update_backfill_job(root, job_id, progress=update, force=False)
+
+    try:
+        _update_backfill_job(root, job_id, status="running", progress={"event": "started"}, force=True)
+        result = _run_sidebar_weflow_once(root, payload, cancel_event=stop_event, progress_callback=progress)
+        result = {**result, "backfill": True, "backfilled_talkers": payload.get("talkers", [])}
+        if stop_event.is_set() and result.get("status") != "cancelled":
+            result = {**result, "status": "cancelled"}
+        final_status = "cancelled" if result.get("status") == "cancelled" else "completed"
+        _update_backfill_job(
+            root,
+            job_id,
+            status="finalizing",
+            result=result,
+            progress={
+                "scanned_count": result.get("source", {}).get("scanned_count", 0),
+                "appended_count": result.get("source", {}).get("appended_count", 0),
+                "processed_count": result.get("pull", {}).get("processed_count", 0),
+                "event": final_status,
+            },
+            force=True,
+        )
+        _write_weflow_sidebar_state(
+            root,
+            {"last_backfill": result, "last_error": "", "backfill_job": _weflow_backfill_job_state(root), **_weflow_public_params(_weflow_params(root, payload))},
+        )
+        _append_weflow_operation_history(root, "backfill", result)
+        _update_backfill_job(root, job_id, status=final_status, progress={"event": final_status}, force=True)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        result = {"status": "error", "error": error, "backfill": True, "backfilled_talkers": payload.get("talkers", [])}
+        _update_backfill_job(root, job_id, status="error", result=result, last_error=error, force=True)
+        _write_weflow_sidebar_state(
+            root,
+            {"last_backfill": result, "last_error": error, "backfill_job": _weflow_backfill_job_state(root), **_weflow_public_params(_weflow_params(root, payload))},
+        )
+        _append_weflow_operation_history(root, "backfill", result)
+
+
+def _update_backfill_job(
+    root: Path,
+    job_id: str,
+    *,
+    status: str | None = None,
+    progress: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    last_error: str | None = None,
+    force: bool = False,
+) -> None:
+    key = str(root.resolve())
+    should_write = force
+    with _WEFLOW_LOCK:
+        job = _WEFLOW_BACKFILL_JOBS.get(key)
+        if not job or str(job.get("job_id")) != job_id:
+            return
+        now = time.time()
+        if status is not None:
+            job["status"] = status
+        if result is not None:
+            job["result"] = result
+        if last_error is not None:
+            job["last_error"] = last_error
+        if progress:
+            current = job.get("progress")
+            if not isinstance(current, dict):
+                current = {}
+            event = str(progress.get("event") or "")
+            if event == "page":
+                current["page_count"] = int(progress.get("page_count") or current.get("page_count") or 0)
+                current["current_session_id"] = str(progress.get("session_id") or current.get("current_session_id") or "")
+                current["page_messages"] = int(progress.get("page_messages") or 0)
+                current["total_messages"] = int(progress.get("total_messages") or current.get("total_messages") or 0)
+                current["has_more"] = bool(progress.get("has_more"))
+            elif event == "message":
+                current["current_session_id"] = str(progress.get("session_id") or current.get("current_session_id") or "")
+                current["scanned_count"] = max(int(current.get("scanned_count") or 0), int(progress.get("scanned_count") or 0))
+                current["appended_count"] = max(int(current.get("appended_count") or 0), int(progress.get("appended_count") or 0))
+                current["last_raw_id"] = str(progress.get("last_raw_id") or current.get("last_raw_id") or "")
+            elif event == "sessions":
+                current["session_count"] = int(progress.get("session_count") or current.get("session_count") or 0)
+            else:
+                current.update({key: value for key, value in progress.items() if value not in ("", None)})
+            current["event"] = event or str(current.get("event") or "")
+            job["progress"] = current
+        job["updated_at"] = now
+        last_write = float(job.get("_last_state_write", 0) or 0)
+        if should_write or now - last_write >= 0.75:
+            job["_last_state_write"] = now
+            should_write = True
+        snapshot = _public_backfill_job(job)
+    if should_write:
+        _write_weflow_sidebar_state(root, {"backfill_job": snapshot})
+
+
+def _weflow_backfill_job_state(root: Path, persisted: dict[str, Any] | None = None) -> dict[str, Any]:
+    key = str(root.resolve())
+    with _WEFLOW_LOCK:
+        job = _WEFLOW_BACKFILL_JOBS.get(key)
+        if job:
+            return _public_backfill_job(job)
+    persisted_job = (persisted or {}).get("backfill_job") if isinstance(persisted, dict) else {}
+    if not isinstance(persisted_job, dict):
+        return {}
+    # No live thread backs a persisted snapshot (e.g. the server restarted while
+    # a backfill was mid-flight). Never report it as still running, or the UI
+    # would keep the Backfill button disabled and Cancel enabled forever with
+    # nothing left to clear the flag.
+    running = bool(persisted_job.get("running"))
+    if running:
+        status = str(persisted_job.get("status") or "")
+        interrupted = status in {"running", "cancel_requested", ""}
+        return {
+            **persisted_job,
+            "running": False,
+            "status": "interrupted" if interrupted else status,
+        }
+    return persisted_job
+
+
+def _public_backfill_job(job: dict[str, Any]) -> dict[str, Any]:
+    running = _thread_alive(job.get("thread"))
+    status = str(job.get("status") or ("running" if running else "idle"))
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "status": status,
+        "running": running,
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "talkers": list(job.get("talkers") or []),
+        "started_at": job.get("started_at", 0),
+        "updated_at": job.get("updated_at", 0),
+        "seconds_running": round(max(0.0, time.time() - float(job.get("started_at") or time.time())), 3) if running else 0,
+        "progress": job.get("progress") if isinstance(job.get("progress"), dict) else {},
+        "last_error": str(job.get("last_error") or ""),
+        "result": _compact_weflow_history_payload(job.get("result") or {}),
+    }
+
+
+def _thread_alive(value: Any) -> bool:
+    return isinstance(value, threading.Thread) and value.is_alive()
+
+
 def _weflow_worker_state(root: Path) -> dict[str, Any]:
     key = str(root.resolve())
     with _WEFLOW_LOCK:
@@ -664,11 +1134,84 @@ def _weflow_worker_state(root: Path) -> dict[str, Any]:
 
 def _write_weflow_sidebar_state(data_dir: str | Path, update: dict[str, Any]) -> None:
     path = Path(data_dir) / "weflow_sidebar_state.json"
-    current = _read_json(path, {})
-    payload = current if isinstance(current, dict) else {}
-    payload.update(update)
-    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    _write_json(path, payload)
+    with _WEFLOW_STATE_FILE_LOCK:
+        current = _read_json(path, {})
+        payload = current if isinstance(current, dict) else {}
+        payload.update(update)
+        payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_json(path, payload)
+
+
+def _append_weflow_operation_history(data_dir: str | Path, action: str, result: dict[str, Any]) -> None:
+    path = Path(data_dir) / "weflow_sidebar_state.json"
+    with _WEFLOW_STATE_FILE_LOCK:
+        current = _read_json(path, {})
+        payload = current if isinstance(current, dict) else {}
+        existing = payload.get("operation_history")
+        history = existing if isinstance(existing, list) else []
+        entry = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "action": str(action),
+            "status": str(result.get("status", "")) if isinstance(result, dict) else "",
+            "summary": _weflow_operation_summary(result),
+            "result": _compact_weflow_history_payload(result),
+        }
+        payload["operation_history"] = [entry, *[item for item in history if isinstance(item, dict)]][:50]
+        payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_json(path, payload)
+
+
+def _weflow_operation_summary(result: dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return ""
+    message = str(result.get("message") or result.get("error") or "").strip()
+    parts = []
+    if result.get("count") is not None:
+        parts.append(f"会话数={result.get('count')}")
+    if "backfilled_talkers" in result:
+        talkers = result.get("backfilled_talkers")
+        if isinstance(talkers, list):
+            parts.append(f"回填对象={len(talkers)}个")
+        else:
+            parts.append(f"回填对象={talkers}")
+    if result.get("workers") is not None:
+        parts.append(f"workers={result.get('workers')}")
+    source = result.get("source") if isinstance(result.get("source"), dict) else {}
+    pull = result.get("pull") if isinstance(result.get("pull"), dict) else {}
+    imported = pull.get("import") if isinstance(pull.get("import"), dict) else {}
+    if source:
+        if source.get("status") is not None:
+            parts.append(f"源={source.get('status')}")
+        if source.get("scanned_count") is not None:
+            parts.append(f"源扫描={source.get('scanned_count')}")
+        if source.get("appended_count") is not None:
+            parts.append(f"源新增={source.get('appended_count')}")
+    if imported and imported.get("appended_count") is not None:
+        parts.append(f"导入后端={imported.get('appended_count')}")
+    if pull:
+        if pull.get("processed_count") is not None:
+            parts.append(f"写入对话={pull.get('processed_count')}")
+    if message:
+        parts.append(message)
+    return " / ".join(part for part in parts if part and not part.endswith("=None"))[:500]
+
+
+def _compact_weflow_history_payload(value: Any, *, depth: int = 0) -> Any:
+    if depth > 3:
+        return "<truncated>"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 30:
+                result["<truncated_keys>"] = max(0, len(value) - index)
+                break
+            result[str(key)] = _compact_weflow_history_payload(item, depth=depth + 1)
+        return result
+    if isinstance(value, list):
+        return [_compact_weflow_history_payload(item, depth=depth + 1) for item in value[:20]]
+    if isinstance(value, str):
+        return value if len(value) <= 1000 else value[:1000] + "...<truncated>"
+    return value
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -724,10 +1267,8 @@ def _background_send_status(config: Any, bridge: dict[str, Any]) -> str:
     if str(getattr(config, "send_driver", "")) == "bridge_outbox":
         if not bool(getattr(config, "send_enabled", False)):
             return "bridge_outbox_configured_disabled"
-        if int(bridge.get("manual_bound_count", 0) or 0) > 0:
-            return "bridge_outbox_ready_for_manual_channels"
-        return "bridge_outbox_waiting_for_manual_capture"
-    return "bridge_outbox_manual_capture_only_available"
+        return "bridge_outbox_ready"
+    return "bridge_outbox_available"
 
 
 def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> Path:

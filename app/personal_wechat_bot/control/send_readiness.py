@@ -44,7 +44,6 @@ def _checks(preflight: dict[str, Any]) -> list[dict[str, str]]:
     wechat_access = preflight.get("wechat_access", {})
     model = preflight.get("model", {})
     channels = preflight.get("conversation_channels", {})
-    manual_bound_count = int(wechat_access.get("manual_bound_channels", {}).get("count", 0) or 0)
     checks: list[dict[str, str]] = []
     checks.append(
         _check(
@@ -104,14 +103,6 @@ def _checks(preflight: dict[str, Any]) -> list[dict[str, str]]:
     )
     checks.append(
         _check(
-            "manual_bridge_channels",
-            "pass" if wechat_access.get("send_driver") != "bridge_outbox" or manual_bound_count > 0 else "blocker",
-            f"{manual_bound_count} manually captured channel(s) available for bridge_outbox",
-            "bridge_outbox requires at least one manually captured WeChat channel binding",
-        )
-    )
-    checks.append(
-        _check(
             "confirm_first_rollout",
             "pass" if preflight.get("mode") == "confirm" else "warn",
             "confirm mode is active",
@@ -139,7 +130,7 @@ def _required_next_steps(blockers: list[dict[str, str]]) -> list[str]:
     if "send_enabled" in ids:
         next_steps.append("keep send_enabled=false until a guarded send driver passes confirm-mode rollout")
     if "manual_bridge_channels" in ids:
-        next_steps.append("manually bind at least one target WeChat conversation before using bridge_outbox")
+        next_steps.append("start the WeChatFerry send bridge worker (scripts/send_bridge_worker.py) before using bridge_outbox")
     if "api_keys" in ids:
         next_steps.append("configure at least one available model API key")
     return next_steps
@@ -152,7 +143,7 @@ def _recommended_rollout(preflight: dict[str, Any]) -> list[str]:
         steps = [
             "keep confirm mode active while validating guarded real sends",
             "approve/send only from the sidebar or confirm queue after reviewing message text",
-            "switch focus to the exact target WeChat chat before probe/send countdown ends",
+            "start the WeChatFerry send bridge worker so approved replies are delivered non-foreground by wxid/roomid",
             "limit initial real sending to one private conversation and very low rate",
             "only consider auto mode after confirm-mode audit logs are clean",
         ]

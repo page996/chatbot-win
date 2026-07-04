@@ -39,6 +39,9 @@ class BotConfig:
     data_dir: str = "data"
     send_enabled: bool = False
     send_driver: str = "not_implemented"
+    send_backend: str = "dry_run"
+    wcf_host: str = "127.0.0.1"
+    wcf_port: int = 10086
     send_confirm_required: bool = True
     send_max_chars: int = 800
     send_min_interval_seconds: int = 5
@@ -106,6 +109,12 @@ class BotConfig:
         ]
     )
     file_max_bytes: int = 20 * 1024 * 1024
+    # Outgoing (agent-produced) files are trusted artifacts, so they use relaxed
+    # limits: an empty allowed-extensions list disables the extension gate, and a
+    # larger size cap avoids blocking legitimate tool outputs (archives, media).
+    # Integrity of the agent's own output takes priority over the inbound guard.
+    outgoing_file_allowed_extensions: list[str] = field(default_factory=list)
+    outgoing_file_max_bytes: int = 200 * 1024 * 1024
     search_blocklist: list[str] = field(
         default_factory=lambda: [
             "baidu.com",
