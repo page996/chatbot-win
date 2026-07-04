@@ -14,7 +14,9 @@ from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 
 
 CHANNEL_POLICY = "auto_accept_wechat_contacts_and_groups"
-TRUSTED_CHANNEL_SOURCES = frozenset({"backend_events_jsonl", "backend_file_watcher", "manual_backend_event"})
+TRUSTED_CHANNEL_SOURCES = frozenset(
+    {"backend_events_jsonl", "backend_file_watcher", "manual_backend_event", "weflow_discovery"}
+)
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from importlib.util import find_spec
 from pathlib import Path
@@ -16,18 +17,21 @@ from uuid import uuid4
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.config.loader import load_config, migrate_file_allowed_extensions
-from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
-from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
+from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
+from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
+from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
-from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError
+from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError, blocking_process_lock
 from app.personal_wechat_bot.runtime.weflow_state_summary import summarize_weflow_bridge_state
 from app.personal_wechat_bot.runtime.weflow_worker_metrics import WeflowWorkerMetrics
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
+from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
+    clear_send_audit,
     list_confirm_queue,
     list_send_audit,
     probe_send_controls,
@@ -57,6 +61,7 @@ _WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
 _WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
 _WEFLOW_LOCK = threading.Lock()
 _WEFLOW_STATE_FILE_LOCK = threading.RLock()
+_WEFLOW_OPERATION_LOCK = threading.Lock()
 # Serializes the hook *consume* step (import + backend replay + scheduler)
 # across threads *within this process*. It fronts the cross-process file lock
 # (HookMessagePullRunner.consume_lock_path) so at most one sidebar thread polls
@@ -73,7 +78,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
     config = load_config(data_dir)
     queues = {status: list_confirm_queue(data_dir, status=status) for status in QUEUE_STATUSES}
     channels = _channel_state(data_dir)
-    send_bridge = bridge_state(data_dir, limit=12)
+    send_bridge = _sidebar_bridge_state(data_dir, channels_state=channels, limit=12)
     return {
         "status": "ok",
         "role": "visual_audit_console",
@@ -183,13 +188,18 @@ def append_sidebar_backend_event(data_dir: str | Path, payload: dict[str, Any]) 
 
 
 def build_sidebar_bridge_state(data_dir: str | Path = "data") -> dict[str, Any]:
-    return bridge_state(data_dir, limit=50)
+    return _sidebar_bridge_state(data_dir, limit=50)
+
+
+def clear_sidebar_send_audit(data_dir: str | Path) -> dict[str, Any]:
+    return clear_send_audit(data_dir)
 
 
 def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
     root = Path(data_dir)
     persisted = _read_json(root / "weflow_sidebar_state.json", {})
     worker = _weflow_worker_state(root)
+    cached_sessions = _weflow_cached_sessions_from_channels(root, limit=200)
     try:
         migration = migrate_file_allowed_extensions(root)
     except Exception as exc:
@@ -215,6 +225,12 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "bridge_state": summarize_weflow_bridge_state(root / "weflow_bridge_state.json"),
         "last_health": persisted.get("last_health", {}) if isinstance(persisted, dict) else {},
         "last_discover": persisted.get("last_discover", {}) if isinstance(persisted, dict) else {},
+        "discovered_sessions": {
+            "status": "ok",
+            "source": "channel_store",
+            "count": len(cached_sessions),
+            "sessions": cached_sessions,
+        },
         "last_pull": persisted.get("last_pull", {}) if isinstance(persisted, dict) else {},
         "last_backfill": persisted.get("last_backfill", {}) if isinstance(persisted, dict) else {},
         "operation_history": persisted.get("operation_history", []) if isinstance(persisted, dict) else [],
@@ -262,30 +278,58 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
             for session in (_normalize_weflow_session(item) for item in bridge.list_sessions(limit=limit))
             if session.get("id") and not is_system_account(session.get("id"))
         ]
+        registration = _register_weflow_sessions(data_dir, sessions)
         result = {
             "status": "ok",
+            "source": "weflow_live",
             "sessions": sessions,
             "count": len(sessions),
+            **registration,
             "weflow_ready": weflow_ready,
         }
-        _write_weflow_sidebar_state(
+        _record_weflow_state_safely(
             data_dir,
             {"last_discover": result, "last_error": "", **_weflow_public_params(params)},
+            action="discover-sessions",
+            result=result,
         )
-        _append_weflow_operation_history(data_dir, "discover-sessions", result)
         return result
     except Exception as exc:
+        cached_sessions = _weflow_cached_sessions_from_channels(data_dir, limit=limit)
+        if cached_sessions:
+            result = {
+                "status": "ok",
+                "source": "channel_store_cache",
+                "live_status": "error",
+                "live_error": f"{type(exc).__name__}: {exc}",
+                "message": "实时发现失败，已返回本地通道库中的 WeFlow 会话",
+                "sessions": cached_sessions,
+                "count": len(cached_sessions),
+                "registered_count": len(cached_sessions),
+            }
+            _record_weflow_state_safely(
+                data_dir,
+                {
+                    "last_discover": result,
+                    "last_error": f"{type(exc).__name__}: {exc}",
+                    **_weflow_public_params(params),
+                },
+                action="discover-sessions-cache",
+                result=result,
+            )
+            return result
         result = {
             "status": "error",
             "message": str(exc),
             "type": type(exc).__name__,
             "sessions": [],
         }
-        _write_weflow_sidebar_state(
+        _record_weflow_state_safely(
             data_dir,
             {"last_discover": result, "last_error": f"{type(exc).__name__}: {exc}", **_weflow_public_params(params)},
+            action="discover-sessions",
+            result=result,
         )
-        _append_weflow_operation_history(data_dir, "discover-sessions", result)
         return result
 
 
@@ -489,11 +533,21 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
 def sidebar_weflow_stop(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(data_dir).resolve()
     key = str(root)
+    thread: threading.Thread | None = None
     with _WEFLOW_LOCK:
         worker = _WEFLOW_WORKERS.get(key)
         if worker and worker.get("stop"):
             worker["stop"].set()
-    result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取停止信号已发送"}
+            worker["stop_requested"] = True
+            thread = worker.get("thread") if isinstance(worker.get("thread"), threading.Thread) else None
+    if thread is not None:
+        thread.join(timeout=1.0)
+    worker_state = _weflow_worker_state(root)
+    result = {
+        "status": "ok",
+        "worker": worker_state,
+        "message": "WeFlow 后台拉取已停止" if not worker_state.get("running") else "WeFlow 后台拉取停止信号已发送，当前 tick 会先收尾",
+    }
     _append_weflow_operation_history(data_dir, "stop", result)
     return result
 
@@ -504,30 +558,8 @@ def sidebar_weflow_clear_history(data_dir: str | Path, payload: dict[str, Any] |
 
 
 def sidebar_weflow_dependency_status(data_dir: str | Path = "data", *, record_history: bool = True) -> dict[str, Any]:
-    modules = {
-        "PyMuPDF": "fitz",
-        "pypdf": "pypdf",
-        "pdfminer.six": "pdfminer",
-        "openpyxl": "openpyxl",
-    }
-    items = [
-        {"package": package, "module": module, "runtime": "main_python", "available": find_spec(module) is not None}
-        for package, module in modules.items()
-    ]
-    rapidocr_python = Path("vendor/ocr-python/Scripts/python.exe")
-    items.append(
-        {
-            "package": "rapidocr-onnxruntime",
-            "module": "rapidocr_onnxruntime",
-            "runtime": str(rapidocr_python),
-            "available": _subprocess_module_available(rapidocr_python, "rapidocr_onnxruntime"),
-        }
-    )
-    result = {
-        "status": "ok" if all(item["available"] for item in items) else "missing_optional",
-        "items": items,
-        "requirements": str(Path("requirements-ocr.txt").resolve()),
-    }
+    with _weflow_exclusive_operation(data_dir, label="weflow_dependency_status"):
+        result = {**_weflow_dependency_status_snapshot(), "exclusive_operation": True}
     if record_history:
         _append_weflow_operation_history(data_dir, "dependencies", result)
     return result
@@ -550,24 +582,53 @@ def sidebar_weflow_install_deps(data_dir: str | Path, payload: dict[str, Any]) -
     if not bool(payload.get("confirm_install", False)):
         raise ValueError("confirm_install=true is required")
     requirements = Path("requirements-ocr.txt").resolve()
-    completed = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
-        capture_output=True,
-        text=True,
-        timeout=900,
-        check=False,
-        encoding="utf-8",
-        errors="replace",
-    )
-    result = {
-        "status": "ok" if completed.returncode == 0 else "failed",
-        "returncode": completed.returncode,
-        "stdout_tail": completed.stdout[-4000:],
-        "stderr_tail": completed.stderr[-4000:],
-        "dependencies": sidebar_weflow_dependency_status(data_dir, record_history=False),
-    }
+    with _weflow_exclusive_operation(data_dir, label="weflow_install_deps", wait_timeout_seconds=1200.0):
+        completed = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+        result = {
+            "status": "ok" if completed.returncode == 0 else "failed",
+            "returncode": completed.returncode,
+            "stdout_tail": completed.stdout[-4000:],
+            "stderr_tail": completed.stderr[-4000:],
+            "dependencies": _weflow_dependency_status_snapshot(),
+            "exclusive_operation": True,
+        }
     _append_weflow_operation_history(data_dir, "install-deps", result)
     return result
+
+
+def _weflow_dependency_status_snapshot() -> dict[str, Any]:
+    modules = {
+        "PyMuPDF": "fitz",
+        "pypdf": "pypdf",
+        "pdfminer.six": "pdfminer",
+        "openpyxl": "openpyxl",
+    }
+    items = [
+        {"package": package, "module": module, "runtime": "main_python", "available": find_spec(module) is not None}
+        for package, module in modules.items()
+    ]
+    rapidocr_python = Path("vendor/ocr-python/Scripts/python.exe")
+    items.append(
+        {
+            "package": "rapidocr-onnxruntime",
+            "module": "rapidocr_onnxruntime",
+            "runtime": str(rapidocr_python),
+            "available": _subprocess_module_available(rapidocr_python, "rapidocr_onnxruntime"),
+        }
+    )
+    return {
+        "status": "ok" if all(item["available"] for item in items) else "missing_optional",
+        "items": items,
+        "requirements": str(Path("requirements-ocr.txt").resolve()),
+    }
 
 
 def build_sidebar_runtime_cards(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -729,34 +790,36 @@ def _run_weflow_pull_tick(
     params = context["params"]
     bridge: WeFlowHttpBridge = context["bridge"]
     runner: HookMessagePullRunner = context["runner"]
-    source = bridge.pull_once(
-        talkers=params["talkers"],
-        session_limit=params["session_limit"],
-        message_limit=params["message_limit"],
-        max_pages=params["max_pages"],
-        max_messages=params["max_messages"],
-        since=params["since"],
-        lookback_seconds=params["lookback_seconds"],
-        workers=params["workers"],
-        media=params["media"],
-        context_only=params["context_only"],
-        cancel_event=cancel_event,
-        progress_callback=progress_callback,
-    )
-    if cancel_event is not None and cancel_event.is_set():
-        pull = {
-            "status": "cancelled",
-            "hook_event_file": str(params["hook_event_file"]),
-            "backend_event_file": str(params["backend_event_file"]),
-            "processed_count": 0,
-            "processed": [],
-            "send_enabled": False,
-        }
-    else:
-        # Single-instance the consume step so a concurrent worker tick / backfill
-        # / pull-once never race the shared hook offset and message deduper.
-        with _WEFLOW_CONSUMER_LOCK:
-            pull = runner.run_once()
+    lock_root = Path(params.get("hook_state_file") or params.get("hook_event_file") or "data").parent
+    with _weflow_exclusive_operation(lock_root, label="weflow_pull_tick"):
+        source = bridge.pull_once(
+            talkers=params["talkers"],
+            session_limit=params["session_limit"],
+            message_limit=params["message_limit"],
+            max_pages=params["max_pages"],
+            max_messages=params["max_messages"],
+            since=params["since"],
+            lookback_seconds=params["lookback_seconds"],
+            workers=params["workers"],
+            media=params["media"],
+            context_only=params["context_only"],
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            pull = {
+                "status": "cancelled",
+                "hook_event_file": str(params["hook_event_file"]),
+                "backend_event_file": str(params["backend_event_file"]),
+                "processed_count": 0,
+                "processed": [],
+                "send_enabled": False,
+            }
+        else:
+            # Single-instance the consume step so a concurrent worker tick / backfill
+            # / pull-once never race the shared hook offset and message deduper.
+            with _WEFLOW_CONSUMER_LOCK:
+                pull = runner.run_once()
     status = "ok" if source.status == "ok" and pull.get("status") == "ok" else "partial_error"
     if source.status == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
         status = "cancelled"
@@ -826,33 +889,52 @@ def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: thr
                     # fork-marker check before pulling again.
                     context = None
                 consumer_lock.heartbeat()
+                tick_record: dict[str, Any] = {}
                 with _WEFLOW_LOCK:
                     worker = _WEFLOW_WORKERS.get(key, {})
                     metrics = worker.get("metrics")
                     if isinstance(metrics, WeflowWorkerMetrics):
-                        metrics.record_tick(result, duration)
+                        tick_record = metrics.record_tick(result, duration).to_dict()
                     worker["last_status"] = result.get("status", "")
                     worker["last_tick_at"] = time.time()
                     _WEFLOW_WORKERS[key] = worker
                 _write_weflow_sidebar_state(root, {"last_pull": result, "last_error": "", **_weflow_public_params(_weflow_params(root, payload))})
+                _append_weflow_operation_history(
+                    root,
+                    "background-tick",
+                    {**result, "background": True, "tick": tick_record},
+                )
             except Exception as exc:
                 context = None
                 duration = time.monotonic() - tick_started
                 error = f"{type(exc).__name__}: {exc}"
                 consumer_lock.heartbeat()
+                tick_record = {}
                 with _WEFLOW_LOCK:
                     worker = _WEFLOW_WORKERS.get(key, {})
                     metrics = worker.get("metrics")
                     if isinstance(metrics, WeflowWorkerMetrics):
-                        metrics.record_error(error, duration)
+                        tick_record = metrics.record_error(error, duration).to_dict()
                     worker["last_status"] = "error"
                     worker["last_error"] = error
                     worker["last_tick_at"] = time.time()
                     _WEFLOW_WORKERS[key] = worker
                 _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
+                _append_weflow_operation_history(
+                    root,
+                    "background-tick",
+                    {"status": "error", "error": error, "background": True, "tick": tick_record},
+                )
             stop_event.wait(interval)
     finally:
         consumer_lock.release()
+        with _WEFLOW_LOCK:
+            worker = _WEFLOW_WORKERS.get(key, {})
+            worker["stop_requested"] = False
+            if str(worker.get("last_status") or "") not in {"error"}:
+                worker["last_status"] = "stopped"
+            worker["last_tick_at"] = time.time()
+            _WEFLOW_WORKERS[key] = worker
 
 
 def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -903,6 +985,26 @@ def _env_value(name: str) -> str:
     return str(raw or "").strip()
 
 
+@contextmanager
+def _weflow_exclusive_operation(
+    data_dir: str | Path,
+    *,
+    label: str,
+    wait_timeout_seconds: float = 900.0,
+):
+    root = Path(data_dir)
+    lock_path = root / "weflow_global_operation.lock"
+    with _WEFLOW_OPERATION_LOCK:
+        with blocking_process_lock(
+            lock_path,
+            label=label,
+            stale_after_seconds=1800.0,
+            wait_timeout_seconds=wait_timeout_seconds,
+            poll_interval_seconds=0.05,
+        ):
+            yield
+
+
 def _normalize_weflow_session(session: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(session, dict):
         return {}
@@ -939,6 +1041,103 @@ def _normalize_weflow_session(session: dict[str, Any]) -> dict[str, Any]:
             session.get("lastMessageTime", session.get("lastActiveTime", session.get("updateTime"))),
         ),
     }
+
+
+def _register_weflow_sessions(data_dir: str | Path, sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        store = _channel_store(data_dir)
+    except Exception as exc:
+        return {
+            "registered_count": 0,
+            "registered_channels": [],
+            "registration_errors": [{"type": type(exc).__name__, "message": str(exc)}],
+        }
+    registered: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for session in sessions:
+        session_id = str(session.get("id") or "").strip()
+        if not session_id:
+            continue
+        try:
+            channel = store.ensure_channel(_weflow_session_channel_message(session))
+            registered.append(
+                {
+                    "id": session_id,
+                    "name": str(session.get("name") or session_id),
+                    "conversation_id": channel.conversation_id,
+                    "conversation_type": channel.conversation_type,
+                    "chat_title": channel.chat_title,
+                }
+            )
+        except Exception as exc:
+            errors.append({"session": session_id, "type": type(exc).__name__, "message": str(exc)})
+    return {
+        "registered_count": len(registered),
+        "registered_channels": registered,
+        "registration_errors": errors[:20],
+    }
+
+
+def _weflow_session_channel_message(session: dict[str, Any]) -> NormalizedMessage:
+    session_id = str(session.get("id") or "").strip()
+    if not session_id:
+        raise ValueError("session id is required")
+    conversation_type = "group" if _weflow_session_is_group(session) else "private"
+    name = str(session.get("name") or session_id).strip() or session_id
+    return NormalizedMessage(
+        message_id=f"weflow-discovery:{session_id}",
+        conversation_id=conversation_id_for(conversation_type, session_id),
+        conversation_type=conversation_type,
+        chat_title=name,
+        sender_name=name,
+        text="",
+        is_self=False,
+        received_at=utc_now_iso(),
+        sender_wechat_id=session_id,
+        metadata={
+            "source": "weflow_discovery",
+            "trusted_channel_source": True,
+            "conversation_key": session_id,
+            "talker": session_id,
+            "weflow_session": session,
+        },
+    )
+
+
+def _weflow_cached_sessions_from_channels(data_dir: str | Path, *, limit: int) -> list[dict[str, Any]]:
+    try:
+        channels = _channel_store(data_dir).list_channels()
+    except Exception:
+        return []
+    sessions: list[dict[str, Any]] = []
+    for channel in channels:
+        source_names = {str(item).strip() for item in channel.source_names if str(item).strip()}
+        if "weflow_discovery" not in source_names:
+            continue
+        session_id = next((str(item).strip() for item in channel.sender_wechat_ids if str(item).strip()), "")
+        if not session_id or is_system_account(session_id):
+            continue
+        sessions.append(
+            {
+                "id": session_id,
+                "name": channel.chat_title or session_id,
+                "type": channel.conversation_type,
+                "conversation_id": channel.conversation_id,
+                "cached": True,
+                "updated_at": channel.updated_at,
+            }
+        )
+    return sorted(sessions, key=lambda item: str(item.get("updated_at", "")), reverse=True)[:limit]
+
+
+def _weflow_session_is_group(session: dict[str, Any]) -> bool:
+    session_id = str(session.get("id") or session.get("sessionId") or session.get("username") or "").strip()
+    session_type = str(session.get("type") or session.get("sessionType") or session.get("session_type") or "").strip()
+    if session_type in {"group", "2"}:
+        return True
+    if session_type in {"private", "friend", "other", "1"}:
+        return False
+    return session_id.endswith("@chatroom")
 
 
 def _weflow_public_params(params: dict[str, Any]) -> dict[str, Any]:
@@ -1124,6 +1323,7 @@ def _weflow_worker_state(root: Path) -> dict[str, Any]:
             "last_status": str(worker.get("last_status", "")),
             "last_error": str(worker.get("last_error", "")),
             "last_tick_at": worker.get("last_tick_at", 0),
+            "stop_requested": bool(worker.get("stop_requested")),
         }
         if isinstance(metrics, WeflowWorkerMetrics):
             snapshot = metrics.snapshot(running=running)
@@ -1140,6 +1340,28 @@ def _write_weflow_sidebar_state(data_dir: str | Path, update: dict[str, Any]) ->
         payload.update(update)
         payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _write_json(path, payload)
+
+
+def _record_weflow_state_safely(
+    data_dir: str | Path,
+    update: dict[str, Any],
+    *,
+    action: str,
+    result: dict[str, Any],
+) -> None:
+    """Persist sidebar state/history without turning a successful WeFlow action
+    into a failed HTTP response when Windows temporarily locks the state file."""
+
+    try:
+        _write_weflow_sidebar_state(data_dir, update)
+    except Exception as exc:
+        if isinstance(result, dict):
+            result["state_write_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        _append_weflow_operation_history(data_dir, action, result)
+    except Exception as exc:
+        if isinstance(result, dict):
+            result["history_write_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def _append_weflow_operation_history(data_dir: str | Path, action: str, result: dict[str, Any]) -> None:
@@ -1225,9 +1447,27 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    last_error: Exception | None = None
+    for attempt in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.03 * (attempt + 1))
+        except OSError as exc:
+            last_error = exc
+            if getattr(exc, "winerror", None) not in {5, 32}:
+                raise
+            time.sleep(0.03 * (attempt + 1))
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if last_error is not None:
+        raise last_error
 
 
 def _jsonable(value: Any) -> dict[str, Any]:
@@ -1281,6 +1521,50 @@ def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> P
     if resolved != root and root not in resolved.parents:
         raise ValueError("event_file must stay inside data_dir")
     return resolved
+
+
+def _key_pool(data_dir: str | Path) -> ApiKeyPool:
+    config = load_config(data_dir)
+    root = Path(data_dir)
+    chat_provider = config.providers.get("chat", config.llm)
+    return ApiKeyPool(chat_provider, root)
+
+
+def list_api_keys(data_dir: str | Path) -> dict[str, Any]:
+    """List the LLM API key pool with masked previews (never raw values)."""
+    pool = _key_pool(data_dir)
+    keys = pool.describe()
+    key_file = pool.key_file_path()
+    return {
+        "status": "ok",
+        "keys": keys,
+        "available_count": sum(1 for item in keys if item.get("available")),
+        "key_file": str(key_file) if key_file else "",
+        "key_file_writable": key_file is not None,
+    }
+
+
+def add_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Append a literal secret key to the pool file. Returns the new masked ref."""
+    value = str(payload.get("value") or payload.get("key") or "").strip()
+    name = str(payload.get("name") or "").strip() or None
+    if not value:
+        raise ValueError("value is required")
+    pool = _key_pool(data_dir)
+    ref = pool.add_key(value, name=name)
+    return {"status": "ok", "ref": ref.ref, "source": ref.source, **list_api_keys(data_dir)}
+
+
+def remove_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove a file-backed key from the pool by its anonymized ref."""
+    ref = str(payload.get("ref") or "").strip()
+    if not ref:
+        raise ValueError("ref is required")
+    pool = _key_pool(data_dir)
+    removed = pool.remove_key(ref)
+    if not removed:
+        raise ValueError("key not found or not file-backed")
+    return {"status": "ok", "removed": ref, **list_api_keys(data_dir)}
 
 
 def _channel_store(data_dir: str | Path) -> ConversationChannelStore:
@@ -1339,6 +1623,47 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
         "hidden_items": sorted(hidden, key=lambda item: item.get("updated_at", ""), reverse=True)[:20],
         "hidden_items_all": sorted(hidden, key=lambda item: item.get("updated_at", ""), reverse=True),
     }
+
+
+def _sidebar_bridge_state(
+    data_dir: str | Path,
+    *,
+    channels_state: dict[str, Any] | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    state = bridge_state(data_dir, limit=limit)
+    channels_state = channels_state if isinstance(channels_state, dict) else _channel_state(data_dir)
+    channels = channels_state.get("items") if isinstance(channels_state.get("items"), list) else []
+    bridge_channels = [_bridge_channel_payload(item) for item in channels if isinstance(item, dict)]
+    state["channels"] = bridge_channels
+    state["channel_count"] = len(bridge_channels)
+    state["contract"] = {
+        **(state.get("contract") if isinstance(state.get("contract"), dict) else {}),
+        "channel_sync": "visible service channels are projected into send_bridge.channels; outbox records carry receiver wxid/roomid from the channel registry when available",
+    }
+    return state
+
+
+def _bridge_channel_payload(channel: dict[str, Any]) -> dict[str, Any]:
+    sender_ids = channel.get("sender_wechat_ids") if isinstance(channel.get("sender_wechat_ids"), list) else []
+    receiver = next((str(item).strip() for item in sender_ids if _looks_like_wechat_receiver(str(item).strip())), "")
+    conversation_id = str(channel.get("conversation_id") or "").strip()
+    if not receiver and _looks_like_wechat_receiver(conversation_id):
+        receiver = conversation_id
+    return {
+        "conversation_id": conversation_id,
+        "conversation_type": str(channel.get("conversation_type") or ""),
+        "display_name": str(channel.get("chat_title") or ""),
+        "receiver": receiver,
+        "bridge_ready": bool(receiver),
+        "updated_at": str(channel.get("updated_at") or ""),
+        "source_names": channel.get("source_names") if isinstance(channel.get("source_names"), list) else [],
+    }
+
+
+def _looks_like_wechat_receiver(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text.startswith("wxid_") or text.startswith("gh_") or text.endswith("@chatroom"))
 
 
 def _visible_channel_policy(root: Path, config: Any) -> dict[str, set[str]]:

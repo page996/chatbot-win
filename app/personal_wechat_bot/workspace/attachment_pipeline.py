@@ -135,6 +135,7 @@ def _artifact_refs(staged) -> dict[str, Any]:
         "content_path": str(derived_dir / "content.md"),
         "analysis_path": str(derived_dir / "analysis.json"),
         "parse_result_path": str(derived_dir / "parse_result.json"),
+        "ai_summary": str(analysis.get("ai_summary", "")) if isinstance(analysis, dict) else "",
         "chunks_dir": str(derived_dir / "chunks"),
         "chunk_count": len(chunks) if isinstance(chunks, list) else 0,
         "chunks": [dict(item) for item in chunks if isinstance(item, dict)] if isinstance(chunks, list) else [],
@@ -193,68 +194,53 @@ def _conversation_parse_text(raw_text: str, kind: str, artifacts: dict[str, Any]
     preview_json = json.dumps(rows, ensure_ascii=False, indent=2) if isinstance(rows, list) else "[]"
     lines = [
         "[structured_table:first_chunk]",
-        f"table_index_path={artifacts.get('table_index_path', '')}",
-        f"tables_dir={artifacts.get('tables_dir', '')}",
-        f"table_chunk_count={artifacts.get('table_chunk_count', 0)}",
         f"first_chunk_path={chunk_path}",
         "rows_json=",
         _compact(preview_json, 6000),
     ]
-    if raw_text.strip():
-        lines.extend(["", "[spreadsheet_text_preview]", _compact(raw_text, 1200)])
+    # The flattened raw_text of a spreadsheet just repeats the rows above, so we
+    # keep only the structured chunk here and let the index point at the rest.
     return _with_artifact_context("\n".join(lines).strip(), artifacts)
 
 
 def _with_artifact_context(raw_text: str, artifacts: dict[str, Any]) -> str:
     lines = [raw_text.strip()] if raw_text.strip() else []
-    refs = _artifact_reference_lines(artifacts)
-    if refs:
+    index_line = _file_index_line(artifacts)
+    if index_line:
         if lines:
             lines.append("")
-        lines.extend(["[file_artifacts]", *refs])
-    ocr_preview = _media_ocr_preview(artifacts)
-    if ocr_preview:
-        lines.extend(["", "[media_ocr_preview]", ocr_preview])
+        lines.append(index_line)
     return "\n".join(lines).strip()
 
 
-def _artifact_reference_lines(artifacts: dict[str, Any]) -> list[str]:
-    refs: list[str] = []
-    for key in ("content_path", "analysis_path", "parse_result_path"):
-        value = str(artifacts.get(key, "")).strip()
+def _file_index_line(artifacts: dict[str, Any]) -> str:
+    # A single compact pointer line instead of a multi-line dump. The full
+    # derived artifacts (content.md, analysis.json, OCR/ASR indexes, chunks)
+    # live on disk; the model/reader follows content_path when it needs them.
+    parts: list[str] = []
+    content_path = str(artifacts.get("content_path", "")).strip()
+    if content_path:
+        parts.append(f"content={content_path}")
+    counters = (
+        ("chunk_count", "chunks"),
+        ("table_chunk_count", "tables"),
+        ("media_extract_count", "media"),
+        ("media_ocr_count", "ocr"),
+        ("media_asr_count", "asr"),
+    )
+    for key, label in counters:
+        value = int(artifacts.get(key, 0) or 0)
         if value:
-            refs.append(f"{key}={value}")
-    chunk_count = int(artifacts.get("chunk_count", 0) or 0)
-    if chunk_count:
-        refs.append(f"chunks_dir={artifacts.get('chunks_dir', '')}")
-        refs.append(f"chunk_count={chunk_count}")
-    table_chunk_count = int(artifacts.get("table_chunk_count", 0) or 0)
-    if table_chunk_count:
-        refs.append(f"table_index_path={artifacts.get('table_index_path', '')}")
-        refs.append(f"table_chunk_count={table_chunk_count}")
-    media_extract_count = int(artifacts.get("media_extract_count", 0) or 0)
-    if media_extract_count:
-        refs.append(f"media_index_path={artifacts.get('media_index_path', '')}")
-        refs.append(f"media_extract_count={media_extract_count}")
-    ocr_index = str(artifacts.get("media_ocr_index_path", "")).strip()
-    if ocr_index:
-        refs.append(f"media_ocr_index_path={ocr_index}")
-        refs.append(f"media_ocr_count={artifacts.get('media_ocr_count', 0)}")
-    asr_count = int(artifacts.get("media_asr_count", 0) or 0)
-    if asr_count:
-        refs.append(f"media_asr_dir={artifacts.get('media_asr_dir', '')}")
-        refs.append(f"media_asr_count={asr_count}")
-    return refs
-
-
-def _media_ocr_preview(artifacts: dict[str, Any]) -> str:
-    index_path_raw = str(artifacts.get("media_ocr_index_path", "")).strip()
-    if not index_path_raw:
+            parts.append(f"{label}={value}")
+    if not parts:
         return ""
-    index_path = Path(index_path_raw)
-    if not index_path.is_file():
-        return ""
-    return _compact(index_path.read_text(encoding="utf-8", errors="replace"), 8000)
+    index_line = "[file_index] " + " ".join(parts)
+    summary = str(artifacts.get("ai_summary", "")).strip()
+    if summary:
+        # A one-line AI gist right under the index so the reader grasps the file
+        # without opening content.md; the full analysis lives in analysis.json.
+        index_line += "\n[ai_summary] " + _compact(summary.replace("\n", " "), 400)
+    return index_line
 
 
 def _compact(text: str, max_chars: int) -> str:

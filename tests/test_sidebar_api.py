@@ -7,18 +7,21 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from app.personal_wechat_bot.config.loader import create_default_config, load_config
+from app.personal_wechat_bot.config.loader import create_default_config, load_config, save_config
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.control import sidebar_api
 from app.personal_wechat_bot.control.send_commands import set_send_controls
 from app.personal_wechat_bot.control.sidebar_api import (
     ack_sidebar_bridge_item,
+    add_api_key,
     append_sidebar_backend_event,
     build_sidebar_bridge_state,
     build_sidebar_runtime_cards,
     build_sidebar_state,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
+    list_api_keys,
+    remove_api_key,
     sidebar_weflow_backfill,
     sidebar_weflow_cancel_backfill,
     sidebar_queue_action,
@@ -255,6 +258,41 @@ class SidebarApiTest(unittest.TestCase):
 
             self.assertEqual(result["deleted_count"], 1)
             self.assertIsNone(store.get_channel(message.conversation_id))
+
+    def test_sidebar_bridge_state_projects_visible_service_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            message = MessageNormalizer().normalize(
+                RawWeChatMessage(
+                    "1",
+                    "Alice",
+                    "Alice",
+                    "hello",
+                    sender_wechat_id="wxid_real_alice",
+                    driver_meta={
+                        "source": "weflow_discovery",
+                        "trusted_channel_source": True,
+                        "conversation_key": "wxid_real_alice",
+                    },
+                )
+            )
+            assert message is not None
+            store.ensure_channel(message)
+
+            state = build_sidebar_bridge_state(data_dir)
+
+            self.assertEqual(state["channel_count"], 1)
+            self.assertEqual(state["channels"][0]["display_name"], "Alice")
+            self.assertEqual(state["channels"][0]["receiver"], "wxid_real_alice")
+            self.assertTrue(state["channels"][0]["bridge_ready"])
 
     def test_weflow_backfill_returns_async_job_and_can_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -591,6 +629,55 @@ class WeflowBackgroundLoopTest(unittest.TestCase):
         # The loop tests mock _build_weflow_pull_context to return a context with
         # no runtime; refresh must handle that gracefully.
         self.assertFalse(sidebar_api._refresh_weflow_send_controls({"context_id": 1}))
+
+
+class SidebarKeyPoolApiTest(unittest.TestCase):
+    def _configure_key_file(self, data_dir: Path, relative: str = "keys.md") -> None:
+        create_default_config(data_dir)
+        config = load_config(data_dir)
+        provider = config.providers.get("chat", config.llm)
+        provider.api_key_file = relative
+        config.llm.api_key_file = relative
+        config.providers["chat"] = provider
+        save_config(config)
+
+    def test_list_add_remove_api_keys_roundtrip_without_exposing_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            self._configure_key_file(data_dir)
+
+            empty = list_api_keys(data_dir)
+            self.assertEqual(empty["status"], "ok")
+            self.assertEqual(empty["available_count"], 0)
+            self.assertTrue(empty["key_file_writable"])
+
+            added = add_api_key(data_dir, {"value": "sk-abcd-secret-7777"})
+            self.assertEqual(added["status"], "ok")
+            self.assertEqual(added["available_count"], 1)
+            self.assertNotIn("sk-abcd-secret-7777", str(added))
+            new_ref = added["ref"]
+
+            listed = list_api_keys(data_dir)
+            previews = {item["ref"]: item["preview"] for item in listed["keys"]}
+            self.assertEqual(previews[new_ref], "****7777")
+
+            removed = remove_api_key(data_dir, {"ref": new_ref})
+            self.assertEqual(removed["status"], "ok")
+            self.assertEqual(removed["available_count"], 0)
+
+    def test_add_api_key_requires_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            self._configure_key_file(data_dir)
+            with self.assertRaises(ValueError):
+                add_api_key(data_dir, {"value": "  "})
+
+    def test_remove_api_key_unknown_ref_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            self._configure_key_file(data_dir)
+            with self.assertRaises(ValueError):
+                remove_api_key(data_dir, {"ref": "missing:secret:deadbeef"})
 
 
 def _reply() -> ReplyCandidate:

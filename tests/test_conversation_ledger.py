@@ -182,6 +182,31 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertIn("file parsed content", markdown)
             self.assertIn("manifest=workspace/file123/manifest.json", markdown)
 
+    def test_duplicate_attachment_metadata_collapses_to_single_block(self) -> None:
+        # Voice messages can arrive with the same media emitted twice (a voice
+        # backend event plus the generic attachment record). Only one block/
+        # attachment should survive.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            attachment = {
+                "status": "indexed",
+                "file_id": "voice-abc",
+                "name": "voice_10.wav",
+                "kind": "audio",
+                "parse": {"status": "parsed", "kind": "audio", "text": "转写文本"},
+            }
+            entry = store.append_message(
+                _message(
+                    "m1",
+                    "语音消息",
+                    metadata={"attachments": [dict(attachment), dict(attachment)]},
+                )
+            )
+
+            audio_blocks = [b for b in entry.text_blocks if b["kind"] == "attachment:audio"]
+            self.assertEqual(len(audio_blocks), 1)
+            self.assertEqual(len(entry.attachments), 1)
+
     def test_backend_message_uses_original_text_as_primary_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))

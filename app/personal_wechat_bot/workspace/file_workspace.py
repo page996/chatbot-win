@@ -57,9 +57,13 @@ class FileWorkspace:
     artifacts next to it.
     """
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, analyzer: Any = None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        # Optional LLM-backed analyzer (workspace.file_analysis.FileAnalyzer).
+        # When absent, analysis.json holds mechanical metadata only. Set once in
+        # bootstrap so the driver + pipeline that share this instance all use it.
+        self.analyzer = analyzer
 
     def stage_file(
         self,
@@ -171,6 +175,7 @@ class FileWorkspace:
             embedded_media_ocr=embedded_media_ocr,
             embedded_media_asr=embedded_media_asr,
         )
+        ai_analysis = self._run_file_analysis(staged, result, media_artifacts)
         payload = {
             "file_id": staged.file_id,
             "conversation_id": staged.conversation_id,
@@ -183,11 +188,12 @@ class FileWorkspace:
             "chunks": chunks,
             "table_artifacts": table_artifacts,
             "media_artifacts": media_artifacts,
+            "ai_analysis": ai_analysis,
             "result": asdict(result),
             "updated_at": utc_now_iso(),
         }
         _write_json(derived_dir / "parse_result.json", payload)
-        analysis = _analysis_payload(staged, result, chunks, table_artifacts, media_artifacts)
+        analysis = _analysis_payload(staged, result, chunks, table_artifacts, media_artifacts, ai_analysis)
         _write_json(analysis_path, analysis)
         content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
         if result.text:
@@ -201,6 +207,46 @@ class FileWorkspace:
             table_artifacts,
             media_artifacts,
         )
+
+    def _run_file_analysis(
+        self,
+        staged: StagedFile,
+        result: AttachmentParseResult,
+        media_artifacts: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Produce (or reuse) the LLM analysis for this file.
+
+        Cached in parse_result.json keyed on sha256, so a re-render (e.g. media
+        artifact refresh) does not re-invoke the LLM. Returns a plain dict so the
+        result serializes cleanly; ``{"status": "disabled"}`` when no analyzer is
+        wired in. Never raises into the parse path.
+        """
+        if self.analyzer is None:
+            return {"status": "disabled"}
+        cached = _read_json(Path(staged.derived_dir) / "parse_result.json", None)
+        if isinstance(cached, dict) and cached.get("sha256") == staged.sha256:
+            prior = cached.get("ai_analysis")
+            if isinstance(prior, dict) and prior.get("status") == "analyzed":
+                return prior
+        text = result.text or ""
+        # For media-only files (image/audio) the parsed text is a placeholder, so
+        # fold in any OCR/ASR text we extracted, giving the model something real.
+        text = _augment_analysis_text(text, media_artifacts)
+        extra = {
+            "has_tables": result.kind == "spreadsheet",
+            "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
+        }
+        try:
+            analysis = self.analyzer.analyze(
+                name=staged.original_name,
+                kind=result.kind,
+                text=text,
+                extra=extra,
+            )
+        except Exception as exc:  # defense in depth; analyzer already guards
+            return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        to_dict = getattr(analysis, "to_dict", None)
+        return to_dict() if callable(to_dict) else dict(analysis)
 
     def staged_from_manifest(self, manifest_path: str | Path) -> StagedFile:
         safe_manifest_path = _ensure_within(Path(manifest_path).resolve(), self.root)
@@ -379,17 +425,41 @@ def _safe_filename(name: str, fallback_suffix: str) -> str:
     return cleaned[:180]
 
 
+def _augment_analysis_text(text: str, media_artifacts: dict[str, Any] | None) -> str:
+    """Fold extracted OCR/ASR text into the analysis input for media-only files.
+
+    A pure image/audio file has only a placeholder as its parsed text, so the
+    LLM would have nothing to analyze. Append any OCR/ASR text we extracted so
+    the analysis reflects the real content.
+    """
+    parts = [text.strip()] if text and text.strip() else []
+    artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
+    for item in artifacts.get("images", []) or []:
+        if isinstance(item, dict):
+            ocr_text = str(item.get("ocr_text", "")).strip()
+            if ocr_text:
+                parts.append(ocr_text)
+    for item in artifacts.get("audio", []) or []:
+        if isinstance(item, dict):
+            asr_text = str(item.get("asr_text", "")).strip()
+            if asr_text:
+                parts.append(asr_text)
+    return "\n\n".join(parts).strip()
+
+
 def _analysis_payload(
     staged: StagedFile,
     result: AttachmentParseResult,
     chunks: list[dict[str, Any]],
     table_artifacts: dict[str, Any] | None = None,
     media_artifacts: dict[str, Any] | None = None,
+    ai_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     text = result.text or ""
     suffix = Path(staged.staged_path).suffix.lower()
     table_artifacts = table_artifacts if isinstance(table_artifacts, dict) else {}
     media_artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
+    ai_analysis = ai_analysis if isinstance(ai_analysis, dict) else {}
     media = _document_media_analysis(Path(staged.staged_path), suffix, media_artifacts)
     table_chunks = [
         dict(item)
@@ -404,6 +474,12 @@ def _analysis_payload(
         "suffix": suffix,
         "kind": result.kind,
         "status": result.status,
+        "ai_analysis_status": str(ai_analysis.get("status", "disabled")),
+        "ai_summary": str(ai_analysis.get("summary", "")),
+        "ai_key_points": [str(item) for item in ai_analysis.get("key_points", []) if str(item).strip()],
+        "ai_topics": [str(item) for item in ai_analysis.get("topics", []) if str(item).strip()],
+        "ai_model": str(ai_analysis.get("model", "")),
+        "ai_error": str(ai_analysis.get("error", "")),
         "estimated_tokens": _estimate_tokens(text),
         "char_count": len(text),
         "line_count": len(text.splitlines()) if text else 0,
@@ -472,6 +548,7 @@ def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysi
         "",
         result.summary or "",
         "",
+        *_ai_analysis_content_lines(analysis),
         *_table_content_lines(analysis),
         *_media_content_lines(analysis),
         "## Text",
@@ -482,6 +559,28 @@ def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysi
     if result.error:
         lines.extend(["## Error", "", result.error, ""])
     return "\n".join(lines)
+
+
+def _ai_analysis_content_lines(analysis: dict[str, Any]) -> list[str]:
+    if str(analysis.get("ai_analysis_status", "")) != "analyzed":
+        return []
+    summary = str(analysis.get("ai_summary", "")).strip()
+    key_points = [str(item).strip() for item in analysis.get("ai_key_points", []) if str(item).strip()]
+    topics = [str(item).strip() for item in analysis.get("ai_topics", []) if str(item).strip()]
+    if not (summary or key_points or topics):
+        return []
+    lines = ["## AI Analysis", ""]
+    if summary:
+        lines.extend([summary, ""])
+    if key_points:
+        lines.append("### Key Points")
+        lines.append("")
+        lines.extend(f"- {point}" for point in key_points)
+        lines.append("")
+    if topics:
+        lines.append(f"- topics: {', '.join(topics)}")
+        lines.append("")
+    return lines
 
 
 def _table_content_lines(analysis: dict[str, Any]) -> list[str]:
@@ -830,24 +929,33 @@ def _write_media_asr_artifacts(
     updated: list[dict[str, Any]] = []
     asr_count = 0
     error_count = 0
+    empty_count = 0
     for index, item in enumerate(audio, start=1):
         audio_path = Path(str(item.get("path", "")))
         output_path = asr_dir / f"{index:04d}_{Path(str(item.get('name', 'audio'))).stem}.md"
         current = dict(item)
         transcript = embedded_media_asr.transcribe(audio_path)
-        output_path.write_text(_media_asr_markdown(current, transcript.status, text=transcript.text, error=transcript.error), encoding="utf-8")
+        text = transcript.text
+        # An "empty" transcript means the audio ran through ASR cleanly but held
+        # no detectable speech. Record a placeholder so the reader can tell this
+        # apart from a transcription failure, and never emit blank content.
+        if transcript.status == "empty" and not text.strip():
+            text = _audio_asr_placeholder_text(current, "ASR 未识别到语音内容")
+        output_path.write_text(_media_asr_markdown(current, transcript.status, text=text, error=transcript.error), encoding="utf-8")
         current.update(
             {
                 "asr_status": transcript.status,
                 "asr_path": str(output_path),
                 "asr_backend": transcript.backend,
                 "asr_model": transcript.model,
-                "asr_text": _compact(transcript.text, 2000),
+                "asr_text": _compact(text, 2000),
                 "asr_error": transcript.error,
             }
         )
         if transcript.status == "transcribed":
             asr_count += 1
+        elif transcript.status == "empty":
+            empty_count += 1
         elif transcript.status in {"failed", "blocked"}:
             error_count += 1
         updated.append(current)
@@ -861,9 +969,20 @@ def _write_media_asr_artifacts(
         "status": status,
         "asr_dir": str(asr_dir),
         "asr_count": asr_count,
+        "empty_count": empty_count,
         "error_count": error_count,
         "audio": updated,
     }
+
+
+def _audio_asr_placeholder_text(item: dict[str, Any], reason: str) -> str:
+    return (
+        "[音频 ASR 占位符]\n"
+        f"- 文件名: {item.get('name', '')}\n"
+        f"- 本地路径: {item.get('path', '')}\n"
+        f"- 原因: {reason}\n"
+        "- 说明: 该音频已进入文件中间层，但本地 ASR 未转写出文字内容。"
+    )
 
 
 def _media_asr_markdown(item: dict[str, Any], status: str, *, text: str = "", error: str = "") -> str:
@@ -882,6 +1001,42 @@ def _media_asr_markdown(item: dict[str, Any], status: str, *, text: str = "", er
     if error:
         lines.extend(["## Error", "", error, ""])
     return "\n".join(lines)
+
+
+def _run_structured_ocr(engine: OcrEngine, image_path: Path):
+    """Call read_structured when available, else adapt read_text to OcrResult."""
+    from app.personal_wechat_bot.vision.ocr import OcrResult
+
+    read_structured = getattr(engine, "read_structured", None)
+    if callable(read_structured):
+        return read_structured(image_path)
+    return OcrResult(text=engine.read_text(image_path), items=[])
+
+
+def _write_ocr_detail_sidecar(markdown_path: Path, result: Any) -> int:
+    """Write per-detection geometry/confidence next to the OCR markdown.
+
+    Returns the number of detections written. When the engine returned no
+    structured items (e.g. a text-only fallback) nothing is written.
+    """
+    items = getattr(result, "items", None) or []
+    if not items:
+        return 0
+    detail_path = markdown_path.with_suffix(".json")
+    payload = {
+        "text": getattr(result, "text", ""),
+        "detection_count": len(items),
+        "detections": [
+            {
+                "text": item.text,
+                "score": round(float(item.score), 4),
+                "box": item.box,
+            }
+            for item in items
+        ],
+    }
+    _write_json(detail_path, payload)
+    return len(items)
 
 
 def _write_media_ocr_artifacts(
@@ -903,17 +1058,23 @@ def _write_media_ocr_artifacts(
         output_path = ocr_dir / f"{index:04d}_{Path(str(item.get('name', 'image'))).stem}.md"
         current = dict(item)
         try:
-            text = embedded_media_ocr.read_text(image_path)
+            result = _run_structured_ocr(embedded_media_ocr, image_path)
+            text = result.text
             status = "parsed" if text.strip() else "empty"
             if not text.strip():
                 text = _image_ocr_placeholder_text(current, "OCR 未识别到有效文本")
+            # Persist the layout-aware markdown plus a JSON sidecar carrying the
+            # per-detection geometry/confidence so structure is not lost.
             output_path.write_text(_media_ocr_markdown(current, status, text=text), encoding="utf-8")
+            detail_count = _write_ocr_detail_sidecar(output_path, result)
             current.update(
                 {
                     "ocr_status": status,
                     "ocr_path": str(output_path),
                     "ocr_text": _compact(text, 2000),
                     "ocr_char_count": len(text),
+                    "ocr_detection_count": detail_count,
+                    "ocr_detail_path": str(output_path.with_suffix(".json")) if detail_count else "",
                 }
             )
             ocr_count += 1
@@ -962,6 +1123,11 @@ def _media_ocr_index_markdown(images: list[dict[str, Any]]) -> str:
                 f"- image_path: {item.get('path', '')}",
                 f"- ocr_path: {item.get('ocr_path', '')}",
                 f"- status: {item.get('ocr_status', '')}",
+                *(
+                    [f"- detections: {item.get('ocr_detection_count', 0)} (detail: {item.get('ocr_detail_path', '')})"]
+                    if int(item.get("ocr_detection_count", 0) or 0)
+                    else []
+                ),
                 "",
             ]
         )

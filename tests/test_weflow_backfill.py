@@ -6,10 +6,17 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from app.personal_wechat_bot.config.loader import create_default_config
-from app.personal_wechat_bot.control.sidebar_api import build_sidebar_weflow_state, run_weflow_backfill_sync, sidebar_weflow_backfill, sidebar_weflow_discover_sessions
+from app.personal_wechat_bot.control import sidebar_api
+from app.personal_wechat_bot.control.sidebar_api import (
+    build_sidebar_weflow_state,
+    run_weflow_backfill_sync,
+    sidebar_weflow_backfill,
+    sidebar_weflow_discover_sessions,
+)
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import WEFLOW_LOCAL_BUILD_FLAVOR
@@ -114,10 +121,47 @@ class WeflowBackfillTest(unittest.TestCase):
         self.assertEqual(result.get("count"), 2)
         self.assertEqual([item["id"] for item in result["sessions"]], ["wxid_history", "room@chatroom"])
         self.assertEqual(result["sessions"][0]["name"], "History Friend")
+        self.assertEqual(result["registered_count"], 2)
 
         state = json.loads((self.data_dir / "weflow_sidebar_state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["last_discover"]["status"], "ok")
         self.assertTrue(state["token_present"])
+        private_id = conversation_id_for("private", "wxid_history")
+        group_id = conversation_id_for("group", "room@chatroom")
+        private_channel = json.loads(
+            (self.data_dir / "conversation_channels" / private_id / "channel.json").read_text(encoding="utf-8")
+        )
+        group_channel = json.loads(
+            (self.data_dir / "conversation_channels" / group_id / "channel.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(private_channel["chat_title"], "History Friend")
+        self.assertEqual(group_channel["chat_title"], "Room")
+        self.assertIn("weflow_discovery", private_channel["source_names"])
+        self.assertTrue(private_channel["trusted_channel_source"])
+
+        cached = build_sidebar_weflow_state(self.data_dir)["discovered_sessions"]
+        self.assertEqual(cached["source"], "channel_store")
+        self.assertEqual({item["id"] for item in cached["sessions"]}, {"wxid_history", "room@chatroom"})
+
+        fallback = sidebar_weflow_discover_sessions(
+            self.data_dir,
+            {"base_url": "http://127.0.0.1:1", "token": "test-token", "limit": 20},
+        )
+        self.assertEqual(fallback["status"], "ok", fallback)
+        self.assertEqual(fallback["source"], "channel_store_cache")
+        self.assertEqual({item["id"] for item in fallback["sessions"]}, {"wxid_history", "room@chatroom"})
+
+    def test_discover_sessions_survives_sidebar_state_write_failure(self) -> None:
+        with _FakeWeFlowServer() as server:
+            with mock.patch.object(sidebar_api, "_write_weflow_sidebar_state", side_effect=PermissionError("locked")):
+                result = sidebar_weflow_discover_sessions(
+                    self.data_dir,
+                    {"base_url": server.base_url, "token": "test-token", "limit": 20},
+                )
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["count"], 2)
+        self.assertIn("PermissionError", result["state_write_error"])
 
 
 class _FakeWeFlowServer:

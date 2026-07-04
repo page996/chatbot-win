@@ -145,7 +145,17 @@ class LocalAsrSubprocessEngine:
         payload = json.loads(payload_line)
         text_b64 = str(payload.get("text_b64", ""))
         text = base64.b64decode(text_b64.encode("ascii")).decode("utf-8") if text_b64 else ""
-        status = "transcribed" if text.strip() and payload.get("ok") else "failed"
+        worker_ok = bool(payload.get("ok"))
+        worker_error = str(payload.get("error") or "")
+        if text.strip():
+            status = "transcribed"
+        elif worker_ok and not worker_error:
+            # The worker ran cleanly but produced no text: this is silence / no
+            # detectable speech, not a failure. Mark it "empty" so the caller can
+            # tell "recognized nothing" apart from "engine broke" (mirrors OCR).
+            status = "empty"
+        else:
+            status = "failed"
         return AsrTranscript(
             status=status,
             text=text.strip(),
@@ -153,7 +163,7 @@ class LocalAsrSubprocessEngine:
             model=str(payload.get("model") or self.model),
             language=str(payload.get("language") or ""),
             source_path=str(source),
-            error=str(payload.get("error") or ""),
+            error=worker_error,
         )
 
 

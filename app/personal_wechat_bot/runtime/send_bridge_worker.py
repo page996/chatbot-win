@@ -145,9 +145,11 @@ class BridgeWorker:
             self._ack(bridge_id, "failed", last_reason or "send_failed")
 
     def _receiver_for(self, conversation_id: str, record: dict[str, Any]) -> str:
-        # conversation_id is the wxid/roomid (session identity comes from the
-        # talker, per the project's identity rule), which is exactly what wcf's
-        # send_* expects as the receiver.
+        receiver = str(record.get("receiver") or "").strip()
+        if receiver:
+            return receiver
+        # Legacy outbox records did not have receiver. Keep the fallback so old
+        # queues remain consumable; new records carry the wxid/roomid explicitly.
         return conversation_id.strip()
 
     def _ack(self, bridge_id: str, status: str, reason: str, *, external_message_id: str = "") -> None:

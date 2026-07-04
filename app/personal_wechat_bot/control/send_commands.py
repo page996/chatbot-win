@@ -164,6 +164,11 @@ def list_send_audit(data_dir: str | Path, *, limit: int = 20, status: str | None
     return {"status": "ok", "count": len(items), "items": items}
 
 
+def clear_send_audit(data_dir: str | Path) -> dict[str, Any]:
+    cleared_count = _audit(data_dir).clear()
+    return {"status": "ok", "count": 0, "items": [], "cleared_count": cleared_count}
+
+
 def probe_send_controls(data_dir: str | Path, *, driver: str | None = None) -> dict[str, Any]:
     config = load_config(data_dir)
     if driver is not None:

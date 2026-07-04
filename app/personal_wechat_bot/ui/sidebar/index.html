@@ -196,6 +196,7 @@
               <span>Talkers</span>
               <input id="weflowTalkers" type="text" placeholder="空=会话列表；多个用逗号分隔" />
             </label>
+            <div id="weflowTalkerChips" class="talker-chip-list" hidden></div>
             <label>
               <span>Workers</span>
               <input id="weflowWorkers" type="number" min="1" max="16" value="2" />
@@ -232,6 +233,14 @@
                 <button id="weflowDiscoverButton" class="ghost small" data-tooltip="拉取当前可用会话列表，点击会话会填入 Talkers。">发现会话</button>
               </div>
               <div id="weflowSessionList" class="session-list" hidden></div>
+              <div class="stored-session-panel">
+                <div class="stored-session-head">
+                  <span>本地通道库</span>
+                  <small id="weflowStoredSessionCount">0</small>
+                </div>
+                <input id="weflowStoredSessionFilter" class="compact-input" type="text" placeholder="筛选昵称或 wxid/roomid" />
+                <div id="weflowStoredSessionList" class="stored-session-list"></div>
+              </div>
             </section>
             <section class="action-group">
               <span>拉取与回填</span>
@@ -289,7 +298,10 @@
         <section class="audit">
           <div class="section-head">
             <h2>发送审计</h2>
-            <span id="auditCount">0</span>
+            <div class="section-head-actions">
+              <span id="auditCount">0</span>
+              <button id="clearAuditButton" class="ghost mini">清空</button>
+            </div>
           </div>
           <p class="section-copy">记录审核、拒绝、发送尝试和失败原因，方便回看。</p>
           <div id="auditList" class="audit-list"></div>
@@ -306,8 +318,22 @@
           <div id="handleList" class="handle-list"></div>
           <pre id="probeBox" hidden></pre>
         </section>
+        <section class="inspector">
+          <div class="section-head">
+            <h2>API 密钥池</h2>
+            <button id="refreshKeys" class="ghost small">刷新</button>
+          </div>
+          <p class="diagnostic-copy">多个 DeepSeek key 会按会话轮询分摊额度。密钥只显示末位，不回传明文。</p>
+          <div id="keyPoolSummary" class="key-pool-summary"></div>
+          <div id="keyPoolList" class="key-pool-list"></div>
+          <div class="key-pool-add">
+            <input id="newKeyValue" type="password" placeholder="粘贴新的 sk-... 密钥" autocomplete="off" spellcheck="false" />
+            <button id="addKey" class="primary small">添加</button>
+          </div>
+          <p id="keyPoolMessage" class="key-pool-message" hidden></p>
+        </section>
       </section>
     </main>
-    <script src="/app.js?v=20260703-task-queue"></script>
+    <script src="/app.js?v=20260703-key-pool"></script>
   </body>
 </html>

@@ -12,6 +12,7 @@ from app.personal_wechat_bot.config.loader import create_default_config, load_co
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
+    clear_send_audit,
     list_confirm_queue,
     list_send_audit,
     probe_send_controls,
@@ -84,6 +85,21 @@ class SendCommandsTest(unittest.TestCase):
             self.assertIn("confirm_approve", actions)
             self.assertIn("confirm_reject", actions)
             self.assertIn("confirm_send_attempt", actions)
+
+    def test_clear_send_audit_truncates_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(_reply("message-1", "hello"))
+            approve_confirm_item(data_dir, queue_id, reviewer="tester", note="ok")
+            self.assertGreater(list_send_audit(data_dir, limit=10)["count"], 0)
+
+            result = clear_send_audit(data_dir)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["cleared_count"], 1)
+            self.assertEqual(list_send_audit(data_dir, limit=10)["items"], [])
 
     def test_send_approved_confirm_item_calls_driver_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

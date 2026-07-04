@@ -147,6 +147,21 @@ class BackendAttachmentParserTest(unittest.TestCase):
             self.assertIn("本地 ASR", result.summary)
             self.assertEqual(result.text, "转写文本")
 
+    def test_audio_attachment_empty_transcript_is_distinct_from_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "voice.m4a"
+            path.write_bytes(b"fake audio")
+
+            result = BackendAttachmentParser(
+                asr_engine=_FakeAsr("", status="empty"),
+                max_preview_chars=100,
+            ).parse(path)
+
+            self.assertEqual(result.status, "empty")
+            self.assertEqual(result.kind, "audio")
+            self.assertIn("未识别到语音内容", result.summary)
+            self.assertIn("[附件占位符]", result.text)
+
     def test_csv_attachment_extracts_rows_with_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "table.csv"

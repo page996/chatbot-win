@@ -116,7 +116,17 @@ class BackendAttachmentParser:
         error = transcript.error if transcript is not None else "local_asr_not_configured"
         backend = transcript.backend if transcript is not None else "local_asr_subprocess"
         bytes_note = f" bytes={path.stat().st_size}" if path.exists() else ""
-        if transcript is not None and transcript.status == "failed":
+        status = transcript.status if transcript is not None else "blocked"
+        if status == "empty":
+            # Ran cleanly, no speech detected: this is a definitive (empty) result,
+            # not an error. Surface it as a distinct placeholder.
+            return AttachmentParseResult(
+                "empty",
+                "audio",
+                f"音频已保存到文件中间层，本地 ASR 未识别到语音内容 backend={backend}{bytes_note}",
+                _audio_placeholder_text(path, "ASR 未识别到语音内容"),
+            )
+        if status == "failed":
             summary = f"音频已保存到文件中间层，本地 ASR 转写失败 backend={backend}{bytes_note}"
         else:
             summary = f"音频已保存到文件中间层，本地 ASR 暂不可用 backend={backend}{bytes_note}"
@@ -124,6 +134,7 @@ class BackendAttachmentParser:
             "skipped",
             "audio",
             summary,
+            _audio_placeholder_text(path, summary),
             error=error or "local_asr_not_configured",
         )
 
@@ -207,6 +218,10 @@ def _image_placeholder(path: Path, reason: str, *, status: str = "skipped") -> A
         f"{label}已登记到本地文件中间层；{reason}，当前以占位符进入对话上下文。",
         _unsupported_text(path, "image", label, reason=reason),
     )
+
+
+def _audio_placeholder_text(path: Path, reason: str) -> str:
+    return _unsupported_text(path, "audio", "语音/音频", reason=reason)
 
 
 def _unsupported_text(path: Path, kind: str, label: str, *, reason: str = "") -> str:

@@ -59,6 +59,18 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(state["items"][0]["status"], "sent")
             self.assertEqual(state["items"][0]["bridge_id"], record["bridge_id"])
 
+    def test_worker_prefers_record_receiver_over_conversation_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("hashed-conversation-id", "hello there", receiver="wxid_real_alice")
+
+            backend = DryRunSendBackend()
+            BridgeWorker(data_dir, backend).run_once()
+
+            self.assertEqual(backend.sent_texts, [("wxid_real_alice", "hello there")])
+
     def test_worker_is_restart_safe_and_does_not_resend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"

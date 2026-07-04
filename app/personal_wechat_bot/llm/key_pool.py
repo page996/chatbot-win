@@ -16,6 +16,14 @@ class ApiKeyRef:
     available: bool
 
 
+def _mask_secret(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    tail = value[-4:] if len(value) >= 4 else value
+    return f"****{tail}"
+
+
 class ApiKeyPool:
     def __init__(self, provider: ProviderConfig, data_dir: str | Path = "data"):
         self.provider = provider
@@ -78,19 +86,109 @@ class ApiKeyPool:
                 values[ref] = value
         return values
 
-    def _key_file_lines(self) -> list[str]:
+    def key_file_path(self) -> Path | None:
         if not self.provider.api_key_file:
-            return []
+            return None
         path = Path(self.provider.api_key_file)
         if not path.is_absolute():
             path = self.data_dir / path
-        if not path.exists():
+        return path
+
+    def _key_file_lines(self) -> list[str]:
+        path = self.key_file_path()
+        if path is None or not path.exists():
             return []
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return []
         return text.splitlines()
+
+    def describe(self) -> list[dict[str, str | bool]]:
+        """Return refs enriched with a masked preview, safe to expose to the UI.
+
+        Raw key values are never included — only a ``****tail`` masked preview and
+        the anonymized ref. For env-var keys the preview reflects the resolved
+        environment value (if set), so the operator can tell a configured slot
+        from an empty one without seeing the secret.
+        """
+        secret_values = self._file_secret_values()
+        described: list[dict[str, str | bool]] = []
+        for item in self.refs():
+            if item.source == "file_secret":
+                preview = _mask_secret(secret_values.get(item.ref, ""))
+            else:
+                preview = _mask_secret(os.environ.get(item.ref, ""))
+            described.append(
+                {
+                    "ref": item.ref,
+                    "source": item.source,
+                    "available": item.available,
+                    "preview": preview,
+                }
+            )
+        return described
+
+    def add_key(self, value: str, name: str | None = None) -> ApiKeyRef:
+        """Append a literal secret key to the key file as ``NAME = value``.
+
+        Returns the anonymized ref for the new key. Raises ValueError when no
+        key file is configured or the value is empty/duplicate.
+        """
+        value = value.strip()
+        if not value:
+            raise ValueError("api key value is empty")
+        path = self.key_file_path()
+        if path is None:
+            raise ValueError("no api_key_file configured for this provider")
+        if value in self._file_secret_values().values():
+            raise ValueError("api key already present in pool")
+        name = (name or "").strip() or self._next_key_name()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError("invalid key name")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        prefix = "" if not existing or existing.endswith("\n") else "\n"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{prefix}{name} = {value}\n")
+        return ApiKeyRef(ref=_secret_ref(name, value), source="file_secret", available=True)
+
+    def remove_key(self, ref: str) -> bool:
+        """Remove the key file line whose parsed ref matches ``ref``.
+
+        Only file-backed keys can be removed (env-var pool entries live in
+        config, not the key file). Returns True when a line was removed.
+        """
+        path = self.key_file_path()
+        if path is None or not path.exists():
+            return False
+        lines = path.read_text(encoding="utf-8").splitlines()
+        kept: list[str] = []
+        removed = False
+        for line in lines:
+            parsed = _parse_key_file_line(line)
+            if parsed is not None and parsed[0] == ref and not removed:
+                removed = True
+                continue
+            kept.append(line)
+        if not removed:
+            return False
+        path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        return True
+
+    def _next_key_name(self) -> str:
+        """Derive the next ``PREFIX_NN`` name from existing file entries."""
+        prefix = "DEEPSEEK_KEY"
+        max_index = 0
+        pattern = re.compile(r"^([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*)_(\d+)$")
+        for line in self._key_file_lines():
+            stripped = line.strip().strip("` ")
+            name = stripped.split("=", 1)[0].strip() if "=" in stripped else stripped
+            match = pattern.match(name)
+            if match:
+                prefix = match.group(1)
+                max_index = max(max_index, int(match.group(2)))
+        return f"{prefix}_{max_index + 1:02d}"
 
 
 class ConversationKeyAssigner:

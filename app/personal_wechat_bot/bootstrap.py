@@ -31,6 +31,7 @@ from app.personal_wechat_bot.tools.defaults import register_default_tools
 from app.personal_wechat_bot.tools.registry import ToolRegistry
 from app.personal_wechat_bot.tools.runtime import ToolRuntime
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
+from app.personal_wechat_bot.workspace.file_analysis import LLMFileAnalyzer
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
@@ -88,6 +89,10 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         if chat_provider.base_url
         else FakeLLMClient(model=chat_provider.model)
     )
+    # Give the shared file workspace an LLM-backed analyzer so analysis.json holds
+    # a real summary/key-points instead of only mechanical metadata. The driver
+    # and attachment pipeline both use this same instance.
+    file_workspace.analyzer = LLMFileAnalyzer(llm, model=chat_provider.model)
     registry = ToolRegistry()
     register_default_tools(registry, data_root=data_root, config=config, file_index=file_index)
     tools = ToolRuntime(registry, event_logger)

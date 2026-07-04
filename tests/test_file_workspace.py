@@ -230,6 +230,28 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertIn("转写正文", asr_path.read_text(encoding="utf-8"))
             self.assertIn("first_audio_asr", content)
 
+    def test_audio_file_empty_transcript_is_not_counted_as_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "voice.m4a"
+            source.write_bytes(b"fake audio")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="audio")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("empty", "audio", "no speech", ""),
+                embedded_media_asr=_FakeAsr("", status="empty"),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            asr_path = Path(analysis["media_audio"][0]["asr_path"])
+
+            self.assertEqual(analysis["media_audio"][0]["asr_status"], "empty")
+            self.assertEqual(analysis["media_asr_error_count"], 0)
+            self.assertEqual(analysis["media_asr_count"], 0)
+            self.assertTrue(asr_path.exists())
+            self.assertIn("未识别到语音内容", asr_path.read_text(encoding="utf-8"))
+
     def test_docx_embedded_audio_uses_local_asr_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "audio.docx"
@@ -421,14 +443,15 @@ class _FakeOcr:
 
 
 class _FakeAsr:
-    def __init__(self, text: str):
+    def __init__(self, text: str, status: str = "transcribed"):
         self.text = text
+        self.status = status
 
     def health(self) -> AsrHealth:
         return AsrHealth("fake_asr", True)
 
     def transcribe(self, audio_path: str | Path) -> AsrTranscript:
-        return AsrTranscript("transcribed", self.text, backend="fake_asr", model="fake", source_path=str(audio_path))
+        return AsrTranscript(self.status, self.text, backend="fake_asr", model="fake", source_path=str(audio_path))
 
 
 def _write_docx_with_media(path: Path, *, include_audio: bool = False) -> None:

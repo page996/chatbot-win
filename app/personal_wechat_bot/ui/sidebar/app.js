@@ -247,7 +247,7 @@ function renderQueue() {
         <span>${escapeHtml(queueStatusText(item.status || state.activeStatus))}</span>
         <time>${escapeHtml(shortTime(item.updated_at || reply.created_at || ""))}</time>
       </div>
-      <div class="conversation">${escapeHtml(reply.conversation_id || "")}</div>
+      <div class="conversation">${escapeHtml(conversationLabel(reply.conversation_id || ""))}</div>
       <div class="reply-text">${escapeHtml(reply.text || "")}</div>
       <div class="actions"></div>
     `;
@@ -281,15 +281,49 @@ function renderQueue() {
         target: conversationId,
       }));
     }
+    if (conversationId && channelByConversationId(conversationId)) {
+      actions.append(actionButton("×", "danger mini", () => deleteChannel(conversationId), {
+        label: `删除服务通道：${conversationLabel(conversationId)}`,
+        category: "通道",
+        scope: `conversation:${conversationId}`,
+        target: conversationId,
+      }));
+    }
     list.append(node);
   }
 }
 
 function renderBridge(bridge) {
-  $("#bridgePendingCount").textContent = `${bridge.pending_count || 0} 待消费 / ${bridge.ack_count || 0} 已确认`;
+  $("#bridgePendingCount").textContent = `${bridge.pending_count || 0} 待消费 / ${bridge.ack_count || 0} 已确认 / ${bridge.channel_count || 0} 通道`;
   $("#bridgePath").textContent = bridge.outbox_path || "未创建 outbox";
   const list = $("#bridgeList");
   list.innerHTML = "";
+  const channels = Array.isArray(bridge.channels) ? bridge.channels : [];
+  if (channels.length) {
+    const channelBox = document.createElement("section");
+    channelBox.className = "bridge-channel-list";
+    for (const channel of channels) {
+      const node = document.createElement("article");
+      node.className = "bridge-channel-item";
+      const conversationId = String(channel.conversation_id || "");
+      node.innerHTML = `
+        <div>
+          <strong>${escapeHtml(channel.display_name || conversationLabel(conversationId))}</strong>
+          <span>${escapeHtml(conversationTypeText(channel.conversation_type || ""))} / ${escapeHtml(channel.bridge_ready ? `receiver ${channel.receiver}` : "缺少 receiver")}</span>
+        </div>
+      `;
+      if (conversationId) {
+        node.append(actionButton("×", "danger mini", () => deleteChannel(conversationId), {
+          label: `删除桥通道：${channel.display_name || conversationId}`,
+          category: "通道",
+          scope: `conversation:${conversationId}`,
+          target: conversationId,
+        }));
+      }
+      channelBox.append(node);
+    }
+    list.append(channelBox);
+  }
   const items = bridge.items || [];
   if (!items.length) {
     list.append(emptyNode("非前台桥 outbox 为空"));
@@ -303,9 +337,9 @@ function renderBridge(bridge) {
         <span>${escapeHtml(bridgeStatusText(item.status || "queued"))}</span>
         <time>${escapeHtml(shortTime(item.created_at || ""))}</time>
       </div>
-      <div class="conversation">${escapeHtml(item.conversation_id || "")}</div>
+      <div class="conversation">${escapeHtml(conversationLabel(item.conversation_id || ""))}</div>
       <div class="reply-text">${escapeHtml(item.text || "")}</div>
-      <p>${escapeHtml(item.bridge_id || "")}</p>
+      <p>${escapeHtml([item.bridge_id || "", item.receiver ? `receiver=${item.receiver}` : ""].filter(Boolean).join(" / "))}</p>
       <div class="actions"></div>
     `;
     const actions = node.querySelector(".actions");
@@ -399,6 +433,7 @@ function renderWeFlow(weflow) {
     weflow.security?.requires_local_fork_marker ? "需要本地 fork marker" : "",
     weflow.config_migration?.status === "updated" ? "扩展配置已迁移" : "",
     metrics.stalled ? "⚠ 后台疑似停滞（长时间无成功拉取）" : "",
+    worker.stop_requested ? "正在停止后台拉取" : "",
     metrics.slow_ticks ? `慢 tick ${metrics.slow_ticks} 次` : "",
     bridgeState.session_count ? `会话游标 ${bridgeState.session_count} / 去重 ${bridgeState.seen_raw_id_count || 0}` : "",
     worker.last_error ? `后台错误：${worker.last_error}` : "",
@@ -445,8 +480,130 @@ function renderWeFlow(weflow) {
   if (backfillButton && !backfillButton.dataset.taskLocked) {
     backfillButton.disabled = Boolean(backfillJob.running || backfillJob.status === "cancel_requested");
   }
+  const startButton = $("#weflowStartButton");
+  if (startButton && !startButton.dataset.taskLocked) {
+    startButton.disabled = Boolean(worker.running);
+  }
+  const stopButton = $("#weflowStopButton");
+  if (stopButton && !stopButton.dataset.taskLocked) {
+    stopButton.disabled = !Boolean(worker.running || worker.stop_requested);
+  }
+  const envLocked = Boolean(worker.running || backfillJob.running || backfillJob.status === "cancel_requested");
+  for (const selector of ["#weflowDepsButton", "#weflowInstallButton"]) {
+    const button = $(selector);
+    if (button && !button.dataset.taskLocked) {
+      button.disabled = envLocked;
+    }
+  }
   syncBackfillTask(backfillJob);
+  renderWeFlowStoredSessions(weflow.discovered_sessions?.sessions || []);
+  renderTalkerChips();
   renderWeFlowHistory(weflow.operation_history || []);
+}
+
+function renderWeFlowStoredSessions(sessions) {
+  const list = $("#weflowStoredSessionList");
+  const count = $("#weflowStoredSessionCount");
+  if (!list || !count) return;
+  const items = Array.isArray(sessions) ? sessions : [];
+  const filter = String($("#weflowStoredSessionFilter")?.value || "").trim().toLowerCase();
+  const filtered = filter
+    ? items.filter((session) =>
+        [session.id, session.name, session.conversation_id]
+          .map((value) => String(value || "").toLowerCase())
+          .some((value) => value.includes(filter)),
+      )
+    : items;
+  count.textContent = `${filtered.length}/${items.length} 个`;
+  list.innerHTML = "";
+  if (!items.length) {
+    list.append(emptyNode("本地库为空，先发现一次会话"));
+    return;
+  }
+  if (!filtered.length) {
+    list.append(emptyNode("没有匹配的本地通道"));
+    return;
+  }
+  const selected = new Set(talkerIds());
+  for (const session of filtered.slice(0, 20)) {
+    const sessionId = String(session.id || "").trim();
+    if (!sessionId) continue;
+    const node = document.createElement("article");
+    node.className = "stored-session-item";
+    node.innerHTML = `
+      <div>
+        <strong>${escapeHtml(session.name || sessionId)}</strong>
+        <span>${escapeHtml(conversationTypeText(session.type || ""))} / ${escapeHtml(session.cached ? "本地库" : "实时发现")}</span>
+      </div>
+      <div class="stored-session-actions"></div>
+    `;
+    const actions = node.querySelector(".stored-session-actions");
+    actions.append(simpleButton(selected.has(sessionId) ? "已加入" : "加入", "ghost mini", () => addTalker(sessionId)));
+    if (session.conversation_id) {
+      actions.append(actionButton("×", "danger mini", () => deleteChannel(session.conversation_id), {
+        label: `删除本地通道：${session.name || sessionId}`,
+        category: "通道",
+        scope: `conversation:${session.conversation_id}`,
+        target: session.conversation_id,
+      }));
+    }
+    list.append(node);
+  }
+}
+
+function renderTalkerChips() {
+  const list = $("#weflowTalkerChips");
+  if (!list) return;
+  const ids = talkerIds();
+  list.hidden = !ids.length;
+  list.innerHTML = "";
+  for (const id of ids) {
+    const node = document.createElement("div");
+    node.className = "talker-chip";
+    node.innerHTML = `
+      <div>
+        <strong>${escapeHtml(talkerDisplayName(id))}</strong>
+        <span>${escapeHtml(id)}</span>
+      </div>
+    `;
+    node.append(simpleButton("×", "ghost mini", () => removeTalker(id)));
+    list.append(node);
+  }
+}
+
+function talkerIds() {
+  return splitComma($("#weflowTalkers")?.value || "");
+}
+
+function setTalkerIds(ids) {
+  const input = $("#weflowTalkers");
+  if (!input) return;
+  input.value = [...new Set((ids || []).map((item) => String(item || "").trim()).filter(Boolean))].join(", ");
+  renderTalkerChips();
+  renderWeFlowStoredSessions(state.data?.weflow?.discovered_sessions?.sessions || []);
+}
+
+function addTalker(id) {
+  const sessionId = String(id || "").trim();
+  if (!sessionId) return;
+  setTalkerIds([...talkerIds(), sessionId]);
+  setStatusMessage(`已添加会话：${sessionId}`);
+}
+
+function removeTalker(id) {
+  const sessionId = String(id || "").trim();
+  setTalkerIds(talkerIds().filter((item) => item !== sessionId));
+  setStatusMessage(`已移除会话：${sessionId}`);
+}
+
+function talkerDisplayName(id) {
+  const sessionId = String(id || "").trim();
+  const sources = [
+    ...(state.data?.weflow?.discovered_sessions?.sessions || []),
+    ...(state.data?.weflow?.last_discover?.sessions || []),
+  ];
+  const match = sources.find((item) => String(item?.id || "").trim() === sessionId);
+  return match?.name || sessionId;
 }
 
 function renderCardList({ root, cards, activeIds, emptyText, actionFor }) {
@@ -494,6 +651,18 @@ function renderAudit() {
     `;
     list.append(node);
   }
+}
+
+async function clearSendAudit(helpers = {}) {
+  helpers.update?.(30, "正在清空发送审计");
+  const payload = await api("/api/audit/clear", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  helpers.update?.(78, "发送审计已清空，正在刷新页面状态");
+  setStatusMessage("发送审计已清空");
+  await refresh({ force: true });
+  return payload;
 }
 
 function renderProbeJson() {
@@ -788,6 +957,7 @@ function taskEventText(event) {
 function taskScopeText(scope) {
   const value = String(scope || "");
   if (value.startsWith("conversation:")) return "同会话串行";
+  if (value.startsWith("weflow:exclusive")) return "WeFlow 独占队列";
   if (value.startsWith("weflow:pull")) return "WeFlow 拉取串行";
   if (value.startsWith("weflow:")) return "WeFlow 独立队列";
   if (value.startsWith("settings:")) return "设置串行";
@@ -1034,15 +1204,8 @@ function renderSessionList(sessions) {
     item.addEventListener("click", () => {
       const sessionId = item.dataset.sessionId;
       if (sessionId) {
-        const talkersInput = $("#weflowTalkers");
-        const current = talkersInput.value.trim();
-        const ids = current ? current.split(",").map((x) => x.trim()).filter(Boolean) : [];
-        if (!ids.includes(sessionId)) {
-          ids.push(sessionId);
-        }
-        talkersInput.value = ids.join(", ");
+        addTalker(sessionId);
         list.hidden = true;
-        setStatusMessage(`已添加会话：${sessionId}`);
       }
     });
   });
@@ -1296,6 +1459,18 @@ function actionButton(label, className, handler, meta = {}) {
   return button;
 }
 
+function simpleButton(label, className, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    handler(event);
+  });
+  return button;
+}
+
 function bindTaskButton(selector, meta, handler) {
   const button = $(selector);
   if (!button) return;
@@ -1378,6 +1553,7 @@ function setActivePage(page) {
   $("#weflowPage").hidden = page !== "weflow";
   $("#tasksPage").hidden = page !== "tasks";
   $("#diagnosticsPage").hidden = page !== "diagnostics";
+  if (page === "diagnostics") loadKeyPool();
   setTimeout(repositionTaskProgressPopovers, 0);
 }
 
@@ -1583,6 +1759,21 @@ function channelDisplayHint(channel) {
   return sources ? `${type} / 已绑定消息源 ${sources}` : `${type} / 已隐藏内部会话 ID`;
 }
 
+function channelByConversationId(conversationId) {
+  const id = String(conversationId || "").trim();
+  const items = state.data?.channels?.items || [];
+  return items.find((channel) => String(channel.conversation_id || "").trim() === id) || null;
+}
+
+function conversationLabel(conversationId) {
+  const id = String(conversationId || "").trim();
+  if (!id) return "";
+  const channel = channelByConversationId(id);
+  if (!channel) return id;
+  const name = channelDisplayName(channel);
+  return name && name !== id ? `${name} / ${id}` : id;
+}
+
 function looksLikeInternalConversationId(value) {
   const text = String(value || "").trim();
   return (
@@ -1610,6 +1801,125 @@ function reasonSummary(reasons) {
   return Object.entries(reasons)
     .map(([key, count]) => `${labels[key] || key} ${count}`)
     .join("，");
+}
+
+const keyPoolState = { keys: [], keyFile: "", writable: false, loading: false };
+
+async function loadKeyPool() {
+  if (keyPoolState.loading) return;
+  keyPoolState.loading = true;
+  try {
+    const payload = await api("/api/keys");
+    applyKeyPoolPayload(payload);
+  } catch (error) {
+    setKeyPoolMessage(`加载密钥池失败：${error.message}`, true);
+  } finally {
+    keyPoolState.loading = false;
+  }
+}
+
+function applyKeyPoolPayload(payload) {
+  keyPoolState.keys = Array.isArray(payload.keys) ? payload.keys : [];
+  keyPoolState.keyFile = payload.key_file || "";
+  keyPoolState.writable = Boolean(payload.key_file_writable);
+  renderKeyPool();
+}
+
+function renderKeyPool() {
+  const summary = $("#keyPoolSummary");
+  const list = $("#keyPoolList");
+  if (!summary || !list) return;
+  const total = keyPoolState.keys.length;
+  const available = keyPoolState.keys.filter((item) => item.available).length;
+  summary.textContent = total
+    ? `共 ${total} 个密钥，${available} 个可用`
+    : "尚未配置密钥";
+  list.innerHTML = "";
+  keyPoolState.keys.forEach((item) => list.appendChild(renderKeyRow(item)));
+  const addButton = $("#addKey");
+  const input = $("#newKeyValue");
+  if (addButton) addButton.disabled = !keyPoolState.writable;
+  if (input) input.disabled = !keyPoolState.writable;
+}
+
+function renderKeyRow(item) {
+  const row = document.createElement("div");
+  row.className = "key-pool-row";
+  const info = document.createElement("div");
+  info.className = "key-pool-info";
+  const preview = document.createElement("span");
+  preview.className = "key-pool-preview";
+  preview.textContent = item.preview || (item.available ? "已配置" : "未设置");
+  const meta = document.createElement("span");
+  meta.className = `key-pool-meta ${item.available ? "ok" : "warn"}`;
+  const sourceLabel = { file_secret: "文件密钥", file_env: "文件环境变量", env: "环境变量" }[item.source] || item.source;
+  meta.textContent = `${sourceLabel} · ${item.available ? "可用" : "不可用"}`;
+  info.appendChild(preview);
+  info.appendChild(meta);
+  row.appendChild(info);
+  if (item.source === "file_secret") {
+    row.appendChild(
+      actionButton("移除", "ghost small danger", (helpers) => removeKey(item.ref, helpers), {
+        label: "移除 API 密钥",
+        category: "密钥池",
+        scope: "settings:key-pool",
+      }),
+    );
+  } else {
+    const note = document.createElement("span");
+    note.className = "key-pool-note";
+    note.textContent = "在配置中管理";
+    row.appendChild(note);
+  }
+  return row;
+}
+
+async function addKey(helpers = {}) {
+  const input = $("#newKeyValue");
+  const value = (input?.value || "").trim();
+  if (!value) {
+    setKeyPoolMessage("请先粘贴密钥", true);
+    return { status: "error" };
+  }
+  helpers.update?.(30, "正在写入密钥池");
+  try {
+    const payload = await api("/api/keys/add", { method: "POST", body: JSON.stringify({ value }) });
+    if (input) input.value = "";
+    applyKeyPoolPayload(payload);
+    setKeyPoolMessage("已添加密钥", false);
+    setStatusMessage("密钥池已更新");
+    return payload;
+  } catch (error) {
+    setKeyPoolMessage(`添加失败：${error.message}`, true);
+    return { status: "error", message: error.message };
+  }
+}
+
+async function removeKey(ref, helpers = {}) {
+  helpers.update?.(30, "正在移除密钥");
+  try {
+    const payload = await api("/api/keys/remove", { method: "POST", body: JSON.stringify({ ref }) });
+    applyKeyPoolPayload(payload);
+    setKeyPoolMessage("已移除密钥", false);
+    setStatusMessage("密钥池已更新");
+    return payload;
+  } catch (error) {
+    setKeyPoolMessage(`移除失败：${error.message}`, true);
+    return { status: "error", message: error.message };
+  }
+}
+
+function setKeyPoolMessage(message, isError) {
+  const node = $("#keyPoolMessage");
+  if (!node) return;
+  node.textContent = message;
+  node.hidden = !message;
+  node.classList.toggle("error", Boolean(isError));
+  if (message) {
+    setTimeout(() => {
+      if (node.textContent === message) node.hidden = true;
+    }, 3000);
+  }
 }
 
 document.addEventListener("click", (event) => {
@@ -1674,6 +1984,11 @@ bindTaskButton("#runtimeRefreshButton", {
   category: "技能/人设",
   scope: "ui:runtime-refresh",
 }, () => refresh({ force: true }));
+bindTaskButton("#clearAuditButton", {
+  label: "清空发送审计",
+  category: "发送审计",
+  scope: "audit:clear",
+}, (helpers) => clearSendAudit(helpers));
 bindTaskButton("#weflowRefreshButton", {
   label: "刷新 WeFlow 状态",
   category: "WeFlow",
@@ -1709,12 +2024,12 @@ bindTaskButton("#weflowClearHistoryButton", {
 bindTaskButton("#weflowPullButton", {
   label: "WeFlow 拉取一次",
   category: "WeFlow",
-  scope: "weflow:pull",
+  scope: "weflow:exclusive",
 }, (helpers) => weflowAction("pull-once", {}, helpers));
 bindTaskButton("#weflowBackfillButton", {
   label: "WeFlow 回填历史",
   category: "WeFlow",
-  scope: "weflow:pull",
+  scope: "weflow:exclusive",
 }, (helpers) => weflowBackfill(helpers));
 bindTaskButton("#weflowCancelBackfillButton", {
   label: "取消 WeFlow 回填",
@@ -1734,18 +2049,22 @@ bindTaskButton("#weflowStopButton", {
 bindTaskButton("#weflowDepsButton", {
   label: "检查 WeFlow 依赖",
   category: "WeFlow",
-  scope: "weflow:env",
+  scope: "weflow:exclusive",
 }, (helpers) => weflowDependencies(helpers));
 bindTaskButton("#weflowInstallButton", {
   label: "安装 WeFlow 依赖",
   category: "WeFlow",
-  scope: "weflow:env",
+  scope: "weflow:exclusive",
 }, (helpers) => weflowInstallDeps(helpers));
 ["#weflowBaseUrl", "#weflowTokenEnv"].forEach((selector) => {
   $(selector).addEventListener("input", (event) => {
     event.target.dataset.touched = "1";
   });
 });
+$("#weflowTalkers").addEventListener("input", renderTalkerChips);
+$("#weflowStoredSessionFilter").addEventListener("input", () =>
+  renderWeFlowStoredSessions(state.data?.weflow?.discovered_sessions?.sessions || []),
+);
 $("#personaForm").addEventListener("submit", (event) => {
   event.preventDefault();
   runTask(
@@ -1773,6 +2092,25 @@ $("#taskForm").addEventListener("submit", (event) => {
 $("#toggleProbe").addEventListener("click", () => {
   state.probeExpanded = !state.probeExpanded;
   renderProbeJson();
+});
+bindTaskButton("#refreshKeys", {
+  label: "刷新密钥池",
+  category: "密钥池",
+  scope: "settings:key-pool",
+}, (helpers) => {
+  helpers.update(30, "正在读取密钥池");
+  return loadKeyPool();
+});
+bindTaskButton("#addKey", {
+  label: "添加 API 密钥",
+  category: "密钥池",
+  scope: "settings:key-pool",
+}, (helpers) => addKey(helpers));
+$("#newKeyValue").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    $("#addKey").click();
+  }
 });
 
 refresh({ forceControls: true });

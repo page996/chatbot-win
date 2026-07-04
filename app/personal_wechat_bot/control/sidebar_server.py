@@ -9,14 +9,18 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from app.personal_wechat_bot.control.sidebar_api import (
     ack_sidebar_bridge_item,
+    add_api_key,
     append_sidebar_backend_event,
     build_sidebar_bridge_state,
     build_sidebar_runtime_cards,
     build_sidebar_weflow_state,
     build_sidebar_wechat_probe,
     build_sidebar_state,
+    clear_sidebar_send_audit,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
+    list_api_keys,
+    remove_api_key,
     sidebar_queue_action,
     sidebar_runtime_card_action,
     sidebar_weflow_dependency_status,
@@ -69,6 +73,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/weflow/status":
                 self._json(build_sidebar_weflow_state(data_dir))
                 return
+            if parsed.path == "/api/keys":
+                self._json(list_api_keys(data_dir))
+                return
             self._static(parsed.path)
 
         def do_POST(self) -> None:
@@ -83,6 +90,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/bridge/ack":
                     self._json(ack_sidebar_bridge_item(data_dir, payload))
+                    return
+                if parsed.path == "/api/audit/clear":
+                    self._json(clear_sidebar_send_audit(data_dir))
                     return
                 if parsed.path == "/api/weflow/health":
                     self._json(sidebar_weflow_health(data_dir, payload))
@@ -113,6 +123,12 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/weflow/install-deps":
                     self._json(sidebar_weflow_install_deps(data_dir, payload))
+                    return
+                if parsed.path == "/api/keys/add":
+                    self._json(add_api_key(data_dir, payload))
+                    return
+                if parsed.path == "/api/keys/remove":
+                    self._json(remove_api_key(data_dir, payload))
                     return
                 parts = [part for part in parsed.path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "runtime-cards"]:

@@ -36,18 +36,25 @@ class BridgeOutboxStore:
         self.outbox_path = self.root / "outbox.jsonl"
         self.ack_path = self.root / "acks.jsonl"
         self.root.mkdir(parents=True, exist_ok=True)
+        # Touch outbox/ack files on init so they exist for sidebar/state queries
+        # even before the first send. The worker and state() expect readable files.
+        for path in (self.outbox_path, self.ack_path):
+            if not path.exists():
+                path.write_text("", encoding="utf-8")
 
     def enqueue(
         self,
         conversation_id: str,
         text: str,
         *,
+        receiver: str = "",
         manual_binding: WeChatWindowBinding | None = None,
     ) -> dict[str, Any]:
         bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
         record = {
             "bridge_id": bridge_id,
             "conversation_id": conversation_id,
+            "receiver": receiver,
             "kind": "text",
             "text": text,
             "status": "queued",
@@ -65,12 +72,14 @@ class BridgeOutboxStore:
         *,
         name: str = "",
         caption: str = "",
+        receiver: str = "",
         manual_binding: WeChatWindowBinding | None = None,
     ) -> dict[str, Any]:
         bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
         record = {
             "bridge_id": bridge_id,
             "conversation_id": conversation_id,
+            "receiver": receiver,
             "kind": "file",
             "path": str(path),
             "name": name or Path(path).name,
@@ -204,7 +213,8 @@ class BridgeOutboxSendDriver:
         # longer required. Whitelist authorization is enforced upstream by the
         # router; attach the binding as metadata when present, but never block on it.
         manual_binding = self._manual_binding_for(conversation_id)
-        record = self.store.enqueue(conversation_id, text, manual_binding=manual_binding)
+        receiver = self._receiver_for(conversation_id)
+        record = self.store.enqueue(conversation_id, text, receiver=receiver, manual_binding=manual_binding)
         return SendResult(
             message_id=str(record["bridge_id"]),
             conversation_id=conversation_id,
@@ -218,7 +228,8 @@ class BridgeOutboxSendDriver:
         if not str(path).strip():
             return SendResult("bridge-outbox-send", conversation_id, "failed", "empty_file_path")
         manual_binding = self._manual_binding_for(conversation_id)
-        record = self.store.enqueue_file(conversation_id, path, caption=caption, manual_binding=manual_binding)
+        receiver = self._receiver_for(conversation_id)
+        record = self.store.enqueue_file(conversation_id, path, caption=caption, receiver=receiver, manual_binding=manual_binding)
         return SendResult(
             message_id=str(record["bridge_id"]),
             conversation_id=conversation_id,
@@ -234,9 +245,51 @@ class BridgeOutboxSendDriver:
             return None
         return binding
 
+    def _receiver_for(self, conversation_id: str) -> str:
+        receiver = _channel_receiver(self.data_dir, conversation_id)
+        if receiver:
+            return receiver
+        return str(conversation_id or "").strip()
+
 
 def bridge_state(data_dir: str | Path, *, limit: int = 30) -> dict[str, Any]:
     return BridgeOutboxStore(data_dir).state(limit=limit)
+
+
+def _channel_receiver(data_dir: str | Path, conversation_id: str) -> str:
+    payload = _channel_payload(data_dir, conversation_id)
+    sender_ids = payload.get("sender_wechat_ids") if isinstance(payload, dict) else []
+    if isinstance(sender_ids, list):
+        for item in sender_ids:
+            candidate = str(item or "").strip()
+            if _looks_like_wechat_receiver(candidate):
+                return candidate
+    candidate = str(conversation_id or "").strip()
+    return candidate if _looks_like_wechat_receiver(candidate) else ""
+
+
+def _channel_payload(data_dir: str | Path, conversation_id: str) -> dict[str, Any]:
+    segment = _safe_segment(str(conversation_id or ""))
+    path = Path(data_dir) / "conversation_channels" / segment / "channel.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _looks_like_wechat_receiver(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text.startswith("wxid_") or text.startswith("gh_") or text.endswith("@chatroom"))
+
+
+def _safe_segment(value: str) -> str:
+    import re
+
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return cleaned or "default"
 
 
 def bridge_ack(

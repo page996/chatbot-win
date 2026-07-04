@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.personal_wechat_bot.config.loader import create_default_config
 from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BridgeOutboxSendDriver,
     bridge_ack,
@@ -56,6 +57,35 @@ class BridgeSendTest(unittest.TestCase):
             self.assertEqual(state["pending_count"], 1)
             self.assertEqual(state["items"][0]["text"], "hello bridge")
             self.assertEqual(state["items"][0]["manual_binding"], {})
+
+    def test_bridge_send_uses_channel_receiver_for_hashed_conversation_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = "abc123hashedconversation"
+            channel_dir = data_dir / "conversation_channels" / conversation_id
+            channel_dir.mkdir(parents=True, exist_ok=True)
+            (channel_dir / "channel.json").write_text(
+                """
+{
+  "conversation_id": "abc123hashedconversation",
+  "conversation_type": "private",
+  "chat_title": "Alice",
+  "sender_wechat_ids": ["wxid_real_alice"],
+  "source_names": ["weflow_discovery"],
+  "trusted_channel_source": true
+}
+""".strip(),
+                encoding="utf-8",
+            )
+            driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
+
+            result = driver.send_message(conversation_id, "hello bridge")
+            state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(result.status, "queued_to_bridge")
+            self.assertEqual(state["items"][0]["conversation_id"], conversation_id)
+            self.assertEqual(state["items"][0]["receiver"], "wxid_real_alice")
 
     def test_bridge_send_file_queues_file_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

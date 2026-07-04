@@ -635,10 +635,22 @@ def _attachments_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]
     if not isinstance(raw, list):
         return []
     attachments: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
         attachment = dict(item)
+        # The same media can be emitted more than once upstream (e.g. a voice
+        # backend event plus the generic attachment record). Collapse identical
+        # payloads so the ledger keeps a single block per file.
+        key = (
+            str(attachment.get("file_id", "")).strip(),
+            str(attachment.get("path", "")).strip(),
+            str(attachment.get("name", "")).strip(),
+        )
+        if key != ("", "", "") and key in seen:
+            continue
+        seen.add(key)
         _attach_parse_artifact_refs(attachment)
         attachments.append(attachment)
     return attachments

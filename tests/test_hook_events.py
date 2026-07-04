@@ -356,7 +356,7 @@ class HookEventsTest(unittest.TestCase):
         self.assertEqual(message["metadata"]["backend_event_source"], "wechat_hook_jsonl")
         self.assertEqual(message["metadata"]["conversation_key"], "wxid_page")
         self.assertTrue(entries[0].text_blocks[1]["text"].startswith("hook file body"))
-        self.assertIn("[file_artifacts]", entries[0].text_blocks[1]["text"])
+        self.assertIn("[file_index]", entries[0].text_blocks[1]["text"])
 
     def test_recall_event_marks_target_message_recalled(self) -> None:
         self._append_hook(

@@ -45,6 +45,11 @@ class SendAuditLog:
             records = [item for item in records if item.get("status") == status]
         return records[-limit:]
 
+    def clear(self) -> int:
+        records = self._read_all()
+        self.path.write_text("", encoding="utf-8")
+        return len(records)
+
     def _read_all(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
