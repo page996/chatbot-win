@@ -197,7 +197,13 @@ def _items_from_payload(payload: Any) -> list[OcrItem]:
             except (TypeError, ValueError):
                 score = 0.0
             box = entry.get("box", [])
-            box_points = [list(point) for point in box] if isinstance(box, (list, tuple)) else []
+            box_points: list[list[float]] = []
+            if isinstance(box, (list, tuple)):
+                for point in box:
+                    # Skip malformed points (scalars, wrong length) defensively so
+                    # one bad detection never turns the whole image into an error.
+                    if isinstance(point, (list, tuple)):
+                        box_points.append(list(point))
             items.append(OcrItem(text=text, score=score, box=box_points))
     return items
 

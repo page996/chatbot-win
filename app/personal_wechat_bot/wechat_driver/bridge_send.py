@@ -249,7 +249,11 @@ class BridgeOutboxSendDriver:
         receiver = _channel_receiver(self.data_dir, conversation_id)
         if receiver:
             return receiver
-        return str(conversation_id or "").strip()
+        # Fall back to the conversation_id only when it is itself a valid wcf
+        # receiver (a raw wxid/roomid). A hashed conversation_id is not, so this
+        # yields "" and the send fails cleanly rather than misrouting.
+        candidate = str(conversation_id or "").strip()
+        return candidate if _looks_like_wechat_receiver(candidate) else ""
 
 
 def bridge_state(data_dir: str | Path, *, limit: int = 30) -> dict[str, Any]:
@@ -258,6 +262,25 @@ def bridge_state(data_dir: str | Path, *, limit: int = 30) -> dict[str, Any]:
 
 def _channel_receiver(data_dir: str | Path, conversation_id: str) -> str:
     payload = _channel_payload(data_dir, conversation_id)
+    conversation_type = str(payload.get("conversation_type", "") or "") if isinstance(payload, dict) else ""
+    # The persisted conversation_key is the true talker id (wxid for private,
+    # roomid for groups) the conversation was hashed from — always the correct
+    # receiver when present.
+    conversation_key = str(payload.get("conversation_key", "") or "").strip() if isinstance(payload, dict) else ""
+    if _looks_like_wechat_receiver(conversation_key):
+        return conversation_key
+    if conversation_type == "group":
+        # For a group, only a roomid may receive the reply. sender_wechat_ids
+        # holds speaking members' wxids, so falling back to those would deliver
+        # the group's reply privately to a member. Require a @chatroom id.
+        sender_ids = payload.get("sender_wechat_ids") if isinstance(payload, dict) else []
+        if isinstance(sender_ids, list):
+            for item in sender_ids:
+                candidate = str(item or "").strip()
+                if candidate.endswith("@chatroom"):
+                    return candidate
+        candidate = str(conversation_id or "").strip()
+        return candidate if candidate.endswith("@chatroom") else ""
     sender_ids = payload.get("sender_wechat_ids") if isinstance(payload, dict) else []
     if isinstance(sender_ids, list):
         for item in sender_ids:

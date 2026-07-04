@@ -127,6 +127,38 @@ class FileWorkspaceAnalysisTest(unittest.TestCase):
             self.assertEqual(analysis["ai_analysis_status"], "disabled")
             self.assertNotIn("## AI Analysis", content)
 
+    def test_empty_ocr_placeholder_is_not_analyzed(self) -> None:
+        # Regression: when OCR/ASR recognized nothing, the placeholder text must
+        # NOT be fed to the analyzer as if it were real content. The analyzer
+        # should receive empty input and return skipped, and the LLM must not be
+        # called with placeholder boilerplate.
+        from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
+
+        class _EmptyAsr:
+            def health(self):
+                return AsrHealth("fake_asr", True)
+
+            def transcribe(self, audio_path):
+                return AsrTranscript("empty", "", backend="fake_asr", model="fake", source_path=str(audio_path))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "voice.m4a"
+            source.write_bytes(b"fake audio")
+            llm = _JsonLLM({"summary": "不应被调用"})
+            workspace = FileWorkspace(Path(tmp) / "ws", analyzer=LLMFileAnalyzer(llm))
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="audio")
+
+            # An audio whose ASR is empty: parse result is a placeholder ("empty").
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("empty", "audio", "no speech", ""),
+                embedded_media_asr=_EmptyAsr(),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            self.assertEqual(analysis["ai_analysis_status"], "skipped")
+            self.assertEqual(llm.calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

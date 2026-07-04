@@ -228,10 +228,13 @@ class FileWorkspace:
             prior = cached.get("ai_analysis")
             if isinstance(prior, dict) and prior.get("status") == "analyzed":
                 return prior
-        text = result.text or ""
-        # For media-only files (image/audio) the parsed text is a placeholder, so
-        # fold in any OCR/ASR text we extracted, giving the model something real.
-        text = _augment_analysis_text(text, media_artifacts)
+        # result.text is a placeholder (not real content) whenever the parse did
+        # not actually succeed — empty/skipped/failed images, audio, and
+        # unsupported types all emit "[附件占位符]…". Only feed real text to the
+        # analyzer: use result.text only when status == "parsed"; otherwise rely
+        # on _augment_analysis_text to supply status-filtered OCR/ASR content.
+        base_text = (result.text or "") if result.status == "parsed" else ""
+        text = _augment_analysis_text(base_text, media_artifacts)
         extra = {
             "has_tables": result.kind == "spreadsheet",
             "media_extract_count": int(media_artifacts.get("extract_count", 0) or 0),
@@ -431,16 +434,21 @@ def _augment_analysis_text(text: str, media_artifacts: dict[str, Any] | None) ->
     A pure image/audio file has only a placeholder as its parsed text, so the
     LLM would have nothing to analyze. Append any OCR/ASR text we extracted so
     the analysis reflects the real content.
+
+    Only text from items that actually recognized content is included. When OCR
+    is empty or ASR found no speech, ``ocr_text``/``asr_text`` hold a placeholder
+    string, not real content; including it would make the analyzer summarize the
+    boilerplate as if it were the document, defeating the empty/failed status.
     """
     parts = [text.strip()] if text and text.strip() else []
     artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
     for item in artifacts.get("images", []) or []:
-        if isinstance(item, dict):
+        if isinstance(item, dict) and str(item.get("ocr_status", "")) == "parsed":
             ocr_text = str(item.get("ocr_text", "")).strip()
             if ocr_text:
                 parts.append(ocr_text)
     for item in artifacts.get("audio", []) or []:
-        if isinstance(item, dict):
+        if isinstance(item, dict) and str(item.get("asr_status", "")) == "transcribed":
             asr_text = str(item.get("asr_text", "")).strip()
             if asr_text:
                 parts.append(asr_text)
@@ -1292,11 +1300,19 @@ def _pdf_media_analysis(path: Path) -> dict[str, Any]:
 def _blocked_capabilities(media: dict[str, Any], media_artifacts: dict[str, Any] | None = None) -> list[str]:
     artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
     blocked: list[str] = []
+    # A capability is "blocked" only when OCR/ASR did not actually run (no engine,
+    # missing deps, or error) — NOT when it ran cleanly and simply found no text
+    # (an "empty" result). OCR already counts empty items into ocr_count; ASR
+    # tracks empties separately in empty_count, so fold that in.
     ocr_count = int(artifacts.get("ocr_count", 0) or 0)
-    asr_count = int(artifacts.get("asr_count", 0) or 0)
-    if media.get("embedded") and media.get("has_images") and ocr_count <= 0:
+    ocr_status = str(artifacts.get("ocr_status", ""))
+    asr_ran = int(artifacts.get("asr_count", 0) or 0) + int(artifacts.get("empty_count", 0) or 0)
+    asr_status = str(artifacts.get("asr_status", ""))
+    ocr_ok = ocr_count > 0 or ocr_status in {"completed", "partial"}
+    asr_ok = asr_ran > 0 or asr_status in {"completed", "partial"}
+    if media.get("embedded") and media.get("has_images") and not ocr_ok:
         blocked.append("embedded_image_extraction_and_ocr")
-    if media.get("has_audio") and asr_count <= 0:
+    if media.get("has_audio") and not asr_ok:
         blocked.append("embedded_audio_extraction_and_asr")
     return blocked
 

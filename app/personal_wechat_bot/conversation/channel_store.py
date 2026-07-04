@@ -38,6 +38,7 @@ class ConversationChannel:
     created_at: str
     updated_at: str
     next_key_index: int = 0
+    conversation_key: str = ""
 
 
 class ConversationChannelStore:
@@ -83,6 +84,13 @@ class ConversationChannelStore:
             )
             source_name = str(message.metadata.get("source", "")).strip()
             source_names = _append_unique(list(existing.get("source_names", [])) if existing else [], source_name)
+            # The conversation_key is the upstream talker id (wxid for private,
+            # roomid for groups) the normalizer used to derive conversation_id.
+            # Persist it so the send bridge can always recover the true receiver
+            # — a group's roomid is otherwise unrecoverable from member wxids.
+            conversation_key = _conversation_key_from_message(message)
+            if not conversation_key and existing:
+                conversation_key = str(existing.get("conversation_key", "") or "")
             trusted_channel_source = bool(existing.get("trusted_channel_source", False)) if existing else False
             if source_name in TRUSTED_CHANNEL_SOURCES or message.metadata.get("trusted_channel_source") is True:
                 trusted_channel_source = True
@@ -102,6 +110,7 @@ class ConversationChannelStore:
                 "file_workspace_dir": str(self.file_workspace_root / _safe_segment(message.conversation_id)),
                 "sender_names": sender_names,
                 "sender_wechat_ids": sender_wechat_ids,
+                "conversation_key": conversation_key,
                 "source_names": source_names,
                 "trusted_channel_source": trusted_channel_source,
                 "created_at": existing.get("created_at", now) if existing else now,
@@ -284,11 +293,26 @@ def _channel_from_payload(payload: dict[str, Any]) -> ConversationChannel:
         created_at=str(payload.get("created_at", "")),
         updated_at=str(payload.get("updated_at", "")),
         next_key_index=int(payload.get("next_key_index", 0)),
+        conversation_key=str(payload.get("conversation_key", "") or ""),
     )
 
 
 def _key_slots_for(conversation_type: str) -> int:
     return 2 if conversation_type == "group" else 1
+
+
+def _conversation_key_from_message(message: NormalizedMessage) -> str:
+    """The upstream talker id (wxid/roomid) used to derive conversation_id.
+
+    Mirrors the normalizer's _conversation_key so the persisted receiver stays
+    aligned with the identity the conversation was hashed from.
+    """
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    for key in ("conversation_key", "conversationKey", "talker_id", "talkerId", "talker"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _merge_key_refs(existing: list[str], assigned: list[str], slots: int) -> list[str]:

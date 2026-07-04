@@ -148,8 +148,15 @@ class BridgeWorker:
         receiver = str(record.get("receiver") or "").strip()
         if receiver:
             return receiver
-        # Legacy outbox records did not have receiver. Keep the fallback so old
-        # queues remain consumable; new records carry the wxid/roomid explicitly.
+        # Legacy outbox records did not carry a receiver. Recover it from the
+        # channel registry (roomid for groups, wxid for private) rather than
+        # blindly using the hashed conversation_id, which is never a valid
+        # wcf receiver and would misroute group replies.
+        from app.personal_wechat_bot.wechat_driver.bridge_send import _channel_receiver
+
+        resolved = _channel_receiver(self.data_dir, conversation_id)
+        if resolved:
+            return resolved
         return conversation_id.strip()
 
     def _ack(self, bridge_id: str, status: str, reason: str, *, external_message_id: str = "") -> None:

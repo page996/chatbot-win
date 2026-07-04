@@ -1724,6 +1724,7 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
             "file_workspace_dir": channel.file_workspace_dir,
             "sender_names": channel.sender_names,
             "sender_wechat_ids": channel.sender_wechat_ids,
+            "conversation_key": channel.conversation_key,
             "source_names": channel.source_names,
             "trusted_channel_source": channel.trusted_channel_source,
             "updated_at": channel.updated_at,
@@ -1767,14 +1768,26 @@ def _sidebar_bridge_state(
 
 
 def _bridge_channel_payload(channel: dict[str, Any]) -> dict[str, Any]:
-    sender_ids = channel.get("sender_wechat_ids") if isinstance(channel.get("sender_wechat_ids"), list) else []
-    receiver = next((str(item).strip() for item in sender_ids if _looks_like_wechat_receiver(str(item).strip())), "")
     conversation_id = str(channel.get("conversation_id") or "").strip()
-    if not receiver and _looks_like_wechat_receiver(conversation_id):
-        receiver = conversation_id
+    conversation_type = str(channel.get("conversation_type") or "")
+    sender_ids = channel.get("sender_wechat_ids") if isinstance(channel.get("sender_wechat_ids"), list) else []
+    conversation_key = str(channel.get("conversation_key") or "").strip()
+    # Mirror bridge_send._channel_receiver so the panel shows the true receiver:
+    # prefer the persisted talker id; for groups only a @chatroom id is valid
+    # (a member wxid would misroute the reply privately).
+    if _looks_like_wechat_receiver(conversation_key):
+        receiver = conversation_key
+    elif conversation_type == "group":
+        receiver = next((str(item).strip() for item in sender_ids if str(item).strip().endswith("@chatroom")), "")
+        if not receiver and conversation_id.endswith("@chatroom"):
+            receiver = conversation_id
+    else:
+        receiver = next((str(item).strip() for item in sender_ids if _looks_like_wechat_receiver(str(item).strip())), "")
+        if not receiver and _looks_like_wechat_receiver(conversation_id):
+            receiver = conversation_id
     return {
         "conversation_id": conversation_id,
-        "conversation_type": str(channel.get("conversation_type") or ""),
+        "conversation_type": conversation_type,
         "display_name": str(channel.get("chat_title") or ""),
         "receiver": receiver,
         "bridge_ready": bool(receiver),

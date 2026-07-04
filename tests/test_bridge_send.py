@@ -87,6 +87,67 @@ class BridgeSendTest(unittest.TestCase):
             self.assertEqual(state["items"][0]["conversation_id"], conversation_id)
             self.assertEqual(state["items"][0]["receiver"], "wxid_real_alice")
 
+    def test_group_reply_routes_to_roomid_not_member_wxid(self) -> None:
+        # Regression: a group channel's sender_wechat_ids holds speaking members'
+        # wxids. The reply must go to the group's roomid (from conversation_key),
+        # never privately to a member.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = "grouphash000000000000000"
+            channel_dir = data_dir / "conversation_channels" / conversation_id
+            channel_dir.mkdir(parents=True, exist_ok=True)
+            (channel_dir / "channel.json").write_text(
+                """
+{
+  "conversation_id": "grouphash000000000000000",
+  "conversation_type": "group",
+  "chat_title": "家庭群",
+  "conversation_key": "12345678@chatroom",
+  "sender_wechat_ids": ["wxid_alice_member", "wxid_bob_member"],
+  "source_names": ["backend_events_jsonl"],
+  "trusted_channel_source": true
+}
+""".strip(),
+                encoding="utf-8",
+            )
+            driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
+
+            result = driver.send_message(conversation_id, "群里好")
+            state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(result.status, "queued_to_bridge")
+            self.assertEqual(state["items"][0]["receiver"], "12345678@chatroom")
+
+    def test_group_without_roomid_does_not_leak_to_member_wxid(self) -> None:
+        # If no roomid is recoverable, the receiver must be empty (send fails
+        # cleanly) rather than delivering privately to a member wxid.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = "grouphash111111111111111"
+            channel_dir = data_dir / "conversation_channels" / conversation_id
+            channel_dir.mkdir(parents=True, exist_ok=True)
+            (channel_dir / "channel.json").write_text(
+                """
+{
+  "conversation_id": "grouphash111111111111111",
+  "conversation_type": "group",
+  "chat_title": "无roomid群",
+  "sender_wechat_ids": ["wxid_alice_member"],
+  "source_names": ["backend_events_jsonl"],
+  "trusted_channel_source": true
+}
+""".strip(),
+                encoding="utf-8",
+            )
+            driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
+
+            driver.send_message(conversation_id, "群里好")
+            state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(state["items"][0]["receiver"], "")
+
     def test_bridge_send_file_queues_file_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
