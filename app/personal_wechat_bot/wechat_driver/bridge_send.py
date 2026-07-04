@@ -101,8 +101,8 @@ class BridgeOutboxStore:
         external_message_id: str = "",
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if status not in {"sent", "failed", "blocked"}:
-            raise ValueError("status must be sent, failed, or blocked")
+        if status not in {"sent", "failed", "blocked", "retry"}:
+            raise ValueError("status must be sent, failed, blocked, or retry")
         record = {
             "bridge_id": bridge_id,
             "status": status,
@@ -125,7 +125,14 @@ class BridgeOutboxStore:
             ack = latest_acks.get(bridge_id)
             status = str(ack.get("status", item.get("status", "queued"))) if ack else str(item.get("status", "queued"))
             items.append({**item, "status": status, "ack": ack or {}})
-        pending_count = sum(1 for item in outbox if str(latest_acks.get(str(item.get("bridge_id", "")), {}).get("status", item.get("status", "queued"))) == "queued")
+        # Pending = not yet terminally acked. A "retry" ack is non-terminal, so a
+        # record awaiting another delivery attempt still counts as pending.
+        pending_count = sum(
+            1
+            for item in outbox
+            if str(latest_acks.get(str(item.get("bridge_id", "")), {}).get("status", item.get("status", "queued")))
+            not in {"sent", "failed", "blocked"}
+        )
         return {
             "status": "ok",
             "driver": BRIDGE_OUTBOX_SEND_DRIVER,

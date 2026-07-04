@@ -22,6 +22,7 @@ Design constraints (see the WeFlow concurrency model memory note):
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -36,9 +37,34 @@ from app.personal_wechat_bot.wechat_driver.send_backends import SendBackend, bui
 
 logger = logging.getLogger(__name__)
 
-# Non-retryable ack reasons: delivering again cannot succeed, so mark failed and
-# move on rather than blocking the queue behind a permanently-bad record.
+# A record is "done" (removed from the pending set) only on a terminal ack.
 _TERMINAL_ACK_STATUSES = {"sent", "failed"}
+
+# Substrings marking a transient failure: the backend/receiver may recover, so
+# the record is left pending and retried on a later tick rather than dropped.
+# Anything not matching is treated as permanent (terminal failed).
+_RETRYABLE_REASON_MARKERS = (
+    "unavailable",
+    "connect_failed",
+    "timeout",
+    "timed_out",
+    "temporarily",
+    "econnreset",
+    "connection",
+    "not_login",
+    "is_login",
+    "missing_receiver",
+)
+
+# How many times a single record may be retried across ticks before giving up
+# and writing a terminal failed ack (prevents an unreachable backend from
+# retrying one record forever).
+_MAX_CROSS_TICK_RETRIES = 8
+
+
+def _is_retryable_failure(reason: str) -> bool:
+    lowered = str(reason or "").lower()
+    return any(marker in lowered for marker in _RETRYABLE_REASON_MARKERS)
 
 
 @dataclass
@@ -99,9 +125,26 @@ class BridgeWorker:
     def run_once(self) -> int:
         """Deliver all currently-pending records. Returns the count processed."""
         self.stats.ticks += 1
+        # Re-sync any terminal acks whose ledger/confirm-queue sync previously
+        # failed, so a transient state-write error becomes eventually consistent.
+        self._reconcile_unsynced_acks()
         processed = 0
         for record in self.pending_records():
-            self._deliver(record)
+            bridge_id = str(record.get("bridge_id", ""))
+            try:
+                self._deliver(record)
+            except Exception as exc:
+                # A poison record (e.g. an embedded-NUL path raising ValueError
+                # deep in the backend) must not crash the whole worker and
+                # re-crash every restart. Quarantine it with a terminal ack so
+                # the FIFO queue advances past it.
+                reason = f"deliver_exception:{type(exc).__name__}:{exc}"
+                logger.exception("bridge deliver crashed for %s; quarantining", bridge_id)
+                self.stats.last_error = reason
+                try:
+                    self._ack(bridge_id, "failed", reason)
+                except Exception:  # pragma: no cover - last-resort survival
+                    logger.exception("bridge quarantine ack failed for %s", bridge_id)
             processed += 1
         return processed
 
@@ -112,7 +155,9 @@ class BridgeWorker:
         receiver = self._receiver_for(conversation_id, record)
 
         if not receiver:
-            self._ack(bridge_id, "failed", "missing_receiver")
+            # The receiver may be registered by a later channel update, so treat
+            # a missing receiver as retryable rather than dropping the reply.
+            self._fail_or_retry(bridge_id, "missing_receiver")
             return
 
         outcome = None
@@ -121,6 +166,7 @@ class BridgeWorker:
             if kind == "file":
                 path = str(record.get("path", ""))
                 if not path or not Path(path).exists():
+                    # A vanished/never-present file cannot be re-delivered: terminal.
                     self._ack(bridge_id, "failed", f"file_not_found:{path}")
                     return
                 outcome = self.backend.send_file(receiver, path, str(record.get("caption", "")))
@@ -141,8 +187,36 @@ class BridgeWorker:
 
         if outcome is not None and outcome.ok:
             self._ack(bridge_id, "sent", outcome.reason, external_message_id=outcome.external_message_id)
-        else:
-            self._ack(bridge_id, "failed", last_reason or "send_failed")
+            return
+        self._fail_or_retry(bridge_id, last_reason or "send_failed")
+
+    def _fail_or_retry(self, bridge_id: str, reason: str) -> None:
+        """Ack a delivery failure as retryable (stays pending) or terminal.
+
+        A transient reason (backend down, receiver momentarily unavailable) is
+        left pending so a later tick retries it, up to a cross-tick cap. A
+        permanent reason — or an exhausted retry budget — becomes terminal.
+        """
+        if _is_retryable_failure(reason):
+            prior_retries = self._retry_count(bridge_id)
+            if prior_retries < _MAX_CROSS_TICK_RETRIES:
+                self._ack(
+                    bridge_id,
+                    "retry",
+                    reason,
+                    payload={"retry_attempt": prior_retries + 1, "max_retries": _MAX_CROSS_TICK_RETRIES},
+                )
+                return
+            reason = f"retries_exhausted:{reason}"
+        self._ack(bridge_id, "failed", reason)
+
+    def _retry_count(self, bridge_id: str) -> int:
+        """Number of non-terminal retry acks already recorded for this record."""
+        count = 0
+        for ack in self.store._read_all(self.store.ack_path):
+            if str(ack.get("bridge_id", "")) == bridge_id and str(ack.get("status", "")) == "retry":
+                count += 1
+        return count
 
     def _receiver_for(self, conversation_id: str, record: dict[str, Any]) -> str:
         receiver = str(record.get("receiver") or "").strip()
@@ -159,7 +233,15 @@ class BridgeWorker:
             return resolved
         return conversation_id.strip()
 
-    def _ack(self, bridge_id: str, status: str, reason: str, *, external_message_id: str = "") -> None:
+    def _ack(
+        self,
+        bridge_id: str,
+        status: str,
+        reason: str,
+        *,
+        external_message_id: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         if not bridge_id:
             return
         try:
@@ -168,12 +250,22 @@ class BridgeWorker:
                 status=status,
                 reason=reason,
                 external_message_id=external_message_id,
+                payload=payload,
             )
         except Exception as exc:  # pragma: no cover - best effort persistence
             self.stats.last_error = f"append_ack_failed:{type(exc).__name__}:{exc}"
             logger.error("bridge %s", self.stats.last_error)
+        # A non-terminal retry ack must not trigger ledger/queue sync (the send
+        # has not resolved yet) and must not be marked synced.
+        if status not in _TERMINAL_ACK_STATUSES and status != "blocked":
+            self.stats.record(status, reason)
+            return
         # Sync confirm queue + ledger. This is best-effort: a sync failure must
         # not prevent the ack (delivery already happened) from being recorded.
+        # For terminal acks we record whether the sync succeeded so a later tick
+        # can reconcile any that failed (otherwise the ledger/queue would stay
+        # unflipped forever once the record leaves the pending set).
+        synced = False
         try:
             sync_bridge_ack_to_send_state(
                 self.data_dir,
@@ -182,10 +274,73 @@ class BridgeWorker:
                 reason=reason,
                 external_message_id=external_message_id,
             )
+            synced = True
         except Exception as exc:  # pragma: no cover - best effort
             self.stats.last_error = f"sync_failed:{type(exc).__name__}:{exc}"
             logger.error("bridge %s", self.stats.last_error)
+        if status in _TERMINAL_ACK_STATUSES and synced:
+            self._mark_synced(bridge_id)
         self.stats.record(status, reason)
+
+    def _synced_marker_path(self) -> Path:
+        return self.data_dir / "send_bridge" / "synced_acks.json"
+
+    def _load_synced(self) -> set[str]:
+        path = self._synced_marker_path()
+        if not path.exists():
+            return set()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+        ids = payload.get("synced") if isinstance(payload, dict) else None
+        return {str(item) for item in ids} if isinstance(ids, list) else set()
+
+    def _mark_synced(self, bridge_id: str) -> None:
+        synced = self._load_synced()
+        if bridge_id in synced:
+            return
+        synced.add(bridge_id)
+        path = self._synced_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps({"synced": sorted(synced)}, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:  # pragma: no cover - best effort
+            logger.error("bridge synced-marker write failed: %s", exc)
+
+    def _reconcile_unsynced_acks(self) -> None:
+        """Re-run ledger/confirm-queue sync for terminal acks that never synced.
+
+        A terminal ack is durable in acks.jsonl even if its downstream sync
+        failed (Windows file lock, disk error). Because the record then leaves
+        the pending set, _deliver never runs again — without this pass the ledger
+        and confirm queue would stay unflipped forever. sync is idempotent, so
+        re-running for an already-synced record is harmless; the marker just
+        avoids redundant work.
+        """
+        synced = self._load_synced()
+        terminal: dict[str, dict[str, Any]] = {}
+        for ack in self.store._read_all(self.store.ack_path):
+            bridge_id = str(ack.get("bridge_id", ""))
+            if bridge_id and str(ack.get("status", "")) in _TERMINAL_ACK_STATUSES:
+                terminal[bridge_id] = ack  # keep the latest terminal ack
+        for bridge_id, ack in terminal.items():
+            if bridge_id in synced:
+                continue
+            try:
+                sync_bridge_ack_to_send_state(
+                    self.data_dir,
+                    bridge_id,
+                    status=str(ack.get("status", "")),
+                    reason=str(ack.get("reason", "")),
+                    external_message_id=str(ack.get("external_message_id", "")),
+                )
+                self._mark_synced(bridge_id)
+            except Exception as exc:  # pragma: no cover - retried next tick
+                self.stats.last_error = f"reconcile_sync_failed:{type(exc).__name__}:{exc}"
+                logger.error("bridge %s", self.stats.last_error)
 
 
 def run_bridge_worker(
