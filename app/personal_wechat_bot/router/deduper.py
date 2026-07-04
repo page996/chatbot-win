@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import sqlite3
 from contextlib import closing
 from pathlib import Path
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.memory.sqlite_utils import connect
 
 
 class Deduper:
@@ -20,7 +20,7 @@ class Deduper:
             return True
         if self.db_path is None:
             return False
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             row = conn.execute(
                 "SELECT 1 FROM processed_messages WHERE message_id = ?",
                 (message_id,),
@@ -34,7 +34,7 @@ class Deduper:
         self._seen.add(message_id)
         if self.db_path is None:
             return
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """
@@ -47,7 +47,7 @@ class Deduper:
     def _init_db(self) -> None:
         if self.db_path is None:
             return
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """

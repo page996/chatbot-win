@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
-import sqlite3
 from contextlib import closing
 from pathlib import Path
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.memory.sqlite_utils import connect
 
 
 class FileIndex:
@@ -16,7 +16,7 @@ class FileIndex:
         self._init()
 
     def _init(self) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """
@@ -37,7 +37,7 @@ class FileIndex:
         digest = _sha256_file(file_path)
         file_id = digest[:24]
         mime_type = mimetypes.guess_type(file_path.name)[0]
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """

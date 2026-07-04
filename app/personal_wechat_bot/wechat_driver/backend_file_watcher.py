@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event
+from app.personal_wechat_bot.memory.sqlite_utils import connect
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ class BackendFileWatcher:
         return created
 
     def _init_db(self) -> None:
-        with closing(sqlite3.connect(self.state_db)) as conn:
+        with closing(connect(self.state_db)) as conn:
             with conn:
                 conn.execute(
                     """
@@ -88,7 +88,7 @@ class BackendFileWatcher:
                 )
 
     def _try_mark_seen(self, fingerprint: str, path: Path) -> bool:
-        with closing(sqlite3.connect(self.state_db)) as conn:
+        with closing(connect(self.state_db)) as conn:
             with conn:
                 cursor = conn.execute(
                     """

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.logging.jsonl_rotation import append_line_with_rotation
 
 
 class EventLogger:
@@ -20,8 +21,7 @@ class EventLogger:
             **ids,
             "payload": _to_jsonable(payload),
         }
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_line_with_rotation(self.path, json.dumps(record, ensure_ascii=False))
 
 
 def _to_jsonable(value: Any) -> Any:

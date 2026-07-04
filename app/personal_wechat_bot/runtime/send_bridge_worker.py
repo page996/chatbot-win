@@ -61,6 +61,11 @@ _RETRYABLE_REASON_MARKERS = (
 # retrying one record forever).
 _MAX_CROSS_TICK_RETRIES = 8
 
+# Outbox/acks compaction cadence and retention. Compaction drops old terminally-
+# resolved records so the files (re-read in full every tick) stay bounded.
+_COMPACT_EVERY_TICKS = 50
+_KEEP_RESOLVED_RECORDS = 500
+
 
 def _is_retryable_failure(reason: str) -> bool:
     lowered = str(reason or "").lower()
@@ -146,7 +151,38 @@ class BridgeWorker:
                 except Exception:  # pragma: no cover - last-resort survival
                     logger.exception("bridge quarantine ack failed for %s", bridge_id)
             processed += 1
+        self._maybe_compact()
         return processed
+
+    def _maybe_compact(self) -> None:
+        """Periodically compact the outbox/acks so they don't grow unbounded.
+
+        Both files are re-read in full every tick, so compaction keeps steady-
+        state read cost bounded. Runs every _COMPACT_EVERY_TICKS ticks; the marker
+        of synced bridge_ids is pruned to whatever compaction retained.
+        """
+        if self.stats.ticks % _COMPACT_EVERY_TICKS != 0:
+            return
+        try:
+            result = self.store.compact(keep_resolved=_KEEP_RESOLVED_RECORDS)
+        except Exception as exc:  # pragma: no cover - best effort
+            self.stats.last_error = f"compact_failed:{type(exc).__name__}:{exc}"
+            logger.error("bridge %s", self.stats.last_error)
+            return
+        if result.get("removed_outbox") or result.get("removed_acks"):
+            self._prune_synced_marker()
+
+    def _prune_synced_marker(self) -> None:
+        """Drop synced-marker ids no longer present in the (compacted) acks."""
+        try:
+            live = {str(ack.get("bridge_id", "")) for ack in self.store._read_all(self.store.ack_path)}
+            synced = self._load_synced() & live
+            path = self._synced_marker_path()
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"synced": sorted(synced)}, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:  # pragma: no cover - best effort
+            logger.error("bridge synced-marker prune failed: %s", exc)
 
     def _deliver(self, record: dict[str, Any]) -> None:
         bridge_id = str(record.get("bridge_id", ""))

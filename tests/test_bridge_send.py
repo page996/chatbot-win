@@ -7,6 +7,7 @@ from pathlib import Path
 from app.personal_wechat_bot.config.loader import create_default_config
 from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BridgeOutboxSendDriver,
+    BridgeOutboxStore,
     bridge_ack,
     bridge_state,
 )
@@ -189,6 +190,66 @@ class BridgeSendTest(unittest.TestCase):
 
             self.assertEqual(probe.health, "ready")
             self.assertEqual(probe.blockers, [])
+
+
+class BridgeOutboxCompactionTest(unittest.TestCase):
+    def test_compact_drops_old_resolved_keeps_pending_and_recent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            # 5 resolved (sent) records + 1 still-pending record.
+            resolved_ids = []
+            for i in range(5):
+                rec = store.enqueue("wxid_a", f"msg {i}")
+                store.append_ack(rec["bridge_id"], status="sent", reason="ok")
+                resolved_ids.append(rec["bridge_id"])
+            pending = store.enqueue("wxid_b", "still pending")
+
+            # keep only the 2 most recent resolved records.
+            result = store.compact(keep_resolved=2)
+
+            self.assertEqual(result["removed_outbox"], 3)
+            state = store.state(limit=50)
+            remaining = {item["bridge_id"] for item in state["items"]}
+            # pending always retained
+            self.assertIn(pending["bridge_id"], remaining)
+            # 2 newest resolved retained, 3 oldest dropped
+            self.assertIn(resolved_ids[-1], remaining)
+            self.assertIn(resolved_ids[-2], remaining)
+            self.assertNotIn(resolved_ids[0], remaining)
+            self.assertEqual(state["pending_count"], 1)
+
+    def test_compact_is_noop_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "one")
+            store.append_ack(rec["bridge_id"], status="sent", reason="ok")
+
+            result = store.compact(keep_resolved=500)
+
+            self.assertEqual(result, {"removed_outbox": 0, "removed_acks": 0})
+
+    def test_compacted_records_are_not_redelivered(self) -> None:
+        # A dropped record is terminally resolved, so a fresh worker must not
+        # re-send it (restart-safety survives compaction).
+        from app.personal_wechat_bot.runtime.send_bridge_worker import BridgeWorker
+        from app.personal_wechat_bot.wechat_driver.send_backends import DryRunSendBackend
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            for i in range(4):
+                rec = store.enqueue("wxid_a", f"done {i}")
+                store.append_ack(rec["bridge_id"], status="sent", reason="ok")
+            store.compact(keep_resolved=1)
+
+            backend = DryRunSendBackend()
+            processed = BridgeWorker(data_dir, backend).run_once()
+
+            self.assertEqual(processed, 0)
+            self.assertEqual(backend.sent_texts, [])
 
 
 if __name__ == "__main__":

@@ -160,6 +160,63 @@ class BridgeOutboxStore:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def compact(self, *, keep_resolved: int = 500) -> dict[str, int]:
+        """Drop old terminally-resolved records from outbox.jsonl + acks.jsonl.
+
+        The bridge worker re-reads both files in full on every tick, so without
+        compaction they grow forever and each tick gets slower. A record is
+        "resolved" once its latest ack is terminal (sent/failed/blocked); such
+        records will never be delivered again, so dropping the oldest ones is
+        restart-safe. The most recent ``keep_resolved`` resolved records are
+        retained for history/audit, plus every not-yet-resolved (pending/retry)
+        record and all acks referencing a retained bridge_id.
+
+        Returns counts of removed outbox/ack lines. A no-op-safe rewrite: if
+        nothing is droppable it leaves the files untouched.
+        """
+        outbox = self._read_all(self.outbox_path)
+        acks = self._read_all(self.ack_path)
+        latest = _latest_by_bridge_id(acks)
+        terminal = {"sent", "failed", "blocked"}
+
+        resolved_order: list[str] = []
+        pending_ids: set[str] = set()
+        for item in outbox:
+            bridge_id = str(item.get("bridge_id", ""))
+            if not bridge_id:
+                continue
+            status = str(latest.get(bridge_id, {}).get("status", "")) if bridge_id in latest else ""
+            if status in terminal:
+                resolved_order.append(bridge_id)
+            else:
+                pending_ids.add(bridge_id)
+
+        if len(resolved_order) <= max(0, keep_resolved):
+            return {"removed_outbox": 0, "removed_acks": 0}
+
+        # Keep the most-recent resolved ids (outbox is FIFO, so tail = newest).
+        keep_resolved_ids = set(resolved_order[-keep_resolved:]) if keep_resolved > 0 else set()
+        keep_ids = pending_ids | keep_resolved_ids
+
+        new_outbox = [item for item in outbox if str(item.get("bridge_id", "")) in keep_ids]
+        new_acks = [ack for ack in acks if str(ack.get("bridge_id", "")) in keep_ids]
+        removed_outbox = len(outbox) - len(new_outbox)
+        removed_acks = len(acks) - len(new_acks)
+        if removed_outbox <= 0 and removed_acks <= 0:
+            return {"removed_outbox": 0, "removed_acks": 0}
+
+        self._rewrite(self.outbox_path, new_outbox)
+        self._rewrite(self.ack_path, new_acks)
+        return {"removed_outbox": removed_outbox, "removed_acks": removed_acks}
+
+    def _rewrite(self, path: Path, records: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        tmp.replace(path)
+
     def _read_all(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []

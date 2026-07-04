@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.memory.sqlite_utils import connect
 
 
 class ConversationCooldown:
@@ -38,7 +38,7 @@ class ConversationCooldown:
         self._last_seen[conversation_id] = now
         if self.db_path is None:
             return
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """
@@ -55,7 +55,7 @@ class ConversationCooldown:
             return self._last_seen[conversation_id]
         if self.db_path is None:
             return None
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             row = conn.execute(
                 "SELECT last_reply_at FROM conversation_cooldowns WHERE conversation_id = ?",
                 (conversation_id,),
@@ -69,7 +69,7 @@ class ConversationCooldown:
     def _init_db(self) -> None:
         if self.db_path is None:
             return
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """
