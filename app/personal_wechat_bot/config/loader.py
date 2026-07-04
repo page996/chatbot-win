@@ -150,6 +150,44 @@ def rename_group(data_dir: str | Path, old_name: str, new_name: str) -> None:
     save_config(config)
 
 
+def set_model_provider(
+    data_dir: str | Path,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
+    max_wait_seconds: int | None = None,
+) -> ProviderConfig:
+    """Update the chat provider's model/endpoint/format in place.
+
+    Only the fields the model-config panel edits are touched; the key pool link
+    (api_key_file / api_key_env_pool) is preserved so existing keys keep working.
+    The async-summary path shares the chat provider, so it follows the same
+    model automatically. Returns the updated chat provider config.
+    """
+    config = load_config(data_dir)
+    current = config.providers.get("chat", config.llm)
+    updated = LLMConfig(
+        provider_id="chat",
+        provider=str(provider) if provider is not None else current.provider,
+        model=str(model) if model is not None else current.model,
+        base_url=str(base_url) if base_url is not None else current.base_url,
+        api_key_env=str(api_key_env) if api_key_env is not None else current.api_key_env,
+        api_key_env_pool=list(current.api_key_env_pool),
+        api_key_file=current.api_key_file,
+        stream=current.stream,
+        max_wait_seconds=max_wait_seconds if max_wait_seconds is not None else current.max_wait_seconds,
+        capabilities=list(current.capabilities),
+        max_concurrency=current.max_concurrency,
+        cooldown_seconds=current.cooldown_seconds,
+    )
+    config.llm = updated
+    config.providers["chat"] = updated
+    save_config(config)
+    return updated
+
+
 def set_chat_provider(
     data_dir: str | Path,
     base_url: str,

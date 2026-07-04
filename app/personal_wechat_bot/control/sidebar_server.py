@@ -19,8 +19,11 @@ from app.personal_wechat_bot.control.sidebar_api import (
     clear_sidebar_send_audit,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
+    get_model_config,
     list_api_keys,
+    probe_model_fetch,
     remove_api_key,
+    set_model_config,
     sidebar_queue_action,
     sidebar_runtime_card_action,
     sidebar_weflow_dependency_status,
@@ -76,6 +79,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/keys":
                 self._json(list_api_keys(data_dir))
                 return
+            if parsed.path == "/api/model-config":
+                self._json(get_model_config(data_dir))
+                return
             self._static(parsed.path)
 
         def do_POST(self) -> None:
@@ -129,6 +135,12 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/keys/remove":
                     self._json(remove_api_key(data_dir, payload))
+                    return
+                if parsed.path == "/api/model-config":
+                    self._json(set_model_config(data_dir, payload))
+                    return
+                if parsed.path == "/api/model-config/probe":
+                    self._json(probe_model_fetch(data_dir, payload))
                     return
                 parts = [part for part in parsed.path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "runtime-cards"]:

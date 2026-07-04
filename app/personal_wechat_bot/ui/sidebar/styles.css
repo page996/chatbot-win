@@ -1433,3 +1433,72 @@ button.mini {
 .key-pool-message.error {
   color: #b42318;
 }
+
+.model-config-form {
+  display: grid;
+  gap: 8px;
+}
+
+.model-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: #475467;
+}
+
+.model-field select,
+.model-field input {
+  border: 1px solid #d9e2ee;
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 13px;
+}
+
+.model-config-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.model-probe-result {
+  margin-top: 10px;
+  border: 1px solid #e4eaf2;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #f8fafc;
+  font-size: 12px;
+}
+
+.model-probe-result.error {
+  border-color: #fda29b;
+  background: #fef3f2;
+  color: #b42318;
+}
+
+.model-probe-head {
+  color: #182230;
+  margin-bottom: 6px;
+}
+
+.model-probe-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.model-chip {
+  border: 1px solid #d9e2ee;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  background: #fff;
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.model-chip.active {
+  border-color: #067647;
+  color: #067647;
+}

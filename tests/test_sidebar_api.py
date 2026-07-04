@@ -20,8 +20,11 @@ from app.personal_wechat_bot.control.sidebar_api import (
     build_sidebar_state,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
+    get_model_config,
     list_api_keys,
+    probe_model_fetch,
     remove_api_key,
+    set_model_config,
     sidebar_weflow_backfill,
     sidebar_weflow_cancel_backfill,
     sidebar_queue_action,
@@ -678,6 +681,72 @@ class SidebarKeyPoolApiTest(unittest.TestCase):
             self._configure_key_file(data_dir)
             with self.assertRaises(ValueError):
                 remove_api_key(data_dir, {"ref": "missing:secret:deadbeef"})
+
+
+class SidebarModelConfigApiTest(unittest.TestCase):
+    def test_get_and_set_model_config_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            initial = get_model_config(data_dir)
+            self.assertEqual(initial["status"], "ok")
+            self.assertIn("deepseek", initial["provider_formats"])
+            self.assertTrue(initial["async_summary_follows_chat"])
+
+            result = set_model_config(
+                data_dir,
+                {"provider": "relay", "model": "gpt-5.5", "base_url": "https://relay.example/v1", "max_wait_seconds": 90},
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["model"], "gpt-5.5")
+
+            updated = get_model_config(data_dir)
+            self.assertEqual(updated["provider"], "relay")
+            self.assertEqual(updated["model"], "gpt-5.5")
+            self.assertEqual(updated["base_url"], "https://relay.example/v1")
+            self.assertEqual(updated["max_wait_seconds"], 90)
+
+    def test_set_model_config_preserves_key_pool_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            provider = config.providers.get("chat", config.llm)
+            provider.api_key_file = "keys.md"
+            config.llm.api_key_file = "keys.md"
+            config.providers["chat"] = provider
+            save_config(config)
+
+            set_model_config(data_dir, {"model": "deepseek-v4-flash"})
+
+            after = load_config(data_dir)
+            # The key-file link must survive a model edit so keys keep working.
+            self.assertEqual(after.providers["chat"].api_key_file, "keys.md")
+
+    def test_set_model_config_rejects_unknown_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            with self.assertRaises(ValueError):
+                set_model_config(data_dir, {"provider": "not-a-format"})
+
+    def test_probe_model_fetch_without_key_reports_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            # No key pool configured -> probe should fail gracefully, not raise.
+            result = probe_model_fetch(data_dir, {"base_url": "https://api.deepseek.com", "provider": "deepseek"})
+            self.assertEqual(result["status"], "error")
+            self.assertFalse(result["reachable"])
+            self.assertEqual(result["error"], "no_api_key_available")
+
+    def test_probe_model_fetch_requires_base_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            with self.assertRaises(ValueError):
+                probe_model_fetch(data_dir, {"base_url": ""})
 
 
 def _reply() -> ReplyCandidate:

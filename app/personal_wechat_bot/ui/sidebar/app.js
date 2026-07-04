@@ -1553,7 +1553,10 @@ function setActivePage(page) {
   $("#weflowPage").hidden = page !== "weflow";
   $("#tasksPage").hidden = page !== "tasks";
   $("#diagnosticsPage").hidden = page !== "diagnostics";
-  if (page === "diagnostics") loadKeyPool();
+  if (page === "diagnostics") {
+    loadModelConfig();
+    loadKeyPool();
+  }
   setTimeout(repositionTaskProgressPopovers, 0);
 }
 
@@ -1804,6 +1807,159 @@ function reasonSummary(reasons) {
 }
 
 const keyPoolState = { keys: [], keyFile: "", writable: false, loading: false };
+
+const modelConfigState = { loading: false, loaded: false };
+
+async function loadModelConfig() {
+  if (modelConfigState.loading) return;
+  modelConfigState.loading = true;
+  try {
+    const payload = await api("/api/model-config");
+    applyModelConfig(payload);
+    modelConfigState.loaded = true;
+  } catch (error) {
+    setModelConfigMessage(`加载模型配置失败：${error.message}`, true);
+  } finally {
+    modelConfigState.loading = false;
+  }
+}
+
+function applyModelConfig(payload) {
+  const providerSelect = $("#modelProvider");
+  if (providerSelect) {
+    const formats = Array.isArray(payload.provider_formats) && payload.provider_formats.length
+      ? payload.provider_formats
+      : ["deepseek", "relay"];
+    providerSelect.innerHTML = "";
+    for (const format of formats) {
+      const option = document.createElement("option");
+      option.value = format;
+      option.textContent = format === "deepseek" ? "deepseek" : "relay (OpenAI 兼容)";
+      providerSelect.append(option);
+    }
+    providerSelect.value = payload.provider || formats[0];
+  }
+  const nameInput = $("#modelName");
+  if (nameInput) nameInput.value = payload.model || "";
+  const baseInput = $("#modelBaseUrl");
+  if (baseInput) baseInput.value = payload.base_url || "";
+  const waitInput = $("#modelMaxWait");
+  if (waitInput) waitInput.value = payload.max_wait_seconds != null ? payload.max_wait_seconds : "";
+}
+
+function modelConfigPayload() {
+  const maxWaitRaw = String($("#modelMaxWait")?.value || "").trim();
+  return {
+    provider: $("#modelProvider")?.value || "",
+    model: String($("#modelName")?.value || "").trim(),
+    base_url: String($("#modelBaseUrl")?.value || "").trim(),
+    ...(maxWaitRaw ? { max_wait_seconds: Number(maxWaitRaw) } : {}),
+  };
+}
+
+async function saveModelConfig(helpers = {}) {
+  const payload = modelConfigPayload();
+  if (!payload.model) {
+    setModelConfigMessage("请填写模型名", true);
+    return { status: "error" };
+  }
+  if (!payload.base_url) {
+    setModelConfigMessage("请填写请求地址 base_url", true);
+    return { status: "error" };
+  }
+  helpers.update?.(30, "正在保存模型配置");
+  try {
+    const result = await api("/api/model-config", { method: "POST", body: JSON.stringify(payload) });
+    applyModelConfig(result.model_config || {});
+    setModelConfigMessage("模型配置已保存", false);
+    setStatusMessage("模型配置已保存");
+    return result;
+  } catch (error) {
+    setModelConfigMessage(`保存失败：${error.message}`, true);
+    return { status: "error", message: error.message };
+  }
+}
+
+async function probeModelFetch(helpers = {}) {
+  const payload = modelConfigPayload();
+  if (!payload.base_url) {
+    setModelConfigMessage("请先填写请求地址 base_url", true);
+    return { status: "error" };
+  }
+  helpers.update?.(30, "正在试拉取模型列表");
+  try {
+    const result = await api("/api/model-config/probe", { method: "POST", body: JSON.stringify(payload) });
+    renderModelProbe(result);
+    if (result.status === "ok") {
+      setModelConfigMessage(`试拉取成功，返回 ${result.model_count} 个模型`, false);
+    } else {
+      setModelConfigMessage(`试拉取失败：${result.error || "unknown"}`, true);
+    }
+    return result;
+  } catch (error) {
+    renderModelProbe({ status: "error", error: error.message });
+    setModelConfigMessage(`试拉取失败：${error.message}`, true);
+    return { status: "error", message: error.message };
+  }
+}
+
+function renderModelProbe(result) {
+  const box = $("#modelProbeResult");
+  const datalist = $("#modelNameOptions");
+  if (!box) return;
+  box.hidden = false;
+  box.classList.toggle("error", result.status !== "ok");
+  if (result.status !== "ok") {
+    const detail = result.http_status ? `HTTP ${result.http_status}` : (result.error || "unknown");
+    box.textContent = `不可达 / ${detail}`;
+    return;
+  }
+  const models = Array.isArray(result.models) ? result.models : [];
+  if (datalist) {
+    datalist.innerHTML = "";
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model;
+      datalist.append(option);
+    }
+  }
+  box.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "model-probe-head";
+  const configured = result.configured_model;
+  const availability = result.configured_model_available;
+  head.textContent = `可达 · ${result.model_count} 个模型` +
+    (configured ? ` · 当前模型 ${configured} ${availability ? "✓ 可用" : "✗ 不在列表"}` : "");
+  box.append(head);
+  const list = document.createElement("div");
+  list.className = "model-probe-list";
+  for (const model of models.slice(0, 40)) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "model-chip" + (model === configured ? " active" : "");
+    chip.textContent = model;
+    chip.addEventListener("click", () => {
+      const input = $("#modelName");
+      if (input) input.value = model;
+      setModelConfigMessage(`已选择模型 ${model}，记得保存`, false);
+    });
+    list.append(chip);
+  }
+  box.append(list);
+}
+
+function setModelConfigMessage(message, isError) {
+  const node = $("#modelConfigMessage");
+  if (!node) return;
+  node.textContent = message;
+  node.hidden = !message;
+  node.classList.toggle("error", Boolean(isError));
+  if (message && !isError) {
+    setTimeout(() => {
+      if (node.textContent === message) node.hidden = true;
+    }, 3000);
+  }
+}
 
 async function loadKeyPool() {
   if (keyPoolState.loading) return;
@@ -2111,6 +2267,31 @@ $("#newKeyValue").addEventListener("keydown", (event) => {
     event.preventDefault();
     $("#addKey").click();
   }
+});
+bindTaskButton("#refreshModelConfig", {
+  label: "刷新模型配置",
+  category: "模型配置",
+  scope: "settings:model-config",
+}, (helpers) => {
+  helpers.update(30, "正在读取模型配置");
+  return loadModelConfig();
+});
+bindTaskButton("#probeModelButton", {
+  label: "试拉取模型",
+  category: "模型配置",
+  scope: "settings:model-config",
+}, (helpers) => probeModelFetch(helpers));
+$("#modelConfigForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  runTask(
+    {
+      label: "保存模型配置",
+      category: "模型配置",
+      scope: "settings:model-config",
+      button: event.submitter || null,
+    },
+    (helpers) => saveModelConfig(helpers),
+  );
 });
 
 refresh({ forceControls: true });

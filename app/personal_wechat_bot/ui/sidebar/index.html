@@ -320,6 +320,38 @@
         </section>
         <section class="inspector">
           <div class="section-head">
+            <h2>模型配置</h2>
+            <button id="refreshModelConfig" class="ghost small">刷新</button>
+          </div>
+          <p class="diagnostic-copy">主对话模型；异步摘要沿用同一模型。密钥仍走上方密钥池轮询，此处只配置请求格式/地址/模型。</p>
+          <form id="modelConfigForm" class="model-config-form" autocomplete="off">
+            <label class="model-field">
+              <span>请求格式</span>
+              <select id="modelProvider"></select>
+            </label>
+            <label class="model-field">
+              <span>模型 model</span>
+              <input id="modelName" type="text" list="modelNameOptions" placeholder="deepseek-v4-flash / gpt-5.5 …" spellcheck="false" />
+              <datalist id="modelNameOptions"></datalist>
+            </label>
+            <label class="model-field">
+              <span>请求地址 base_url</span>
+              <input id="modelBaseUrl" type="text" placeholder="https://api.deepseek.com" spellcheck="false" />
+            </label>
+            <label class="model-field">
+              <span>超时秒数 (可选)</span>
+              <input id="modelMaxWait" type="number" min="1" placeholder="60" />
+            </label>
+            <div class="model-config-actions">
+              <button id="probeModelButton" class="ghost small" type="button">试拉取模型</button>
+              <button id="saveModelConfig" class="primary small" type="submit">保存</button>
+            </div>
+          </form>
+          <p id="modelConfigMessage" class="key-pool-message" hidden></p>
+          <div id="modelProbeResult" class="model-probe-result" hidden></div>
+        </section>
+        <section class="inspector">
+          <div class="section-head">
             <h2>API 密钥池</h2>
             <button id="refreshKeys" class="ghost small">刷新</button>
           </div>
@@ -334,6 +366,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js?v=20260703-key-pool"></script>
+    <script src="/app.js?v=20260704-model-config"></script>
   </body>
 </html>

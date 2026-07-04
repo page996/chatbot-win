@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
-from app.personal_wechat_bot.config.loader import load_config, migrate_file_allowed_extensions
+from app.personal_wechat_bot.config.loader import load_config, migrate_file_allowed_extensions, set_model_provider
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
@@ -1565,6 +1565,128 @@ def remove_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
     if not removed:
         raise ValueError("key not found or not file-backed")
     return {"status": "ok", "removed": ref, **list_api_keys(data_dir)}
+
+
+# Provider request formats the model-config panel can select. Both are
+# OpenAI-compatible; the value drives normalize_openai_base_url's /v1 handling.
+_MODEL_PROVIDER_FORMATS = ["deepseek", "relay"]
+
+
+def get_model_config(data_dir: str | Path) -> dict[str, Any]:
+    """Return the current chat provider's model/endpoint/format for the panel."""
+    config = load_config(data_dir)
+    provider = config.providers.get("chat", config.llm)
+    pool = _key_pool(data_dir)
+    return {
+        "status": "ok",
+        "provider": provider.provider,
+        "model": provider.model,
+        "base_url": provider.base_url,
+        "api_key_env": provider.api_key_env,
+        "max_wait_seconds": provider.max_wait_seconds,
+        "provider_formats": list(_MODEL_PROVIDER_FORMATS),
+        "key_pool_available_count": pool.available_count(),
+        "async_summary_follows_chat": True,
+    }
+
+
+def set_model_config(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist edited model/endpoint/format for the chat provider."""
+    provider = payload.get("provider")
+    if provider is not None:
+        provider = str(provider).strip().lower()
+        if provider not in _MODEL_PROVIDER_FORMATS:
+            raise ValueError(f"provider must be one of {_MODEL_PROVIDER_FORMATS}")
+    model = payload.get("model")
+    if model is not None and not str(model).strip():
+        raise ValueError("model must not be empty")
+    base_url = payload.get("base_url")
+    api_key_env = payload.get("api_key_env")
+    max_wait = payload.get("max_wait_seconds")
+    updated = set_model_provider(
+        data_dir,
+        provider=provider,
+        model=str(model).strip() if model is not None else None,
+        base_url=str(base_url).strip() if base_url is not None else None,
+        api_key_env=str(api_key_env).strip() if api_key_env is not None else None,
+        max_wait_seconds=int(max_wait) if max_wait not in (None, "") else None,
+    )
+    return {"status": "ok", "model_config": get_model_config(data_dir), "model": updated.model}
+
+
+def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Test-fetch the model list from the provider (GET /v1/models).
+
+    Uses the panel's supplied base_url/provider (falling back to saved config)
+    plus a key from the pool. Read-only, no token cost. Returns the available
+    model ids, and whether the currently-configured model is among them.
+    """
+    from app.personal_wechat_bot.llm.openai_client import DEFAULT_USER_AGENT, normalize_openai_base_url
+
+    config = load_config(data_dir)
+    provider_cfg = config.providers.get("chat", config.llm)
+    base_url = str(payload.get("base_url") or provider_cfg.base_url or "").strip()
+    provider = str(payload.get("provider") or provider_cfg.provider or "relay").strip().lower()
+    target_model = str(payload.get("model") or provider_cfg.model or "").strip()
+    if not base_url:
+        raise ValueError("base_url is required to probe models")
+    api_key = _key_pool(data_dir).default_key()
+    if not api_key:
+        return {
+            "status": "error",
+            "reachable": False,
+            "error": "no_api_key_available",
+            "hint": "先在密钥池中添加至少一个可用密钥",
+        }
+    url = normalize_openai_base_url(base_url, provider) + "/models"
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": DEFAULT_USER_AGENT,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return {"status": "error", "reachable": True, "http_status": exc.code, "error": f"http_{exc.code}", "url": url}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {"status": "error", "reachable": False, "error": f"{type(exc).__name__}: {exc}", "url": url}
+    try:
+        parsed = _json.loads(body)
+    except _json.JSONDecodeError:
+        return {"status": "error", "reachable": True, "error": "invalid_json_response", "url": url}
+    models = _extract_model_ids(parsed)
+    return {
+        "status": "ok",
+        "reachable": True,
+        "url": url,
+        "model_count": len(models),
+        "models": models[:200],
+        "configured_model": target_model,
+        "configured_model_available": target_model in models if target_model else None,
+    }
+
+
+def _extract_model_ids(payload: Any) -> list[str]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    items = data if isinstance(data, list) else (payload if isinstance(payload, list) else [])
+    models: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            model_id = str(item.get("id") or item.get("model") or "").strip()
+        else:
+            model_id = str(item).strip()
+        if model_id:
+            models.append(model_id)
+    return models
 
 
 def _channel_store(data_dir: str | Path) -> ConversationChannelStore:
