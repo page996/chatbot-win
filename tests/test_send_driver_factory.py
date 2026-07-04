@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.config.schema import BotConfig
 from app.personal_wechat_bot.wechat_driver.bridge_send import BRIDGE_OUTBOX_SEND_DRIVER
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
@@ -44,6 +48,23 @@ class SendDriverFactoryTest(unittest.TestCase):
         self.assertFalse(probe["registered"])
         self.assertFalse(probe["driver_present"])
         self.assertIsNone(probe["driver_probe"])
+
+    def test_deprecated_windows_guarded_config_normalizes_to_bridge_outbox(self) -> None:
+        # Regression: a stale config naming the removed windows_guarded driver
+        # must self-heal to bridge_outbox at load time, so sends resolve to a
+        # real driver instead of silently failing with send_driver_missing.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config_path = data_dir / "config.json"
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["send_driver"] = "windows_guarded"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            config = load_config(data_dir)
+
+            self.assertEqual(config.send_driver, BRIDGE_OUTBOX_SEND_DRIVER)
+            self.assertIsNotNone(build_send_driver(config))
 
 
 if __name__ == "__main__":

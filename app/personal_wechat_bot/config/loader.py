@@ -9,6 +9,18 @@ from app.personal_wechat_bot.config.schema import BotConfig, LLMConfig, Provider
 from app.personal_wechat_bot.domain.errors import ConfigError
 
 
+# Deprecated/removed send drivers mapped to their replacement. windows_guarded
+# was removed in favour of the non-foreground bridge_outbox driver; a stale
+# config naming it would otherwise pass the send guard but resolve to no driver
+# (silent send_driver_missing). Normalizing at load time is self-healing.
+_DEPRECATED_SEND_DRIVERS = {"windows_guarded": "bridge_outbox"}
+
+
+def _normalize_send_driver(name: str) -> str:
+    cleaned = str(name or "").strip()
+    return _DEPRECATED_SEND_DRIVERS.get(cleaned, cleaned)
+
+
 def _read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -60,7 +72,7 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         mode=mode,
         data_dir=str(root),
         send_enabled=bool(raw.get("send_enabled", False)),
-        send_driver=str(raw.get("send_driver", "not_implemented")),
+        send_driver=_normalize_send_driver(raw.get("send_driver", "not_implemented")),
         send_backend=str(raw.get("send_backend", "dry_run")),
         wcf_host=str(raw.get("wcf_host", "127.0.0.1")),
         wcf_port=int(raw.get("wcf_port", 10086)),

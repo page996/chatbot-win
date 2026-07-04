@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -57,6 +58,7 @@ from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoi
 
 
 QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent", "failed")
+logger = logging.getLogger(__name__)
 _WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
 _WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
 _WEFLOW_LOCK = threading.Lock()
@@ -898,33 +900,40 @@ def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: thr
                     worker["last_status"] = result.get("status", "")
                     worker["last_tick_at"] = time.time()
                     _WEFLOW_WORKERS[key] = worker
-                _write_weflow_sidebar_state(root, {"last_pull": result, "last_error": "", **_weflow_public_params(_weflow_params(root, payload))})
-                _append_weflow_operation_history(
+                _record_weflow_state_safely(
                     root,
-                    "background-tick",
-                    {**result, "background": True, "tick": tick_record},
+                    {"last_pull": result, "last_error": "", **_weflow_public_params(_weflow_params(root, payload))},
+                    action="background-tick",
+                    result={**result, "background": True, "tick": tick_record},
                 )
             except Exception as exc:
+                # A per-tick failure must never kill the daemon thread: record it
+                # and continue to the next tick. The recording itself is wrapped
+                # so that even a state-file write error (Windows lock, disk full)
+                # or a params-build failure cannot escape and terminate the loop.
                 context = None
                 duration = time.monotonic() - tick_started
                 error = f"{type(exc).__name__}: {exc}"
-                consumer_lock.heartbeat()
-                tick_record = {}
-                with _WEFLOW_LOCK:
-                    worker = _WEFLOW_WORKERS.get(key, {})
-                    metrics = worker.get("metrics")
-                    if isinstance(metrics, WeflowWorkerMetrics):
-                        tick_record = metrics.record_error(error, duration).to_dict()
-                    worker["last_status"] = "error"
-                    worker["last_error"] = error
-                    worker["last_tick_at"] = time.time()
-                    _WEFLOW_WORKERS[key] = worker
-                _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
-                _append_weflow_operation_history(
-                    root,
-                    "background-tick",
-                    {"status": "error", "error": error, "background": True, "tick": tick_record},
-                )
+                try:
+                    consumer_lock.heartbeat()
+                    tick_record = {}
+                    with _WEFLOW_LOCK:
+                        worker = _WEFLOW_WORKERS.get(key, {})
+                        metrics = worker.get("metrics")
+                        if isinstance(metrics, WeflowWorkerMetrics):
+                            tick_record = metrics.record_error(error, duration).to_dict()
+                        worker["last_status"] = "error"
+                        worker["last_error"] = error
+                        worker["last_tick_at"] = time.time()
+                        _WEFLOW_WORKERS[key] = worker
+                    _record_weflow_state_safely(
+                        root,
+                        {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))},
+                        action="background-tick",
+                        result={"status": "error", "error": error, "background": True, "tick": tick_record},
+                    )
+                except Exception:  # pragma: no cover - last-resort thread survival
+                    logger.exception("weflow worker error-handler failed; continuing loop")
             stop_event.wait(interval)
     finally:
         consumer_lock.release()
@@ -1630,6 +1639,13 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
     target_model = str(payload.get("model") or provider_cfg.model or "").strip()
     if not base_url:
         raise ValueError("base_url is required to probe models")
+    # Validate the target BEFORE attaching the live API key, so a malformed or
+    # non-http(s) base_url can never cause the key to egress somewhere unexpected
+    # (e.g. file://, ftp://, or a schemeless string).
+    url = normalize_openai_base_url(base_url, provider) + "/models"
+    url_error = _validate_probe_url(url)
+    if url_error:
+        return {"status": "error", "reachable": False, "error": url_error, "url": url}
     api_key = _key_pool(data_dir).default_key()
     if not api_key:
         return {
@@ -1638,7 +1654,6 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
             "error": "no_api_key_available",
             "hint": "先在密钥池中添加至少一个可用密钥",
         }
-    url = normalize_openai_base_url(base_url, provider) + "/models"
     import json as _json
     import urllib.error
     import urllib.request
@@ -1654,7 +1669,9 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            body = response.read().decode("utf-8", errors="replace")
+            # Cap the read: this hits a self-supplied URL, so don't let a hostile
+            # or misbehaving endpoint stream an unbounded body into memory.
+            body = response.read(2_000_000).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         return {"status": "error", "reachable": True, "http_status": exc.code, "error": f"http_{exc.code}", "url": url}
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -1673,6 +1690,26 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
         "configured_model": target_model,
         "configured_model_available": target_model in models if target_model else None,
     }
+
+
+def _validate_probe_url(url: str) -> str:
+    """Return an error string if the probe URL is unsafe to send the key to.
+
+    Only http/https with a real host is allowed. This runs before the API key is
+    attached, so a bad base_url (file://, ftp://, schemeless, no host) can never
+    leak the key to an unintended destination.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "invalid_base_url"
+    if parsed.scheme not in {"http", "https"}:
+        return f"unsupported_url_scheme:{parsed.scheme or 'none'}"
+    if not parsed.hostname:
+        return "missing_url_host"
+    return ""
 
 
 def _extract_model_ids(payload: Any) -> list[str]:

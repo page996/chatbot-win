@@ -5,6 +5,7 @@ from typing import Any
 
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.control.preflight import build_preflight_report
+from app.personal_wechat_bot.wechat_driver.send_driver_factory import is_send_driver_registered
 
 
 def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -77,12 +78,14 @@ def _checks(preflight: dict[str, Any]) -> list[dict[str, str]]:
             "current WeChat access is read-only",
         )
     )
+    driver_name = str(wechat_access.get("send_driver") or "")
+    driver_registered = is_send_driver_registered(driver_name)
     checks.append(
         _check(
             "send_driver_name",
-            "pass" if wechat_access.get("send_driver") != "not_implemented" else "blocker",
-            f"send driver: {wechat_access.get('send_driver')}",
-            "send driver is not implemented",
+            "pass" if driver_registered else "blocker",
+            f"send driver: {driver_name}",
+            f"send driver '{driver_name}' is not a registered driver",
         )
     )
     checks.append(

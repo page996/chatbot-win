@@ -748,6 +748,26 @@ class SidebarModelConfigApiTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 probe_model_fetch(data_dir, {"base_url": ""})
 
+    def test_probe_model_fetch_rejects_non_http_url_before_key_egress(self) -> None:
+        # Even with an available key, a non-http(s) base_url must be rejected
+        # before the key is attached, so the key can't leak to file://, ftp://, etc.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            provider = config.providers.get("chat", config.llm)
+            provider.api_key_file = "keys.md"
+            config.llm.api_key_file = "keys.md"
+            config.providers["chat"] = provider
+            save_config(config)
+            (data_dir / "keys.md").write_text("KEY_01 = sk-available-1234\n", encoding="utf-8")
+
+            result = probe_model_fetch(data_dir, {"base_url": "file:///etc/passwd", "provider": "relay"})
+
+            self.assertEqual(result["status"], "error")
+            self.assertFalse(result["reachable"])
+            self.assertTrue(result["error"].startswith("unsupported_url_scheme"))
+
 
 def _reply() -> ReplyCandidate:
     return ReplyCandidate(

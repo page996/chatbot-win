@@ -79,6 +79,21 @@ class SendReadinessTest(unittest.TestCase):
             self.assertEqual(rollout["status"], "warn")
             self.assertIn("confirm mode is active", rollout["detail"])
 
+    def test_unregistered_driver_name_blocks_consistently_with_real_send_check(self) -> None:
+        # Regression: send_driver_name must key off the driver registry, not a
+        # weak "!= not_implemented" test, so an unregistered driver name blocks
+        # consistently with the real_send_driver check (no contradiction).
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="some_unregistered_driver")
+
+            report = build_send_readiness_report(data_dir)
+            by_id = {item["id"]: item for item in report["checks"]}
+
+            self.assertEqual(by_id["send_driver_name"]["status"], "blocker")
+            self.assertEqual(by_id["real_send_driver"]["status"], "blocker")
+
 
 if __name__ == "__main__":
     unittest.main()
