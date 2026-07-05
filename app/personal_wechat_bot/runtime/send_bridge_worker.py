@@ -27,7 +27,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.control.send_commands import sync_bridge_ack_to_send_state
@@ -101,12 +101,24 @@ class BridgeWorker:
         backend: SendBackend,
         *,
         max_send_attempts: int = 3,
+        heartbeat: Callable[[], None] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.backend = backend
         self.max_send_attempts = max(1, int(max_send_attempts))
         self.store = BridgeOutboxStore(self.data_dir)
         self.stats = BridgeWorkerStats()
+        # Called before each wire send so a slow drain keeps the single-instance
+        # lock fresh (else a second worker could see it stale and double-send).
+        self._heartbeat = heartbeat
+
+    def _beat(self) -> None:
+        if self._heartbeat is None:
+            return
+        try:
+            self._heartbeat()
+        except Exception:  # pragma: no cover - heartbeat must never break delivery
+            logger.exception("bridge heartbeat callback failed")
 
     def _acked_bridge_ids(self) -> set[str]:
         acked: set[str] = set()
@@ -127,12 +139,42 @@ class BridgeWorker:
             pending.append(record)
         return pending
 
+    def _latest_ack_status(self) -> dict[str, str]:
+        """Map each bridge_id to the status of its most-recently-written ack."""
+        latest: dict[str, str] = {}
+        for ack in self.store._read_all(self.store.ack_path):
+            bridge_id = str(ack.get("bridge_id", ""))
+            if bridge_id:
+                latest[bridge_id] = str(ack.get("status", ""))
+        return latest
+
+    def _quarantine_interrupted_sends(self) -> None:
+        """Fail records whose latest ack is 'inflight' (crash mid-send).
+
+        _deliver writes an 'inflight' ack immediately before the wire send. If
+        the process crashes between the send and the terminal ack, the record is
+        left with 'inflight' as its latest status. It may already have been
+        delivered, and WeChatFerry returns no message id to dedup against, so
+        re-sending risks a duplicate. The safe choice is to stop retrying and
+        surface it for operator review rather than silently re-send.
+        """
+        for bridge_id, status in self._latest_ack_status().items():
+            if status == "inflight":
+                logger.warning(
+                    "bridge %s was interrupted mid-send; quarantining as possible duplicate", bridge_id
+                )
+                self._ack(bridge_id, "failed", "possible_duplicate_send_after_crash")
+
     def run_once(self) -> int:
         """Deliver all currently-pending records. Returns the count processed."""
         self.stats.ticks += 1
         # Re-sync any terminal acks whose ledger/confirm-queue sync previously
         # failed, so a transient state-write error becomes eventually consistent.
         self._reconcile_unsynced_acks()
+        # Quarantine records whose delivery was interrupted mid-send by a crash
+        # (an inflight marker with no terminal ack). These may already have been
+        # delivered on the wire, so they must NOT be blindly re-sent.
+        self._quarantine_interrupted_sends()
         processed = 0
         for record in self.pending_records():
             bridge_id = str(record.get("bridge_id", ""))
@@ -198,7 +240,15 @@ class BridgeWorker:
 
         outcome = None
         last_reason = ""
+        # Mark inflight right before the wire send. If we crash between the send
+        # and the terminal ack, the next run sees 'inflight' as the latest ack and
+        # quarantines the record instead of risking a duplicate re-send.
+        self._ack(bridge_id, "inflight", "delivering")
         for attempt in range(self.max_send_attempts):
+            # Keep the single-instance lock fresh right before each blocking send
+            # so a slow drain or a slow individual send can't let the lock go
+            # stale and invite a second worker to take over and double-deliver.
+            self._beat()
             if kind == "file":
                 path = str(record.get("path", ""))
                 if not path or not Path(path).exists():
@@ -402,6 +452,10 @@ def run_bridge_worker(
         except ProcessLockError as exc:
             logger.error("send bridge worker already running: %s", exc)
             raise
+        # Heartbeat before each send too (not just per-drain), so a large backlog
+        # or a slow individual send can't let the 60s lock go stale mid-drain and
+        # invite a second worker to take over and double-deliver.
+        worker._heartbeat = lock.heartbeat
 
     try:
         iterations = 0

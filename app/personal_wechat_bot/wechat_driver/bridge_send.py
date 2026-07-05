@@ -101,8 +101,8 @@ class BridgeOutboxStore:
         external_message_id: str = "",
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if status not in {"sent", "failed", "blocked", "retry"}:
-            raise ValueError("status must be sent, failed, blocked, or retry")
+        if status not in {"sent", "failed", "blocked", "retry", "inflight"}:
+            raise ValueError("status must be sent, failed, blocked, retry, or inflight")
         record = {
             "bridge_id": bridge_id,
             "status": status,

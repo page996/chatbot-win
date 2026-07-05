@@ -175,6 +175,60 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(backend.sent_texts, [("wxid_a", "here is the doc")])
             self.assertEqual(backend.sent_files, [("wxid_a", str(target), "")])
 
+    def test_interrupted_send_is_quarantined_not_resent(self) -> None:
+        # A crash between the wire send and the terminal ack leaves an 'inflight'
+        # ack as the latest. On the next run the record must be quarantined
+        # (failed, possible duplicate) and NOT re-delivered.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "crashed mid-send")
+            store.append_ack(rec["bridge_id"], status="inflight", reason="delivering")
+
+            backend = DryRunSendBackend()
+            BridgeWorker(data_dir, backend).run_once()
+
+            self.assertEqual(backend.sent_texts, [])  # never re-sent
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], "failed")
+            self.assertEqual(item["ack"]["reason"], "possible_duplicate_send_after_crash")
+
+    def test_healthy_send_writes_inflight_then_sent(self) -> None:
+        # A normal delivery records inflight before the send and sent after, so
+        # the latest ack is terminal 'sent' and it is not quarantined.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "clean send")
+
+            backend = DryRunSendBackend()
+            BridgeWorker(data_dir, backend).run_once()
+
+            self.assertEqual(backend.sent_texts, [("wxid_a", "clean send")])
+            acks = [a for a in store._read_all(store.ack_path) if a["bridge_id"] == rec["bridge_id"]]
+            statuses = [a["status"] for a in acks]
+            self.assertEqual(statuses, ["inflight", "sent"])
+            self.assertEqual(store.state(limit=10)["items"][0]["status"], "sent")
+
+    def test_heartbeat_fires_per_send_during_drain(self) -> None:
+        # The worker must beat the lock before each send so a slow multi-record
+        # drain keeps the single-instance lock fresh (no takeover / double-send).
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            for i in range(3):
+                store.enqueue("wxid_a", f"msg {i}")
+
+            beats = {"n": 0}
+            worker = BridgeWorker(data_dir, DryRunSendBackend(), heartbeat=lambda: beats.__setitem__("n", beats["n"] + 1))
+            worker.run_once()
+
+            # One beat per delivered record (3), at minimum.
+            self.assertGreaterEqual(beats["n"], 3)
+
     def test_retryable_failure_stays_pending_across_ticks(self) -> None:
         # A transient backend failure must NOT write a terminal ack; the record
         # stays pending so a later tick retries it (no silent drop).
