@@ -10,6 +10,53 @@ from app.personal_wechat_bot.llm.key_pool import ApiKeyPool, ConversationKeyAssi
 
 
 class ApiKeyPoolTest(unittest.TestCase):
+    def test_mask_secret_never_reveals_full_short_value(self) -> None:
+        from app.personal_wechat_bot.llm.key_pool import _mask_secret
+
+        # Empty stays empty.
+        self.assertEqual(_mask_secret(""), "")
+        # Short/mis-pasted values are masked entirely — never echoed in full.
+        self.assertEqual(_mask_secret("sk"), "****")
+        self.assertEqual(_mask_secret("abcd"), "****")
+        self.assertEqual(_mask_secret("1234567"), "****")
+        # Only a long value exposes a last-4 tail (with >= 4 chars still hidden).
+        self.assertEqual(_mask_secret("sk-abcd1234wxyz"), "****wxyz")
+        self.assertNotIn("abcd1234", _mask_secret("sk-abcd1234wxyz"))
+
+    def test_concurrent_add_key_does_not_lose_or_corrupt_writes(self) -> None:
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_file="keys.md")
+
+            barrier = threading.Barrier(8)
+            errors: list[Exception] = []
+
+            def add(i: int) -> None:
+                try:
+                    barrier.wait()
+                    ApiKeyPool(provider, data_dir).add_key(f"secret-value-{i:02d}")
+                except Exception as exc:  # pragma: no cover - surfaced via errors
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=add, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            pool = ApiKeyPool(provider, data_dir)
+            secrets = set(pool._file_secret_values().values())
+            # All 8 distinct keys persisted, none lost to an interleaved write.
+            self.assertEqual(secrets, {f"secret-value-{i:02d}" for i in range(8)})
+            # No line carries more than one "name = value" entry (no concatenation).
+            key_file = data_dir / "keys.md"
+            for line in key_file.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    self.assertEqual(line.count("="), 1)
+
     def test_refs_include_primary_env_and_pool_without_duplicates(self) -> None:
         provider = ProviderConfig(api_key_env="KEY_A", api_key_env_pool=["KEY_A", "KEY_B"])
 

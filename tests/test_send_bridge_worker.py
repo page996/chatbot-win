@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +72,26 @@ class SendBridgeWorkerTest(unittest.TestCase):
             BridgeWorker(data_dir, backend).run_once()
 
             self.assertEqual(backend.sent_texts, [("wxid_real_alice", "hello there")])
+
+    def test_worker_does_not_send_to_hashed_conversation_id_fallback(self) -> None:
+        # No explicit receiver and no channel registered: the hashed
+        # conversation_id is NOT a valid wcf receiver, so the worker must treat
+        # it as missing_receiver (retryable) rather than deliver to a bogus id.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("hashed-conversation-id", "should not send")
+
+            backend = DryRunSendBackend()
+            BridgeWorker(data_dir, backend).run_once()
+
+            # Nothing delivered to a bogus receiver.
+            self.assertEqual(backend.sent_texts, [])
+            item = store.state(limit=10)["items"][0]
+            # Still pending (retry ack), waiting for a real receiver.
+            self.assertNotIn(item["status"], {"sent", "failed"})
+            self.assertIn("missing_receiver", item["ack"]["reason"])
 
     def test_worker_is_restart_safe_and_does_not_resend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -300,6 +322,44 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(item["status"], "failed")
             self.assertIn("wcf_rpc_timeout", item["ack"]["reason"])
 
+    def test_wcf_rpc_timeout_is_not_resent_within_same_tick(self) -> None:
+        # A timeout means the message may already be on the wire. Even with a
+        # multi-attempt budget, the worker must call the backend exactly once and
+        # not re-send it during the remaining attempts of the same tick.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("wxid_a", "maybe sent")
+
+            class _CountingTimeoutBackend:
+                name = "timeout"
+
+                def __init__(self) -> None:
+                    self.text_calls = 0
+
+                def health_check(self) -> bool:
+                    return True
+
+                def send_text(self, receiver: str, text: str) -> SendOutcome:
+                    self.text_calls += 1
+                    return SendOutcome.failure("wcf_send_text_error:wcf_rpc_timeout:1s")
+
+                def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                    return SendOutcome.failure("wcf_send_file_error:wcf_rpc_timeout:1s")
+
+                def close(self) -> None:
+                    return None
+
+            backend = _CountingTimeoutBackend()
+            BridgeWorker(data_dir, backend, max_send_attempts=3).run_once()
+
+            # Exactly one wire attempt despite a budget of 3.
+            self.assertEqual(backend.text_calls, 1)
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], "failed")
+            self.assertIn("wcf_rpc_timeout", item["ack"]["reason"])
+
     def test_retryable_failure_becomes_terminal_after_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -444,6 +504,42 @@ class SendBridgeWorkerTest(unittest.TestCase):
             entry = ledger.read_entries("wxid_a")[0]
             self.assertEqual(entry.send["status"], "sent")
             self.assertEqual(queue.get(queue_id)["status"], "sent")
+
+
+class SendBridgeWorkerScriptDataDirGuardTest(unittest.TestCase):
+    _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "send_bridge_worker.py"
+
+    def test_strict_data_dir_refuses_without_config(self) -> None:
+        # A data dir with no config.json is almost certainly the wrong one (the
+        # app always writes config.json). Under --strict-data-dir the worker must
+        # refuse rather than silently drain an empty/foreign outbox.
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "no_config_here"
+            empty.mkdir()
+            completed = subprocess.run(
+                [sys.executable, str(self._SCRIPT), "--data-dir", str(empty), "--once", "--strict-data-dir"],
+                cwd=self._SCRIPT.parent.parent,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(completed.returncode, 3)
+            self.assertIn("no config.json", completed.stderr)
+
+    def test_valid_data_dir_runs_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            completed = subprocess.run(
+                [sys.executable, str(self._SCRIPT), "--data-dir", str(data_dir), "--once", "--strict-data-dir"],
+                cwd=self._SCRIPT.parent.parent,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("using data dir", completed.stderr)
+            self.assertIn("delivered=", completed.stdout)
 
 
 if __name__ == "__main__":

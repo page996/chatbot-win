@@ -9,6 +9,11 @@ from pathlib import Path
 from app.personal_wechat_bot.config.schema import ProviderConfig
 
 
+# Default key-file name under the data dir, used when no api_key_file is set so
+# the sidebar add-key flow works on a fresh install. Created lazily on first add.
+_DEFAULT_KEY_FILE_NAME = "api_keys.local.md"
+
+
 @dataclass(frozen=True)
 class ApiKeyRef:
     ref: str
@@ -20,8 +25,12 @@ def _mask_secret(value: str) -> str:
     value = value.strip()
     if not value:
         return ""
-    tail = value[-4:] if len(value) >= 4 else value
-    return f"****{tail}"
+    # Never reveal the whole secret. Only expose a last-4 tail when at least as
+    # many characters stay hidden (len >= 8); a shorter/mis-pasted value is
+    # masked entirely so it can't be echoed in full to the UI or logs.
+    if len(value) >= 8:
+        return f"****{value[-4:]}"
+    return "****"
 
 
 class ApiKeyPool:
@@ -41,6 +50,14 @@ class ApiKeyPool:
 
     def available_count(self) -> int:
         return sum(1 for item in self.refs() if item.available)
+
+    def available_refs(self) -> list[str]:
+        """Refs whose secret value currently resolves, in pool order.
+
+        Used by the client's per-request failover to enumerate keys it may try
+        when the primary pick returns an auth/rate error.
+        """
+        return [item.ref for item in self.refs() if self.key_for_ref(item.ref)]
 
     def key_for_ref(self, ref: str) -> str | None:
         env_value = os.environ.get(ref)
@@ -88,7 +105,11 @@ class ApiKeyPool:
 
     def key_file_path(self) -> Path | None:
         if not self.provider.api_key_file:
-            return None
+            # No explicit key file configured: fall back to a default location
+            # under the data dir so the sidebar add-key flow works out of the box
+            # on a fresh install. The file is only created when a key is actually
+            # added; reads tolerate its absence, so this is a no-op until used.
+            return self.data_dir / _DEFAULT_KEY_FILE_NAME
         path = Path(self.provider.api_key_file)
         if not path.is_absolute():
             path = self.data_dir / path
@@ -134,6 +155,11 @@ class ApiKeyPool:
 
         Returns the anonymized ref for the new key. Raises ValueError when no
         key file is configured or the value is empty/duplicate.
+
+        The duplicate-check + append run under a cross-process lock so two
+        concurrent add/remove operations (threaded HTTP server, multiple app
+        instances) can't interleave their read-modify-write and lose a write or
+        concatenate two entries onto one line.
         """
         value = value.strip()
         if not value:
@@ -141,40 +167,56 @@ class ApiKeyPool:
         path = self.key_file_path()
         if path is None:
             raise ValueError("no api_key_file configured for this provider")
-        if value in self._file_secret_values().values():
-            raise ValueError("api key already present in pool")
-        name = (name or "").strip() or self._next_key_name()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise ValueError("invalid key name")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        prefix = "" if not existing or existing.endswith("\n") else "\n"
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{prefix}{name} = {value}\n")
-        return ApiKeyRef(ref=_secret_ref(name, value), source="file_secret", available=True)
+        with self._file_lock(path):
+            if value in self._file_secret_values().values():
+                raise ValueError("api key already present in pool")
+            name = (name or "").strip() or self._next_key_name()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError("invalid key name")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            prefix = "" if not existing or existing.endswith("\n") else "\n"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{prefix}{name} = {value}\n")
+            return ApiKeyRef(ref=_secret_ref(name, value), source="file_secret", available=True)
 
     def remove_key(self, ref: str) -> bool:
         """Remove the key file line whose parsed ref matches ``ref``.
 
         Only file-backed keys can be removed (env-var pool entries live in
-        config, not the key file). Returns True when a line was removed.
+        config, not the key file). Returns True when a line was removed. Runs
+        under the same cross-process lock as :meth:`add_key`.
         """
         path = self.key_file_path()
         if path is None or not path.exists():
             return False
-        lines = path.read_text(encoding="utf-8").splitlines()
-        kept: list[str] = []
-        removed = False
-        for line in lines:
-            parsed = _parse_key_file_line(line)
-            if parsed is not None and parsed[0] == ref and not removed:
-                removed = True
-                continue
-            kept.append(line)
-        if not removed:
-            return False
-        path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-        return True
+        with self._file_lock(path):
+            if not path.exists():
+                return False
+            lines = path.read_text(encoding="utf-8").splitlines()
+            kept: list[str] = []
+            removed = False
+            for line in lines:
+                parsed = _parse_key_file_line(line)
+                if parsed is not None and parsed[0] == ref and not removed:
+                    removed = True
+                    continue
+                kept.append(line)
+            if not removed:
+                return False
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            return True
+
+    def _file_lock(self, path: Path):
+        """Cross-process lock guarding read-modify-write of the key file."""
+        from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
+
+        return blocking_process_lock(
+            path.with_name(path.name + ".lock"),
+            label="api_key_pool",
+            stale_after_seconds=30.0,
+            wait_timeout_seconds=15.0,
+        )
 
     def _next_key_name(self) -> str:
         """Derive the next ``PREFIX_NN`` name from existing file entries."""

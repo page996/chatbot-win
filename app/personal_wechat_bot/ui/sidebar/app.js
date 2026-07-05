@@ -1694,7 +1694,9 @@ function backgroundSendText(value) {
   return {
     bridge_outbox_available: "bridge_outbox 可入队",
     bridge_outbox_configured_disabled: "bridge_outbox 已配置，发送未启用",
-    bridge_outbox_ready: "bridge_outbox 已启用",
+    bridge_outbox_ready: "bridge_outbox 已启用（投递中）",
+    bridge_outbox_worker_down: "bridge_outbox 已启用，但投递进程未运行",
+    bridge_outbox_worker_down_backlog: "bridge_outbox 投递进程未运行，有待发消息积压",
   }[value] || value;
 }
 

@@ -126,22 +126,35 @@ class ConversationChannelStore:
         return _channel_from_payload(payload) if payload else None
 
     def api_key_for_request(self, conversation_id: str) -> str | None:
+        ref = self.ref_for_request(conversation_id)
+        if ref is None:
+            return self.key_pool.default_key()
+        return self.key_pool.key_for_ref(ref) or self.key_pool.default_key()
+
+    def ref_for_request(self, conversation_id: str) -> str | None:
+        """Return the next rotated key *ref* for this conversation.
+
+        Advances the round-robin cursor and persists it, exactly as before, but
+        returns the ref (not the resolved secret) so the caller can fail over to
+        other refs on an auth/rate error. Returns None when the conversation has
+        no channel or no available refs (caller falls back to the pool default).
+        """
         with self._lock:
             path = self._channel_path(conversation_id)
             payload = self._read_channel_payload(path)
             if not payload:
-                return self.key_pool.default_key()
+                return None
             refs = [str(item) for item in payload.get("api_key_refs", []) if item]
             available_refs = [ref for ref in refs if self.key_pool.key_for_ref(ref)]
             if not available_refs:
-                return self.key_pool.default_key()
+                return None
             next_index = int(payload.get("next_key_index", 0))
             ref = available_refs[next_index % len(available_refs)]
             payload["next_key_index"] = (next_index + 1) % len(available_refs)
             payload["updated_at"] = utc_now_iso()
             self._write_json(path, payload)
             self._update_index(payload)
-            return self.key_pool.key_for_ref(ref)
+            return ref
 
     def list_channels(self) -> list[ConversationChannel]:
         channels: list[ConversationChannel] = []

@@ -219,6 +219,55 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
             self.assertNotIn(resolved_ids[0], remaining)
             self.assertEqual(state["pending_count"], 1)
 
+    def test_concurrent_append_during_compaction_is_not_lost(self) -> None:
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            # Seed enough resolved records that compaction will actually rewrite.
+            for i in range(10):
+                rec = store.enqueue("wxid_a", f"seed {i}")
+                store.append_ack(rec["bridge_id"], status="sent", reason="ok")
+
+            appended_ids: list[str] = []
+            errors: list[Exception] = []
+            barrier = threading.Barrier(2)
+
+            def appender() -> None:
+                try:
+                    barrier.wait()
+                    for i in range(20):
+                        rec = BridgeOutboxStore(data_dir).enqueue("wxid_b", f"live {i}")
+                        appended_ids.append(rec["bridge_id"])
+                except Exception as exc:  # pragma: no cover - surfaced via errors
+                    errors.append(exc)
+
+            def compactor() -> None:
+                try:
+                    barrier.wait()
+                    for _ in range(20):
+                        BridgeOutboxStore(data_dir).compact(keep_resolved=1)
+                except Exception as exc:  # pragma: no cover - surfaced via errors
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=appender), threading.Thread(target=compactor)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            # Every live-appended record must still be present: the store lock
+            # serializes append vs compaction's read-modify-rewrite so no append
+            # is dropped inside the compaction window.
+            all_ids = {
+                str(rec.get("bridge_id", ""))
+                for rec in BridgeOutboxStore(data_dir)._read_all(store.outbox_path)
+            }
+            for bridge_id in appended_ids:
+                self.assertIn(bridge_id, all_ids)
+
     def test_compact_is_noop_below_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"

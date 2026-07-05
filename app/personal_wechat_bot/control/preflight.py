@@ -51,6 +51,7 @@ def build_preflight_report(
             "auto_requested": config.mode == "auto",
             "real_send_implemented": real_send_implemented,
             "send_enabled": config.send_enabled,
+            "send_backend": str(getattr(config, "send_backend", "dry_run") or "dry_run"),
             "send_confirm_required": config.send_confirm_required,
             "send_max_chars": config.send_max_chars,
             "send_min_interval_seconds": config.send_min_interval_seconds,

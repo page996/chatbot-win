@@ -87,6 +87,17 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            # CSRF / cross-origin guard. The sidebar UI is served from and calls
+            # the same loopback origin, so a legitimate request either carries no
+            # Origin (same-origin fetch in some browsers) or an Origin/Referer
+            # whose host matches our own Host header. A cross-site page trying to
+            # drive these mutating endpoints (add/remove keys, model-config,
+            # probe -> key egress) fails this check and is rejected before any
+            # handler — and before any API key is touched.
+            csrf_error = self._csrf_check()
+            if csrf_error:
+                self._json({"status": "error", "error": csrf_error}, status=403)
+                return
             try:
                 payload = self._read_json()
                 if parsed.path == "/api/controls":
@@ -168,6 +179,46 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
 
         def log_message(self, format: str, *args: Any) -> None:
             return
+
+        def _csrf_check(self) -> str:
+            """Return an error string if a POST looks cross-origin, else "".
+
+            Defends the mutating endpoints against a malicious page in the user's
+            browser (the server binds loopback but any site can POST to it). Two
+            layers:
+
+            1. Content-Type must be JSON. A cross-site page can only send
+               ``application/x-www-form-urlencoded`` / ``multipart/form-data`` /
+               ``text/plain`` without triggering a CORS preflight; requiring JSON
+               forces a preflight the browser will block for a disallowed origin.
+            2. If an Origin/Referer header is present, its host:port must match
+               our own Host header. A forged Origin cannot be set by browser JS.
+            """
+            content_type = str(self.headers.get("content-type", "")).split(";")[0].strip().lower()
+            if content_type != "application/json":
+                return "unsupported_content_type"
+            host = str(self.headers.get("host", "")).strip().lower()
+            origin = str(self.headers.get("origin", "")).strip()
+            referer = str(self.headers.get("referer", "")).strip()
+            source = origin or referer
+            if not source:
+                # No Origin/Referer: same-origin fetches may omit Origin, and a
+                # non-browser client (curl) is not a CSRF vector. The JSON
+                # content-type gate above already blocks the cross-site case.
+                return ""
+            try:
+                source_host = urlparse(source).netloc.strip().lower()
+            except ValueError:
+                return "invalid_origin"
+            if not source_host:
+                return "invalid_origin"
+            # Compare host:port. If our Host header lacks a port (proxied), fall
+            # back to comparing hostname only.
+            if source_host == host:
+                return ""
+            if host and ":" not in host and source_host.split(":")[0] == host:
+                return ""
+            return "cross_origin_forbidden"
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("content-length", "0"))

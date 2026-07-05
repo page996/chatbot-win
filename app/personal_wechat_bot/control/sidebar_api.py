@@ -66,6 +66,12 @@ _WEFLOW_LOCK = threading.Lock()
 _WEFLOW_STATE_FILE_LOCK = threading.RLock()
 # Max times the supervisor auto-restarts a died worker loop before giving up.
 _WEFLOW_MAX_RESTARTS = 10
+# In-process send-bridge workers, keyed by data-dir. Started alongside the
+# WeFlow pull worker (the pull->reply->deliver chain needs both halves) and
+# stopped with it. Each entry: {thread, stop, started_at, last_status, ...}.
+_BRIDGE_WORKERS: dict[str, dict[str, Any]] = {}
+_BRIDGE_LOCK = threading.Lock()
+_BRIDGE_MAX_RESTARTS = 10
 _WEFLOW_OPERATION_LOCK = threading.Lock()
 # Serializes the hook *consume* step (import + backend replay + scheduler)
 # across threads *within this process*. It fronts the cross-process file lock
@@ -94,7 +100,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "supports_multi_conversation": True,
             "send_driver_boundary": "bridge_outbox queues replies for the WeChatFerry send bridge (non-foreground, delivered by wxid/roomid); backend events can receive multiple conversations without page OCR",
             "input_pipeline": "POST /api/backend-events or append-backend-event -> backend_events.jsonl -> run-agent/poll-backend-events -> conversation_ledgers",
-            "background_send_status": _background_send_status(config, send_bridge),
+            "background_send_status": _background_send_status(config, send_bridge, data_dir),
         },
         "config": {
             "mode": config.mode,
@@ -552,6 +558,10 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
             "metrics": WeflowWorkerMetrics(),
         }
         thread.start()
+    # Start the send-bridge delivery worker alongside the pull worker: the
+    # pull->reply->deliver chain needs both halves running. No-op unless the
+    # active send driver is bridge_outbox.
+    _start_bridge_worker(root, dict(payload))
     result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已启动"}
     _append_weflow_operation_history(data_dir, "start", result)
     return result
@@ -569,6 +579,8 @@ def sidebar_weflow_stop(data_dir: str | Path, payload: dict[str, Any]) -> dict[s
             thread = worker.get("thread") if isinstance(worker.get("thread"), threading.Thread) else None
     if thread is not None:
         thread.join(timeout=1.0)
+    # Stop the send-bridge worker together with the pull worker.
+    _stop_bridge_worker(root)
     worker_state = _weflow_worker_state(root)
     result = {
         "status": "ok",
@@ -873,6 +885,139 @@ def _run_sidebar_weflow_once(
 ) -> dict[str, Any]:
     context = _build_weflow_pull_context(data_dir, payload)
     return _run_weflow_pull_tick(context, cancel_event=cancel_event, progress_callback=progress_callback)
+
+
+def _bridge_worker_state(root: Path) -> dict[str, Any]:
+    """Public snapshot of the in-process send-bridge worker for this data dir."""
+    key = str(root)
+    with _BRIDGE_LOCK:
+        worker = _BRIDGE_WORKERS.get(key)
+        if not worker:
+            return {"running": False, "last_status": "stopped"}
+        thread = worker.get("thread")
+        return {
+            "running": bool(isinstance(thread, threading.Thread) and thread.is_alive()),
+            "last_status": str(worker.get("last_status") or ""),
+            "last_error": str(worker.get("last_error") or ""),
+            "started_at": worker.get("started_at"),
+            "restart_count": int(worker.get("restart_count", 0) or 0),
+            "last_tick_at": worker.get("last_tick_at"),
+        }
+
+
+def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
+    """Supervise the send-bridge worker loop, mirroring the WeFlow supervisor.
+
+    Runs ``run_bridge_worker`` (its own single-instance ProcessLock guards
+    against a second in-process or CLI worker) until a stop is requested. If it
+    dies unexpectedly (uncaught error, or returns without a stop), respawn with
+    capped exponential backoff up to a max restart count. A held lock (another
+    worker legitimately running) is a deliberate refusal, not a crash: record it
+    and stop supervising without resurrection.
+    """
+    from app.personal_wechat_bot.runtime.process_lock import ProcessLockError
+    from app.personal_wechat_bot.runtime.send_bridge_worker import run_bridge_worker
+
+    key = str(root)
+    interval = max(0.5, float(payload.get("bridge_interval_seconds") or 2.0))
+    max_restarts = int(payload.get("bridge_max_restarts", _BRIDGE_MAX_RESTARTS) or _BRIDGE_MAX_RESTARTS)
+    restart_count = 0
+
+    def _mark(status: str, error: str = "") -> None:
+        with _BRIDGE_LOCK:
+            worker = _BRIDGE_WORKERS.get(key, {})
+            worker["last_status"] = status
+            if error:
+                worker["last_error"] = error
+            worker["last_tick_at"] = time.time()
+            worker["restart_count"] = restart_count
+            _BRIDGE_WORKERS[key] = worker
+
+    while not stop_event.is_set():
+        _mark("running")
+        try:
+            # poll while stop_event is clear; the worker checks it each tick.
+            run_bridge_worker(
+                root,
+                poll_interval_seconds=interval,
+                once=False,
+                lock_enabled=True,
+                stop_event=stop_event,
+            )
+        except ProcessLockError as exc:
+            # Another bridge worker (CLI or a second sidebar) holds the lock:
+            # a legitimate single-instance refusal, not a crash. Do not restart.
+            _mark("lock_held", f"{type(exc).__name__}: {exc}")
+            stop_event.set()
+            break
+        except Exception as exc:  # the loop should not raise, but be safe
+            logger.exception("send bridge worker loop crashed")
+            _mark("crashed", f"loop_crashed:{type(exc).__name__}: {exc}")
+        if stop_event.is_set():
+            break
+        restart_count += 1
+        if restart_count > max_restarts:
+            _mark("crashed", f"max_restarts_exceeded:{max_restarts}")
+            logger.error("send bridge worker exceeded %d restarts; giving up", max_restarts)
+            break
+        backoff = min(60.0, interval * (2 ** min(restart_count - 1, 5)))
+        _mark("restarting")
+        logger.warning(
+            "send bridge worker died; restart %d/%d after %.1fs backoff", restart_count, max_restarts, backoff
+        )
+        if stop_event.wait(backoff):
+            break
+    _mark("stopped")
+
+
+def _start_bridge_worker(root: Path, payload: dict[str, Any]) -> None:
+    """Start the supervised send-bridge worker for this data dir if not running.
+
+    Only starts when the active send driver is bridge_outbox — that is the only
+    driver whose replies need a bridge to deliver them. Idempotent: a live worker
+    is left as-is.
+    """
+    key = str(root)
+    try:
+        config = load_config(root)
+    except Exception:
+        return
+    if str(getattr(config, "send_driver", "")) != "bridge_outbox":
+        return
+    with _BRIDGE_LOCK:
+        existing = _BRIDGE_WORKERS.get(key)
+        thread = existing.get("thread") if existing else None
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            return
+        stop_event = threading.Event()
+        worker_thread = threading.Thread(
+            target=_bridge_worker_supervisor,
+            args=(root, dict(payload), stop_event),
+            name="sidebar-send-bridge",
+            daemon=True,
+        )
+        _BRIDGE_WORKERS[key] = {
+            "thread": worker_thread,
+            "stop": stop_event,
+            "started_at": time.time(),
+            "last_status": "starting",
+            "restart_count": 0,
+        }
+        worker_thread.start()
+
+
+def _stop_bridge_worker(root: Path) -> None:
+    """Signal the send-bridge worker to stop and briefly join it."""
+    key = str(root)
+    thread: threading.Thread | None = None
+    with _BRIDGE_LOCK:
+        worker = _BRIDGE_WORKERS.get(key)
+        if worker and isinstance(worker.get("stop"), threading.Event):
+            worker["stop"].set()
+            worker["stop_requested"] = True
+            thread = worker.get("thread") if isinstance(worker.get("thread"), threading.Thread) else None
+    if thread is not None:
+        thread.join(timeout=1.0)
 
 
 def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
@@ -1597,10 +1742,44 @@ def _cleanup_note(cleanup: dict[str, Any]) -> str:
     return "通道不存在或已被清理"
 
 
-def _background_send_status(config: Any, bridge: dict[str, Any]) -> str:
+def _bridge_worker_alive(data_dir: str | Path) -> bool:
+    """True if a send-bridge worker holds a fresh single-instance lock.
+
+    Reads ``send_bridge/.bridge_worker.lock`` and treats the holder as alive
+    when its heartbeat is within the lock's stale window. Covers both the
+    in-process supervised worker and a separately-launched CLI worker, since
+    both write the same lock file with periodic heartbeats.
+    """
+    lock_path = Path(data_dir) / "send_bridge" / ".bridge_worker.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    heartbeat = payload.get("heartbeat_at")
+    if not isinstance(heartbeat, (int, float)):
+        return False
+    # run_bridge_worker uses stale_after_seconds=60; consider the worker alive
+    # only if its heartbeat is fresher than that window.
+    return (time.time() - float(heartbeat)) <= 60.0
+
+
+def _background_send_status(config: Any, bridge: dict[str, Any], data_dir: str | Path | None = None) -> str:
     if str(getattr(config, "send_driver", "")) == "bridge_outbox":
         if not bool(getattr(config, "send_enabled", False)):
             return "bridge_outbox_configured_disabled"
+        # send_enabled + bridge_outbox: replies are queued, but nothing is
+        # delivered unless a worker is actually consuming the outbox. Report the
+        # real worker liveness instead of a config-only "ready", and flag a
+        # backlog that is piling up with no live worker to drain it.
+        if data_dir is not None and not _bridge_worker_alive(data_dir):
+            pending = int(bridge.get("pending_count", 0) or 0) if isinstance(bridge, dict) else 0
+            if pending > 0:
+                return "bridge_outbox_worker_down_backlog"
+            return "bridge_outbox_worker_down"
         return "bridge_outbox_ready"
     return "bridge_outbox_available"
 
@@ -1780,21 +1959,14 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
 def _validate_probe_url(url: str) -> str:
     """Return an error string if the probe URL is unsafe to send the key to.
 
-    Only http/https with a real host is allowed. This runs before the API key is
-    attached, so a bad base_url (file://, ftp://, schemeless, no host) can never
-    leak the key to an unintended destination.
+    Delegates to the shared endpoint validator so the model-probe path and the
+    live chat send path enforce the same rule (http/https + real host) before
+    the API key is attached — a bad base_url can never leak the key to file://,
+    ftp://, or a schemeless/hostless destination.
     """
-    from urllib.parse import urlparse
+    from app.personal_wechat_bot.llm.openai_client import validate_endpoint_url
 
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return "invalid_base_url"
-    if parsed.scheme not in {"http", "https"}:
-        return f"unsupported_url_scheme:{parsed.scheme or 'none'}"
-    if not parsed.hostname:
-        return "missing_url_host"
-    return ""
+    return validate_endpoint_url(url)
 
 
 def _extract_model_ids(payload: Any) -> list[str]:

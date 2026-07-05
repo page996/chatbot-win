@@ -120,13 +120,13 @@ class DryRunSendBackend:
         with self._lock:
             self.sent_texts.append((receiver, text))
         logger.info("[dry_run] send_text -> %s: %r", receiver, text)
-        return SendOutcome.success("dry_run_text")
+        return SendOutcome.success("dry_run_not_delivered:text")
 
     def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
         with self._lock:
             self.sent_files.append((receiver, path, caption))
         logger.info("[dry_run] send_file -> %s: %s (caption=%r)", receiver, path, caption)
-        return SendOutcome.success("dry_run_file")
+        return SendOutcome.success("dry_run_not_delivered:file")
 
     def close(self) -> None:
         return None

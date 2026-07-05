@@ -67,12 +67,25 @@ _COMPACT_EVERY_TICKS = 50
 _KEEP_RESOLVED_RECORDS = 500
 
 
+# Reason markers for a send whose delivery outcome is genuinely unknown: the
+# wire send may already have landed but the client never confirmed (e.g. a
+# hard-killed WCF RPC subprocess). Such a record must NOT be re-sent — not on a
+# later tick and not within the same tick's attempt loop — because a re-send
+# would duplicate an already-delivered message.
+_UNKNOWN_DELIVERY_MARKERS = ("wcf_rpc_timeout", "unknown_delivery_state")
+
+
+def _is_unknown_delivery_state(reason: str) -> bool:
+    lowered = str(reason or "").lower()
+    return any(marker in lowered for marker in _UNKNOWN_DELIVERY_MARKERS)
+
+
 def _is_retryable_failure(reason: str) -> bool:
     lowered = str(reason or "").lower()
     # A hard-killed WCF RPC has unknown delivery state: the message may already
     # be on the wire but the client never returned. Retrying blindly risks a
     # duplicate, so quarantine it as terminal failed for operator review.
-    if "wcf_rpc_timeout" in lowered or "unknown_delivery_state" in lowered:
+    if _is_unknown_delivery_state(lowered):
         return False
     return any(marker in lowered for marker in _RETRYABLE_REASON_MARKERS)
 
@@ -273,6 +286,15 @@ class BridgeWorker:
                 bridge_id,
                 last_reason,
             )
+            # An unknown-delivery-state failure (e.g. a hard-killed WCF RPC) may
+            # already have landed on the wire. Never re-send it in the same tick
+            # for the remaining attempts — that would risk a duplicate. Stop the
+            # loop now and let _fail_or_retry quarantine it as terminal failed.
+            if _is_unknown_delivery_state(last_reason):
+                logger.warning(
+                    "bridge %s: unknown delivery state, not re-sending this tick", bridge_id
+                )
+                break
             if attempt < self.max_send_attempts - 1:
                 time.sleep(min(2.0, 0.5 * (attempt + 1)))
 
@@ -317,12 +339,21 @@ class BridgeWorker:
         # channel registry (roomid for groups, wxid for private) rather than
         # blindly using the hashed conversation_id, which is never a valid
         # wcf receiver and would misroute group replies.
-        from app.personal_wechat_bot.wechat_driver.bridge_send import _channel_receiver
+        from app.personal_wechat_bot.wechat_driver.bridge_send import (
+            _channel_receiver,
+            _looks_like_wechat_receiver,
+        )
 
         resolved = _channel_receiver(self.data_dir, conversation_id)
         if resolved:
             return resolved
-        return conversation_id.strip()
+        # Only fall back to the conversation_id when it is itself a valid wcf
+        # receiver (a raw wxid/roomid). A hashed conversation_id is not, so
+        # returning it would misroute or fail on the wire; yield "" instead so
+        # _deliver treats it as missing_receiver (retryable until the channel is
+        # registered), mirroring the driver-side guard.
+        candidate = conversation_id.strip()
+        return candidate if _looks_like_wechat_receiver(candidate) else ""
 
     def _ack(
         self,
@@ -441,8 +472,14 @@ def run_bridge_worker(
     once: bool = False,
     lock_enabled: bool = True,
     max_iterations: int | None = None,
+    stop_event: Any = None,
 ) -> BridgeWorkerStats:
-    """Run the outbox bridge, holding a single-instance lock for its lifetime."""
+    """Run the outbox bridge, holding a single-instance lock for its lifetime.
+
+    ``stop_event`` (any object with ``is_set()``) lets a supervisor request a
+    clean stop between ticks — the loop checks it after each drain and before
+    sleeping, so a stop takes effect within one poll interval.
+    """
     data_dir = Path(data_dir)
     config = load_config(data_dir)
     backend = build_send_backend(config)
@@ -470,6 +507,8 @@ def run_bridge_worker(
                 lock.heartbeat()
             iterations += 1
             if once or (max_iterations is not None and iterations >= max_iterations):
+                break
+            if stop_event is not None and stop_event.is_set():
                 break
             time.sleep(max(0.1, poll_interval_seconds))
     finally:

@@ -730,6 +730,27 @@ class SidebarKeyPoolApiTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 remove_api_key(data_dir, {"ref": "missing:secret:deadbeef"})
 
+    def test_fresh_install_allows_add_key_without_configured_key_file(self) -> None:
+        # On a default config no api_key_file is set. The UI add-key flow must
+        # still work (falls back to a default key file under data_dir), so
+        # key_file_writable is true and add/list/remove round-trips.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            listed = list_api_keys(data_dir)
+            self.assertTrue(listed["key_file_writable"])
+            self.assertTrue(listed["key_file"])  # a concrete default path
+
+            added = add_api_key(data_dir, {"value": "sk-fresh-install-1234"})
+            self.assertEqual(added["status"], "ok")
+            self.assertEqual(added["available_count"], 1)
+            self.assertNotIn("sk-fresh-install-1234", str(added))
+
+            removed = remove_api_key(data_dir, {"ref": added["ref"]})
+            self.assertEqual(removed["status"], "ok")
+            self.assertEqual(removed["available_count"], 0)
+
 
 class SidebarModelConfigApiTest(unittest.TestCase):
     def test_get_and_set_model_config_roundtrip(self) -> None:
@@ -864,6 +885,90 @@ def _reply() -> ReplyCandidate:
         send_mode="confirm",
         model="fake",
     )
+
+
+class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
+    def test_start_bridge_worker_delivers_and_stop_terminates(self) -> None:
+        from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            # bridge_outbox + dry_run backend: worker delivers (acks) without a
+            # live WeChat. enqueue a record for the worker to pick up.
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            root = data_dir.resolve()
+            store = BridgeOutboxStore(root)
+            rec = store.enqueue("wxid_a", "deliver me")
+
+            sidebar_api._start_bridge_worker(root, {"bridge_interval_seconds": 0.2})
+            try:
+                # Wait until the worker acks the record (terminal), up to ~5s.
+                deadline = time.time() + 5.0
+                delivered = False
+                while time.time() < deadline:
+                    item = store.state(limit=10)["items"][0]
+                    if item["status"] in {"sent", "failed"}:
+                        delivered = item["status"] == "sent"
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(delivered, "bridge worker did not deliver the queued record")
+                self.assertTrue(sidebar_api._bridge_worker_state(root)["running"])
+            finally:
+                sidebar_api._stop_bridge_worker(root)
+
+            # After stop, the thread winds down.
+            deadline = time.time() + 5.0
+            while time.time() < deadline and sidebar_api._bridge_worker_state(root)["running"]:
+                time.sleep(0.1)
+            self.assertFalse(sidebar_api._bridge_worker_state(root)["running"])
+
+    def test_start_bridge_worker_noop_when_driver_not_bridge_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)  # default driver is not_implemented
+            root = data_dir.resolve()
+            sidebar_api._start_bridge_worker(root, {})
+            try:
+                self.assertFalse(sidebar_api._bridge_worker_state(root)["running"])
+            finally:
+                sidebar_api._stop_bridge_worker(root)
+
+    def test_background_send_status_reports_worker_down(self) -> None:
+        # bridge_outbox + send_enabled but no live worker lock: the status must
+        # reflect that nothing is delivering, not a config-only "ready".
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            config = load_config(data_dir)
+
+            # No worker lock at all -> worker down.
+            status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+            self.assertEqual(status, "bridge_outbox_worker_down")
+
+            # A pending backlog with no live worker -> down-with-backlog.
+            status = sidebar_api._background_send_status(config, {"pending_count": 3}, data_dir)
+            self.assertEqual(status, "bridge_outbox_worker_down_backlog")
+
+    def test_background_send_status_ready_when_worker_lock_fresh(self) -> None:
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            config = load_config(data_dir)
+
+            # Simulate a live worker by writing a fresh heartbeat lock.
+            lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                _json.dumps({"pid": 1234, "label": "send_bridge_worker", "heartbeat_at": time.time()}),
+                encoding="utf-8",
+            )
+            status = sidebar_api._background_send_status(config, {"pending_count": 2}, data_dir)
+            self.assertEqual(status, "bridge_outbox_ready")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]
             "max_concurrency": preflight["model"]["max_concurrency"],
         },
         "checks": checks,
-        "required_next_steps": _required_next_steps(blockers),
+        "required_next_steps": _required_next_steps(blockers, preflight),
         "recommended_rollout": _recommended_rollout(preflight),
     }
 
@@ -68,6 +68,20 @@ def _checks(preflight: dict[str, Any]) -> list[dict[str, str]]:
             "pass" if send_policy.get("send_enabled") else "blocker",
             "send_enabled is true",
             "send_enabled is false; no code path should send real WeChat messages",
+        )
+    )
+    # A real send driver + send_enabled but a dry_run backend means the bridge
+    # worker only logs and acks 'sent' without delivering anything — the ledger
+    # and UI would show 'sent' for a message that never left. Warn loudly so an
+    # operator doesn't mistake dry-run acks for real delivery.
+    send_backend = str(send_policy.get("send_backend") or "dry_run").lower()
+    intends_real_send = bool(send_policy.get("send_enabled")) and bool(send_policy.get("real_send_implemented"))
+    checks.append(
+        _check(
+            "send_backend",
+            "pass" if send_backend == "wcf" else ("warn" if intends_real_send else "pass"),
+            f"send backend: {send_backend}",
+            f"send backend is '{send_backend}', not 'wcf'; queued replies are acked as sent but NOT delivered",
         )
     )
     checks.append(
@@ -123,19 +137,24 @@ def _check(check_id: str, status: str, ok_detail: str, bad_detail: str | None = 
     }
 
 
-def _required_next_steps(blockers: list[dict[str, str]]) -> list[str]:
-    if not blockers:
-        return []
+def _required_next_steps(blockers: list[dict[str, str]], preflight: dict[str, Any]) -> list[str]:
     next_steps: list[str] = []
     ids = {item["id"] for item in blockers}
     if {"real_send_driver", "send_driver_name", "wechat_write_access"} & ids:
         next_steps.append("select and validate a guarded real WeChat send driver")
     if "send_enabled" in ids:
         next_steps.append("keep send_enabled=false until a guarded send driver passes confirm-mode rollout")
-    if "manual_bridge_channels" in ids:
-        next_steps.append("start the WeChatFerry send bridge worker (scripts/send_bridge_worker.py) before using bridge_outbox")
     if "api_keys" in ids:
         next_steps.append("configure at least one available model API key")
+    # The bridge_outbox driver only *queues* replies; a separate worker must be
+    # running to deliver them. Surface this whenever bridge_outbox is the active
+    # driver (not gated on a blocker id — there is no check that emits one, and
+    # the worker requirement holds even when every other check passes).
+    send_driver = str(preflight.get("wechat_access", {}).get("send_driver") or "")
+    if send_driver == "bridge_outbox":
+        next_steps.append(
+            "start the WeChatFerry send bridge worker (scripts/send_bridge_worker.py) so queued replies are delivered"
+        )
     return next_steps
 
 

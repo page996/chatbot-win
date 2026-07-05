@@ -35,6 +35,11 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=2.0, help="poll interval seconds")
     parser.add_argument("--once", action="store_true", help="deliver current backlog then exit")
     parser.add_argument("--no-lock", action="store_true", help="skip single-instance lock (tests only)")
+    parser.add_argument(
+        "--strict-data-dir",
+        action="store_true",
+        help="refuse to start if the data dir has no config.json (likely the wrong dir)",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -43,9 +48,28 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # Guard against the classic footgun: the worker and the app reading/writing
+    # DIFFERENT data dirs (so the app queues into one outbox while the worker
+    # drains another), which silently delivers nothing with no error. The app's
+    # data dir always contains a config.json; a data dir without one is almost
+    # certainly wrong. Warn loudly, and refuse under --strict-data-dir.
+    resolved = Path(args.data_dir).resolve()
+    config_path = resolved / "config.json"
+    if not config_path.exists():
+        message = (
+            f"data dir {resolved} has no config.json; the app likely uses a different "
+            f"data dir. Queued replies there will never be delivered from here."
+        )
+        if args.strict_data_dir:
+            print(f"refusing to start: {message}", file=sys.stderr)
+            return 3
+        print(f"warning: {message}", file=sys.stderr)
+    else:
+        print(f"send bridge worker using data dir: {resolved}", file=sys.stderr)
+
     try:
         stats = run_bridge_worker(
-            args.data_dir,
+            str(resolved),
             poll_interval_seconds=args.interval,
             once=args.once,
             lock_enabled=not args.no_lock,

@@ -78,6 +78,28 @@ class SendReadinessTest(unittest.TestCase):
             rollout = next(item for item in report["checks"] if item["id"] == "rollout_mode")
             self.assertEqual(rollout["status"], "warn")
             self.assertIn("confirm mode is active", rollout["detail"])
+            # The bridge worker must be started to deliver queued replies; this
+            # required next-step must actually appear for the bridge_outbox driver
+            # (previously it was keyed on a blocker id no check ever emitted).
+            self.assertIn(
+                "start the WeChatFerry send bridge worker",
+                " ".join(report["required_next_steps"]),
+            )
+
+    def test_dry_run_backend_warns_when_real_send_intended(self) -> None:
+        # send_enabled + bridge_outbox but the default dry_run backend means the
+        # worker acks 'sent' without delivering. The send_backend check must warn
+        # so the operator doesn't mistake dry-run acks for real delivery.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+
+            report = build_send_readiness_report(data_dir)
+            by_id = {item["id"]: item for item in report["checks"]}
+
+            self.assertEqual(by_id["send_backend"]["status"], "warn")
+            self.assertIn("not 'wcf'", by_id["send_backend"]["detail"])
 
     def test_unregistered_driver_name_blocks_consistently_with_real_send_check(self) -> None:
         # Regression: send_driver_name must key off the driver registry, not a

@@ -157,8 +157,30 @@ class BridgeOutboxStore:
 
     def _append(self, path: Path, record: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # Hold the store lock so an append can never land inside a concurrent
+        # compaction's read-modify-rewrite window (which would drop this record
+        # when compaction replaces the file with its pre-append snapshot).
+        with self._store_lock():
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _store_lock(self):
+        """Cross-process lock serializing append vs compaction of the jsonl files.
+
+        The producer (WeFlow pull process) appends to outbox.jsonl while the
+        consumer (bridge worker) periodically compacts both files. Without a
+        shared lock, an append between compaction's read and its atomic replace
+        is silently lost. Both sides take this short lock; it is unrelated to the
+        long-lived single-instance ``.bridge_worker.lock``.
+        """
+        from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
+
+        return blocking_process_lock(
+            self.root / ".outbox_rw.lock",
+            label="bridge_outbox_rw",
+            stale_after_seconds=30.0,
+            wait_timeout_seconds=15.0,
+        )
 
     def compact(self, *, keep_resolved: int = 500) -> dict[str, int]:
         """Drop old terminally-resolved records from outbox.jsonl + acks.jsonl.
@@ -174,40 +196,45 @@ class BridgeOutboxStore:
         Returns counts of removed outbox/ack lines. A no-op-safe rewrite: if
         nothing is droppable it leaves the files untouched.
         """
-        outbox = self._read_all(self.outbox_path)
-        acks = self._read_all(self.ack_path)
-        latest = _latest_by_bridge_id(acks)
-        terminal = {"sent", "failed", "blocked"}
+        # Hold the store lock across the whole read-modify-write so a concurrent
+        # producer append is serialized (either fully before our read, or fully
+        # after our replace) and can never be dropped. _rewrite does not re-lock,
+        # so there is no reentrancy.
+        with self._store_lock():
+            outbox = self._read_all(self.outbox_path)
+            acks = self._read_all(self.ack_path)
+            latest = _latest_by_bridge_id(acks)
+            terminal = {"sent", "failed", "blocked"}
 
-        resolved_order: list[str] = []
-        pending_ids: set[str] = set()
-        for item in outbox:
-            bridge_id = str(item.get("bridge_id", ""))
-            if not bridge_id:
-                continue
-            status = str(latest.get(bridge_id, {}).get("status", "")) if bridge_id in latest else ""
-            if status in terminal:
-                resolved_order.append(bridge_id)
-            else:
-                pending_ids.add(bridge_id)
+            resolved_order: list[str] = []
+            pending_ids: set[str] = set()
+            for item in outbox:
+                bridge_id = str(item.get("bridge_id", ""))
+                if not bridge_id:
+                    continue
+                status = str(latest.get(bridge_id, {}).get("status", "")) if bridge_id in latest else ""
+                if status in terminal:
+                    resolved_order.append(bridge_id)
+                else:
+                    pending_ids.add(bridge_id)
 
-        if len(resolved_order) <= max(0, keep_resolved):
-            return {"removed_outbox": 0, "removed_acks": 0}
+            if len(resolved_order) <= max(0, keep_resolved):
+                return {"removed_outbox": 0, "removed_acks": 0}
 
-        # Keep the most-recent resolved ids (outbox is FIFO, so tail = newest).
-        keep_resolved_ids = set(resolved_order[-keep_resolved:]) if keep_resolved > 0 else set()
-        keep_ids = pending_ids | keep_resolved_ids
+            # Keep the most-recent resolved ids (outbox is FIFO, so tail = newest).
+            keep_resolved_ids = set(resolved_order[-keep_resolved:]) if keep_resolved > 0 else set()
+            keep_ids = pending_ids | keep_resolved_ids
 
-        new_outbox = [item for item in outbox if str(item.get("bridge_id", "")) in keep_ids]
-        new_acks = [ack for ack in acks if str(ack.get("bridge_id", "")) in keep_ids]
-        removed_outbox = len(outbox) - len(new_outbox)
-        removed_acks = len(acks) - len(new_acks)
-        if removed_outbox <= 0 and removed_acks <= 0:
-            return {"removed_outbox": 0, "removed_acks": 0}
+            new_outbox = [item for item in outbox if str(item.get("bridge_id", "")) in keep_ids]
+            new_acks = [ack for ack in acks if str(ack.get("bridge_id", "")) in keep_ids]
+            removed_outbox = len(outbox) - len(new_outbox)
+            removed_acks = len(acks) - len(new_acks)
+            if removed_outbox <= 0 and removed_acks <= 0:
+                return {"removed_outbox": 0, "removed_acks": 0}
 
-        self._rewrite(self.outbox_path, new_outbox)
-        self._rewrite(self.ack_path, new_acks)
-        return {"removed_outbox": removed_outbox, "removed_acks": removed_acks}
+            self._rewrite(self.outbox_path, new_outbox)
+            self._rewrite(self.ack_path, new_acks)
+            return {"removed_outbox": removed_outbox, "removed_acks": removed_acks}
 
     def _rewrite(self, path: Path, records: list[dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

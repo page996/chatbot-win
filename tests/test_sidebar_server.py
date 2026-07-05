@@ -237,6 +237,94 @@ class SidebarServerTest(unittest.TestCase):
             self.assertEqual(payload["status"], "error")
             self.assertEqual(payload["backfilled_talkers"], [])
 
+    def test_cross_origin_post_is_rejected(self) -> None:
+        # A malicious page in the operator's browser must not be able to drive a
+        # mutating endpoint (here: model-config, which could redirect the key).
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/model-config",
+                    data=json.dumps({"provider": "relay"}).encode("utf-8"),
+                    headers={
+                        "content-type": "application/json",
+                        "origin": "http://evil.example.com",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(request, timeout=5)
+                self.assertEqual(ctx.exception.code, 403)
+                body = json.loads(ctx.exception.read().decode("utf-8"))
+                self.assertEqual(body["error"], "cross_origin_forbidden")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_non_json_content_type_post_is_rejected(self) -> None:
+        # A simple cross-site form POST (text/plain, no preflight) must be
+        # blocked by the content-type gate.
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/model-config",
+                    data=b'{"provider":"relay"}',
+                    headers={"content-type": "text/plain"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(request, timeout=5)
+                self.assertEqual(ctx.exception.code, 403)
+                body = json.loads(ctx.exception.read().decode("utf-8"))
+                self.assertEqual(body["error"], "unsupported_content_type")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_same_origin_post_is_allowed(self) -> None:
+        # A request whose Origin host matches our Host header passes the guard.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/model-config",
+                    data=json.dumps({}).encode("utf-8"),
+                    headers={
+                        "content-type": "application/json",
+                        "origin": f"http://{host}:{port}",
+                    },
+                    method="POST",
+                )
+                payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

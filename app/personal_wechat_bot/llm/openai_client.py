@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import urllib.error
 import urllib.request
 
 from app.personal_wechat_bot.config.schema import ProviderConfig
@@ -12,6 +14,15 @@ from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36"
+
+# HTTP statuses that mean "this key is bad/exhausted right now": don't keep
+# using it — fail over to another key and put this one on a cooldown so it isn't
+# reselected immediately.
+_KEY_FAILOVER_STATUSES = {401, 403, 429}
+# How long a key stays retired after an auth/rate failure before it may be
+# retried (a 429 is often transient; a 401 usually is not, but a bounded
+# cooldown lets a rotated/re-enabled key recover without a restart).
+_BAD_KEY_COOLDOWN_SECONDS = 300.0
 
 
 def normalize_openai_base_url(base_url: str, provider: str = "relay") -> str:
@@ -23,6 +34,26 @@ def normalize_openai_base_url(base_url: str, provider: str = "relay") -> str:
     if base.endswith("/v1"):
         return base
     return f"{base}/v1"
+
+
+def validate_endpoint_url(url: str) -> str:
+    """Return an error string if ``url`` is unsafe to attach an API key to.
+
+    Only http/https with a real host is allowed. Used on both the model-probe
+    path and the live chat send path so the API key is never egressed to a
+    non-http(s) scheme (file://, ftp://, ...) or a schemeless/hostless string.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "invalid_base_url"
+    if parsed.scheme not in {"http", "https"}:
+        return f"unsupported_url_scheme:{parsed.scheme or 'none'}"
+    if not parsed.hostname:
+        return "missing_url_host"
+    return ""
 
 
 class RelayOpenAIClient:
@@ -42,6 +73,9 @@ class RelayOpenAIClient:
         self.model = config.model
         self.key_pool = key_pool or ApiKeyPool(config)
         self.channel_store = channel_store
+        # ref -> monotonic timestamp until which the key is retired after an
+        # auth/rate failure. Kept in-memory (per client); a restart clears it.
+        self._bad_keys: dict[str, float] = {}
 
     def generate_reply(self, prompt: str) -> str:
         data = self._chat_completion(
@@ -122,25 +156,90 @@ class RelayOpenAIClient:
     ) -> dict[str, object]:
         if not self.config.base_url:
             raise RuntimeError("missing relay base_url")
-        api_key = self._api_key_for_conversation(conversation_id)
-        if not api_key:
-            raise RuntimeError(f"missing API key env: {self.config.api_key_env}")
+        endpoint = normalize_openai_base_url(self.config.base_url, self.config.provider) + "/chat/completions"
+        # Validate the endpoint BEFORE attaching the API key so a malformed or
+        # non-http(s) base_url can never egress the key to an unexpected target.
+        url_error = validate_endpoint_url(endpoint)
+        if url_error:
+            raise RuntimeError(f"invalid base_url: {url_error}")
         payload: dict[str, object] = {"model": self.model, "messages": messages}
         if temperature is not None:
             payload["temperature"] = temperature
-        req = urllib.request.Request(
-            normalize_openai_base_url(self.config.base_url, self.config.provider) + "/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": DEFAULT_USER_AGENT,
-            },
-            method="POST",
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        # Try each candidate key in turn. On a 401/403/429 the key is retired
+        # (cooldown) and we fail over to the next; a bounded candidate list means
+        # we never loop forever. Non-auth errors (network, 5xx) propagate on the
+        # first key — those are not a key-selection problem.
+        candidates = self._candidate_refs(conversation_id)
+        if not candidates:
+            raise RuntimeError(f"missing API key env: {self.config.api_key_env}")
+        last_auth_error: Exception | None = None
+        for ref in candidates:
+            api_key = self.key_pool.key_for_ref(ref)
+            if not api_key:
+                continue
+            req = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": DEFAULT_USER_AGENT,
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.config.max_wait_seconds) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code in _KEY_FAILOVER_STATUSES:
+                    self._retire_key(ref)
+                    last_auth_error = RuntimeError(f"key {ref} rejected: HTTP {exc.code}")
+                    continue
+                raise
+        raise RuntimeError(
+            f"all candidate API keys exhausted (last auth error: {last_auth_error})"
         )
-        with urllib.request.urlopen(req, timeout=self.config.max_wait_seconds) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+
+    def _candidate_refs(self, conversation_id: str) -> list[str]:
+        """Ordered list of key refs to try for this request.
+
+        Starts with the conversation's sticky/rotated pick (when a channel store
+        is present), then appends every other currently-available ref as
+        failover, skipping refs on cooldown. Cooldowned refs are appended last as
+        a last resort so a request can still go out if every key is cooling down.
+        """
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def _add(ref: str | None) -> None:
+            if ref and ref not in seen:
+                seen.add(ref)
+                ordered.append(ref)
+
+        if conversation_id and self.channel_store is not None:
+            _add(self.channel_store.ref_for_request(conversation_id))
+        for ref in self.key_pool.available_refs():
+            _add(ref)
+
+        fresh = [ref for ref in ordered if not self._is_on_cooldown(ref)]
+        cooling = [ref for ref in ordered if self._is_on_cooldown(ref)]
+        return fresh + cooling
+
+    def _is_on_cooldown(self, ref: str) -> bool:
+        until = self._bad_keys.get(ref)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            # Cooldown elapsed: give the key another chance.
+            self._bad_keys.pop(ref, None)
+            return False
+        return True
+
+    def _retire_key(self, ref: str) -> None:
+        self._bad_keys[ref] = time.monotonic() + _BAD_KEY_COOLDOWN_SECONDS
 
     def _api_key_for_conversation(self, conversation_id: str) -> str | None:
         if conversation_id and self.channel_store is not None:
