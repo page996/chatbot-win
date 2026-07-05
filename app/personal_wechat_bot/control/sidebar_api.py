@@ -30,6 +30,7 @@ from app.personal_wechat_bot.runtime.weflow_state_summary import summarize_weflo
 from app.personal_wechat_bot.runtime.weflow_worker_metrics import WeflowWorkerMetrics
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
+from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     clear_send_audit,
@@ -63,6 +64,8 @@ _WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
 _WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
 _WEFLOW_LOCK = threading.Lock()
 _WEFLOW_STATE_FILE_LOCK = threading.RLock()
+# Max times the supervisor auto-restarts a died worker loop before giving up.
+_WEFLOW_MAX_RESTARTS = 10
 _WEFLOW_OPERATION_LOCK = threading.Lock()
 # Serializes the hook *consume* step (import + backend replay + scheduler)
 # across threads *within this process*. It fronts the cross-process file lock
@@ -130,6 +133,28 @@ def delete_sidebar_channel(data_dir: str | Path, conversation_id: str) -> dict[s
         "cleanup": cleanup,
         "note": _cleanup_note(cleanup),
     }
+
+
+def cleanup_file_workspace(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Prune old per-file workspace dirs to bound disk growth (explicit, opt-in).
+
+    The general artifact-cleanup report deliberately retains file_workspace as the
+    isolated per-conversation middle layer, so this is a separate, operator-driven
+    action with conservative defaults (keep newest 50, prune older than 30 days).
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    max_age_days = payload.get("max_age_days", 30)
+    keep_min = int(payload.get("keep_min", 50) or 0)
+    max_total_mb = payload.get("max_total_mb")
+    max_age_seconds = float(max_age_days) * 86400.0 if max_age_days not in (None, "") else None
+    max_total_bytes = int(float(max_total_mb) * 1024 * 1024) if max_total_mb not in (None, "") else None
+    workspace = FileWorkspace(Path(data_dir) / "file_workspace")
+    result = workspace.cleanup(
+        max_age_seconds=max_age_seconds,
+        max_total_bytes=max_total_bytes,
+        keep_min=keep_min,
+    )
+    return {**result, "keep_min": keep_min, "max_age_days": max_age_days}
 
 
 def cleanup_sidebar_channels(data_dir: str | Path, *, hidden_only: bool = True) -> dict[str, Any]:
@@ -851,6 +876,60 @@ def _run_sidebar_weflow_once(
 
 
 def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
+    """Supervise the worker loop: restart it if it dies while still intended-running.
+
+    The inner loop (`_weflow_worker_loop`) can terminate on a genuine stop, or die
+    from an uncaught exception outside the per-tick handler (e.g. the consumer-lock
+    acquire, or a crash between ticks). Without supervision the sidebar would show
+    running=false forever with no recovery. Here we respawn with capped exponential
+    backoff, bounded by a max restart count, and clear the intent on stop() so a
+    stopped worker is never resurrected.
+    """
+    key = str(root)
+    interval = max(1.0, float(payload.get("interval_seconds") or 5.0))
+    max_restarts = int(payload.get("max_restarts", _WEFLOW_MAX_RESTARTS) or _WEFLOW_MAX_RESTARTS)
+    restart_count = 0
+    while not stop_event.is_set():
+        try:
+            _weflow_worker_loop(root, payload, stop_event)
+        except Exception as exc:  # the loop itself should not raise, but be safe
+            logger.exception("weflow worker loop crashed")
+            with _WEFLOW_LOCK:
+                worker = _WEFLOW_WORKERS.get(key, {})
+                worker["last_status"] = "crashed"
+                worker["last_error"] = f"loop_crashed:{type(exc).__name__}: {exc}"
+                worker["last_tick_at"] = time.time()
+                _WEFLOW_WORKERS[key] = worker
+        # A clean stop request means we're done — don't resurrect.
+        if stop_event.is_set():
+            break
+        # The loop returned/died without a stop request: supervise a restart.
+        restart_count += 1
+        if restart_count > max_restarts:
+            with _WEFLOW_LOCK:
+                worker = _WEFLOW_WORKERS.get(key, {})
+                worker["last_status"] = "crashed"
+                worker["last_error"] = f"max_restarts_exceeded:{max_restarts}"
+                worker["restart_count"] = restart_count - 1
+                worker["last_tick_at"] = time.time()
+                _WEFLOW_WORKERS[key] = worker
+            logger.error("weflow worker exceeded %d restarts; giving up", max_restarts)
+            break
+        backoff = min(60.0, interval * (2 ** min(restart_count - 1, 5)))
+        with _WEFLOW_LOCK:
+            worker = _WEFLOW_WORKERS.get(key, {})
+            worker["last_status"] = "restarting"
+            worker["restart_count"] = restart_count
+            worker["last_restart_at"] = time.time()
+            worker["last_tick_at"] = time.time()
+            _WEFLOW_WORKERS[key] = worker
+        logger.warning("weflow worker died; restart %d/%d after %.1fs backoff", restart_count, max_restarts, backoff)
+        # Interruptible backoff: a stop during the wait aborts the restart.
+        if stop_event.wait(backoff):
+            break
+
+
+def _weflow_worker_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
     interval = max(1.0, float(payload.get("interval_seconds") or 5.0))
     key = str(root)
     # Single-instance guard: refuse to run if another consumer (a CLI puller or
@@ -869,6 +948,10 @@ def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: thr
             worker["last_tick_at"] = time.time()
             _WEFLOW_WORKERS[key] = worker
         _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
+        # A held consumer lock means another consumer is legitimately running.
+        # This is a deliberate single-instance refusal, NOT a crash — signal the
+        # supervisor to stop (no restart) by setting the stop event.
+        stop_event.set()
         return
     context: dict[str, Any] | None = None
     try:
@@ -1333,6 +1416,8 @@ def _weflow_worker_state(root: Path) -> dict[str, Any]:
             "last_error": str(worker.get("last_error", "")),
             "last_tick_at": worker.get("last_tick_at", 0),
             "stop_requested": bool(worker.get("stop_requested")),
+            "restart_count": int(worker.get("restart_count", 0) or 0),
+            "last_restart_at": worker.get("last_restart_at", 0),
         }
         if isinstance(metrics, WeflowWorkerMetrics):
             snapshot = metrics.snapshot(running=running)

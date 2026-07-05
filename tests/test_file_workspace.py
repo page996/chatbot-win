@@ -468,5 +468,89 @@ def _write_docx_with_media(path: Path, *, include_audio: bool = False) -> None:
             docx.writestr("word/media/audio1.mp3", b"fake audio bytes")
 
 
+class FileWorkspaceCleanupTest(unittest.TestCase):
+    def _stage(self, workspace: FileWorkspace, root: Path, name: str) -> str:
+        src = root / name
+        src.write_text(f"content of {name}", encoding="utf-8")
+        staged = workspace.stage_file(src, conversation_id="c1", session_id="s1", original_name=name, kind="file")
+        return staged.file_id
+
+    def test_cleanup_prunes_old_dirs_but_keeps_min(self) -> None:
+        import os
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = FileWorkspace(root / "ws")
+            ids = [self._stage(ws, root, f"f{i}.txt") for i in range(5)]
+            # Age all dirs well past the TTL.
+            old = time.time() - 10_000
+            for fid in ids:
+                d = ws.file_dir("c1", "s1", fid)
+                os.utime(d, (old, old))
+
+            result = ws.cleanup(max_age_seconds=1000, keep_min=2)
+
+            # 5 dirs, keep newest 2 -> at most 3 removable, all old -> 3 removed.
+            self.assertEqual(result["removed"], 3)
+            remaining = [fid for fid in ids if ws.file_dir("c1", "s1", fid).exists()]
+            self.assertEqual(len(remaining), 2)
+
+    def test_cleanup_noop_when_within_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = FileWorkspace(root / "ws")
+            for i in range(3):
+                self._stage(ws, root, f"f{i}.txt")
+
+            result = ws.cleanup(max_age_seconds=100_000, keep_min=0)
+
+            self.assertEqual(result["removed"], 0)
+            self.assertEqual(result["scanned"], 3)
+
+    def test_cleanup_updates_session_index(self) -> None:
+        import os
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = FileWorkspace(root / "ws")
+            ids = [self._stage(ws, root, f"f{i}.txt") for i in range(4)]
+            old = time.time() - 10_000
+            for fid in ids:
+                d = ws.file_dir("c1", "s1", fid)
+                os.utime(d, (old, old))
+
+            ws.cleanup(max_age_seconds=1000, keep_min=1)
+
+            index_files = {item["file_id"] for item in ws.list_session_files("c1", "s1")}
+            existing = {fid for fid in ids if ws.file_dir("c1", "s1", fid).exists()}
+            # Index only lists dirs that still exist.
+            self.assertEqual(index_files, existing)
+
+    def test_cleanup_size_cap_removes_oldest(self) -> None:
+        import os
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = FileWorkspace(root / "ws")
+            ids = []
+            base = time.time() - 5000
+            for i in range(4):
+                fid = self._stage(ws, root, f"f{i}.txt")
+                ids.append(fid)
+                # Stagger mtimes so "oldest" is deterministic.
+                stamp = base + i * 100
+                os.utime(ws.file_dir("c1", "s1", fid), (stamp, stamp))
+
+            # Tiny size cap forces pruning of the oldest, keep_min small.
+            result = ws.cleanup(max_total_bytes=1, keep_min=1, max_age_seconds=None)
+
+            self.assertGreaterEqual(result["removed"], 1)
+            # The very newest must survive (keep_min + recency).
+            self.assertTrue(ws.file_dir("c1", "s1", ids[-1]).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

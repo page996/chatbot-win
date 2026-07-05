@@ -434,6 +434,8 @@ function renderWeFlow(weflow) {
     weflow.config_migration?.status === "updated" ? "扩展配置已迁移" : "",
     metrics.stalled ? "⚠ 后台疑似停滞（长时间无成功拉取）" : "",
     worker.stop_requested ? "正在停止后台拉取" : "",
+    worker.last_status === "restarting" ? `⚠ 后台已崩溃，自动重启中（第 ${worker.restart_count || 0} 次）` : "",
+    worker.last_status === "crashed" ? `✕ 后台已崩溃并停止（重启 ${worker.restart_count || 0} 次后放弃）` : "",
     metrics.slow_ticks ? `慢 tick ${metrics.slow_ticks} 次` : "",
     bridgeState.session_count ? `会话游标 ${bridgeState.session_count} / 去重 ${bridgeState.seen_raw_id_count || 0}` : "",
     worker.last_error ? `后台错误：${worker.last_error}` : "",
@@ -1810,12 +1812,12 @@ const keyPoolState = { keys: [], keyFile: "", writable: false, loading: false };
 
 const modelConfigState = { loading: false, loaded: false };
 
-async function loadModelConfig() {
+async function loadModelConfig({ force = false } = {}) {
   if (modelConfigState.loading) return;
   modelConfigState.loading = true;
   try {
     const payload = await api("/api/model-config");
-    applyModelConfig(payload);
+    applyModelConfig(payload, { force });
     modelConfigState.loaded = true;
   } catch (error) {
     setModelConfigMessage(`加载模型配置失败：${error.message}`, true);
@@ -1824,7 +1826,7 @@ async function loadModelConfig() {
   }
 }
 
-function applyModelConfig(payload) {
+function applyModelConfig(payload, { force = false } = {}) {
   const providerSelect = $("#modelProvider");
   if (providerSelect) {
     const formats = Array.isArray(payload.provider_formats) && payload.provider_formats.length
@@ -1837,14 +1839,28 @@ function applyModelConfig(payload) {
       option.textContent = format === "deepseek" ? "deepseek" : "relay (OpenAI 兼容)";
       providerSelect.append(option);
     }
-    providerSelect.value = payload.provider || formats[0];
+    // Don't clobber an in-progress edit on tab re-entry; only set when the user
+    // hasn't touched the field (or when forced, e.g. right after a save).
+    if (force || !providerSelect.dataset.touched) {
+      providerSelect.value = payload.provider || formats[0];
+    }
   }
   const nameInput = $("#modelName");
-  if (nameInput) nameInput.value = payload.model || "";
+  if (nameInput && (force || !nameInput.dataset.touched)) nameInput.value = payload.model || "";
   const baseInput = $("#modelBaseUrl");
-  if (baseInput) baseInput.value = payload.base_url || "";
+  if (baseInput && (force || !baseInput.dataset.touched)) baseInput.value = payload.base_url || "";
   const waitInput = $("#modelMaxWait");
-  if (waitInput) waitInput.value = payload.max_wait_seconds != null ? payload.max_wait_seconds : "";
+  if (waitInput && (force || !waitInput.dataset.touched)) {
+    waitInput.value = payload.max_wait_seconds != null ? payload.max_wait_seconds : "";
+  }
+  if (force) clearModelConfigTouched();
+}
+
+function clearModelConfigTouched() {
+  for (const sel of ["#modelProvider", "#modelName", "#modelBaseUrl", "#modelMaxWait"]) {
+    const el = $(sel);
+    if (el) delete el.dataset.touched;
+  }
 }
 
 function modelConfigPayload() {
@@ -1870,7 +1886,7 @@ async function saveModelConfig(helpers = {}) {
   helpers.update?.(30, "正在保存模型配置");
   try {
     const result = await api("/api/model-config", { method: "POST", body: JSON.stringify(payload) });
-    applyModelConfig(result.model_config || {});
+    applyModelConfig(result.model_config || {}, { force: true });
     setModelConfigMessage("模型配置已保存", false);
     setStatusMessage("模型配置已保存");
     return result;
@@ -1940,7 +1956,10 @@ function renderModelProbe(result) {
     chip.textContent = model;
     chip.addEventListener("click", () => {
       const input = $("#modelName");
-      if (input) input.value = model;
+      if (input) {
+        input.value = model;
+        input.dataset.touched = "1";  // survive tab re-entry until saved
+      }
       setModelConfigMessage(`已选择模型 ${model}，记得保存`, false);
     });
     list.append(chip);
@@ -2274,7 +2293,16 @@ bindTaskButton("#refreshModelConfig", {
   scope: "settings:model-config",
 }, (helpers) => {
   helpers.update(30, "正在读取模型配置");
-  return loadModelConfig();
+  // Explicit refresh: user wants the saved values, so discard any local edits.
+  clearModelConfigTouched();
+  return loadModelConfig({ force: true });
+});
+["#modelProvider", "#modelName", "#modelBaseUrl", "#modelMaxWait"].forEach((selector) => {
+  const el = $(selector);
+  if (el) {
+    const evt = el.tagName === "SELECT" ? "change" : "input";
+    el.addEventListener(evt, () => { el.dataset.touched = "1"; });
+  }
 });
 bindTaskButton("#probeModelButton", {
   label: "试拉取模型",

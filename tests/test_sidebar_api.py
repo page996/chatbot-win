@@ -18,6 +18,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     build_sidebar_bridge_state,
     build_sidebar_runtime_cards,
     build_sidebar_state,
+    cleanup_file_workspace,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
     get_model_config,
@@ -570,6 +571,53 @@ class WeflowBackgroundLoopTest(unittest.TestCase):
 
             self.assertEqual(build_calls, 2)
 
+    def test_supervisor_restarts_worker_loop_then_stops(self) -> None:
+        # If the worker loop dies unexpectedly (not a stop, not a lock refusal),
+        # the supervisor restarts it with backoff and tracks restart_count; a
+        # stop during backoff ends the supervision without resurrection.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            root = data_dir.resolve()
+            stop_event = threading.Event()
+            calls = {"n": 0}
+
+            def flaky_loop(r, payload, ev):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("boom in loop")
+                ev.set()  # second run: request stop so the supervisor exits
+
+            with mock.patch.object(sidebar_api, "_weflow_worker_loop", side_effect=flaky_loop), mock.patch.object(
+                stop_event, "wait", return_value=False
+            ):
+                sidebar_api._weflow_background_loop(root, {"interval_seconds": 1}, stop_event)
+
+            self.assertEqual(calls["n"], 2)  # crashed once, restarted once
+            state = sidebar_api._weflow_worker_state(root)
+            self.assertGreaterEqual(state["restart_count"], 1)
+
+    def test_supervisor_gives_up_after_max_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            root = data_dir.resolve()
+            stop_event = threading.Event()
+            calls = {"n": 0}
+
+            def always_crash(r, payload, ev):
+                calls["n"] += 1
+                raise RuntimeError("always down")
+
+            with mock.patch.object(sidebar_api, "_weflow_worker_loop", side_effect=always_crash), mock.patch.object(
+                stop_event, "wait", return_value=False
+            ):
+                sidebar_api._weflow_background_loop(root, {"interval_seconds": 1, "max_restarts": 3}, stop_event)
+
+            self.assertEqual(calls["n"], 4)  # initial run + 3 restarts, then give up
+            state = sidebar_api._weflow_worker_state(root)
+            self.assertEqual(state["last_status"], "crashed")
+
     def test_background_loop_fails_fast_when_consumer_lock_held(self) -> None:
         from app.personal_wechat_bot.runtime.process_lock import ProcessLock
 
@@ -767,6 +815,45 @@ class SidebarModelConfigApiTest(unittest.TestCase):
             self.assertEqual(result["status"], "error")
             self.assertFalse(result["reachable"])
             self.assertTrue(result["error"].startswith("unsupported_url_scheme"))
+
+
+class SidebarWorkspaceCleanupApiTest(unittest.TestCase):
+    def test_cleanup_file_workspace_prunes_old_dirs(self) -> None:
+        import os
+        import time as _time
+
+        from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            ws = FileWorkspace(data_dir / "file_workspace")
+            ids = []
+            for i in range(4):
+                p = data_dir / f"doc{i}.txt"
+                p.write_text(f"distinct {i}", encoding="utf-8")
+                staged = ws.stage_file(p, conversation_id="c1", session_id="s1", original_name=f"doc{i}.txt", kind="file")
+                ids.append(staged.file_id)
+            old = _time.time() - 100_000
+            for fid in ids:
+                d = ws.file_dir("c1", "s1", fid)
+                os.utime(d, (old, old))
+
+            result = cleanup_file_workspace(data_dir, {"max_age_days": 1, "keep_min": 1})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["removed"], 3)
+            self.assertEqual(result["keep_min"], 1)
+
+    def test_cleanup_file_workspace_defaults_are_conservative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            # Empty workspace -> nothing to remove, no error.
+            result = cleanup_file_workspace(data_dir, {})
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["removed"], 0)
+            self.assertEqual(result["keep_min"], 50)
 
 
 def _reply() -> ReplyCandidate:

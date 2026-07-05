@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+import time
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -308,6 +309,96 @@ class FileWorkspace:
 
     def file_dir(self, conversation_id: str, session_id: str, file_id: str) -> Path:
         return self.root / _safe_segment(conversation_id) / _safe_segment(session_id) / _safe_segment(file_id)
+
+    def cleanup(
+        self,
+        *,
+        max_age_seconds: float | None = None,
+        max_total_bytes: int | None = None,
+        keep_min: int = 20,
+    ) -> dict[str, Any]:
+        """Prune old per-file workspace dirs to bound disk growth.
+
+        Each attachment stages an ``original/`` + ``derived/`` (incl. 2x-zoom PDF
+        page renders + OCR/media) dir that otherwise accumulates forever. This
+        removes whole ``<conv>/<session>/<file_id>/`` dirs, oldest first, when
+        they exceed ``max_age_seconds`` or when the workspace total exceeds
+        ``max_total_bytes`` — but always retains the newest ``keep_min`` dirs so
+        recent context is never dropped. Session ``index.json`` files are updated
+        to drop pruned entries. Best-effort and idempotent.
+        """
+        entries = self._all_file_dirs()
+        # Oldest first (by mtime); newest kept for keep_min / recency.
+        entries.sort(key=lambda item: item["mtime"])
+        now = time.time()
+        total_bytes = sum(item["bytes"] for item in entries)
+        removable_max = max(0, len(entries) - max(0, keep_min))
+        removed: list[str] = []
+        freed = 0
+        for item in entries[:removable_max]:
+            too_old = max_age_seconds is not None and (now - item["mtime"]) > max_age_seconds
+            over_size = max_total_bytes is not None and (total_bytes - freed) > max_total_bytes
+            if not (too_old or over_size):
+                continue
+            try:
+                shutil.rmtree(item["path"])
+            except OSError:
+                continue
+            removed.append(item["path"])
+            freed += item["bytes"]
+            self._drop_index_entry(item["conversation_id"], item["session_id"], item["file_id"])
+        return {
+            "status": "ok",
+            "scanned": len(entries),
+            "removed": len(removed),
+            "freed_bytes": freed,
+            "remaining_bytes": max(0, total_bytes - freed),
+        }
+
+    def _all_file_dirs(self) -> list[dict[str, Any]]:
+        """Enumerate every staged file dir with its size and mtime."""
+        results: list[dict[str, Any]] = []
+        if not self.root.exists():
+            return results
+        for conv_dir in self.root.iterdir():
+            if not conv_dir.is_dir():
+                continue
+            for session_dir in conv_dir.iterdir():
+                if not session_dir.is_dir():
+                    continue
+                for file_dir in session_dir.iterdir():
+                    if not file_dir.is_dir():
+                        continue
+                    manifest = _read_json(file_dir / "manifest.json", None)
+                    if not isinstance(manifest, dict):
+                        # Not a staged-file dir (e.g. index.json lives at session level).
+                        continue
+                    results.append(
+                        {
+                            "path": str(file_dir),
+                            "conversation_id": conv_dir.name,
+                            "session_id": session_dir.name,
+                            "file_id": file_dir.name,
+                            "bytes": _dir_size(file_dir),
+                            "mtime": file_dir.stat().st_mtime,
+                        }
+                    )
+        return results
+
+    def _drop_index_entry(self, conversation_id: str, session_id: str, file_id: str) -> None:
+        index_path = self.root / conversation_id / session_id / "index.json"
+        index = _read_json(index_path, None)
+        if not isinstance(index, dict):
+            return
+        files = index.get("files", [])
+        if not isinstance(files, list):
+            return
+        kept = [item for item in files if not (isinstance(item, dict) and item.get("file_id") == file_id)]
+        if len(kept) == len(files):
+            return
+        index["files"] = kept
+        index["updated_at"] = utc_now_iso()
+        _write_json(index_path, index)
 
     def list_session_files(self, conversation_id: str, session_id: str) -> list[dict[str, Any]]:
         index = _read_json(self._session_index_path(conversation_id, session_id), {})
@@ -1477,6 +1568,20 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            if child.is_file():
+                try:
+                    total += child.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return total
+    return total
 
 
 def _read_json(path: Path, default: Any) -> Any:
