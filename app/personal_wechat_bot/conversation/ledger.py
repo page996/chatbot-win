@@ -387,7 +387,7 @@ class ConversationLedgerStore:
         while fd is None:
             try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
                 if _stale_lock(lock_path):
                     try:
                         lock_path.unlink()

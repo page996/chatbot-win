@@ -42,6 +42,7 @@ class BotConfig:
     send_backend: str = "dry_run"
     wcf_host: str = "127.0.0.1"
     wcf_port: int = 10086
+    wcf_send_timeout_seconds: float = 15.0
     send_confirm_required: bool = True
     send_max_chars: int = 800
     send_min_interval_seconds: int = 5

@@ -272,6 +272,34 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(state_after_2["items"][0]["status"], "sent")
             self.assertEqual(state_after_2["pending_count"], 0)
 
+    def test_wcf_rpc_timeout_is_quarantined_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("wxid_a", "maybe sent")
+
+            class _TimeoutBackend:
+                name = "timeout"
+
+                def health_check(self) -> bool:
+                    return True
+
+                def send_text(self, receiver: str, text: str) -> SendOutcome:
+                    return SendOutcome.failure("wcf_send_text_error:wcf_rpc_timeout:1s")
+
+                def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                    return SendOutcome.failure("wcf_send_file_error:wcf_rpc_timeout:1s")
+
+                def close(self) -> None:
+                    return None
+
+            BridgeWorker(data_dir, _TimeoutBackend(), max_send_attempts=1).run_once()
+
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], "failed")
+            self.assertIn("wcf_rpc_timeout", item["ack"]["reason"])
+
     def test_retryable_failure_becomes_terminal_after_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"

@@ -69,6 +69,11 @@ _KEEP_RESOLVED_RECORDS = 500
 
 def _is_retryable_failure(reason: str) -> bool:
     lowered = str(reason or "").lower()
+    # A hard-killed WCF RPC has unknown delivery state: the message may already
+    # be on the wire but the client never returned. Retrying blindly risks a
+    # duplicate, so quarantine it as terminal failed for operator review.
+    if "wcf_rpc_timeout" in lowered or "unknown_delivery_state" in lowered:
+        return False
     return any(marker in lowered for marker in _RETRYABLE_REASON_MARKERS)
 
 

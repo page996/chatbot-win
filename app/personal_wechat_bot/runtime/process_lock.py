@@ -84,7 +84,7 @@ class ProcessLock:
 
         try:
             self.acquire()
-        except ProcessLockError:
+        except (ProcessLockError, PermissionError):
             return False
         return True
 

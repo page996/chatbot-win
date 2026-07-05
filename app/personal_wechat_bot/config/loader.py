@@ -76,6 +76,7 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         send_backend=str(raw.get("send_backend", "dry_run")),
         wcf_host=str(raw.get("wcf_host", "127.0.0.1")),
         wcf_port=int(raw.get("wcf_port", 10086)),
+        wcf_send_timeout_seconds=float(raw.get("wcf_send_timeout_seconds", 15.0)),
         send_confirm_required=bool(raw.get("send_confirm_required", True)),
         send_max_chars=int(raw.get("send_max_chars", 800)),
         send_min_interval_seconds=int(raw.get("send_min_interval_seconds", 5)),
