@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,9 @@ from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import as_payload, memory_dir_for_conversation
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import utc_now_iso
+
+
+_MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-maintainer")
 
 
 @dataclass(frozen=True)
@@ -47,10 +51,14 @@ class MemoryMaintainer:
         *,
         max_summary_lines: int = 80,
         max_text_chars_per_entry: int = 260,
+        llm: Any | None = None,
+        async_llm: bool = False,
     ):
         self.ledger_store = ledger_store
         self.max_summary_lines = max_summary_lines
         self.max_text_chars_per_entry = max_text_chars_per_entry
+        self.llm = llm
+        self.async_llm = async_llm
 
     def maintain(self, conversation_id: str, *, session_id: str = DEFAULT_SESSION_ID) -> MemoryMaintenanceResult:
         conversation_dir = self.ledger_store.conversation_markdown_path(conversation_id).parent
@@ -94,6 +102,11 @@ class MemoryMaintainer:
                 "updated_at": utc_now_iso(),
             },
         )
+        if self.llm is not None:
+            if self.async_llm:
+                _MEMORY_EXECUTOR.submit(self._write_llm_memory, conversation_id, session_id, memory_dir, entries, draft)
+            else:
+                self._write_llm_memory(conversation_id, session_id, memory_dir, entries, draft)
         return MemoryMaintenanceResult(
             conversation_id=conversation_id,
             session_id=session_id,
@@ -182,6 +195,35 @@ class MemoryMaintainer:
         _write_text_atomic(memory_dir / "summary.md", summary)
         _write_json_atomic(memory_dir / "preferences.json", draft.preferences)
         _write_json_atomic(memory_dir / "entities.json", draft.entities)
+        _write_json_atomic(memory_dir / "maintenance_state.json", state)
+
+    def _write_llm_memory(
+        self,
+        conversation_id: str,
+        session_id: str,
+        memory_dir: Path,
+        entries: list[dict[str, Any]],
+        fallback: MemoryDraft,
+    ) -> None:
+        if self.llm is None or not entries:
+            return
+        prompt = _memory_prompt(conversation_id, session_id, entries)
+        try:
+            raw = self.llm.generate_reply(prompt)
+            parsed = _parse_json_object(raw)
+        except Exception:
+            return
+        if not parsed:
+            return
+        summary = _render_llm_summary(conversation_id, session_id, parsed, fallback.summary_lines)
+        preferences = parsed.get("preferences") if isinstance(parsed.get("preferences"), dict) else fallback.preferences
+        entities = parsed.get("entities") if isinstance(parsed.get("entities"), dict) else fallback.entities
+        state = _read_json(memory_dir / "maintenance_state.json")
+        state["llm_memory_updated_at"] = utc_now_iso()
+        state["llm_memory_status"] = "updated"
+        _write_text_atomic(memory_dir / "summary.md", summary)
+        _write_json_atomic(memory_dir / "preferences.json", preferences)
+        _write_json_atomic(memory_dir / "entities.json", entities)
         _write_json_atomic(memory_dir / "maintenance_state.json", state)
 
 
@@ -306,6 +348,86 @@ def _render_summary(conversation_id: str, session_id: str, lines: list[str]) -> 
     ]
     body = lines or ["- No active session entries yet."]
     return "\n".join([*header, *body, ""])
+
+
+def _memory_prompt(conversation_id: str, session_id: str, entries: list[dict[str, Any]]) -> str:
+    compact_entries = []
+    for entry in entries[-120:]:
+        compact_entries.append(
+            {
+                "sequence": int(entry.get("sequence", 0) or 0),
+                "sender": entry.get("sender_name", ""),
+                "role": "self" if entry.get("is_self") else entry.get("role", "user"),
+                "time": entry.get("received_at", ""),
+                "text": _compact(_entry_text(entry), 900),
+                "files": _entry_files(entry),
+                "urls": _entry_urls(entry),
+            }
+        )
+    return (
+        "你是一个长期记忆维护器。请从下面的会话 ledger 中提炼对后续真实对话有帮助的记忆，"
+        "不要逐条复述。关注：稳定偏好/指令、仍在进行的任务、已完成结论、重要实体、文件引用、用户当前主题。"
+        "如果某条用户指令已被后续消息废止，请不要把它作为偏好。只返回 JSON：\n"
+        '{"summary": {"conversation_review": "...", "active_tasks": ["..."], "resolved": ["..."], "current_topics": ["..."]}, '
+        '"preferences": {"instructions": [{"value": "...", "confidence": 0.0, "source_sequence": 1}], "avoid": [], "likes": [], "needs": []}, '
+        '"entities": {"people": [], "files": [], "urls": [], "topics": []}}\n'
+        f"\nconversation_id={conversation_id} session_id={session_id}\n"
+        f"entries={json.dumps(compact_entries, ensure_ascii=False)}"
+    )
+
+
+def _render_llm_summary(
+    conversation_id: str,
+    session_id: str,
+    parsed: dict[str, Any],
+    fallback_lines: list[str],
+) -> str:
+    summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
+    lines = [
+        "# Session Memory Summary",
+        "",
+        f"conversation_id: {conversation_id}",
+        f"session_id: {session_id}",
+        "",
+        "The summary is an LLM-maintained memory distilled from active ledger entries.",
+        "",
+    ]
+    review = str(summary.get("conversation_review", "")).strip()
+    if review:
+        lines.extend(["## Conversation Review", "", review, ""])
+    for title, key in (
+        ("Active Tasks", "active_tasks"),
+        ("Resolved Notes", "resolved"),
+        ("Current Topics", "current_topics"),
+    ):
+        values = summary.get(key, [])
+        if isinstance(values, list) and values:
+            lines.extend([f"## {title}", ""])
+            lines.extend(f"- {str(item).strip()}" for item in values if str(item).strip())
+            lines.append("")
+    if len(lines) <= 7:
+        lines.extend(["## Recent Durable Notes", "", *(fallback_lines or ["- No active session entries yet."]), ""])
+    return "\n".join(lines)
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
 
 
 def _read_json(path: Path) -> dict[str, Any]:

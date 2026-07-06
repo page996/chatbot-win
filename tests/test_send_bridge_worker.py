@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.control.send_commands import send_approved_confirm_item, set_send_controls
@@ -13,7 +14,7 @@ from app.personal_wechat_bot.domain.models import ReplyCandidate
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
 from app.personal_wechat_bot.runtime.send_bridge_worker import BridgeWorker, run_bridge_worker
-from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxSendDriver, BridgeOutboxStore
+from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxSendDriver, BridgeOutboxStore
 from app.personal_wechat_bot.wechat_driver.send_backends import DryRunSendBackend, SendOutcome
 
 
@@ -109,6 +110,90 @@ class SendBridgeWorkerTest(unittest.TestCase):
             processed = BridgeWorker(data_dir, backend2).run_once()
             self.assertEqual(processed, 0)
             self.assertEqual(backend2.sent_texts, [])
+
+    def test_blocked_ack_is_terminal_and_not_delivered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "should stay blocked")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.BLOCKED, reason="manual_block")
+
+            backend = DryRunSendBackend()
+            processed = BridgeWorker(data_dir, backend).run_once()
+
+            self.assertEqual(processed, 0)
+            self.assertEqual(backend.sent_texts, [])
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], BridgeAckStatus.BLOCKED)
+            self.assertEqual(item["ack"]["reason"], "manual_block")
+
+    def test_stale_inflight_after_terminal_ack_is_not_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "already stopped")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.BLOCKED, reason="manual_block")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.INFLIGHT, reason="stale_inflight")
+
+            backend = DryRunSendBackend()
+            processed = BridgeWorker(data_dir, backend).run_once()
+
+            self.assertEqual(processed, 0)
+            self.assertEqual(backend.sent_texts, [])
+            acks = [ack for ack in store._read_all(store.ack_path) if ack["bridge_id"] == rec["bridge_id"]]
+            self.assertEqual(
+                [ack["status"] for ack in acks],
+                [BridgeAckStatus.BLOCKED, BridgeAckStatus.INFLIGHT],
+            )
+
+    def test_worker_does_not_send_when_inflight_ack_cannot_be_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("wxid_a", "ack append fails")
+
+            backend = DryRunSendBackend()
+            worker = BridgeWorker(data_dir, backend)
+            with mock.patch.object(worker.store, "append_ack", side_effect=OSError("locked")):
+                processed = worker.run_once()
+
+            self.assertEqual(processed, 1)
+            self.assertEqual(backend.sent_texts, [])
+            self.assertEqual(store._read_all(store.ack_path), [])
+            self.assertIn("append_ack_failed", worker.stats.last_error)
+
+    def test_worker_rechecks_effective_ack_after_inflight_before_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "race window")
+
+            backend = DryRunSendBackend()
+            worker = BridgeWorker(data_dir, backend)
+            original_append = worker.store.append_ack
+
+            def _racing_append(bridge_id: str, **kwargs):
+                if kwargs.get("status") == BridgeAckStatus.INFLIGHT:
+                    original_append(bridge_id, status=BridgeAckStatus.SENT, reason="racing_sent")
+                return original_append(bridge_id, **kwargs)
+
+            with mock.patch.object(worker.store, "append_ack", side_effect=_racing_append):
+                processed = worker.run_once()
+
+            self.assertEqual(processed, 1)
+            self.assertEqual(backend.sent_texts, [])
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], BridgeAckStatus.SENT)
+            self.assertEqual(item["ack"]["reason"], "racing_sent")
+            acks = [ack for ack in store._read_all(store.ack_path) if ack["bridge_id"] == rec["bridge_id"]]
+            self.assertEqual(
+                [ack["status"] for ack in acks],
+                [BridgeAckStatus.SENT, BridgeAckStatus.INFLIGHT],
+            )
 
     def test_worker_retries_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

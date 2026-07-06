@@ -31,6 +31,8 @@ from app.personal_wechat_bot.tools.defaults import register_default_tools
 from app.personal_wechat_bot.tools.registry import ToolRegistry
 from app.personal_wechat_bot.tools.runtime import ToolRuntime
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
+from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.workspace.file_analysis import LLMFileAnalyzer
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
@@ -73,7 +75,7 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         runtime_cards=runtime_cards,
     )
     memory_maintainer = MemoryMaintainer(ledger_store)
-    file_workspace = FileWorkspace(data_root / "file_workspace")
+    file_workspace = FileWorkspace(data_root / "file_workspace", analysis_async=True)
     model_router = ModelRouter(config.providers)
     chat_provider = model_router.chat_provider().config
     key_pool = ApiKeyPool(chat_provider, data_root)
@@ -89,12 +91,22 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         if chat_provider.base_url
         else FakeLLMClient(model=chat_provider.model)
     )
+    memory_maintainer.llm = llm
+    memory_maintainer.async_llm = True
     # Give the shared file workspace an LLM-backed analyzer so analysis.json holds
     # a real summary/key-points instead of only mechanical metadata. The driver
     # and attachment pipeline both use this same instance.
     file_workspace.analyzer = LLMFileAnalyzer(llm, model=chat_provider.model)
+    tool_attachment_parser = BackendAttachmentParser(RapidOcrSubprocessEngine())
     registry = ToolRegistry()
-    register_default_tools(registry, data_root=data_root, config=config, file_index=file_index)
+    register_default_tools(
+        registry,
+        data_root=data_root,
+        config=config,
+        file_index=file_index,
+        file_workspace=file_workspace,
+        attachment_parser=tool_attachment_parser,
+    )
     tools = ToolRuntime(registry, event_logger)
     link_annotations = LinkAnnotationService(ledger_store, tools)
     tool_orchestrator = ToolTaskOrchestrator(data_root, max_parallel=2)

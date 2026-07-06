@@ -118,6 +118,16 @@ def migrate_conversations(
     *,
     dry_run: bool = True,
 ) -> MigrationReport:
+    """Rehash conversations from an old id scheme to a new one.
+
+    WARNING: This tool predates the human-readable directory naming
+    (``chat_title_hashPrefix``, see conversation/segment.py). It assumes each
+    top-level directory under CONVERSATION_DIR_NAMES is named by the raw
+    conversation_id. Under the current layout that assumption no longer holds,
+    so a move-by-id here will not find the readable dirs. It is retained only
+    for the legacy hash-only-id migration path; do NOT use it against a store
+    created with the readable naming without first updating the segment logic.
+    """
     root = Path(data_dir)
     report = MigrationReport(dry_run=dry_run, data_dir=str(root))
     for migration in migrations:

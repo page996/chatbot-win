@@ -6,12 +6,143 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import SendResult, utc_now_iso
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBinding, WeChatWindowBindingStore
 
 
 BRIDGE_OUTBOX_SEND_DRIVER = "bridge_outbox"
 ALLOWED_MANUAL_BINDING_STATUSES = {"active", "stale"}
+
+
+class BridgeAckStatus:
+    SENT = "sent"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    RETRY = "retry"
+    INFLIGHT = "inflight"
+
+
+BRIDGE_ACK_STATUSES = frozenset(
+    {
+        BridgeAckStatus.SENT,
+        BridgeAckStatus.FAILED,
+        BridgeAckStatus.BLOCKED,
+        BridgeAckStatus.RETRY,
+        BridgeAckStatus.INFLIGHT,
+    }
+)
+BRIDGE_TERMINAL_ACK_STATUSES = frozenset(
+    {BridgeAckStatus.SENT, BridgeAckStatus.FAILED, BridgeAckStatus.BLOCKED}
+)
+
+
+def is_terminal_bridge_ack_status(status: str) -> bool:
+    return str(status or "") in BRIDGE_TERMINAL_ACK_STATUSES
+
+
+_BRIDGE_TERMINAL_ACK_PRIORITY = {
+    BridgeAckStatus.FAILED: 1,
+    BridgeAckStatus.BLOCKED: 2,
+    BridgeAckStatus.SENT: 3,
+}
+
+
+@dataclass(frozen=True)
+class BridgeAckState:
+    bridge_id: str
+    status: str
+    ack: dict[str, Any]
+    terminal: bool
+    ack_count: int
+    invalid_count: int
+
+
+def resolve_bridge_ack_state(
+    records: list[dict[str, Any]],
+    *,
+    bridge_id: str = "",
+    default_status: str = "queued",
+) -> BridgeAckState:
+    """Resolve append-only ack lines into the effective monotonic state.
+
+    Non-terminal markers (retry/inflight) describe work in progress. Once a
+    terminal ack exists, stale non-terminal lines must never make the bridge look
+    pending again. A sent ack is strongest because a real delivery cannot be
+    undone by a later stale failure marker; blocked wins over failed for manual
+    operator stops.
+    """
+    target_bridge_id = str(bridge_id or "")
+    latest_valid: dict[str, Any] = {}
+    best_terminal: dict[str, Any] = {}
+    best_terminal_priority = 0
+    valid_count = 0
+    invalid_count = 0
+    resolved_bridge_id = target_bridge_id
+
+    for record in records:
+        if not isinstance(record, dict):
+            invalid_count += 1
+            continue
+        record_bridge_id = str(record.get("bridge_id", ""))
+        if target_bridge_id and record_bridge_id != target_bridge_id:
+            continue
+        status = str(record.get("status", ""))
+        if status not in BRIDGE_ACK_STATUSES:
+            invalid_count += 1
+            continue
+        if record_bridge_id:
+            resolved_bridge_id = record_bridge_id
+        valid_count += 1
+        latest_valid = record
+        if is_terminal_bridge_ack_status(status):
+            priority = _BRIDGE_TERMINAL_ACK_PRIORITY.get(status, 0)
+            if priority >= best_terminal_priority:
+                best_terminal = record
+                best_terminal_priority = priority
+
+    if best_terminal:
+        status = str(best_terminal.get("status", default_status))
+        return BridgeAckState(
+            bridge_id=resolved_bridge_id,
+            status=status,
+            ack=best_terminal,
+            terminal=True,
+            ack_count=valid_count,
+            invalid_count=invalid_count,
+        )
+    if latest_valid:
+        status = str(latest_valid.get("status", default_status))
+        return BridgeAckState(
+            bridge_id=resolved_bridge_id,
+            status=status,
+            ack=latest_valid,
+            terminal=False,
+            ack_count=valid_count,
+            invalid_count=invalid_count,
+        )
+    return BridgeAckState(
+        bridge_id=resolved_bridge_id,
+        status=default_status,
+        ack={},
+        terminal=False,
+        ack_count=0,
+        invalid_count=invalid_count,
+    )
+
+
+def effective_bridge_ack_states(records: list[dict[str, Any]]) -> dict[str, BridgeAckState]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        bridge_id = str(record.get("bridge_id", ""))
+        if bridge_id:
+            grouped.setdefault(bridge_id, []).append(record)
+    return {
+        bridge_id: resolve_bridge_ack_state(group, bridge_id=bridge_id)
+        for bridge_id, group in grouped.items()
+    }
 
 
 @dataclass(frozen=True)
@@ -101,7 +232,7 @@ class BridgeOutboxStore:
         external_message_id: str = "",
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if status not in {"sent", "failed", "blocked", "retry", "inflight"}:
+        if status not in BRIDGE_ACK_STATUSES:
             raise ValueError("status must be sent, failed, blocked, retry, or inflight")
         record = {
             "bridge_id": bridge_id,
@@ -118,20 +249,20 @@ class BridgeOutboxStore:
         outbox = self._read_all(self.outbox_path)
         acks = self._read_all(self.ack_path)
         manual_bindings = manual_bridge_bindings(self.data_dir)
-        latest_acks = _latest_by_bridge_id(acks)
+        ack_states = effective_bridge_ack_states(acks)
         items = []
         for item in outbox[-max(1, limit) :]:
             bridge_id = str(item.get("bridge_id", ""))
-            ack = latest_acks.get(bridge_id)
-            status = str(ack.get("status", item.get("status", "queued"))) if ack else str(item.get("status", "queued"))
+            ack_state = ack_states.get(bridge_id)
+            ack = ack_state.ack if ack_state is not None else {}
+            status = ack_state.status if ack_state is not None else str(item.get("status", "queued"))
             items.append({**item, "status": status, "ack": ack or {}})
         # Pending = not yet terminally acked. A "retry" ack is non-terminal, so a
         # record awaiting another delivery attempt still counts as pending.
         pending_count = sum(
             1
             for item in outbox
-            if str(latest_acks.get(str(item.get("bridge_id", "")), {}).get("status", item.get("status", "queued")))
-            not in {"sent", "failed", "blocked"}
+            if not ack_states.get(str(item.get("bridge_id", "")), BridgeAckState("", "", {}, False, 0, 0)).terminal
         )
         return {
             "status": "ok",
@@ -203,8 +334,7 @@ class BridgeOutboxStore:
         with self._store_lock():
             outbox = self._read_all(self.outbox_path)
             acks = self._read_all(self.ack_path)
-            latest = _latest_by_bridge_id(acks)
-            terminal = {"sent", "failed", "blocked"}
+            ack_states = effective_bridge_ack_states(acks)
 
             resolved_order: list[str] = []
             pending_ids: set[str] = set()
@@ -212,8 +342,8 @@ class BridgeOutboxStore:
                 bridge_id = str(item.get("bridge_id", ""))
                 if not bridge_id:
                     continue
-                status = str(latest.get(bridge_id, {}).get("status", "")) if bridge_id in latest else ""
-                if status in terminal:
+                ack_state = ack_states.get(bridge_id)
+                if ack_state is not None and ack_state.terminal:
                     resolved_order.append(bridge_id)
                 else:
                     pending_ids.add(bridge_id)
@@ -383,7 +513,10 @@ def _channel_receiver(data_dir: str | Path, conversation_id: str) -> str:
 
 
 def _channel_payload(data_dir: str | Path, conversation_id: str) -> dict[str, Any]:
-    segment = _safe_segment(str(conversation_id or ""))
+    # Channel dirs are named chat_title_hashPrefix, not the raw conversation_id,
+    # so resolve the segment via the channel index. This is the ONLY reliable
+    # path for the out-of-process send worker, which has no in-memory cache.
+    segment = resolve_segment(data_dir, str(conversation_id or ""))
     path = Path(data_dir) / "conversation_channels" / segment / "channel.json"
     if not path.exists():
         return {}
@@ -399,13 +532,6 @@ def _looks_like_wechat_receiver(value: str) -> bool:
     return bool(text.startswith("wxid_") or text.startswith("gh_") or text.endswith("@chatroom"))
 
 
-def _safe_segment(value: str) -> str:
-    import re
-
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
-    return cleaned or "default"
-
-
 def bridge_ack(
     data_dir: str | Path,
     bridge_id: str,
@@ -415,23 +541,45 @@ def bridge_ack(
     external_message_id: str = "",
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    record = BridgeOutboxStore(data_dir).append_ack(
+    store = BridgeOutboxStore(data_dir)
+    record = store.append_ack(
         bridge_id,
         status=status,
         reason=reason,
         external_message_id=external_message_id,
         payload=payload,
     )
-    return {"status": "ok", "ack": record}
+    effective = bridge_ack_state(data_dir, bridge_id, store=store)
+    return {
+        "status": "ok",
+        "ack": record,
+        "effective_status": effective.status,
+        "effective_ack": effective.ack,
+    }
+
+
+def bridge_ack_state(
+    data_dir: str | Path,
+    bridge_id: str,
+    *,
+    store: BridgeOutboxStore | None = None,
+) -> BridgeAckState:
+    store = store if store is not None else BridgeOutboxStore(data_dir)
+    target_bridge_id = str(bridge_id or "")
+    records = [
+        ack
+        for ack in store._read_all(store.ack_path)
+        if str(ack.get("bridge_id", "")) == target_bridge_id
+    ]
+    return resolve_bridge_ack_state(records, bridge_id=target_bridge_id)
 
 
 def _latest_by_bridge_id(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for record in records:
-        bridge_id = str(record.get("bridge_id", ""))
-        if bridge_id:
-            result[bridge_id] = record
-    return result
+    return {
+        bridge_id: state.ack
+        for bridge_id, state in effective_bridge_ack_states(records).items()
+        if state.ack
+    }
 
 
 def manual_bridge_bindings(data_dir: str | Path) -> list[WeChatWindowBinding]:

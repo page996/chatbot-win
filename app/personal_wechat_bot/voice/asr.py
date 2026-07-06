@@ -72,13 +72,22 @@ class LocalAsrSubprocessEngine:
         command = [
             str(self.python_executable),
             "-c",
-            "import faster_whisper; import pocketsphinx; print('ok')",
+            (
+                "import importlib.util, sys; "
+                "mods=[('funasr','funasr'),('torch','torch'),('torchaudio','torchaudio'),"
+                "('modelscope','modelscope'),('soundfile','soundfile'),"
+                "('faster-whisper','faster_whisper'),('pocketsphinx','pocketsphinx'),"
+                "('SpeechRecognition','speech_recognition')]; "
+                "missing=[pkg for pkg, mod in mods if importlib.util.find_spec(mod) is None]; "
+                "sys.exit('missing modules: '+', '.join(missing)) if missing else None; "
+                "import torch, torchaudio; print('ok')"
+            ),
         ]
         try:
             completed = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return AsrHealth("local_asr_subprocess", False, detail=str(exc), model=self.model)
-        detail = (completed.stderr or completed.stdout).strip()
+        detail = completed.stdout.strip() if completed.returncode == 0 else (completed.stderr or completed.stdout).strip()
         if completed.returncode != 0:
             detail = _missing_dependency_detail(detail)
         return AsrHealth(
@@ -193,6 +202,11 @@ def _asr_subprocess_env() -> dict[str, str]:
 def _missing_dependency_detail(detail: str) -> str:
     missing: list[str] = []
     for package, module in (
+        ("funasr", "funasr"),
+        ("torch", "torch"),
+        ("torchaudio", "torchaudio"),
+        ("modelscope", "modelscope"),
+        ("soundfile", "soundfile"),
         ("faster-whisper", "faster_whisper"),
         ("pocketsphinx", "pocketsphinx"),
         ("SpeechRecognition", "speech_recognition"),

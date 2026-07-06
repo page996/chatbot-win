@@ -194,6 +194,7 @@ class WeFlowHttpBridge:
         lookback_seconds: int = 300,
         media: bool = True,
         context_only: bool | None = None,
+        ignore_seen: bool = False,
         workers: int = 1,
         cancel_event: Event | None = None,
         progress_callback: ProgressCallback | None = None,
@@ -245,6 +246,7 @@ class WeFlowHttpBridge:
                         max_messages=max_messages,
                         media=media,
                         context_only=context_only,
+                        ignore_seen=ignore_seen,
                         cancel_event=cancel_event,
                         progress_callback=progress_callback,
                     )
@@ -263,6 +265,7 @@ class WeFlowHttpBridge:
                         max_messages=max_messages,
                         media=media,
                         context_only=context_only,
+                        ignore_seen=ignore_seen,
                         cancel_event=cancel_event,
                         progress_callback=progress_callback,
                     ): session
@@ -310,6 +313,7 @@ class WeFlowHttpBridge:
         max_messages: int,
         media: bool,
         context_only: bool | None,
+        ignore_seen: bool = False,
         cancel_event: Event | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> _WeFlowSessionPullResult:
@@ -323,10 +327,11 @@ class WeFlowHttpBridge:
         appended = 0
         now_since = int(time.time()) - max(0, lookback_seconds)
         history_context_only = context_only if context_only is not None else (since is not None and since <= 0)
+        cursor_recovery_context_only = False
         with _path_lock(_talker_lock_path(self.state_path, session_id), timeout_seconds=self.timeout_seconds):
             _raise_if_cancelled(cancel_event)
             state_snapshot = _read_weflow_state_locked(self.state_path, timeout_seconds=self.timeout_seconds)
-            seen = set(_string_list(state_snapshot.get("seen_raw_ids")))
+            seen = set() if ignore_seen else set(_string_list(state_snapshot.get("seen_raw_ids")))
             sessions_state = state_snapshot.get("sessions")
             if not isinstance(sessions_state, dict):
                 sessions_state = {}
@@ -334,6 +339,10 @@ class WeFlowHttpBridge:
             session_since = since
             if session_since is None:
                 session_since = _safe_int(session_state.get("since"), now_since)
+            last_message_at = _session_last_message_at(session)
+            if since is None and last_message_at > 0 and session_since > last_message_at + 2 and not seen:
+                session_since = max(0, last_message_at - max(2, min(max(0, lookback_seconds), 3600)))
+                cursor_recovery_context_only = True
             start_time = max(0, session_since - 2)
             try:
                 payloads = self.raw_message_pages(
@@ -381,7 +390,7 @@ class WeFlowHttpBridge:
                     message,
                     session_id=session_id,
                     session_meta=meta,
-                    context_only=bool(history_context_only),
+                    context_only=bool(history_context_only or cursor_recovery_context_only),
                 )
                 raw_id = str(normalized.get("raw_id") or "").strip()
                 if raw_id in seen:
@@ -1056,6 +1065,20 @@ def _session_id_from_meta(session: dict[str, Any]) -> str:
     return str(session.get("id") or session.get("username") or session.get("talker") or session.get("sessionId") or "").strip()
 
 
+def _session_last_message_at(session: dict[str, Any]) -> int:
+    if not isinstance(session, dict):
+        return 0
+    return _epoch_seconds(
+        session.get("lastMessageAt")
+        or session.get("last_message_at")
+        or session.get("last_message_time")
+        or session.get("lastMessageTime")
+        or session.get("lastActiveTime")
+        or session.get("updateTime"),
+        0,
+    )
+
+
 def _weflow_push_has_session(payload: dict[str, Any]) -> bool:
     return bool(_first_text(payload, "sessionId", "session_id", "talker", "talkerId"))
 
@@ -1289,7 +1312,9 @@ def _path_lock(path: Path, *, timeout_seconds: float) -> Iterator[None]:
     while fd is None:
         try:
             fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except (FileExistsError, PermissionError) as exc:
+            if isinstance(exc, PermissionError) and not path.exists():
+                raise
             if _stale_lock(path):
                 try:
                     path.unlink()

@@ -16,8 +16,10 @@ from app.personal_wechat_bot.control.sidebar_api import (
     run_weflow_backfill_sync,
     sidebar_weflow_backfill,
     sidebar_weflow_discover_sessions,
+    sidebar_weflow_pull_once,
 )
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
+from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import WEFLOW_LOCAL_BUILD_FLAVOR
 
@@ -128,11 +130,14 @@ class WeflowBackfillTest(unittest.TestCase):
         self.assertTrue(state["token_present"])
         private_id = conversation_id_for("private", "wxid_history")
         group_id = conversation_id_for("group", "room@chatroom")
+        # Channel dirs use human-readable segments (chat_title_hashPrefix).
+        private_segment = conversation_segment(private_id, "History Friend")
+        group_segment = conversation_segment(group_id, "Room")
         private_channel = json.loads(
-            (self.data_dir / "conversation_channels" / private_id / "channel.json").read_text(encoding="utf-8")
+            (self.data_dir / "conversation_channels" / private_segment / "channel.json").read_text(encoding="utf-8")
         )
         group_channel = json.loads(
-            (self.data_dir / "conversation_channels" / group_id / "channel.json").read_text(encoding="utf-8")
+            (self.data_dir / "conversation_channels" / group_segment / "channel.json").read_text(encoding="utf-8")
         )
         self.assertEqual(private_channel["chat_title"], "History Friend")
         self.assertEqual(group_channel["chat_title"], "Room")
@@ -163,6 +168,66 @@ class WeflowBackfillTest(unittest.TestCase):
         self.assertEqual(result["count"], 2)
         self.assertIn("PermissionError", result["state_write_error"])
 
+    def test_pull_once_bootstraps_empty_derived_state_when_source_cursor_is_advanced(self) -> None:
+        with _FakeWeFlowServer() as server:
+            discover = sidebar_weflow_discover_sessions(
+                self.data_dir,
+                {"base_url": server.base_url, "token": "test-token", "limit": 20},
+            )
+            self.assertEqual(discover["status"], "ok", discover)
+            raw_ids = [f"weflow:message:wxid_history:s{i}" for i in range(1, 6)]
+            (self.data_dir / "weflow_bridge_state.json").write_text(
+                json.dumps(
+                    {
+                        "sessions": {"wxid_history": {"since": 999999}},
+                        "seen_raw_ids": raw_ids,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = sidebar_weflow_pull_once(
+                self.data_dir,
+                {"base_url": server.base_url, "token": "test-token", "talkers": ["wxid_history"], "message_limit": 10},
+            )
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["recovery"]["status"], "recovered", result)
+        self.assertEqual(result["recovery"]["reason"], "empty_local_conversation_state")
+        self.assertEqual(result["recovery"]["original_source"]["scanned_count"], 0)
+        self.assertEqual(result["source"]["appended_count"], 5)
+        self.assertEqual(result["pull"]["processed_count"], 5)
+        self.assertTrue(all(item.get("context_only") for item in result["pull"]["processed"]), result["pull"]["processed"])
+
+        conversation_id = conversation_id_for("private", "wxid_history")
+        ledger = ConversationLedgerStore(self.data_dir)
+        texts = [entry.text_blocks[0]["text"] for entry in ledger.read_entries(conversation_id) if entry.text_blocks]
+        self.assertEqual(texts, ["msg-1", "msg-2", "msg-3", "msg-4", "msg-5"])
+
+    def test_pull_once_future_cursor_recovery_is_context_only(self) -> None:
+        with _FakeWeFlowServer() as server:
+            discover = sidebar_weflow_discover_sessions(
+                self.data_dir,
+                {"base_url": server.base_url, "token": "test-token", "limit": 20},
+            )
+            self.assertEqual(discover["status"], "ok", discover)
+            (self.data_dir / "weflow_bridge_state.json").write_text(
+                json.dumps({"sessions": {"wxid_history": {"since": 999999}}, "seen_raw_ids": []}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = sidebar_weflow_pull_once(
+                self.data_dir,
+                {"base_url": server.base_url, "token": "test-token", "message_limit": 10},
+            )
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["source"]["appended_count"], 5)
+        self.assertEqual(result["pull"]["processed_count"], 5)
+        self.assertTrue(all(item.get("context_only") for item in result["pull"]["processed"]), result["pull"]["processed"])
+        self.assertFalse(any(item.get("reply") for item in result["pull"]["processed"]))
+
 
 class _FakeWeFlowServer:
     def __enter__(self):
@@ -171,8 +236,8 @@ class _FakeWeFlowServer:
             for i in range(1, 6)
         ]
         sessions = [
-            {"username": "wxid_history", "displayName": "History Friend", "type": "private"},
-            {"sessionId": "room@chatroom", "name": "Room", "type": "group"},
+            {"username": "wxid_history", "displayName": "History Friend", "type": "private", "lastMessageAt": 50},
+            {"sessionId": "room@chatroom", "name": "Room", "type": "group", "lastMessageAt": 0},
             {"id": "filehelper", "name": "File Helper", "type": "private"},
         ]
 
@@ -192,13 +257,15 @@ class _FakeWeFlowServer:
                     query = parse_qs(parsed.query)
                     offset = int((query.get("offset") or ["0"])[0])
                     limit = int((query.get("limit") or ["100"])[0])
-                    page = history[offset : offset + limit]
+                    start = int((query.get("start") or ["0"])[0])
+                    filtered = [item for item in history if int(item.get("createTime") or 0) >= start]
+                    page = filtered[offset : offset + limit]
                     self._send(
                         {
                             "success": True,
                             "talker": (query.get("talker") or [""])[0],
                             "count": len(page),
-                            "hasMore": offset + limit < len(history),
+                            "hasMore": offset + limit < len(filtered),
                             "messages": page,
                         }
                     )

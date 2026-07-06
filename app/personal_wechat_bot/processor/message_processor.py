@@ -32,7 +32,7 @@ class MessageProcessor:
             pending_context_item = {"session_id": reset_session_id, "reset": True}
         else:
             pending_context_item = None
-        session_id = reset_session_id or self.runtime.session_store.current_session_id(message.conversation_id)
+        session_id = reset_session_id or self.runtime.session_store.current_session_id_for_message(message)
         message = self._with_session_id(message, session_id)
 
         recall_item = self._handle_recall_event(message)
@@ -40,7 +40,7 @@ class MessageProcessor:
             self._mark_done(original_message_id, message.message_id)
             return recall_item
 
-        raw = self._enrich_backend_media(raw, message.conversation_id)
+        raw = self._enrich_backend_media(raw, message.conversation_id, session_id)
         if raw.driver_meta.get("backend_media_pending") is False or raw.driver_meta.get("backend_attachments_pending") is False:
             enriched = self.runtime.normalizer.normalize(raw)
             enriched = self._with_session_id(enriched, session_id) if enriched is not None else None
@@ -140,7 +140,7 @@ class MessageProcessor:
             daily_trace_context=speak.daily_trace_context,
         )
 
-    def _enrich_backend_media(self, raw: RawWeChatMessage, conversation_id: str) -> RawWeChatMessage:
+    def _enrich_backend_media(self, raw: RawWeChatMessage, conversation_id: str, session_id: str) -> RawWeChatMessage:
         if not (
             raw.driver_meta.get("backend_media_pending")
             or raw.driver_meta.get("backend_attachments_pending")
@@ -151,7 +151,6 @@ class MessageProcessor:
         enrich = getattr(driver, "enrich_message_attachments", None)
         if enrich is None:
             return raw
-        session_id = self.runtime.session_store.current_session_id(conversation_id)
         try:
             return enrich(raw, conversation_id=conversation_id, session_id=session_id)
         except Exception as exc:

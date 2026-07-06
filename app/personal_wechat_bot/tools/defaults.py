@@ -12,6 +12,8 @@ from app.personal_wechat_bot.tools.search.model_relevance_filter import FakeMode
 from app.personal_wechat_bot.tools.vision.ocr_tool import OcrImageTool
 from app.personal_wechat_bot.tools.voice.asr_tool import LocalAsrTool
 from app.personal_wechat_bot.tools.web.fetch import WebFetchTool
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
 def register_default_tools(
@@ -20,6 +22,8 @@ def register_default_tools(
     data_root: Path,
     config: BotConfig,
     file_index: FileIndex,
+    file_workspace: FileWorkspace | None = None,
+    attachment_parser: BackendAttachmentParser | None = None,
 ) -> None:
     relevance_filter = FakeModelRelevanceFilter()
     input_roots = resolve_allowed_roots(data_root, config.file_read_roots)
@@ -53,4 +57,11 @@ def register_default_tools(
             max_input_bytes=config.file_max_bytes,
         )
     )
-    registry.register(WebFetchTool(data_root / "tool_outputs" / "web_fetch", file_index))
+    registry.register(
+        WebFetchTool(
+            data_root / "tool_outputs" / "web_fetch",
+            file_index,
+            file_workspace=file_workspace,
+            attachment_parser=attachment_parser,
+        )
+    )

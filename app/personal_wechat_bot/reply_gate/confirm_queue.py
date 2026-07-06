@@ -12,6 +12,10 @@ _ALLOWED_TRANSITIONS = {
     "pending": {"approved", "rejected"},
     "approved": {"rejected", "queued_to_bridge", "sent", "failed"},
     "queued_to_bridge": {"sent", "failed"},
+    # A durable bridge "sent" ack is stronger than a previous local failure
+    # marker: the message is on the wire, so reconciliation must be able to
+    # repair the queue state.
+    "failed": {"sent"},
 }
 
 

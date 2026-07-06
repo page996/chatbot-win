@@ -202,10 +202,10 @@ class SidebarApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             conversation_id = "legacy-noise"
-            channel_file = data_dir / "conversation_channels" / conversation_id / "channel.json"
-            ledger_dir = data_dir / "conversation_ledgers" / conversation_id
-            workspace_dir = data_dir / "file_workspace" / conversation_id
-            session_dir = data_dir / "conversation_sessions" / conversation_id
+            channel_file = data_dir / "conversation_channels" / "NOISE_legacy-n" / "channel.json"
+            ledger_dir = data_dir / "conversation_ledgers" / "NOISE_legacy-n"
+            workspace_dir = data_dir / "file_workspace" / "NOISE_legacy-n"
+            session_dir = data_dir / "conversation_sessions" / "NOISE_legacy-n"
             channel_file.parent.mkdir(parents=True, exist_ok=True)
             ledger_dir.mkdir(parents=True, exist_ok=True)
             workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -486,6 +486,20 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(ack["status"], "ok")
             self.assertEqual(state["status"], "ok")
             self.assertEqual(state["ack_count"], 1)
+
+    def test_sidebar_manual_ack_rejects_nonterminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            with self.assertRaisesRegex(ValueError, "sent, failed, or blocked"):
+                ack_sidebar_bridge_item(
+                    data_dir,
+                    {"bridge_id": "bridge:test", "status": "retry", "reason": "not_final"},
+                )
+            state = build_sidebar_bridge_state(data_dir)
+
+            self.assertEqual(state["ack_count"], 0)
 
     def test_sidebar_runtime_cards_actions_are_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -888,6 +902,57 @@ def _reply() -> ReplyCandidate:
 
 
 class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
+    def test_weflow_start_existing_worker_repairs_bridge_worker_without_deadlock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = (Path(tmp) / "data").resolve()
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            stop = threading.Event()
+            alive_thread = threading.Thread(target=lambda: stop.wait(2), daemon=True)
+            alive_thread.start()
+            key = str(data_dir)
+            sidebar_api._WEFLOW_WORKERS[key] = {
+                "thread": alive_thread,
+                "stop": stop,
+                "started_at": time.time(),
+                "metrics": sidebar_api.WeflowWorkerMetrics(),
+            }
+            try:
+                with mock.patch.object(sidebar_api, "_start_bridge_worker") as start_bridge:
+                    result = sidebar_api.sidebar_weflow_start(data_dir, {})
+            finally:
+                stop.set()
+                alive_thread.join(timeout=1)
+                sidebar_api._WEFLOW_WORKERS.pop(key, None)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["worker"]["running"])
+            start_bridge.assert_called_once()
+
+    def test_bridge_supervisor_preserves_crashed_state_after_giveup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = (Path(tmp) / "data").resolve()
+            create_default_config(data_dir)
+            stop_event = threading.Event()
+            key = str(data_dir)
+            try:
+                with mock.patch(
+                    "app.personal_wechat_bot.runtime.send_bridge_worker.run_bridge_worker",
+                    side_effect=RuntimeError("bridge down"),
+                ), mock.patch.object(stop_event, "wait", return_value=False):
+                    sidebar_api._bridge_worker_supervisor(
+                        data_dir,
+                        {"bridge_interval_seconds": 0.5, "bridge_max_restarts": 1},
+                        stop_event,
+                    )
+                state = sidebar_api._bridge_worker_state(data_dir)
+            finally:
+                sidebar_api._BRIDGE_WORKERS.pop(key, None)
+
+            self.assertFalse(state["running"])
+            self.assertEqual(state["last_status"], "crashed")
+            self.assertIn("max_restarts_exceeded", state["last_error"])
+
     def test_start_bridge_worker_delivers_and_stop_terminates(self) -> None:
         from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxStore
 

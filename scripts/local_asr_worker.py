@@ -6,43 +6,155 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("audio")
     parser.add_argument("--model", default="base")
     parser.add_argument("--language", default="auto")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     path = Path(args.audio)
     language = str(args.language or "auto").strip().lower()
-    whisper_payload = _try_faster_whisper(path, args.model, language=language)
-    if whisper_payload.get("ok") or not _should_fallback_to_pocketsphinx(str(whisper_payload.get("error", ""))):
-        payload = whisper_payload
-    else:
-        if language in {"en", "en-us", "english"}:
-            payload = _try_pocketsphinx(
-                path,
-                args.model,
-                whisper_error=str(whisper_payload.get("error", "")),
-                sapi_error="windows_sapi_not_used",
-            )
-        elif _env_enabled("CHATBOT_WIN_ENABLE_WINDOWS_SAPI_ASR"):
-            payload = _try_windows_sapi(path, args.model, whisper_error=str(whisper_payload.get("error", "")))
+    prepared_path, cleanup = _prepare_audio(path)
+    try:
+        funasr_payload = _try_funasr(prepared_path, args.model, language=language)
+        if funasr_payload.get("ok") or not _should_fallback_from_funasr(str(funasr_payload.get("error", ""))):
+            payload = funasr_payload
         else:
-            payload = {
-                "ok": False,
-                "backend": "windows_sapi",
-                "model": "installed_recognizer",
-                "language": "",
-                "fallback_from": "faster_whisper",
-                "fallback_error": str(whisper_payload.get("error", "")),
-                "error": "windows_sapi_fallback_disabled",
-                "text_b64": "",
-            }
+            whisper_payload = _try_faster_whisper(prepared_path, args.model, language=language)
+            if whisper_payload.get("ok") or not _should_fallback_to_pocketsphinx(str(whisper_payload.get("error", ""))):
+                payload = whisper_payload
+            else:
+                if language in {"en", "en-us", "english"}:
+                    payload = _try_pocketsphinx(
+                        prepared_path,
+                        args.model,
+                        whisper_error=str(whisper_payload.get("error", "")),
+                        sapi_error="windows_sapi_not_used",
+                    )
+                elif _env_enabled("CHATBOT_WIN_ENABLE_WINDOWS_SAPI_ASR"):
+                    payload = _try_windows_sapi(prepared_path, args.model, whisper_error=str(whisper_payload.get("error", "")))
+                else:
+                    payload = {
+                        "ok": True,
+                        "backend": "local_asr",
+                        "model": args.model,
+                        "language": "",
+                        "fallback_from": "faster_whisper",
+                        "fallback_error": str(whisper_payload.get("error", "")),
+                        "error": "",
+                        "text_b64": "",
+                    }
+    finally:
+        for item in cleanup:
+            try:
+                item.unlink()
+            except OSError:
+                pass
     print("LOCAL_ASR_JSON:" + json.dumps(payload, ensure_ascii=True))
     return 0
+
+
+def _prepare_audio(path: Path) -> tuple[Path, list[Path]]:
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is None:
+        return path, []
+    fd, tmp_name = tempfile.mkstemp(suffix=".16k.wav")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    command = [
+        str(ffmpeg),
+        "-y",
+        "-i",
+        str(path),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-vn",
+        str(tmp),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+    except Exception:
+        return path, []
+    if completed.returncode != 0 or not tmp.exists() or tmp.stat().st_size <= 44:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return path, []
+    return tmp, [tmp]
+
+
+def _find_ffmpeg() -> str | None:
+    from shutil import which
+
+    found = which("ffmpeg")
+    if found:
+        return found
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        repo_root / "vendor" / "ffmpeg" / "bin" / "ffmpeg.exe",
+        repo_root / "vendor" / "ffmpeg.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _try_funasr(path: Path, model: str, *, language: str) -> dict[str, object]:
+    try:
+        from funasr import AutoModel
+
+        model_name = os.environ.get("CHATBOT_WIN_FUNASR_MODEL", "").strip() or "iic/SenseVoiceSmall"
+        vad_model = os.environ.get("CHATBOT_WIN_FUNASR_VAD_MODEL", "").strip() or "fsmn-vad"
+        asr = AutoModel(model=model_name, vad_model=vad_model, disable_update=True)
+        language_hint = "auto" if language in {"", "auto"} else language
+        result = asr.generate(input=str(path), language=language_hint)
+        text = _funasr_text(result)
+        return {
+            "ok": True,
+            "backend": "funasr",
+            "model": model_name,
+            "language": language_hint,
+            "text_b64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            "error": "",
+        }
+    except ModuleNotFoundError as exc:
+        return {
+            "ok": False,
+            "backend": "funasr",
+            "model": "iic/SenseVoiceSmall",
+            "error": f"missing_backend:{type(exc).__name__}: {exc}",
+            "text_b64": "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "backend": "funasr",
+            "model": "iic/SenseVoiceSmall",
+            "error": f"{type(exc).__name__}: {exc}",
+            "text_b64": "",
+        }
+
+
+def _funasr_text(result: object) -> str:
+    if isinstance(result, list):
+        parts = []
+        for item in result:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", "")).strip())
+            elif item is not None:
+                parts.append(str(item).strip())
+        return "\n".join(part for part in parts if part)
+    if isinstance(result, dict):
+        return str(result.get("text", "")).strip()
+    return str(result or "").strip()
 
 
 def _try_faster_whisper(path: Path, model: str, *, language: str) -> dict[str, object]:
@@ -54,10 +166,11 @@ def _try_faster_whisper(path: Path, model: str, *, language: str) -> dict[str, o
         segments, info = whisper.transcribe(str(path), vad_filter=True, language=language_hint)
         text = "\n".join(segment.text.strip() for segment in segments if segment.text.strip())
         return {
-            "ok": bool(text.strip()),
+            "ok": True,
             "backend": "faster_whisper",
             "model": model,
             "language": getattr(info, "language", "") or "",
+            "error": "",
             "text_b64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
         }
     except Exception as exc:
@@ -198,6 +311,16 @@ def _should_fallback_to_pocketsphinx(error: str) -> bool:
         "Hub",
     )
     return any(marker.lower() in error.lower() for marker in markers)
+
+
+def _is_missing_backend(error: str) -> bool:
+    return "missing_backend" in error or "No module named" in error
+
+
+def _should_fallback_from_funasr(error: str) -> bool:
+    if _is_missing_backend(error):
+        return True
+    return _should_fallback_to_pocketsphinx(error)
 
 
 if __name__ == "__main__":

@@ -142,7 +142,7 @@ class BackendEventJsonlDriver:
             return None
         conversation_id = conversation_id_for(conversation_type, conversation_key)
         session_id = (
-            self.session_store.current_session_id(conversation_id)
+            self.session_store.current_session_id_for_conversation(conversation_id, event.chat_title)
             if self.session_store is not None
             else DEFAULT_SESSION_ID
         )
@@ -271,6 +271,7 @@ class BackendEventJsonlDriver:
                         path=attachment.path,
                         original_name=attachment.original_name,
                         kind=attachment.kind,
+                        chat_title=raw.chat_title,
                     ),
                     conversation_id=conversation_id,
                     session_id=session_id,
@@ -370,6 +371,7 @@ class BackendEventJsonlDriver:
                 original_name=_voice_audio_name(voice) or Path(audio_path).name,
                 kind="audio",
                 source="backend_event_voice_audio" if resolver_payload is None else "wechat_voice_cache_resolver",
+                chat_title=chat_title,
             ),
             conversation_id=conversation_id,
             session_id=session_id,
@@ -893,7 +895,7 @@ def _voice_fallback_text(attachment: dict[str, Any] | None) -> str:
         return ""
     if parse.get("kind") != "audio":
         return ""
-    return str(parse.get("raw_text") or parse.get("text") or "").strip()
+    return str(parse.get("context_text") or parse.get("text") or "").strip()
 
 
 def _voice_fallback_summary(attachment: dict[str, Any] | None) -> dict[str, Any]:

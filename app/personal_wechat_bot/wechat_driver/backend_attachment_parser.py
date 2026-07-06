@@ -28,6 +28,7 @@ class AttachmentParseResult:
     summary: str
     text: str = ""
     error: str = ""
+    context_text: str = ""
 
 
 class BackendAttachmentParser:
@@ -82,27 +83,24 @@ class BackendAttachmentParser:
             )
 
     def _parse_text(self, path: Path) -> AttachmentParseResult:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-        preview = _preview(text, self.max_preview_chars)
-        if not preview:
+        text = _normalize_text(path.read_text(encoding="utf-8-sig", errors="replace"))
+        if not text:
             return AttachmentParseResult("empty", "text", "文本附件为空")
-        return AttachmentParseResult("parsed", "text", "已读取文本附件预览", preview)
+        return AttachmentParseResult("parsed", "text", "已读取文本附件", text, context_text=_preview(text, self.max_preview_chars))
 
     def _parse_docx(self, path: Path) -> AttachmentParseResult:
-        text = _read_docx_text(path)
-        preview = _preview(text, self.max_preview_chars)
-        if not preview:
+        text = _normalize_text(_read_docx_text(path))
+        if not text:
             return AttachmentParseResult("empty", "docx", "DOCX 未提取到文本")
-        return AttachmentParseResult("parsed", "docx", "已提取 DOCX 文本预览", preview)
+        return AttachmentParseResult("parsed", "docx", "已提取 DOCX 文本", text, context_text=_preview(text, self.max_preview_chars))
 
     def _parse_image(self, path: Path) -> AttachmentParseResult:
         if self.ocr_engine is None:
             return _image_placeholder(path, "OCR 引擎未启用")
-        text = self.ocr_engine.read_text(path)
-        preview = _preview(text, self.max_preview_chars)
-        if not preview:
+        text = _normalize_text(self.ocr_engine.read_text(path))
+        if not text:
             return _image_placeholder(path, "OCR 未识别到有效文本", status="empty")
-        return AttachmentParseResult("parsed", "image", "已完成图片 OCR 预览", preview)
+        return AttachmentParseResult("parsed", "image", "已完成图片 OCR", text, context_text=_preview(text, self.max_preview_chars))
 
     def _parse_audio(self, path: Path) -> AttachmentParseResult:
         transcript = self.asr_engine.transcribe(path) if self.asr_engine is not None else None
@@ -111,7 +109,8 @@ class BackendAttachmentParser:
                 "parsed",
                 "audio",
                 f"已完成本地 ASR 转写 backend={transcript.backend} model={transcript.model}".strip(),
-                _preview(transcript.text, self.max_preview_chars),
+                _normalize_text(transcript.text),
+                context_text=_preview(transcript.text, self.max_preview_chars),
             )
         error = transcript.error if transcript is not None else "local_asr_not_configured"
         backend = transcript.backend if transcript is not None else "local_asr_subprocess"
@@ -163,13 +162,11 @@ class BackendAttachmentParser:
         payload = json.loads(payload_line)
         if not payload.get("ok"):
             return AttachmentParseResult("failed", kind, f"{kind} 解析失败", error=str(payload.get("error", "")))
-        text_b64 = str(payload.get("text_b64", ""))
-        text = base64.b64decode(text_b64.encode("ascii")).decode("utf-8") if text_b64 else ""
-        preview = _preview(text, self.max_preview_chars)
-        if not preview:
+        text = _read_worker_text(payload)
+        if not text:
             return AttachmentParseResult("empty", kind, f"{kind} 未提取到文本")
-        summary = "已提取 PDF 文本预览" if kind == "pdf" else "已提取表格文本预览"
-        return AttachmentParseResult("parsed", kind, summary, preview)
+        summary = "已提取 PDF 文本" if kind == "pdf" else "已提取表格文本"
+        return AttachmentParseResult("parsed", kind, summary, text, context_text=_preview(text, self.max_preview_chars))
 
 
 def _read_docx_text(path: Path) -> str:
@@ -191,14 +188,32 @@ def _read_docx_text(path: Path) -> str:
     return "\n".join(paragraphs)
 
 
-def _preview(text: str, max_chars: int) -> str:
+def _normalize_text(text: str) -> str:
     text = text.lstrip("\ufeff")
-    normalized = "\n".join(line.strip().lstrip("\ufeff") for line in text.splitlines() if line.strip())
+    return "\n".join(line.strip().lstrip("\ufeff") for line in text.splitlines() if line.strip())
+
+
+def _preview(text: str, max_chars: int) -> str:
+    normalized = _normalize_text(text)
     if max_chars <= 0:
         return ""
     if len(normalized) <= max_chars:
         return normalized
     return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _read_worker_text(payload: dict[str, object]) -> str:
+    text_path = str(payload.get("text_path", "") or "").strip()
+    if text_path:
+        path = Path(text_path)
+        try:
+            return _normalize_text(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return ""
+    text_b64 = str(payload.get("text_b64", "") or "")
+    if not text_b64:
+        return ""
+    return _normalize_text(base64.b64decode(text_b64.encode("ascii")).decode("utf-8", errors="replace"))
 
 
 def _unsupported_placeholder(path: Path, kind: str, label: str) -> AttachmentParseResult:

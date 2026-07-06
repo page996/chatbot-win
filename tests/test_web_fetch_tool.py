@@ -9,6 +9,8 @@ from pathlib import Path
 from app.personal_wechat_bot.domain.models import ToolCallRequest
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.web.fetch import WebFetchTool
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
 class WebFetchToolTest(unittest.TestCase):
@@ -41,6 +43,41 @@ class WebFetchToolTest(unittest.TestCase):
             self.assertIn("Title", content)
             self.assertIn("Hello page text.", content)
             self.assertNotIn("ignored()", content)
+
+    def test_file_url_enters_local_file_workspace_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "report.txt").write_text("file url body\nsecond line", encoding="utf-8")
+            server = _LocalServer(root)
+            server.start()
+            try:
+                workspace = FileWorkspace(root / "file_workspace")
+                tool = WebFetchTool(
+                    root / "outputs",
+                    FileIndex(root / "files.sqlite"),
+                    file_workspace=workspace,
+                    attachment_parser=BackendAttachmentParser(),
+                )
+                result = tool.run(
+                    ToolCallRequest(
+                        tool_name="web.fetch",
+                        call_id="call-file",
+                        conversation_id="conv1",
+                        requested_by="test",
+                        arguments={"url": server.url("/report.txt"), "session_id": "s1", "chat_title": "PAGE"},
+                    )
+                )
+            finally:
+                server.stop()
+
+            self.assertEqual(result.status, "completed")
+            self.assertIn("local file workflow", result.summary)
+            self.assertEqual(result.payload["parse"]["status"], "parsed")
+            self.assertEqual(result.payload["parse"]["kind"], "text")
+            self.assertTrue(Path(result.payload["artifacts"]["content_path"]).exists())
+            self.assertTrue(Path(result.payload["artifacts"]["full_text_path"]).exists())
+            self.assertEqual(Path(result.output_refs[0]).name, "content.md")
+            self.assertIn("file url body", Path(result.output_refs[0]).read_text(encoding="utf-8"))
 
     def test_blocks_non_http_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

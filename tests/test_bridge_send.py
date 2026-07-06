@@ -1,16 +1,38 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from app.personal_wechat_bot.config.loader import create_default_config
+from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.wechat_driver.bridge_send import (
+    BridgeAckStatus,
     BridgeOutboxSendDriver,
     BridgeOutboxStore,
     bridge_ack,
     bridge_state,
 )
+
+
+def _write_channel(data_dir: Path, conversation_id: str, payload: dict) -> None:
+    """Write a channel.json + index.json exactly as ConversationChannelStore does.
+
+    Channel dirs are named by the human-readable segment (chat_title_hashPrefix)
+    and the out-of-process send worker recovers that segment from index.json,
+    so a faithful fixture must create both.
+    """
+    chat_title = str(payload.get("chat_title", "") or "")
+    segment = conversation_segment(conversation_id, chat_title)
+    channel_dir = data_dir / "conversation_channels" / segment
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    (channel_dir / "channel.json").write_text(json.dumps(payload), encoding="utf-8")
+    index_path = data_dir / "conversation_channels" / "index.json"
+    (index_path).write_text(
+        json.dumps({"channels": [{"conversation_id": conversation_id, "chat_title": chat_title}]}),
+        encoding="utf-8",
+    )
 
 
 class BridgeSendTest(unittest.TestCase):
@@ -44,6 +66,48 @@ class BridgeSendTest(unittest.TestCase):
             self.assertEqual(confirmed["pending_count"], 0)
             self.assertEqual(confirmed["items"][0]["status"], "sent")
 
+    def test_terminal_ack_is_not_overridden_by_stale_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "already sent")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.SENT, reason="wcf_sent")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.RETRY, reason="stale_retry")
+
+            state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(state["pending_count"], 0)
+            self.assertEqual(state["items"][0]["status"], BridgeAckStatus.SENT)
+            self.assertEqual(state["items"][0]["ack"]["reason"], "wcf_sent")
+
+    def test_sent_ack_is_not_downgraded_by_later_failed_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "wire result wins")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.SENT, reason="wcf_sent")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.FAILED, reason="stale_failed")
+
+            state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(state["pending_count"], 0)
+            self.assertEqual(state["items"][0]["status"], BridgeAckStatus.SENT)
+            self.assertEqual(state["items"][0]["ack"]["reason"], "wcf_sent")
+
+    def test_blocked_ack_is_not_overridden_by_later_inflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "operator stopped")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.BLOCKED, reason="manual_block")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.INFLIGHT, reason="stale_inflight")
+
+            state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(state["pending_count"], 0)
+            self.assertEqual(state["items"][0]["status"], BridgeAckStatus.BLOCKED)
+            self.assertEqual(state["items"][0]["ack"]["reason"], "manual_block")
+
     def test_bridge_send_queues_without_manual_binding(self) -> None:
         # wcf sends by wxid/roomid, so no manual foreground binding is required.
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,20 +128,17 @@ class BridgeSendTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             conversation_id = "abc123hashedconversation"
-            channel_dir = data_dir / "conversation_channels" / conversation_id
-            channel_dir.mkdir(parents=True, exist_ok=True)
-            (channel_dir / "channel.json").write_text(
-                """
-{
-  "conversation_id": "abc123hashedconversation",
-  "conversation_type": "private",
-  "chat_title": "Alice",
-  "sender_wechat_ids": ["wxid_real_alice"],
-  "source_names": ["weflow_discovery"],
-  "trusted_channel_source": true
-}
-""".strip(),
-                encoding="utf-8",
+            _write_channel(
+                data_dir,
+                conversation_id,
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "Alice",
+                    "sender_wechat_ids": ["wxid_real_alice"],
+                    "source_names": ["weflow_discovery"],
+                    "trusted_channel_source": True,
+                },
             )
             driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
 
@@ -96,21 +157,18 @@ class BridgeSendTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             conversation_id = "grouphash000000000000000"
-            channel_dir = data_dir / "conversation_channels" / conversation_id
-            channel_dir.mkdir(parents=True, exist_ok=True)
-            (channel_dir / "channel.json").write_text(
-                """
-{
-  "conversation_id": "grouphash000000000000000",
-  "conversation_type": "group",
-  "chat_title": "家庭群",
-  "conversation_key": "12345678@chatroom",
-  "sender_wechat_ids": ["wxid_alice_member", "wxid_bob_member"],
-  "source_names": ["backend_events_jsonl"],
-  "trusted_channel_source": true
-}
-""".strip(),
-                encoding="utf-8",
+            _write_channel(
+                data_dir,
+                conversation_id,
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "group",
+                    "chat_title": "家庭群",
+                    "conversation_key": "12345678@chatroom",
+                    "sender_wechat_ids": ["wxid_alice_member", "wxid_bob_member"],
+                    "source_names": ["backend_events_jsonl"],
+                    "trusted_channel_source": True,
+                },
             )
             driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
 
@@ -127,20 +185,17 @@ class BridgeSendTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             conversation_id = "grouphash111111111111111"
-            channel_dir = data_dir / "conversation_channels" / conversation_id
-            channel_dir.mkdir(parents=True, exist_ok=True)
-            (channel_dir / "channel.json").write_text(
-                """
-{
-  "conversation_id": "grouphash111111111111111",
-  "conversation_type": "group",
-  "chat_title": "无roomid群",
-  "sender_wechat_ids": ["wxid_alice_member"],
-  "source_names": ["backend_events_jsonl"],
-  "trusted_channel_source": true
-}
-""".strip(),
-                encoding="utf-8",
+            _write_channel(
+                data_dir,
+                conversation_id,
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "group",
+                    "chat_title": "无roomid群",
+                    "sender_wechat_ids": ["wxid_alice_member"],
+                    "source_names": ["backend_events_jsonl"],
+                    "trusted_channel_source": True,
+                },
             )
             driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
 
@@ -148,6 +203,51 @@ class BridgeSendTest(unittest.TestCase):
             state = bridge_state(data_dir, limit=10)
 
             self.assertEqual(state["items"][0]["receiver"], "")
+
+    def test_send_worker_resolves_receiver_from_real_store_channel(self) -> None:
+        # End-to-end cross-process regression: the channel is written by the
+        # real ConversationChannelStore under a human-readable segment dir, and
+        # a *fresh* bridge send (standing in for the out-of-process worker with
+        # no in-memory cache) must still recover the receiver via index.json.
+        from app.personal_wechat_bot.config.schema import ProviderConfig
+        from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
+        from app.personal_wechat_bot.domain.models import NormalizedMessage
+        from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            conversation_id = "e2ehashedconversationid00"
+            store.ensure_channel(
+                NormalizedMessage(
+                    message_id="m1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",  # type: ignore[arg-type]
+                    chat_title="Bob",
+                    sender_name="Bob",
+                    text="hi",
+                    is_self=False,
+                    received_at="2026-07-05T00:00:00+00:00",
+                    sender_wechat_id="wxid_real_bob",
+                    metadata={"source": "weflow_discovery", "trusted_channel_source": True},
+                )
+            )
+            # Confirm the dir is NOT the raw hash id (readable naming in effect).
+            self.assertFalse((data_dir / "conversation_channels" / conversation_id).exists())
+
+            # Fresh driver instance = no shared cache with the store.
+            driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
+            result = driver.send_message(conversation_id, "hello from worker")
+            state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(result.status, "queued_to_bridge")
+            self.assertEqual(state["items"][0]["receiver"], "wxid_real_bob")
 
     def test_bridge_send_file_queues_file_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,6 +318,19 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
             self.assertIn(resolved_ids[-2], remaining)
             self.assertNotIn(resolved_ids[0], remaining)
             self.assertEqual(state["pending_count"], 1)
+
+    def test_compact_treats_terminal_ack_with_stale_retry_as_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "done")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.SENT, reason="ok")
+            store.append_ack(rec["bridge_id"], status=BridgeAckStatus.RETRY, reason="stale_retry")
+
+            result = store.compact(keep_resolved=0)
+
+            self.assertEqual(result["removed_outbox"], 1)
+            self.assertEqual(store.state(limit=10)["items"], [])
 
     def test_concurrent_append_during_compaction_is_not_lost(self) -> None:
         import threading

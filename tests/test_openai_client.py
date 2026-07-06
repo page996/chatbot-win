@@ -173,6 +173,54 @@ class KeyFailoverTest(unittest.TestCase):
             # A 5xx is not a key problem: fail fast on the first key, no failover.
             self.assertEqual(len(calls), 1)
 
+    def test_retired_key_is_removed_from_candidates_until_cooldown_expires(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client, _ = self._client_with_two_keys(tmp)
+            refs = client.key_pool.available_refs()
+            client._retire_key(refs[0])
+
+            candidates = client._candidate_refs("conversation-1")
+
+            self.assertNotIn(refs[0], candidates)
+            self.assertIn(refs[1], candidates)
+
+    def test_single_cooling_key_fails_without_network_retry(self) -> None:
+        import tempfile
+        import urllib.request
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / "keys.md"
+            key_file.write_text("K1 = only-key\n", encoding="utf-8")
+            provider = ProviderConfig(
+                provider="relay",
+                model="m",
+                base_url="https://relay.example.com",
+                api_key_env="",
+                api_key_file="keys.md",
+            )
+            client = RelayOpenAIClient(provider, key_pool=ApiKeyPool(provider, tmp))
+            ref = client.key_pool.available_refs()[0]
+            client._retire_key(ref)
+            calls = {"n": 0}
+
+            def fake_urlopen(req, timeout=None):
+                calls["n"] += 1
+                raise AssertionError("cooling key must not be retried")
+
+            orig = urllib.request.urlopen
+            urllib.request.urlopen = fake_urlopen
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    client._chat_completion([{"role": "user", "content": "hi"}])
+            finally:
+                urllib.request.urlopen = orig
+
+            self.assertIn("cooling down", str(ctx.exception))
+            self.assertEqual(calls["n"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

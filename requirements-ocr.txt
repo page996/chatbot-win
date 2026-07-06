@@ -1,5 +1,6 @@
 rapidocr-onnxruntime
-onnxruntime-gpu
+paddleocr
+paddlepaddle
 Pillow
 numpy
 PyMuPDF

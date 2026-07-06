@@ -19,8 +19,9 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "text")
-            self.assertEqual(result.summary, "已读取文本附件预览")
+            self.assertEqual(result.summary, "已读取文本附件")
             self.assertEqual(result.text, "first line\nsecond line")
+            self.assertEqual(result.context_text, "first line\nsecond line")
 
     def test_text_attachment_preview_is_truncated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -29,7 +30,8 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             result = BackendAttachmentParser(max_preview_chars=4).parse(path)
 
-            self.assertEqual(result.text, "a...")
+            self.assertEqual(result.text, "abcdef")
+            self.assertEqual(result.context_text, "a...")
 
     def test_text_attachment_preview_strips_utf8_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -49,7 +51,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "docx")
-            self.assertEqual(result.summary, "已提取 DOCX 文本预览")
+            self.assertEqual(result.summary, "已提取 DOCX 文本")
             self.assertEqual(result.text, "第一段\n第二段")
 
     def test_image_attachment_uses_injected_ocr_engine(self) -> None:
@@ -61,7 +63,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "image")
-            self.assertEqual(result.summary, "已完成图片 OCR 预览")
+            self.assertEqual(result.summary, "已完成图片 OCR")
             self.assertEqual(result.text, "图片里的任务信息")
 
     def test_image_attachment_uses_placeholder_when_ocr_is_empty(self) -> None:
@@ -171,7 +173,7 @@ class BackendAttachmentParserTest(unittest.TestCase):
 
             self.assertEqual(result.status, "parsed")
             self.assertEqual(result.kind, "spreadsheet")
-            self.assertEqual(result.summary, "已提取表格文本预览")
+            self.assertEqual(result.summary, "已提取表格文本")
             self.assertIn("name\tvalue", result.text)
             self.assertIn("alpha\t1", result.text)
 

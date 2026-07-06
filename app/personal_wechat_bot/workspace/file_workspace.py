@@ -6,10 +6,12 @@ import re
 import shutil
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import utc_now_iso
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import OcrEngine
@@ -24,6 +26,8 @@ from app.personal_wechat_bot.workspace.table_artifacts import SPREADSHEET_SUFFIX
 
 CHUNK_TOKEN_TARGET = 4000
 CHUNK_CHAR_TARGET = CHUNK_TOKEN_TARGET * 4
+PREVIEW_CHAR_TARGET = 8000
+_FILE_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="file-analysis")
 
 
 @dataclass(frozen=True)
@@ -58,13 +62,17 @@ class FileWorkspace:
     artifacts next to it.
     """
 
-    def __init__(self, root: str | Path, *, analyzer: Any = None):
+    def __init__(self, root: str | Path, *, analyzer: Any = None, analysis_async: bool = False):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         # Optional LLM-backed analyzer (workspace.file_analysis.FileAnalyzer).
         # When absent, analysis.json holds mechanical metadata only. Set once in
         # bootstrap so the driver + pipeline that share this instance all use it.
         self.analyzer = analyzer
+        self.analysis_async = analysis_async
+        # Cache conversation_id -> stable directory segment. The chat title is
+        # only a bootstrap hint before channel metadata exists.
+        self._segment_cache: dict[str, str] = {}
 
     def stage_file(
         self,
@@ -75,7 +83,9 @@ class FileWorkspace:
         original_name: str = "",
         kind: str = "file",
         source: str = "backend_event_attachment",
+        chat_title: str = "",
     ) -> StagedFile:
+        self._remember_segment(conversation_id, chat_title)
         source_file = Path(source_path).resolve()
         digest = _sha256_file(source_file)
         file_id = digest[:24]
@@ -154,6 +164,7 @@ class FileWorkspace:
             summary=str(result.get("summary", "")),
             text=str(result.get("text", "")),
             error=str(result.get("error", "")),
+            context_text=str(result.get("context_text", "")),
         )
 
     def write_parse_result(
@@ -168,6 +179,7 @@ class FileWorkspace:
         derived_dir.mkdir(parents=True, exist_ok=True)
         content_path = derived_dir / "content.md"
         preview_path = derived_dir / "preview.txt"
+        full_text_path = derived_dir / "full_text.md"
         analysis_path = derived_dir / "analysis.json"
         chunks = _write_chunks(derived_dir / "chunks", result.text)
         table_artifacts = _write_table_artifacts(staged, result)
@@ -176,7 +188,7 @@ class FileWorkspace:
             embedded_media_ocr=embedded_media_ocr,
             embedded_media_asr=embedded_media_asr,
         )
-        ai_analysis = self._run_file_analysis(staged, result, media_artifacts)
+        ai_analysis = self._initial_file_analysis(staged, result, media_artifacts)
         payload = {
             "file_id": staged.file_id,
             "conversation_id": staged.conversation_id,
@@ -185,6 +197,7 @@ class FileWorkspace:
             "staged_suffix": Path(staged.staged_path).suffix.lower(),
             "source_path": staged.staged_path,
             "content_path": str(content_path),
+            "full_text_path": str(full_text_path),
             "analysis_path": str(analysis_path),
             "chunks": chunks,
             "table_artifacts": table_artifacts,
@@ -198,16 +211,33 @@ class FileWorkspace:
         _write_json(analysis_path, analysis)
         content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
         if result.text:
-            preview_path.write_text(result.text, encoding="utf-8")
+            full_text_path.write_text(_full_text_markdown(staged, result), encoding="utf-8")
+        elif full_text_path.exists():
+            full_text_path.unlink()
+        if result.text:
+            preview_path.write_text(_result_context_text(result), encoding="utf-8")
         self._update_manifest_parse_artifacts(
             staged,
             result,
             content_path,
+            full_text_path,
             analysis_path,
             chunks,
             table_artifacts,
             media_artifacts,
+            analysis=analysis,
         )
+        if self._should_schedule_file_analysis(ai_analysis):
+            _FILE_ANALYSIS_EXECUTOR.submit(
+                self._finish_async_file_analysis,
+                staged,
+                result,
+                chunks,
+                table_artifacts,
+                media_artifacts,
+                content_path,
+                analysis_path,
+            )
 
     def _run_file_analysis(
         self,
@@ -251,6 +281,60 @@ class FileWorkspace:
             return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
         to_dict = getattr(analysis, "to_dict", None)
         return to_dict() if callable(to_dict) else dict(analysis)
+
+    def _initial_file_analysis(
+        self,
+        staged: StagedFile,
+        result: AttachmentParseResult,
+        media_artifacts: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.analysis_async:
+            return self._run_file_analysis(staged, result, media_artifacts)
+        if self.analyzer is None:
+            return {"status": "disabled"}
+        cached = _read_json(Path(staged.derived_dir) / "parse_result.json", None)
+        if isinstance(cached, dict) and cached.get("sha256") == staged.sha256:
+            prior = cached.get("ai_analysis")
+            if isinstance(prior, dict) and prior.get("status") == "analyzed":
+                return prior
+        return {"status": "pending", "summary": "文件总结正在后台生成"}
+
+    def _should_schedule_file_analysis(self, ai_analysis: dict[str, Any]) -> bool:
+        return bool(self.analysis_async and self.analyzer is not None and ai_analysis.get("status") == "pending")
+
+    def _finish_async_file_analysis(
+        self,
+        staged: StagedFile,
+        result: AttachmentParseResult,
+        chunks: list[dict[str, Any]],
+        table_artifacts: dict[str, Any],
+        media_artifacts: dict[str, Any],
+        content_path: Path,
+        analysis_path: Path,
+    ) -> None:
+        ai_analysis = self._run_file_analysis(staged, result, media_artifacts)
+        analysis = _analysis_payload(staged, result, chunks, table_artifacts, media_artifacts, ai_analysis)
+        try:
+            _write_json(analysis_path, analysis)
+            content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
+            parse_payload = _read_json(Path(staged.derived_dir) / "parse_result.json", {})
+            if isinstance(parse_payload, dict):
+                parse_payload["ai_analysis"] = ai_analysis
+                parse_payload["updated_at"] = utc_now_iso()
+                _write_json(Path(staged.derived_dir) / "parse_result.json", parse_payload)
+            self._update_manifest_parse_artifacts(
+                staged,
+                result,
+                content_path,
+                Path(staged.derived_dir) / "full_text.md",
+                analysis_path,
+                chunks,
+                table_artifacts,
+                media_artifacts,
+                analysis=analysis,
+            )
+        except Exception:
+            return
 
     def staged_from_manifest(self, manifest_path: str | Path) -> StagedFile:
         safe_manifest_path = _ensure_within(Path(manifest_path).resolve(), self.root)
@@ -307,8 +391,26 @@ class FileWorkspace:
         )
         return result
 
+    def _conversation_segment(self, conversation_id: str) -> str:
+        # Fast path: in-session stable segment. On a miss (cold cache after
+        # restart, or outgoing attachments without a chat title), recover from
+        # the channel index so the dir matches the channel's advertised path.
+        cached_segment = self._segment_cache.get(conversation_id, "")
+        if cached_segment:
+            return cached_segment
+        return resolve_segment(self.root.parent, conversation_id)
+
+    def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
+        if not chat_title:
+            cached_segment = self._segment_cache.get(conversation_id, "")
+            if cached_segment:
+                return cached_segment
+        segment = resolve_segment(self.root.parent, conversation_id, chat_title)
+        self._segment_cache[conversation_id] = segment
+        return segment
+
     def file_dir(self, conversation_id: str, session_id: str, file_id: str) -> Path:
-        return self.root / _safe_segment(conversation_id) / _safe_segment(session_id) / _safe_segment(file_id)
+        return self.root / self._conversation_segment(conversation_id) / _safe_segment(session_id) / _safe_segment(file_id)
 
     def cleanup(
         self,
@@ -418,7 +520,7 @@ class FileWorkspace:
             return WorkspaceOperationResult("failed", "libreoffice.convert_to_pdf failed", error=f"{type(exc).__name__}: {exc}")
 
     def _session_index_path(self, conversation_id: str, session_id: str) -> Path:
-        return self.root / _safe_segment(conversation_id) / _safe_segment(session_id) / "index.json"
+        return self.root / self._conversation_segment(conversation_id) / _safe_segment(session_id) / "index.json"
 
     def _update_session_index(self, staged: StagedFile, manifest: dict[str, Any]) -> None:
         index_path = self._session_index_path(staged.conversation_id, staged.session_id)
@@ -453,10 +555,12 @@ class FileWorkspace:
         staged: StagedFile,
         result: AttachmentParseResult,
         content_path: Path,
+        full_text_path: Path,
         analysis_path: Path,
         chunks: list[dict[str, Any]],
         table_artifacts: dict[str, Any] | None = None,
         media_artifacts: dict[str, Any] | None = None,
+        analysis: dict[str, Any] | None = None,
     ) -> None:
         manifest_path = Path(staged.manifest_path)
         manifest = _read_json(manifest_path, {})
@@ -464,12 +568,23 @@ class FileWorkspace:
             return
         table_artifacts = table_artifacts if isinstance(table_artifacts, dict) else {}
         media_artifacts = media_artifacts if isinstance(media_artifacts, dict) else {}
+        analysis = analysis if isinstance(analysis, dict) else {}
         manifest["parse"] = {
             "status": result.status,
             "kind": result.kind,
             "summary": result.summary,
             "error": result.error,
+            "ai_analysis_status": str(analysis.get("ai_analysis_status", "")),
+            "ai_summary": str(analysis.get("ai_summary", "")),
+            "ai_key_points": [
+                str(item)
+                for item in analysis.get("ai_key_points", [])
+                if str(item).strip()
+            ],
+            "preview_char_count": int(analysis.get("preview_char_count", 0) or 0),
+            "char_count": int(analysis.get("char_count", 0) or 0),
             "content_path": str(content_path),
+            "full_text_path": str(full_text_path) if full_text_path.exists() else "",
             "analysis_path": str(analysis_path),
             "chunks_dir": str(Path(staged.derived_dir) / "chunks"),
             "chunk_count": len(chunks),
@@ -580,8 +695,11 @@ def _analysis_payload(
         "ai_model": str(ai_analysis.get("model", "")),
         "ai_error": str(ai_analysis.get("error", "")),
         "estimated_tokens": _estimate_tokens(text),
+        "preview_tokens": _estimate_tokens(_result_context_text(result)),
         "char_count": len(text),
+        "preview_char_count": len(_result_context_text(result)),
         "line_count": len(text.splitlines()) if text else 0,
+        "full_text_path": str(Path(staged.derived_dir) / "full_text.md") if text else "",
         "has_images": media["has_images"],
         "has_tables": result.kind == "spreadsheet" or bool(table_chunks),
         "has_audio": media["has_audio"],
@@ -634,14 +752,19 @@ def _analysis_payload(
 
 
 def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysis: dict[str, Any]) -> str:
+    preview = _result_context_text(result)
     lines = [
-        f"# Parsed Content: {staged.original_name}",
+        f"# File Context: {staged.original_name}",
         "",
         f"- file_id: {staged.file_id}",
-        f"- source: {staged.staged_path}",
+        f"- name: {staged.original_name}",
         f"- status: {result.status}",
         f"- kind: {result.kind}",
         f"- estimated_tokens: {analysis.get('estimated_tokens', 0)}",
+        f"- chunk_count: {analysis.get('chunk_count', 0)}",
+        f"- table_chunk_count: {analysis.get('table_chunk_count', 0)}",
+        f"- media_ocr_count: {analysis.get('media_ocr_count', 0)}",
+        f"- media_asr_count: {analysis.get('media_asr_count', 0)}",
         "",
         "## Summary",
         "",
@@ -650,14 +773,38 @@ def _content_markdown(staged: StagedFile, result: AttachmentParseResult, analysi
         *_ai_analysis_content_lines(analysis),
         *_table_content_lines(analysis),
         *_media_content_lines(analysis),
-        "## Text",
+        "## Preview",
         "",
-        result.text or "",
+        preview or "",
         "",
     ]
     if result.error:
         lines.extend(["## Error", "", result.error, ""])
     return "\n".join(lines)
+
+
+def _full_text_markdown(staged: StagedFile, result: AttachmentParseResult) -> str:
+    return "\n".join(
+        [
+            f"# Full Parsed Text: {staged.original_name}",
+            "",
+            f"- file_id: {staged.file_id}",
+            f"- status: {result.status}",
+            f"- kind: {result.kind}",
+            "",
+            "## Text",
+            "",
+            result.text or "",
+            "",
+        ]
+    )
+
+
+def _result_context_text(result: AttachmentParseResult) -> str:
+    context = str(getattr(result, "context_text", "") or "").strip()
+    if context:
+        return context
+    return _compact(str(result.text or "").strip(), PREVIEW_CHAR_TARGET)
 
 
 def _ai_analysis_content_lines(analysis: dict[str, Any]) -> list[str]:
@@ -692,8 +839,6 @@ def _table_content_lines(analysis: dict[str, Any]) -> list[str]:
         f"- table_count: {analysis.get('table_count', 0)}",
         f"- row_count: {analysis.get('table_row_count', 0)}",
         f"- chunk_count: {analysis.get('table_chunk_count', 0)}",
-        f"- index: {analysis.get('table_index_path', '')}",
-        f"- chunks_dir: {analysis.get('tables_dir', '')}",
     ]
     error = str(analysis.get("table_error", "")).strip()
     if error:
@@ -702,7 +847,12 @@ def _table_content_lines(analysis: dict[str, Any]) -> list[str]:
     if isinstance(chunks, list) and chunks:
         first = chunks[0]
         if isinstance(first, dict):
-            lines.append(f"- first_chunk: {first.get('path', '')}")
+            lines.append(
+                "- first_chunk: "
+                f"table={first.get('table_index', '')} "
+                f"chunk={first.get('chunk_index', '')} "
+                f"rows={first.get('row_count', '')}"
+            )
     lines.append("")
     return lines
 
@@ -724,14 +874,10 @@ def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
         f"- audio_count: {int(media.get('audio_count', 0) or 0)}",
         f"- extract_status: {analysis.get('media_status', '')}",
         f"- extract_count: {analysis.get('media_extract_count', 0)}",
-        f"- index: {analysis.get('media_index_path', '')}",
         f"- ocr_status: {analysis.get('media_ocr_status', '')}",
         f"- ocr_count: {analysis.get('media_ocr_count', 0)}",
-        f"- ocr_dir: {analysis.get('media_ocr_dir', '')}",
-        f"- ocr_index: {analysis.get('media_ocr_index_path', '')}",
         f"- asr_status: {analysis.get('media_asr_status', '')}",
         f"- asr_count: {analysis.get('media_asr_count', 0)}",
-        f"- asr_dir: {analysis.get('media_asr_dir', '')}",
     ]
     if error:
         lines.append(f"- error: {error}")
@@ -744,16 +890,16 @@ def _media_content_lines(analysis: dict[str, Any]) -> list[str]:
     if isinstance(media_images, list) and media_images:
         first = media_images[0]
         if isinstance(first, dict):
-            lines.append(f"- first_image: {first.get('path', '')}")
+            lines.append(f"- first_image: name={first.get('name', '')} status={first.get('ocr_status', '')}")
             if first.get("ocr_path"):
-                lines.append(f"- first_image_ocr: {first.get('ocr_path', '')}")
+                lines.append(f"- first_image_ocr_chars: {first.get('ocr_char_count', '')}")
     media_audio = analysis.get("media_audio", [])
     if isinstance(media_audio, list) and media_audio:
         first = media_audio[0]
         if isinstance(first, dict):
-            lines.append(f"- first_audio: {first.get('path', '')}")
+            lines.append(f"- first_audio: name={first.get('name', '')} status={first.get('asr_status', '')}")
             if first.get("asr_path"):
-                lines.append(f"- first_audio_asr: {first.get('asr_path', '')}")
+                lines.append(f"- first_audio_asr_backend: {first.get('asr_backend', '')}")
     lines.append("")
     return lines
 
@@ -1529,6 +1675,8 @@ def _compact(text: str, max_chars: int) -> str:
 def _safe_segment(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
     return cleaned or "default"
+
+
 
 
 def _merge_sources(existing: Any, new_source: dict[str, Any]) -> list[dict[str, Any]]:

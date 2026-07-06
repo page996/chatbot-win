@@ -1,3 +1,8 @@
 faster-whisper
+funasr
+torch
+torchaudio
+modelscope
+soundfile
 pocketsphinx
 SpeechRecognition

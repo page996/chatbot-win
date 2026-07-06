@@ -13,12 +13,16 @@ from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import Back
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
+PREVIEW_CHAR_TARGET = 8000
+
+
 @dataclass(frozen=True)
 class IncomingAttachment:
     path: str
     original_name: str = ""
     kind: str = "file"
     source: str = "backend_event_attachment"
+    chat_title: str = ""
 
 
 class AttachmentPipeline:
@@ -71,6 +75,7 @@ class AttachmentPipeline:
                 original_name=attachment.original_name or safe_path.name,
                 kind=attachment.kind,
                 source=attachment.source,
+                chat_title=attachment.chat_title,
             )
             file_id = self.file_index.add(
                 staged.staged_path,
@@ -84,7 +89,8 @@ class AttachmentPipeline:
                 embedded_media_asr=self.embedded_media_asr,
             )
             artifacts = _artifact_refs(staged)
-            parse_text = _conversation_parse_text(parse_result.text, parse_result.kind, artifacts)
+            context_text = _parse_context_text(parse_result)
+            parse_text = _conversation_parse_text(context_text, parse_result.kind, artifacts)
             return {
                 "status": "indexed",
                 "source": attachment.source,
@@ -108,7 +114,7 @@ class AttachmentPipeline:
                     "kind": parse_result.kind,
                     "summary": parse_result.summary,
                     "text": parse_text,
-                    "raw_text": parse_result.text,
+                    "context_text": context_text,
                     "error": parse_result.error,
                 },
                 "artifacts": artifacts,
@@ -132,10 +138,14 @@ def _artifact_refs(staged) -> dict[str, Any]:
     media_images = analysis.get("media_images", []) if isinstance(analysis, dict) else []
     media_audio = analysis.get("media_audio", []) if isinstance(analysis, dict) else []
     return {
+        "file_id": staged.file_id,
         "content_path": str(derived_dir / "content.md"),
+        "full_text_path": str(derived_dir / "full_text.md") if (derived_dir / "full_text.md").is_file() else "",
         "analysis_path": str(derived_dir / "analysis.json"),
         "parse_result_path": str(derived_dir / "parse_result.json"),
         "ai_summary": str(analysis.get("ai_summary", "")) if isinstance(analysis, dict) else "",
+        "preview_char_count": int(analysis.get("preview_char_count", 0) or 0) if isinstance(analysis, dict) else 0,
+        "char_count": int(analysis.get("char_count", 0) or 0) if isinstance(analysis, dict) else 0,
         "chunks_dir": str(derived_dir / "chunks"),
         "chunk_count": len(chunks) if isinstance(chunks, list) else 0,
         "chunks": [dict(item) for item in chunks if isinstance(item, dict)] if isinstance(chunks, list) else [],
@@ -214,13 +224,15 @@ def _with_artifact_context(raw_text: str, artifacts: dict[str, Any]) -> str:
 
 
 def _file_index_line(artifacts: dict[str, Any]) -> str:
-    # A single compact pointer line instead of a multi-line dump. The full
-    # derived artifacts (content.md, analysis.json, OCR/ASR indexes, chunks)
-    # live on disk; the model/reader follows content_path when it needs them.
+    # A single compact public index instead of a multi-line local path dump.
+    # Full artifacts live in the file workspace and are tracked in JSON metadata.
     parts: list[str] = []
-    content_path = str(artifacts.get("content_path", "")).strip()
-    if content_path:
-        parts.append(f"content={content_path}")
+    file_id = str(artifacts.get("file_id", "")).strip()
+    if file_id:
+        parts.append(f"file_id={file_id}")
+    char_count = int(artifacts.get("char_count", 0) or 0)
+    if char_count:
+        parts.append(f"chars={char_count}")
     counters = (
         ("chunk_count", "chunks"),
         ("table_chunk_count", "tables"),
@@ -241,6 +253,13 @@ def _file_index_line(artifacts: dict[str, Any]) -> str:
         # without opening content.md; the full analysis lives in analysis.json.
         index_line += "\n[ai_summary] " + _compact(summary.replace("\n", " "), 400)
     return index_line
+
+
+def _parse_context_text(parse_result: Any) -> str:
+    context = str(getattr(parse_result, "context_text", "") or "").strip()
+    if context:
+        return context
+    return _compact(str(getattr(parse_result, "text", "") or "").strip(), PREVIEW_CHAR_TARGET)
 
 
 def _compact(text: str, max_chars: int) -> str:

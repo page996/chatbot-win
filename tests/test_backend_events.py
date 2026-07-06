@@ -240,7 +240,7 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(enriched.text, "本地 ASR fallback 成功")
         self.assertEqual(enriched.driver_meta["voice"]["source"], "local_asr_fallback")
         self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["kind"], "audio")
-        self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["raw_text"], "本地 ASR fallback 成功")
+        self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["context_text"], "本地 ASR fallback 成功")
 
     def test_pending_voice_can_resolve_readable_wechat_voice_cache(self) -> None:
         voice_cache = self.data_dir / "wechat_voice_cache"

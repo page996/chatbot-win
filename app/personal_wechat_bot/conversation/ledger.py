@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, utc_now_iso
 
@@ -50,10 +51,15 @@ class LedgerEntry:
 
 class ConversationLedgerStore:
     def __init__(self, data_dir: str | Path):
-        self.root = Path(data_dir) / "conversation_ledgers"
+        self.data_dir = Path(data_dir)
+        self.root = self.data_dir / "conversation_ledgers"
         self.root.mkdir(parents=True, exist_ok=True)
+        # Cache conversation_id -> stable directory segment. Chat titles can
+        # change; the directory carrying history must stay put.
+        self._segment_cache: dict[str, str] = {}
 
     def append_message(self, message: NormalizedMessage) -> LedgerEntry:
+        self._remember_segment(message.conversation_id, message.chat_title)
         with self._conversation_lock(message.conversation_id):
             conversation_dir = self._conversation_dir(message.conversation_id)
             entries = self._read_entries(message.conversation_id)
@@ -184,6 +190,7 @@ class ConversationLedgerStore:
         conversation_type: str = "private",
         session_id: str = DEFAULT_SESSION_ID,
     ) -> LedgerEntry:
+        self._remember_segment(reply.conversation_id, chat_title)
         with self._conversation_lock(reply.conversation_id):
             entries = self._read_entries(reply.conversation_id)
             attachments = _reply_attachments(reply)
@@ -370,7 +377,61 @@ class ConversationLedgerStore:
         return self._conversation_dir(conversation_id) / "annotations"
 
     def _conversation_dir(self, conversation_id: str) -> Path:
-        return self.root / _safe_segment(conversation_id)
+        # Fast path: in-session cache. Slow path: recover chat_title from the
+        # channel index so writes (messages.jsonl, conversation.md, state.json,
+        # lock) land in the same human-readable dir after a restart with a cold
+        # cache, matching what read_entries and channel cleanup expect.
+        cached_segment = self._segment_cache.get(conversation_id, "")
+        if cached_segment:
+            return self.root / cached_segment
+        return self.root / resolve_segment(self.data_dir, conversation_id)
+
+    def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
+        if not chat_title:
+            cached_segment = self._segment_cache.get(conversation_id, "")
+            if cached_segment:
+                return cached_segment
+            existing_dir = self._find_conversation_dir(conversation_id)
+            if existing_dir.exists():
+                self._segment_cache[conversation_id] = existing_dir.name
+                return existing_dir.name
+        segment = resolve_segment(self.data_dir, conversation_id, chat_title)
+        self._segment_cache[conversation_id] = segment
+        return segment
+
+    def _find_conversation_dir(self, conversation_id: str) -> Path:
+        """Locate the actual directory for a conversation_id.
+
+        Because dirs are now named chat_title_hashPrefix, a fresh store
+        instance (no cache) can't reconstruct the path from conversation_id
+        alone. Strategy:
+        1. Cache / channel-index resolution (via _conversation_dir).
+        2. Scan existing dirs for a messages.jsonl whose first entry carries
+           the matching conversation_id, then populate the cache for future
+           calls. Fallback to the resolved segment so read_entries returns
+           an empty list rather than crashing.
+        """
+        # Fast path: cache or channel index.
+        candidate = self._conversation_dir(conversation_id)
+        if candidate.exists():
+            return candidate
+        # Slow path: scan.
+        if self.root.exists():
+            for messages_jsonl in self.root.glob("*/messages.jsonl"):
+                try:
+                    with messages_jsonl.open("r", encoding="utf-8") as fh:
+                        for raw_line in fh:
+                            raw_line = raw_line.strip()
+                            if not raw_line:
+                                continue
+                            payload = json.loads(raw_line)
+                            if isinstance(payload, dict) and payload.get("conversation_id") == conversation_id:
+                                self._segment_cache[conversation_id] = messages_jsonl.parent.name
+                                return messages_jsonl.parent
+                            break  # only need the first entry for the id check
+                except (OSError, json.JSONDecodeError):
+                    continue
+        return candidate  # fallback: hash-only, will be empty on first read
 
     def _messages_path(self, conversation_id: str) -> Path:
         return self._conversation_dir(conversation_id) / "messages.jsonl"
@@ -409,7 +470,7 @@ class ConversationLedgerStore:
                 pass
 
     def _read_entries(self, conversation_id: str) -> list[dict[str, Any]]:
-        path = self._messages_path(conversation_id)
+        path = self._find_conversation_dir(conversation_id) / "messages.jsonl"
         if not path.exists():
             return []
         entries: list[dict[str, Any]] = []
@@ -906,23 +967,24 @@ def _render_entry_markdown(item: dict[str, Any]) -> list[str]:
         text = str(block.get("text", "")).strip()
         source_ref = str(block.get("source_ref", "")).strip()
         if kind != "text":
-            lines.append(f"[block:{kind}{' source=' + source_ref if source_ref else ''}]")
+            metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+            if kind.startswith("attachment:"):
+                file_id = str(metadata.get("file_id", "")).strip()
+                name = str(metadata.get("name", "")).strip()
+                note = " ".join(part for part in (f"file_id={file_id}" if file_id else "", f"name={name}" if name else "") if part)
+                lines.append(f"[block:{kind}{' ' + note if note else ''}]")
+            else:
+                status = str(metadata.get("status", "")).strip()
+                url_id = str(metadata.get("url_id", "")).strip()
+                note = " ".join(part for part in (f"url_id={url_id}" if url_id else "", f"status={status}" if status else "") if part)
+                lines.append(f"[block:{kind}{' ' + note if note else ''}]")
         if text:
             lines.append(text)
         lines.append("")
     for attachment in item.get("attachments", []):
         if not isinstance(attachment, dict):
             continue
-        name = str(attachment.get("name", ""))
-        file_id = str(attachment.get("file_id", ""))
-        path = str(attachment.get("path", ""))
-        source = str(attachment.get("source", ""))
-        workspace = attachment.get("workspace") if isinstance(attachment.get("workspace"), dict) else {}
-        manifest = str(workspace.get("manifest_path", ""))
-        if file_id or manifest:
-            lines.append(f"[file:{file_id} name={name} manifest={manifest}]")
-        else:
-            lines.append(f"[file:outgoing name={name} path={path} source={source}]")
+        lines.append(_render_attachment_ref(attachment))
     if item.get("attachments"):
         lines.append("")
     for link in item.get("links", []):
@@ -931,6 +993,37 @@ def _render_entry_markdown(item: dict[str, Any]) -> list[str]:
     if item.get("links"):
         lines.append("")
     return lines
+
+
+def _render_attachment_ref(attachment: dict[str, Any]) -> str:
+    name = str(attachment.get("name", "")).strip()
+    file_id = str(attachment.get("file_id", "")).strip()
+    status = str(attachment.get("status", "")).strip()
+    kind = str(attachment.get("kind", "")).strip()
+    source = str(attachment.get("source", "")).strip()
+    artifacts = attachment.get("artifacts") if isinstance(attachment.get("artifacts"), dict) else {}
+    parts = []
+    if name:
+        parts.append(f"name={name}")
+    if kind:
+        parts.append(f"kind={kind}")
+    if status:
+        parts.append(f"status={status}")
+    for key, label in (
+        ("chunk_count", "chunks"),
+        ("table_chunk_count", "table_chunks"),
+        ("media_extract_count", "media"),
+        ("media_ocr_count", "ocr"),
+        ("media_asr_count", "asr"),
+    ):
+        value = artifacts.get(key, "")
+        if value not in ("", None, 0):
+            parts.append(f"{label}={value}")
+    if file_id:
+        return f"[file:{file_id}{' ' + ' '.join(parts) if parts else ''}]"
+    if source:
+        parts.append(f"source={source}")
+    return f"[file:outgoing{' ' + ' '.join(parts) if parts else ''}]"
 
 
 def _find_entry_by_message_id(entries: list[dict[str, Any]], message_id: str) -> dict[str, Any] | None:
@@ -1013,6 +1106,8 @@ def _estimate_tokens(text: str) -> int:
 def _safe_segment(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
     return cleaned or "default"
+
+
 
 
 def _normalize_for_match(text: str) -> str:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import threading
 import uuid
@@ -9,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 
@@ -39,6 +39,7 @@ class ConversationChannel:
     updated_at: str
     next_key_index: int = 0
     conversation_key: str = ""
+    segment: str = ""
 
 
 class ConversationChannelStore:
@@ -65,11 +66,19 @@ class ConversationChannelStore:
         self.context_root = Path(context_root)
         self._lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
+        # Cache conversation_id -> stable directory segment. The display title
+        # may change; the segment must not, or ledgers/sessions/workspaces split.
+        self._segment_cache: dict[str, str] = {}
 
     def ensure_channel(self, message: NormalizedMessage) -> ConversationChannel:
         with self._lock:
-            path = self._channel_path(message.conversation_id)
-            existing = self._read_channel_payload(path)
+            existing_path = self._find_channel_path(message.conversation_id)
+            existing = self._read_channel_payload(existing_path) if existing_path else {}
+            segment = _payload_segment(existing, existing_path.parent.name if existing_path else "")
+            if not segment:
+                segment = conversation_segment(message.conversation_id, message.chat_title)
+            self._segment_cache[message.conversation_id] = segment
+            path = self.root / segment / "channel.json"
             now = utc_now_iso()
             key_slots = _key_slots_for(message.conversation_type)
             api_key_refs = _merge_key_refs(
@@ -94,20 +103,21 @@ class ConversationChannelStore:
             trusted_channel_source = bool(existing.get("trusted_channel_source", False)) if existing else False
             if source_name in TRUSTED_CHANNEL_SOURCES or message.metadata.get("trusted_channel_source") is True:
                 trusted_channel_source = True
-            channel_dir = self._channel_dir(message.conversation_id)
+            channel_dir = self.root / segment
             backend_dir = channel_dir / "backend"
             backend_dir.mkdir(parents=True, exist_ok=True)
             payload = {
                 "conversation_id": message.conversation_id,
                 "conversation_type": message.conversation_type,
                 "chat_title": message.chat_title,
+                "segment": segment,
                 "status": "active",
                 "key_slots": key_slots,
                 "api_key_refs": api_key_refs,
                 "session_scope": "per_conversation_current_session",
                 "backend_dir": str(backend_dir),
-                "context_dir": str(self.context_root / message.conversation_id),
-                "file_workspace_dir": str(self.file_workspace_root / _safe_segment(message.conversation_id)),
+                "context_dir": str(self.context_root / segment),
+                "file_workspace_dir": str(self.file_workspace_root / segment),
                 "sender_names": sender_names,
                 "sender_wechat_ids": sender_wechat_ids,
                 "conversation_key": conversation_key,
@@ -122,8 +132,36 @@ class ConversationChannelStore:
             return _channel_from_payload(payload)
 
     def get_channel(self, conversation_id: str) -> ConversationChannel | None:
-        payload = self._read_channel_payload(self._channel_path(conversation_id))
+        path = self._find_channel_path(conversation_id)
+        payload = self._read_channel_payload(path) if path else {}
+        if payload and path:
+            self._segment_cache[conversation_id] = _payload_segment(payload, path.parent.name)
         return _channel_from_payload(payload) if payload else None
+
+    def _find_channel_path(self, conversation_id: str) -> Path | None:
+        """Locate the channel.json for a given conversation_id.
+
+        Because channel dirs now use human-readable segments (chat_title + hash
+        prefix), we can't reconstruct the segment from conversation_id alone
+        without the chat_title. Strategy:
+        1. Try the cache (fast path for already-open sessions).
+        2. Scan existing dirs (slow path for a fresh store instance after restart).
+        """
+        cached_segment = self._segment_cache.get(conversation_id, "")
+        candidate = self.root / cached_segment / "channel.json" if cached_segment else self.root / resolve_segment(self.data_dir, conversation_id) / "channel.json"
+        if candidate.exists():
+            return candidate
+        # Scan: look for any channel.json whose payload has matching conversation_id.
+        if self.root.exists():
+            for channel_json in self.root.glob("*/channel.json"):
+                try:
+                    payload = json.loads(channel_json.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("conversation_id") == conversation_id:
+                    self._segment_cache[conversation_id] = _payload_segment(payload, channel_json.parent.name)
+                    return channel_json
+        return None
 
     def api_key_for_request(self, conversation_id: str) -> str | None:
         ref = self.ref_for_request(conversation_id)
@@ -132,15 +170,10 @@ class ConversationChannelStore:
         return self.key_pool.key_for_ref(ref) or self.key_pool.default_key()
 
     def ref_for_request(self, conversation_id: str) -> str | None:
-        """Return the next rotated key *ref* for this conversation.
-
-        Advances the round-robin cursor and persists it, exactly as before, but
-        returns the ref (not the resolved secret) so the caller can fail over to
-        other refs on an auth/rate error. Returns None when the conversation has
-        no channel or no available refs (caller falls back to the pool default).
-        """
         with self._lock:
-            path = self._channel_path(conversation_id)
+            path = self._find_channel_path(conversation_id)
+            if not path:
+                return None
             payload = self._read_channel_payload(path)
             if not payload:
                 return None
@@ -169,9 +202,9 @@ class ConversationChannelStore:
 
     def delete_channel_with_cleanup(self, conversation_id: str) -> dict[str, Any]:
         with self._lock:
-            path = self._channel_path(conversation_id)
-            payload = self._read_channel_payload(path)
-            if not path.exists() and not payload:
+            path = self._find_channel_path(conversation_id)
+            payload = self._read_channel_payload(path) if path else {}
+            if not path or (not path.exists() and not payload):
                 return {
                     "deleted": False,
                     "cleanup_policy": "missing",
@@ -182,11 +215,13 @@ class ConversationChannelStore:
             removed: list[str] = []
             retained: list[str] = []
             if cleanup_policy == "non_wechat_purge":
-                for target in self._associated_paths(conversation_id):
+                segment = _payload_segment(payload, path.parent.name)
+                for target in self._associated_paths(conversation_id, segment):
                     if _remove_path(target):
                         removed.append(str(target))
             else:
-                retained.extend(str(target) for target in self._associated_paths(conversation_id))
+                segment = _payload_segment(payload, path.parent.name)
+                retained.extend(str(target) for target in self._associated_paths(conversation_id, segment))
             channel_dir = path.parent
             if _remove_path(channel_dir):
                 removed.append(str(channel_dir))
@@ -208,14 +243,15 @@ class ConversationChannelStore:
         start = _stable_index(conversation_id, len(candidates))
         return [candidates[(start + offset) % len(candidates)] for offset in range(size)]
 
-    def _channel_dir(self, conversation_id: str) -> Path:
-        return self.root / _safe_segment(conversation_id)
+    def _channel_dir(self, conversation_id: str, chat_title: str = "") -> Path:
+        segment = self._segment_cache.get(conversation_id) or resolve_segment(self.data_dir, conversation_id, chat_title)
+        return self.root / segment
 
-    def _channel_path(self, conversation_id: str) -> Path:
-        return self._channel_dir(conversation_id) / "channel.json"
+    def _channel_path(self, conversation_id: str, chat_title: str = "") -> Path:
+        return self._channel_dir(conversation_id, chat_title) / "channel.json"
 
-    def _associated_paths(self, conversation_id: str) -> list[Path]:
-        segment = _safe_segment(conversation_id)
+    def _associated_paths(self, conversation_id: str, segment: str = "") -> list[Path]:
+        segment = segment or self._segment_cache.get(conversation_id) or resolve_segment(self.data_dir, conversation_id)
         return [
             self.context_root / segment,
             self.file_workspace_root / segment,
@@ -251,6 +287,7 @@ class ConversationChannelStore:
                 "conversation_id": payload.get("conversation_id", ""),
                 "conversation_type": payload.get("conversation_type", ""),
                 "chat_title": payload.get("chat_title", ""),
+                "segment": payload.get("segment", ""),
                 "status": payload.get("status", ""),
                 "key_slots": payload.get("key_slots", 0),
                 "api_key_refs": payload.get("api_key_refs", []),
@@ -307,6 +344,7 @@ def _channel_from_payload(payload: dict[str, Any]) -> ConversationChannel:
         updated_at=str(payload.get("updated_at", "")),
         next_key_index=int(payload.get("next_key_index", 0)),
         conversation_key=str(payload.get("conversation_key", "") or ""),
+        segment=str(payload.get("segment", "") or ""),
     )
 
 
@@ -328,6 +366,11 @@ def _conversation_key_from_message(message: NormalizedMessage) -> str:
     return ""
 
 
+def _payload_segment(payload: dict[str, Any], fallback: str = "") -> str:
+    segment = str(payload.get("segment", "") or "").strip() if payload else ""
+    return segment or str(fallback or "").strip()
+
+
 def _merge_key_refs(existing: list[str], assigned: list[str], slots: int) -> list[str]:
     merged = [item for item in existing if item]
     for item in assigned:
@@ -341,11 +384,6 @@ def _append_unique(values: list[str], value: str) -> list[str]:
     if value and value not in cleaned:
         cleaned.append(value)
     return cleaned[-20:]
-
-
-def _safe_segment(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
-    return cleaned or "default"
 
 
 def _stable_index(value: str, modulo: int) -> int:

@@ -180,7 +180,8 @@ class ConversationLedgerStoreTest(unittest.TestCase):
                 Path("workspace/file123/derived/analysis.json"),
             )
             self.assertIn("file parsed content", markdown)
-            self.assertIn("manifest=workspace/file123/manifest.json", markdown)
+            self.assertIn("[file:file123 name=report.pdf kind=file status=indexed]", markdown)
+            self.assertNotIn("manifest=workspace/file123/manifest.json", markdown)
 
     def test_duplicate_attachment_metadata_collapses_to_single_block(self) -> None:
         # Voice messages can arrive with the same media emitted twice (a voice
@@ -444,7 +445,7 @@ class LedgerContextAssemblerTest(unittest.TestCase):
             self.assertGreater(snapshot.estimated_tokens, snapshot.token_budget)
             self.assertLessEqual(snapshot.estimated_tokens, 180)
 
-    def test_file_section_includes_content_artifact_path(self) -> None:
+    def test_file_section_includes_compact_file_artifact_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
             message = _message(
@@ -468,12 +469,13 @@ class LedgerContextAssemblerTest(unittest.TestCase):
             rendered = snapshot.render_for_prompt()
 
             self.assertIn("Available file refs", rendered)
-            self.assertIn("content=derived", rendered)
-            self.assertIn("content.md", rendered)
-            self.assertIn("chunk_count=3", rendered)
-            self.assertIn("chunks_dir=derived/chunks", rendered)
+            self.assertIn("chunks=3", rendered)
+            self.assertIn("summary=ok", rendered)
+            self.assertNotIn("content=derived", rendered)
+            self.assertNotIn("content.md", rendered)
+            self.assertNotIn("chunks_dir=derived/chunks", rendered)
 
-    def test_file_section_includes_table_artifact_paths(self) -> None:
+    def test_file_section_includes_table_artifact_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
             message = _message(
@@ -500,8 +502,8 @@ class LedgerContextAssemblerTest(unittest.TestCase):
             snapshot = LedgerContextAssembler(store, max_recent_entries=5, token_budget=300).build_snapshot(message)
             rendered = snapshot.render_for_prompt()
 
-            self.assertIn("table_index=derived/tables/index.json", rendered)
-            self.assertIn("table_chunk_count=2", rendered)
+            self.assertIn("table_chunks=2", rendered)
+            self.assertNotIn("table_index=derived/tables/index.json", rendered)
 
     def test_recent_context_is_scoped_to_current_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

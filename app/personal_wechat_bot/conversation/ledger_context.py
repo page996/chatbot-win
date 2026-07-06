@@ -296,25 +296,31 @@ def memory_dir_for_conversation(conversation_dir: Path, session_id: str) -> Path
 def _file_lines(file_refs: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
     for item in file_refs[-30:]:
-        workspace = item.get("workspace") if isinstance(item.get("workspace"), dict) else {}
         parse = item.get("parse") if isinstance(item.get("parse"), dict) else {}
         artifacts = item.get("artifacts") if isinstance(item.get("artifacts"), dict) else {}
-        lines.append(
-            "- "
-            f"name={item.get('name', '')} file_id={item.get('file_id', '')} "
-            f"kind={item.get('kind', '')} status={item.get('status', '')} "
-            f"manifest={workspace.get('manifest_path', '')} "
-            f"content={artifacts.get('content_path', '')} "
-            f"chunk_count={artifacts.get('chunk_count', '')} "
-            f"chunks_dir={artifacts.get('chunks_dir', '')} "
-            f"table_index={artifacts.get('table_index_path', '')} "
-            f"table_chunk_count={artifacts.get('table_chunk_count', '')} "
-            f"media_index={artifacts.get('media_index_path', '')} "
-            f"media_extract_count={artifacts.get('media_extract_count', '')} "
-            f"media_ocr={artifacts.get('media_ocr_status', '')}:{artifacts.get('media_ocr_count', '')} "
-            f"media_asr={artifacts.get('media_asr_status', '')}:{artifacts.get('media_asr_count', '')} "
-            f"parse_status={parse.get('status', '')} summary={_compact(str(parse.get('summary', '')), 300)}"
-        )
+        parts = [
+            f"name={item.get('name', '')}",
+            f"file_id={item.get('file_id', '')}",
+            f"kind={item.get('kind', '')}",
+            f"status={item.get('status', '')}",
+            f"parse_status={parse.get('status', '')}",
+        ]
+        for key, label in (
+            ("char_count", "chars"),
+            ("chunk_count", "chunks"),
+            ("table_chunk_count", "table_chunks"),
+            ("media_extract_count", "media"),
+            ("media_ocr_count", "ocr"),
+            ("media_asr_count", "asr"),
+        ):
+            value = artifacts.get(key, "")
+            if value not in ("", None, 0):
+                parts.append(f"{label}={value}")
+        ai_summary = str(artifacts.get("ai_summary", "")).strip()
+        summary = ai_summary or str(parse.get("summary", "")).strip()
+        if summary:
+            parts.append(f"summary={_compact(summary, 300)}")
+        lines.append("- " + " ".join(part for part in parts if not part.endswith("=")))
     return lines
 
 
@@ -324,7 +330,6 @@ def _link_lines(link_refs: list[dict[str, Any]]) -> list[str]:
         lines.append(
             "- "
             f"url_id={item.get('url_id', '')} status={item.get('status', '')} "
-            f"annotation={item.get('annotation_path', '')} "
             f"summary={_compact(str(item.get('summary', '')), 220)} "
             f"url={item.get('url', '')}"
         )

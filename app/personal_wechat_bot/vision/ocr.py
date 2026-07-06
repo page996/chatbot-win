@@ -111,7 +111,7 @@ class PlaceholderGpuOcrEngine:
         gpu = _nvidia_smi_available()
         missing = [
             name
-            for name in ["paddleocr", "easyocr", "rapidocr_onnxruntime", "onnxruntime", "torch"]
+            for name in ["paddleocr", "paddle", "rapidocr_onnxruntime", "onnxruntime"]
             if importlib.util.find_spec(name) is None
         ]
         detail = "missing OCR python packages: " + ", ".join(missing)

@@ -38,8 +38,10 @@ class AttachmentPipelineTest(unittest.TestCase):
             self.assertEqual(result["status"], "indexed")
             self.assertTrue(result["parse"]["text"].startswith("parsed text"))
             self.assertIn("[file_index]", result["parse"]["text"])
-            self.assertIn("content=", result["parse"]["text"])
+            self.assertNotIn("content=", result["parse"]["text"])
+            self.assertEqual(result["parse"]["context_text"], "parsed text")
             self.assertEqual(result["artifacts"]["chunk_count"], 1)
+            self.assertTrue(Path(result["artifacts"]["full_text_path"]).exists())
             self.assertTrue(Path(result["workspace"]["staged_path"]).exists())
             self.assertTrue((Path(result["workspace"]["derived_dir"]) / "content.md").exists())
 
@@ -101,7 +103,8 @@ class AttachmentPipelineTest(unittest.TestCase):
             self.assertEqual(chunk_payload["rows"][0], {"name": "alpha", "value": "1"})
             self.assertIn("[structured_table:first_chunk]", result["parse"]["text"])
             self.assertIn('"name": "alpha"', result["parse"]["text"])
-            self.assertEqual(result["parse"]["raw_text"], "name\tvalue\nalpha\t1")
+            self.assertNotIn("raw_text", result["parse"])
+            self.assertEqual(result["parse"]["context_text"], "name\tvalue\nalpha\t1")
 
     def test_process_returns_embedded_media_ocr_artifacts_for_docx(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

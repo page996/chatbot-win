@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 
 
@@ -29,8 +30,12 @@ class ConversationSessionStore:
     """
 
     def __init__(self, data_dir: str | Path):
-        self.root = Path(data_dir) / "conversation_sessions"
+        self.data_dir = Path(data_dir)
+        self.root = self.data_dir / "conversation_sessions"
         self.root.mkdir(parents=True, exist_ok=True)
+        # conversation_id -> stable directory segment. A message title is only
+        # used to choose the first segment before a channel exists.
+        self._segment_cache: dict[str, str] = {}
 
     def current_session_id(self, conversation_id: str) -> str:
         state = self._read_state(conversation_id)
@@ -47,7 +52,15 @@ class ConversationSessionStore:
         )
         return DEFAULT_SESSION_ID
 
+    def current_session_id_for_conversation(self, conversation_id: str, chat_title: str = "") -> str:
+        self._remember_segment(conversation_id, chat_title)
+        return self.current_session_id(conversation_id)
+
+    def current_session_id_for_message(self, message: NormalizedMessage) -> str:
+        return self.current_session_id_for_conversation(message.conversation_id, message.chat_title)
+
     def maybe_reset_for_message(self, message: NormalizedMessage) -> str | None:
+        self._remember_segment(message.conversation_id, message.chat_title)
         if not is_reset_command(message.text):
             return None
         return self.reset_session(
@@ -81,7 +94,37 @@ class ConversationSessionStore:
         return session_id
 
     def _conversation_dir(self, conversation_id: str) -> Path:
-        return self.root / _safe_segment(conversation_id)
+        cached_segment = self._segment_cache.get(conversation_id, "")
+        if cached_segment:
+            return self.root / cached_segment
+        return self.root / resolve_segment(self.data_dir, conversation_id)
+
+    def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
+        if not chat_title:
+            cached_segment = self._segment_cache.get(conversation_id, "")
+            if cached_segment:
+                return cached_segment
+            existing_dir = self._find_conversation_dir(conversation_id)
+            if existing_dir.exists():
+                self._segment_cache[conversation_id] = existing_dir.name
+                return existing_dir.name
+        segment = resolve_segment(self.data_dir, conversation_id, chat_title)
+        self._segment_cache[conversation_id] = segment
+        return segment
+
+    def _find_conversation_dir(self, conversation_id: str) -> Path:
+        candidate = self._conversation_dir(conversation_id)
+        if candidate.exists():
+            return candidate
+        if self.root.exists():
+            for state_json in self.root.glob("*/state.json"):
+                try:
+                    payload = json.loads(state_json.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("conversation_id") == conversation_id:
+                    return state_json.parent
+        return candidate
 
     def _state_path(self, conversation_id: str) -> Path:
         return self._conversation_dir(conversation_id) / "state.json"
@@ -90,7 +133,7 @@ class ConversationSessionStore:
         return self._conversation_dir(conversation_id) / "events.jsonl"
 
     def _read_state(self, conversation_id: str) -> dict[str, Any]:
-        path = self._state_path(conversation_id)
+        path = self._find_conversation_dir(conversation_id) / "state.json"
         if not path.exists():
             return {}
         try:
@@ -128,11 +171,6 @@ def is_reset_command(text: str) -> bool:
 def _new_session_id() -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"session_{stamp}_{uuid.uuid4().hex[:8]}"
-
-
-def _safe_segment(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
-    return cleaned or "default"
 
 
 def _normalize_text(text: str) -> str:

@@ -4,6 +4,7 @@ import argparse
 import base64
 import csv
 import json
+import tempfile
 from pathlib import Path
 
 
@@ -29,7 +30,7 @@ def main() -> int:
         payload = {
             "ok": True,
             "kind": kind,
-            "text_b64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            **_text_payload(text),
         }
     except Exception as exc:
         payload = {"ok": False, "kind": "file", "error": f"{type(exc).__name__}: {exc}"}
@@ -63,9 +64,6 @@ def _read_xlsx(path: Path) -> str:
                 continue
             parts.append("\t".join(values).rstrip())
             row_count += 1
-            if row_count >= 80:
-                parts.append("...")
-                break
     return "\n".join(parts)
 
 
@@ -75,10 +73,7 @@ def _read_csv(path: Path) -> str:
             with path.open("r", encoding=encoding, newline="") as f:
                 rows = []
                 reader = csv.reader(f)
-                for index, row in enumerate(reader):
-                    if index >= 80:
-                        rows.append(["..."])
-                        break
+                for row in reader:
                     rows.append(row)
                 return "\n".join("\t".join(cell.strip() for cell in row) for row in rows)
         except UnicodeDecodeError:
@@ -90,6 +85,15 @@ def _format_cell(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _text_payload(text: str, *, inline_limit: int = 512 * 1024) -> dict[str, str]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= inline_limit:
+        return {"text_b64": base64.b64encode(encoded).decode("ascii")}
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".attachment_extract.txt", delete=False) as f:
+        f.write(text)
+        return {"text_path": f.name, "text_b64": ""}
 
 
 if __name__ == "__main__":

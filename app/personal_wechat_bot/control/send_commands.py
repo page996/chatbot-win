@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from app.personal_wechat_bot.reply_gate.send_audit import SendAuditLog
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver, probe_send_driver
+from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, is_terminal_bridge_ack_status
 
 
 def set_send_controls(
@@ -114,28 +116,47 @@ def sync_bridge_ack_to_send_state(
     bridge_id = str(bridge_id or "").strip()
     if not bridge_id:
         return {"status": "skipped", "reason": "bridge_id_empty"}
+    status = str(status or "").strip()
+    if not is_terminal_bridge_ack_status(status):
+        return {
+            "status": "skipped",
+            "reason": "bridge_ack_not_terminal",
+            "bridge_id": bridge_id,
+            "ack_status": status,
+        }
     queue = _queue(data_dir)
     queue_item = queue.find_by_bridge_id(bridge_id)
     queue_updated: dict[str, Any] = {}
     queue_error = ""
-    mapped_queue_status = "sent" if status == "sent" else "failed"
+    queue_sync_status = "not_found"
+    mapped_queue_status = "sent" if status == BridgeAckStatus.SENT else "failed"
+    ledger_status = status
+    sync_reason = reason or f"bridge_ack:{status}"
     if queue_item is not None:
         try:
-            queue_updated = queue.mark_send_result(
-                str(queue_item.get("queue_id", "")),
-                mapped_queue_status,
-                reason or f"bridge_ack:{status}",
-            )
+            current_queue_status = str(queue_item.get("status", ""))
+            if current_queue_status == BridgeAckStatus.SENT and mapped_queue_status != BridgeAckStatus.SENT:
+                queue_updated = queue_item
+                queue_sync_status = "preserved_sent"
+                ledger_status = BridgeAckStatus.SENT
+                sync_reason = str(queue_item.get("note", "")) or sync_reason
+            else:
+                queue_updated = queue.mark_send_result(
+                    str(queue_item.get("queue_id", "")),
+                    mapped_queue_status,
+                    sync_reason,
+                )
+                queue_sync_status = "updated"
             _sync_queue_item_to_ledger(
                 data_dir,
                 queue_updated,
-                status=mapped_queue_status,
-                reason=reason or f"bridge_ack:{status}",
+                status=str(queue_updated.get("status", mapped_queue_status)),
+                reason=sync_reason,
                 send_result={
                     "message_id": bridge_id,
-                    "status": mapped_queue_status,
-                    "reason": reason or f"bridge_ack:{status}",
-                    "sent_at": utc_now_iso() if mapped_queue_status == "sent" else "",
+                    "status": str(queue_updated.get("status", mapped_queue_status)),
+                    "reason": sync_reason,
+                    "sent_at": utc_now_iso() if str(queue_updated.get("status", mapped_queue_status)) == "sent" else "",
                     "external_message_id": external_message_id,
                 },
             )
@@ -145,8 +166,8 @@ def sync_bridge_ack_to_send_state(
     ledger_updates = _sync_bridge_ack_to_ledgers(
         data_dir,
         bridge_id,
-        status=status,
-        reason=reason or f"bridge_ack:{status}",
+        status=ledger_status,
+        reason=sync_reason,
         external_message_id=external_message_id,
     )
     return {
@@ -154,6 +175,7 @@ def sync_bridge_ack_to_send_state(
         "bridge_id": bridge_id,
         "queue_item_found": queue_item is not None,
         "queue_item": queue_updated,
+        "queue_sync_status": queue_sync_status,
         "queue_error": queue_error,
         "ledger_updates": ledger_updates,
     }
@@ -252,7 +274,7 @@ def _sync_bridge_ack_to_ledgers(
     changed: list[str] = []
     store = _ledger(data_dir)
     for messages_path in root.glob("*/messages.jsonl"):
-        conversation_id = messages_path.parent.name
+        conversation_id = _conversation_id_from_messages(messages_path) or messages_path.parent.name
         try:
             updated = store.update_bridge_send_result(
                 conversation_id,
@@ -268,6 +290,21 @@ def _sync_bridge_ack_to_ledgers(
         if updated:
             changed.append(conversation_id)
     return changed
+
+
+def _conversation_id_from_messages(messages_path: Path) -> str:
+    try:
+        with messages_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    return str(payload.get("conversation_id", "") or "").strip()
+                return ""
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return ""
 
 
 def _send_config_payload(config: Any) -> dict[str, Any]:

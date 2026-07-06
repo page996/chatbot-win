@@ -13,7 +13,7 @@ class LinkAnnotationServiceTest(unittest.TestCase):
     def test_annotates_entry_with_web_fetch_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
-            entry = store.append_message(_message("see https://example.com/a"))
+            entry = store.append_message(_message("please read https://example.com/a"))
             service = LinkAnnotationService(store, _FakeTools())
 
             results = service.annotate_entry(entry)
@@ -29,7 +29,7 @@ class LinkAnnotationServiceTest(unittest.TestCase):
     def test_failed_fetch_marks_link_without_annotation_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
-            entry = store.append_message(_message("see https://example.com/a"))
+            entry = store.append_message(_message("please read https://example.com/a"))
             service = LinkAnnotationService(store, _FakeTools(status="failed", text=""))
 
             service.annotate_entry(entry)
@@ -38,13 +38,46 @@ class LinkAnnotationServiceTest(unittest.TestCase):
             self.assertEqual(updated.links[0]["status"], "failed")
             self.assertEqual(len(updated.text_blocks), 1)
 
+    def test_plain_url_is_not_auto_fetched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            entry = store.append_message(_message("see https://example.com/a"))
+            tools = _FakeTools()
+            service = LinkAnnotationService(store, tools)
+
+            results = service.annotate_entry(entry)
+            updated = store.read_entries("conv1")[0]
+
+            self.assertEqual(results, [])
+            self.assertEqual(tools.calls, 0)
+            self.assertEqual(updated.links[0]["status"], "pending")
+
+    def test_explicit_read_of_quoted_url_fetches_target_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("source https://example.com/a", message_id="source"))
+            entry = store.append_message(
+                _message("please read this link", message_id="reader", metadata={"quote": {"message_id": "source"}})
+            )
+            tools = _FakeTools()
+            service = LinkAnnotationService(store, tools)
+
+            results = service.annotate_entry(entry)
+            updated_source = store.read_entries("conv1")[0]
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(tools.calls, 1)
+            self.assertEqual(updated_source.links[0]["status"], "completed")
+
 
 class _FakeTools:
     def __init__(self, status: str = "completed", text: str = "fetched text"):
         self.status = status
         self.text = text
+        self.calls = 0
 
     def execute(self, request):
+        self.calls += 1
         return ToolCallResult(
             call_id=request.call_id,
             tool_name=request.tool_name,
@@ -56,9 +89,9 @@ class _FakeTools:
         )
 
 
-def _message(text: str) -> NormalizedMessage:
+def _message(text: str, *, message_id: str = "m1", metadata: dict | None = None) -> NormalizedMessage:
     return NormalizedMessage(
-        message_id="m1",
+        message_id=message_id,
         conversation_id="conv1",
         conversation_type="private",
         chat_title="PAGE",
@@ -67,7 +100,7 @@ def _message(text: str) -> NormalizedMessage:
         text=text,
         is_self=False,
         received_at="2026-06-29T00:00:00+08:00",
-        metadata={},
+        metadata=metadata or {},
     )
 
 

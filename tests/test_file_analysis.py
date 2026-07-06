@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -127,6 +128,26 @@ class FileWorkspaceAnalysisTest(unittest.TestCase):
             self.assertEqual(analysis["ai_analysis_status"], "disabled")
             self.assertNotIn("## AI Analysis", content)
 
+    def test_async_analysis_backfills_manifest_parse_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "note.txt"
+            source.write_text("async parsed content", encoding="utf-8")
+            llm = _JsonLLM({"summary": "async summary", "key_points": ["point A"], "topics": ["topic A"]})
+            workspace = FileWorkspace(Path(tmp) / "ws", analyzer=LLMFileAnalyzer(llm), analysis_async=True)
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="file")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "text", "summary", "async parsed content"),
+            )
+
+            manifest = _wait_for_manifest_ai_summary(Path(staged.manifest_path), "async summary")
+            content = (Path(staged.derived_dir) / "content.md").read_text(encoding="utf-8")
+
+            self.assertEqual(manifest["parse"]["ai_analysis_status"], "analyzed")
+            self.assertEqual(manifest["parse"]["ai_summary"], "async summary")
+            self.assertIn("async summary", content)
+
     def test_empty_ocr_placeholder_is_not_analyzed(self) -> None:
         # Regression: when OCR/ASR recognized nothing, the placeholder text must
         # NOT be fed to the analyzer as if it were real content. The analyzer
@@ -158,6 +179,18 @@ class FileWorkspaceAnalysisTest(unittest.TestCase):
             analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
             self.assertEqual(analysis["ai_analysis_status"], "skipped")
             self.assertEqual(llm.calls, 0)
+
+
+def _wait_for_manifest_ai_summary(path: Path, expected: str, *, timeout_seconds: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    last: dict = {}
+    while time.monotonic() < deadline:
+        last = json.loads(path.read_text(encoding="utf-8"))
+        parse = last.get("parse") if isinstance(last.get("parse"), dict) else {}
+        if parse.get("ai_summary") == expected:
+            return last
+        time.sleep(0.05)
+    return last
 
 
 if __name__ == "__main__":

@@ -7,8 +7,12 @@ from pathlib import Path
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config
 from app.personal_wechat_bot.conversation.context_store import CLEAR_CONTEXT_PHRASES, DEFAULT_SESSION_ID
+from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.domain.models import RawWeChatMessage
 from app.personal_wechat_bot.processor.message_processor import MessageProcessor
+from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver, append_backend_event
 
 
 class MessageProcessorTest(unittest.TestCase):
@@ -149,6 +153,49 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertEqual(result["context"]["session_id"], session_id)
             self.assertEqual(entries[0].session_id, session_id)
             self.assertEqual(entries[-1].session_id, session_id)
+
+    def test_first_backend_attachment_message_uses_one_segment_for_all_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            runtime = build_runtime(config)
+            driver = BackendEventJsonlDriver(
+                data_dir / "backend_events.jsonl",
+                runtime.file_index,
+                allowed_input_roots=resolve_allowed_roots(data_dir, config.file_read_roots),
+                allowed_extensions=config.file_allowed_extensions,
+                max_input_bytes=config.file_max_bytes,
+                attachment_parser=BackendAttachmentParser(),
+                file_workspace=runtime.file_workspace,
+                session_store=runtime.session_store,
+            )
+            runtime.active_driver = driver
+            note = data_dir / "inbox" / "note.txt"
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text("attachment body", encoding="utf-8")
+            append_backend_event(
+                data_dir / "backend_events.jsonl",
+                chat_title="First Title",
+                sender_name="First Title",
+                sender_wechat_id="wxid_first_title",
+                text="please read",
+                attachments=["note.txt"],
+            )
+            raw = driver.read_new_messages()[0]
+
+            result = MessageProcessor(runtime).process(raw)
+
+            self.assertIsNotNone(result)
+            conversation_id = result["message"]["conversation_id"]
+            session_id = result["message"]["metadata"]["session_id"]
+            segment = conversation_segment(conversation_id, "First Title")
+            self.assertTrue((data_dir / "conversation_channels" / segment / "channel.json").exists())
+            self.assertTrue((data_dir / "conversation_sessions" / segment / "state.json").exists())
+            self.assertTrue((data_dir / "conversation_ledgers" / segment / "messages.jsonl").exists())
+            self.assertTrue((data_dir / "file_workspace" / segment / session_id).exists())
+            attachment = result["message"]["metadata"]["attachments"][0]
+            self.assertIn(segment, attachment["workspace"]["workspace_dir"])
 
 
 class _FakeLinkAnnotations:

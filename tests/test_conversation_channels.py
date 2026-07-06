@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
+from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
 from app.personal_wechat_bot.config.schema import ProviderConfig
 from app.personal_wechat_bot.domain.models import NormalizedMessage
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
@@ -38,8 +40,10 @@ class ConversationChannelStoreTest(unittest.TestCase):
             self.assertTrue(first.trusted_channel_source)
             self.assertIsNotNone(second)
             self.assertEqual(second.api_key_refs, first.api_key_refs)
-            self.assertIn("private-1", first.context_dir)
-            self.assertIn("private-1", first.file_workspace_dir)
+            # After the human-readable naming change, context_dir/file_workspace_dir
+            # contain chat_title + hash prefix, not raw conversation_id.
+            self.assertIn("Alice", first.context_dir)
+            self.assertIn("Alice", first.file_workspace_dir)
 
     def test_group_channel_gets_two_key_slots_when_pool_allows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,7 +62,65 @@ class ConversationChannelStoreTest(unittest.TestCase):
 
             self.assertEqual(channel.key_slots, 2)
             self.assertEqual(len(channel.api_key_refs), 2)
-            self.assertTrue((root / "conversation_channels" / "group-1" / "channel.json").exists())
+            # Human-readable naming: directory name is now chat_title_hashPrefix.
+            self.assertTrue((root / "conversation_channels" / "Study Group_group-1" / "channel.json").exists())
+
+    def test_segment_resolution_scans_channel_json_when_index_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation_id = "private-readable"
+            segment = conversation_segment(conversation_id, "Alice")
+            channel_path = root / "conversation_channels" / segment / "channel.json"
+            channel_path.parent.mkdir(parents=True, exist_ok=True)
+            channel_path.write_text(
+                """
+{
+  "conversation_id": "private-readable",
+  "conversation_type": "private",
+  "chat_title": "Alice"
+}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(resolve_segment(root, conversation_id), segment)
+
+    def test_chat_title_change_preserves_existing_channel_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A", "KEY_B"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            conversation_id = "private-title-change"
+            old_segment = conversation_segment(conversation_id, "Alice")
+            new_segment = conversation_segment(conversation_id, "Alice Renamed")
+
+            first = store.ensure_channel(
+                _message(conversation_id=conversation_id, conversation_type="private", chat_title="Alice")
+            )
+            second = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            ).ensure_channel(
+                _message(conversation_id=conversation_id, conversation_type="private", chat_title="Alice Renamed")
+            )
+            index = json.loads((root / "conversation_channels" / "index.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(first.segment, old_segment)
+            self.assertEqual(second.segment, old_segment)
+            self.assertEqual(second.chat_title, "Alice Renamed")
+            self.assertEqual(resolve_segment(root, conversation_id), old_segment)
+            self.assertTrue((root / "conversation_channels" / old_segment / "channel.json").exists())
+            self.assertFalse((root / "conversation_channels" / new_segment / "channel.json").exists())
+            self.assertEqual(len(list((root / "conversation_channels").glob("*/channel.json"))), 1)
+            self.assertEqual(index["channels"][0]["segment"], old_segment)
+            self.assertEqual(index["channels"][0]["chat_title"], "Alice Renamed")
 
     def test_channel_key_selection_rotates_across_assigned_available_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,10 +217,12 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 context_root=root / "conversation_ledgers",
             )
             conversation_id = "legacy-noise"
-            channel_path = root / "conversation_channels" / conversation_id / "channel.json"
-            ledger_file = root / "conversation_ledgers" / conversation_id / "conversation.md"
-            workspace_file = root / "file_workspace" / conversation_id / "session_default" / "file.txt"
-            session_file = root / "conversation_sessions" / conversation_id / "state.json"
+            # After human-readable naming, the actual directory segment is chat_title_hashPrefix.
+            segment = "PTURE_legacy-n"
+            channel_path = root / "conversation_channels" / segment / "channel.json"
+            ledger_file = root / "conversation_ledgers" / segment / "conversation.md"
+            workspace_file = root / "file_workspace" / segment / "session_default" / "file.txt"
+            session_file = root / "conversation_sessions" / segment / "state.json"
             channel_path.parent.mkdir(parents=True, exist_ok=True)
             ledger_file.parent.mkdir(parents=True, exist_ok=True)
             workspace_file.parent.mkdir(parents=True, exist_ok=True)
@@ -191,7 +255,7 @@ class ConversationChannelStoreTest(unittest.TestCase):
             self.assertEqual(cleanup["cleanup_policy"], "non_wechat_purge")
             self.assertFalse(channel_path.parent.exists())
             self.assertFalse(ledger_file.parent.exists())
-            self.assertFalse((root / "file_workspace" / conversation_id).exists())
+            self.assertFalse((root / "file_workspace" / segment).exists())
             self.assertFalse(session_file.parent.exists())
 
 

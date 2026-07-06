@@ -129,9 +129,9 @@ def build_preflight_report(
             "group_key_slots": 2,
             "storage": str(Path(config.data_dir).resolve() / "conversation_channels"),
             "isolation": {
-                "context": "conversation_ledgers/conversation_id plus conversation_sessions/current_session_id",
-                "files": "file_workspace/conversation_id/session_id",
-                "backend": "conversation_channels/conversation_id/backend",
+                "context": "conversation_ledgers/<stable_segment> plus conversation_sessions/<stable_segment>/current_session_id",
+                "files": "file_workspace/<stable_segment>/session_id",
+                "backend": "conversation_channels/<stable_segment>/backend",
             },
         },
         "files": {

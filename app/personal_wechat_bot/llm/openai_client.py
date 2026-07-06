@@ -173,6 +173,8 @@ class RelayOpenAIClient:
         # first key — those are not a key-selection problem.
         candidates = self._candidate_refs(conversation_id)
         if not candidates:
+            if self.key_pool.available_refs():
+                raise RuntimeError("all candidate API keys are cooling down")
             raise RuntimeError(f"missing API key env: {self.config.api_key_env}")
         last_auth_error: Exception | None = None
         for ref in candidates:
@@ -208,8 +210,8 @@ class RelayOpenAIClient:
 
         Starts with the conversation's sticky/rotated pick (when a channel store
         is present), then appends every other currently-available ref as
-        failover, skipping refs on cooldown. Cooldowned refs are appended last as
-        a last resort so a request can still go out if every key is cooling down.
+        failover. Refs on cooldown are excluded until their cooldown elapses; a
+        cooling key must not be retried immediately after an auth/rate failure.
         """
         ordered: list[str] = []
         seen: set[str] = set()
@@ -224,9 +226,7 @@ class RelayOpenAIClient:
         for ref in self.key_pool.available_refs():
             _add(ref)
 
-        fresh = [ref for ref in ordered if not self._is_on_cooldown(ref)]
-        cooling = [ref for ref in ordered if self._is_on_cooldown(ref)]
-        return fresh + cooling
+        return [ref for ref in ordered if not self._is_on_cooldown(ref)]
 
     def _is_on_cooldown(self, ref: str) -> bool:
         until = self._bad_keys.get(ref)

@@ -19,10 +19,11 @@ from app.personal_wechat_bot.control.send_commands import (
     reject_confirm_item,
     send_approved_confirm_item,
     set_send_controls,
+    sync_bridge_ack_to_send_state,
 )
 from app.personal_wechat_bot.domain.models import ReplyCandidate, SendResult
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
-from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_state
+from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, bridge_state
 
 
 ROOT = Path(__file__).resolve().parent
@@ -229,6 +230,109 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(queue.get(queue_id)["status"], "queued_to_bridge")
             self.assertEqual(bridge["pending_count"], 1)
             self.assertEqual(bridge["items"][0]["text"], "hello bridge")
+
+    def test_nonterminal_bridge_ack_does_not_mark_queue_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            bridge_id = "bridge:private-1:test"
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
+            queue.approve(queue_id, reviewer="tester")
+            queue.mark_send_result(queue_id, "queued_to_bridge", f"queued_to_non_foreground_bridge:{bridge_id}")
+
+            result = sync_bridge_ack_to_send_state(
+                data_dir,
+                bridge_id,
+                status=BridgeAckStatus.RETRY,
+                reason="wcf_unavailable",
+            )
+
+            self.assertEqual(result["status"], "skipped")
+            self.assertEqual(result["reason"], "bridge_ack_not_terminal")
+            self.assertEqual(queue.get(queue_id)["status"], "queued_to_bridge")
+
+    def test_sent_bridge_ack_repairs_failed_queue_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            bridge_id = "bridge:private-1:test"
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
+            queue.approve(queue_id, reviewer="tester")
+            queue.mark_send_result(queue_id, "queued_to_bridge", f"queued_to_non_foreground_bridge:{bridge_id}")
+            queue.mark_send_result(queue_id, "failed", f"old_failure:{bridge_id}")
+
+            result = sync_bridge_ack_to_send_state(
+                data_dir,
+                bridge_id,
+                status=BridgeAckStatus.SENT,
+                reason="wcf_sent",
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["queue_sync_status"], "updated")
+            self.assertEqual(queue.get(queue_id)["status"], "sent")
+
+    def test_failed_bridge_ack_does_not_downgrade_sent_queue_or_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            bridge_id = "bridge:private-1:test"
+            reply = _reply("message-1", "hello bridge")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_reply(reply)
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(reply)
+            queue.approve(queue_id, reviewer="tester")
+            queue.mark_send_result(queue_id, "queued_to_bridge", f"queued_to_non_foreground_bridge:{bridge_id}")
+            queue.mark_send_result(queue_id, "sent", f"wcf_sent:{bridge_id}")
+
+            result = sync_bridge_ack_to_send_state(
+                data_dir,
+                bridge_id,
+                status=BridgeAckStatus.FAILED,
+                reason="stale_failed",
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["queue_sync_status"], "preserved_sent")
+            self.assertEqual(queue.get(queue_id)["status"], "sent")
+            entry = ledger.read_entries("private-1")[0]
+            self.assertEqual(entry.send["status"], "sent")
+            self.assertEqual(entry.send["reason"], f"wcf_sent:{bridge_id}")
+
+    def test_bridge_ack_fanout_updates_ledger_under_readable_segment_without_queue_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            bridge_id = "bridge:private-1:test"
+            reply = _reply("message-1", "hello bridge")
+            ledger = ConversationLedgerStore(data_dir)
+            entry = ledger.append_reply(reply, chat_title="Alice")
+            ledger.update_reply_send_result(
+                "private-1",
+                entry.entry_id,
+                {
+                    "message_id": bridge_id,
+                    "status": "queued_to_bridge",
+                    "reason": f"queued_to_non_foreground_bridge:{bridge_id}",
+                },
+            )
+
+            result = sync_bridge_ack_to_send_state(
+                data_dir,
+                bridge_id,
+                status=BridgeAckStatus.SENT,
+                reason="wcf_sent",
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse(result["queue_item_found"])
+            self.assertEqual(result["ledger_updates"], ["private-1"])
+            updated = ledger.read_entries("private-1")[0]
+            self.assertEqual(updated.send["status"], "sent")
+            self.assertEqual(updated.send["reason"], "wcf_sent")
 
     def test_probe_send_controls_reports_configured_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

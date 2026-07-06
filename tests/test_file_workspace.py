@@ -6,6 +6,7 @@ import json
 import zipfile
 from pathlib import Path
 
+from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -33,11 +34,59 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertTrue(staged_path.exists())
             self.assertEqual(staged_path.read_text(encoding="utf-8"), "hello from wechat cache")
             self.assertEqual(manifest["original_path"], str(source.resolve()))
-            self.assertIn("conversation-a", staged.workspace_dir)
+            # With human-readable naming and no chat_title, segment = hashPrefix only.
+            # session_id segment is unchanged.
             self.assertIn("session-one", staged.workspace_dir)
+            # conversation_id without chat_title → first 8 chars of sha256(conversation-a)
+            self.assertIn("conversa", staged.workspace_dir)
 
             source.write_text("changed outside", encoding="utf-8")
             self.assertEqual(staged_path.read_text(encoding="utf-8"), "hello from wechat cache")
+
+    def test_stage_file_uses_stable_channel_segment_when_chat_title_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            conversation_id = "conversation-title-change"
+            old_segment = conversation_segment(conversation_id, "Alice")
+            new_segment = conversation_segment(conversation_id, "Alice Renamed")
+            channel_path = data_dir / "conversation_channels" / old_segment / "channel.json"
+            channel_path.parent.mkdir(parents=True, exist_ok=True)
+            channel_path.write_text(
+                json.dumps({"conversation_id": conversation_id, "chat_title": "Alice Renamed", "segment": old_segment}),
+                encoding="utf-8",
+            )
+            (data_dir / "conversation_channels" / "index.json").write_text(
+                json.dumps(
+                    {
+                        "channels": [
+                            {
+                                "conversation_id": conversation_id,
+                                "chat_title": "Alice Renamed",
+                                "segment": old_segment,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = root / "wechat" / "note.txt"
+            source.parent.mkdir()
+            source.write_text("hello", encoding="utf-8")
+            workspace = FileWorkspace(data_dir / "file_workspace")
+
+            staged = workspace.stage_file(
+                source,
+                conversation_id=conversation_id,
+                session_id="session_default",
+                original_name="note.txt",
+                chat_title="Alice Renamed",
+            )
+
+            self.assertIn(old_segment, staged.workspace_dir)
+            self.assertNotIn(new_segment, staged.workspace_dir)
+            self.assertTrue((data_dir / "file_workspace" / old_segment / "session_default").exists())
+            self.assertFalse((data_dir / "file_workspace" / new_segment).exists())
 
     def test_parse_result_is_cached_per_staged_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

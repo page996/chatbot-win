@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
+from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.config.loader import load_config, migrate_file_allowed_extensions, set_model_provider
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
@@ -47,7 +48,7 @@ from app.personal_wechat_bot.wechat_driver.window_introspection import build_wec
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
-from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state
+from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state, is_terminal_bridge_ack_status
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
 from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
@@ -62,7 +63,7 @@ QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent",
 logger = logging.getLogger(__name__)
 _WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
 _WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
-_WEFLOW_LOCK = threading.Lock()
+_WEFLOW_LOCK = threading.RLock()
 _WEFLOW_STATE_FILE_LOCK = threading.RLock()
 # Max times the supervisor auto-restarts a died worker loop before giving up.
 _WEFLOW_MAX_RESTARTS = 10
@@ -540,6 +541,7 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
     with _WEFLOW_LOCK:
         existing = _WEFLOW_WORKERS.get(key)
         if existing and existing.get("thread") and existing["thread"].is_alive():
+            _start_bridge_worker(root, dict(payload))
             result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已经在运行"}
             _append_weflow_operation_history(data_dir, "start", result)
             return result
@@ -684,6 +686,8 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
     if not bridge_id:
         raise ValueError("bridge_id is required")
     status = str(payload.get("status", "")).strip()
+    if not is_terminal_bridge_ack_status(status):
+        raise ValueError("status must be sent, failed, or blocked")
     reason = str(payload.get("reason", "")).strip()
     external_message_id = str(payload.get("external_message_id") or payload.get("externalMessageId") or "").strip()
     extra = payload.get("payload")
@@ -695,12 +699,13 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
         external_message_id=external_message_id,
         payload=extra if isinstance(extra, dict) else {},
     )
+    effective_ack = result.get("effective_ack") if isinstance(result.get("effective_ack"), dict) else {}
     result["send_sync"] = sync_bridge_ack_to_send_state(
         data_dir,
         bridge_id,
-        status=status,
-        reason=reason,
-        external_message_id=external_message_id,
+        status=str(result.get("effective_status") or status),
+        reason=str(effective_ack.get("reason", reason)),
+        external_message_id=str(effective_ack.get("external_message_id", external_message_id)),
     )
     return result
 
@@ -859,21 +864,139 @@ def _run_weflow_pull_tick(
             # / pull-once never race the shared hook offset and message deduper.
             with _WEFLOW_CONSUMER_LOCK:
                 pull = runner.run_once()
-    status = "ok" if source.status == "ok" and pull.get("status") == "ok" else "partial_error"
-    if source.status == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
-        status = "cancelled"
+        status = "ok" if source.status == "ok" and pull.get("status") == "ok" else "partial_error"
+        if source.status == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+            status = "cancelled"
+        result = {
+            "status": status,
+            "base_url": bridge.base_url,
+            "workers": params["workers"],
+            "hook_event_file": str(params["hook_event_file"]),
+            "backend_event_file": str(params["backend_event_file"]),
+            "weflow_ready": context["weflow_ready"],
+            "source": _jsonable(source),
+            "pull": pull,
+            "media_roots": context["media_roots"],
+            "send_enabled": False,
+        }
+        recovery = _maybe_recover_empty_weflow_pull(
+            context,
+            result,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
+        return recovery if recovery is not None else result
+
+
+def _maybe_recover_empty_weflow_pull(
+    context: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Any = None,
+) -> dict[str, Any] | None:
+    """Bootstrap channels whose local derived state was cleared but source cursor remains advanced."""
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    params = context["params"]
+    if params.get("since") is not None or params.get("context_only"):
+        return None
+    source = result.get("source") if isinstance(result.get("source"), dict) else {}
+    pull = result.get("pull") if isinstance(result.get("pull"), dict) else {}
+    if (
+        int(source.get("scanned_count", 0) or 0) > 0
+        or int(source.get("appended_count", 0) or 0) > 0
+        or int(pull.get("processed_count", 0) or 0) > 0
+    ):
+        return None
+    if str(source.get("status") or "") != "ok" or str(pull.get("status") or "") != "ok":
+        return None
+    root = Path(params.get("hook_event_file") or params.get("backend_event_file") or "data").parent
+    candidates = _weflow_bootstrap_candidates(root, params.get("talkers", []))
+    if not candidates:
+        return None
+
+    bridge: WeFlowHttpBridge = context["bridge"]
+    runner: HookMessagePullRunner = context["runner"]
+    talkers = [item["talker"] for item in candidates]
+    bootstrap_source = bridge.pull_once(
+        talkers=talkers,
+        session_limit=len(talkers),
+        message_limit=params["message_limit"],
+        max_pages=max(1, int(params.get("max_pages", 1) or 1)),
+        max_messages=params["max_messages"],
+        since=0,
+        lookback_seconds=params["lookback_seconds"],
+        workers=params["workers"],
+        media=params["media"],
+        context_only=True,
+        ignore_seen=True,
+        cancel_event=cancel_event,
+        progress_callback=progress_callback,
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        bootstrap_pull = {
+            "status": "cancelled",
+            "hook_event_file": str(params["hook_event_file"]),
+            "backend_event_file": str(params["backend_event_file"]),
+            "processed_count": 0,
+            "processed": [],
+            "send_enabled": False,
+        }
+    else:
+        with _WEFLOW_CONSUMER_LOCK:
+            bootstrap_pull = runner.run_once()
+    recovered = int(bootstrap_source.appended_count or 0) > 0 or int(bootstrap_pull.get("processed_count", 0) or 0) > 0
+    status = "ok" if bootstrap_source.status == "ok" and bootstrap_pull.get("status") == "ok" else "partial_error"
     return {
-        "status": status,
-        "base_url": bridge.base_url,
-        "workers": params["workers"],
-        "hook_event_file": str(params["hook_event_file"]),
-        "backend_event_file": str(params["backend_event_file"]),
-        "weflow_ready": context["weflow_ready"],
-        "source": _jsonable(source),
-        "pull": pull,
-        "media_roots": context["media_roots"],
-        "send_enabled": False,
+        **result,
+        "status": "cancelled" if cancel_event is not None and cancel_event.is_set() else status,
+        "source": _jsonable(bootstrap_source),
+        "pull": bootstrap_pull,
+        "recovery": {
+            "status": "recovered" if recovered else "attempted_empty",
+            "reason": "empty_local_conversation_state",
+            "context_only": True,
+            "ignore_seen": True,
+            "candidates": candidates,
+            "original_source": source,
+            "original_pull": pull,
+        },
     }
+
+
+def _weflow_bootstrap_candidates(data_dir: str | Path, talkers: Any) -> list[dict[str, Any]]:
+    requested = {str(item).strip() for item in _string_list(talkers) if str(item).strip()}
+    try:
+        channels = _channel_store(data_dir).list_channels()
+    except Exception:
+        return []
+    ledger = ConversationLedgerStore(data_dir)
+    candidates: list[dict[str, Any]] = []
+    for channel in channels:
+        source_names = {str(item).strip() for item in channel.source_names if str(item).strip()}
+        if "weflow_discovery" not in source_names:
+            continue
+        talker = channel.conversation_key or next((str(item).strip() for item in channel.sender_wechat_ids if str(item).strip()), "")
+        if not talker or is_system_account(talker):
+            continue
+        if requested and talker not in requested:
+            continue
+        try:
+            has_ledger = bool(ledger.read_entries(channel.conversation_id, include_removed=True))
+        except Exception:
+            has_ledger = False
+        if has_ledger:
+            continue
+        candidates.append(
+            {
+                "talker": talker,
+                "conversation_id": channel.conversation_id,
+                "chat_title": channel.chat_title,
+                "missing": ["conversation_ledger"],
+            }
+        )
+    return candidates
 
 
 def _run_sidebar_weflow_once(
@@ -922,6 +1045,7 @@ def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: t
     interval = max(0.5, float(payload.get("bridge_interval_seconds") or 2.0))
     max_restarts = int(payload.get("bridge_max_restarts", _BRIDGE_MAX_RESTARTS) or _BRIDGE_MAX_RESTARTS)
     restart_count = 0
+    final_status = ""
 
     def _mark(status: str, error: str = "") -> None:
         with _BRIDGE_LOCK:
@@ -948,16 +1072,19 @@ def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: t
             # Another bridge worker (CLI or a second sidebar) holds the lock:
             # a legitimate single-instance refusal, not a crash. Do not restart.
             _mark("lock_held", f"{type(exc).__name__}: {exc}")
+            final_status = "lock_held"
             stop_event.set()
             break
         except Exception as exc:  # the loop should not raise, but be safe
             logger.exception("send bridge worker loop crashed")
             _mark("crashed", f"loop_crashed:{type(exc).__name__}: {exc}")
         if stop_event.is_set():
+            final_status = "stopped"
             break
         restart_count += 1
         if restart_count > max_restarts:
             _mark("crashed", f"max_restarts_exceeded:{max_restarts}")
+            final_status = "crashed"
             logger.error("send bridge worker exceeded %d restarts; giving up", max_restarts)
             break
         backoff = min(60.0, interval * (2 ** min(restart_count - 1, 5)))
@@ -966,8 +1093,12 @@ def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: t
             "send bridge worker died; restart %d/%d after %.1fs backoff", restart_count, max_restarts, backoff
         )
         if stop_event.wait(backoff):
+            final_status = "stopped"
             break
-    _mark("stopped")
+    if stop_event.is_set() and not final_status:
+        final_status = "stopped"
+    if final_status == "stopped":
+        _mark("stopped")
 
 
 def _start_bridge_worker(root: Path, payload: dict[str, Any]) -> None:
@@ -2019,6 +2150,7 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
             "sender_names": channel.sender_names,
             "sender_wechat_ids": channel.sender_wechat_ids,
             "conversation_key": channel.conversation_key,
+            "segment": channel.segment,
             "source_names": channel.source_names,
             "trusted_channel_source": channel.trusted_channel_source,
             "updated_at": channel.updated_at,
