@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -76,6 +77,7 @@ class RelayOpenAIClient:
         # ref -> monotonic timestamp until which the key is retired after an
         # auth/rate failure. Kept in-memory (per client); a restart clears it.
         self._bad_keys: dict[str, float] = {}
+        self._bad_key_lock = threading.Lock()
 
     def generate_reply(self, prompt: str) -> str:
         data = self._chat_completion(
@@ -154,18 +156,16 @@ class RelayOpenAIClient:
         temperature: float | None = None,
         conversation_id: str = "",
     ) -> dict[str, object]:
-        if not self.config.base_url:
+        if not self.config.base_url and not any(
+            bool(getattr(self.key_pool.config_for_ref(ref), "base_url", ""))
+            for ref in _pool_available_refs(self.key_pool)
+        ):
             raise RuntimeError("missing relay base_url")
-        endpoint = normalize_openai_base_url(self.config.base_url, self.config.provider) + "/chat/completions"
-        # Validate the endpoint BEFORE attaching the API key so a malformed or
-        # non-http(s) base_url can never egress the key to an unexpected target.
-        url_error = validate_endpoint_url(endpoint)
-        if url_error:
-            raise RuntimeError(f"invalid base_url: {url_error}")
-        payload: dict[str, object] = {"model": self.model, "messages": messages}
-        if temperature is not None:
-            payload["temperature"] = temperature
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if self.config.base_url:
+            default_endpoint = normalize_openai_base_url(self.config.base_url, self.config.provider) + "/chat/completions"
+            url_error = validate_endpoint_url(default_endpoint)
+            if url_error:
+                raise RuntimeError(f"invalid base_url: {url_error}")
 
         # Try each candidate key in turn. On a 401/403/429 the key is retired
         # (cooldown) and we fail over to the next; a bounded candidate list means
@@ -173,11 +173,22 @@ class RelayOpenAIClient:
         # first key — those are not a key-selection problem.
         candidates = self._candidate_refs(conversation_id)
         if not candidates:
-            if self.key_pool.available_refs():
+            if _pool_available_refs(self.key_pool):
                 raise RuntimeError("all candidate API keys are cooling down")
             raise RuntimeError(f"missing API key env: {self.config.api_key_env}")
         last_auth_error: Exception | None = None
         for ref in candidates:
+            provider_config = _provider_for_ref(self.key_pool, ref, self.config)
+            endpoint = normalize_openai_base_url(provider_config.base_url, provider_config.provider) + "/chat/completions"
+            # Validate the endpoint BEFORE attaching the API key so a malformed or
+            # non-http(s) base_url can never egress the key to an unexpected target.
+            url_error = validate_endpoint_url(endpoint)
+            if url_error:
+                raise RuntimeError(f"invalid base_url for key {ref}: {url_error}")
+            payload: dict[str, object] = {"model": provider_config.model, "messages": messages}
+            if temperature is not None:
+                payload["temperature"] = temperature
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             api_key = self.key_pool.key_for_ref(ref)
             if not api_key:
                 continue
@@ -193,7 +204,7 @@ class RelayOpenAIClient:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=self.config.max_wait_seconds) as resp:
+                with urllib.request.urlopen(req, timeout=provider_config.max_wait_seconds) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 if exc.code in _KEY_FAILOVER_STATUSES:
@@ -223,23 +234,26 @@ class RelayOpenAIClient:
 
         if conversation_id and self.channel_store is not None:
             _add(self.channel_store.ref_for_request(conversation_id))
-        for ref in self.key_pool.available_refs():
+        for ref in _pool_available_refs(self.key_pool):
             _add(ref)
 
         return [ref for ref in ordered if not self._is_on_cooldown(ref)]
 
     def _is_on_cooldown(self, ref: str) -> bool:
-        until = self._bad_keys.get(ref)
+        with self._bad_key_lock:
+            until = self._bad_keys.get(ref)
         if until is None:
             return False
         if time.monotonic() >= until:
             # Cooldown elapsed: give the key another chance.
-            self._bad_keys.pop(ref, None)
+            with self._bad_key_lock:
+                self._bad_keys.pop(ref, None)
             return False
         return True
 
     def _retire_key(self, ref: str) -> None:
-        self._bad_keys[ref] = time.monotonic() + _BAD_KEY_COOLDOWN_SECONDS
+        with self._bad_key_lock:
+            self._bad_keys[ref] = time.monotonic() + _BAD_KEY_COOLDOWN_SECONDS
 
     def _api_key_for_conversation(self, conversation_id: str) -> str | None:
         if conversation_id and self.channel_store is not None:
@@ -293,3 +307,14 @@ class RelayOpenAIClient:
 def _conversation_id_from_prompt(prompt: str) -> str:
     match = re.search(r"conversation_id=([A-Za-z0-9_.-]+)", prompt)
     return match.group(1) if match else ""
+
+
+def _pool_available_refs(pool: ApiKeyPool) -> list[str]:
+    return pool.available_refs() if hasattr(pool, "available_refs") else []
+
+
+def _provider_for_ref(pool: ApiKeyPool, ref: str, fallback: ProviderConfig) -> ProviderConfig:
+    provider_for_ref = getattr(pool, "provider_for_ref", None)
+    if callable(provider_for_ref):
+        return provider_for_ref(ref)
+    return fallback

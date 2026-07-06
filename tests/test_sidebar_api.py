@@ -18,6 +18,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     build_sidebar_bridge_state,
     build_sidebar_runtime_cards,
     build_sidebar_state,
+    clear_sidebar_history_data,
     cleanup_file_workspace,
     cleanup_sidebar_channels,
     delete_sidebar_channel,
@@ -30,6 +31,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     sidebar_weflow_cancel_backfill,
     sidebar_queue_action,
     sidebar_runtime_card_action,
+    sidebar_weflow_dependency_status,
     update_sidebar_controls,
 )
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
@@ -62,6 +64,38 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("queued_to_bridge", state["queues"])
             self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_available")
             self.assertIn("skill.file_workspace_agent", [item["card_id"] for item in state["runtime_cards"]["active"]["skills"]])
+
+    def test_sidebar_state_restores_config_from_persistent_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            (data_dir / "config.json").unlink()
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(state["status"], "ok")
+            self.assertEqual(state["config"]["mode"], "confirm")
+            self.assertEqual(state["config"]["send_driver"], "bridge_outbox")
+            self.assertTrue((data_dir / "config.json").exists())
+
+    def test_history_clear_preserves_sidebar_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            (data_dir / "conversation_ledgers").mkdir()
+            (data_dir / "conversation_ledgers" / "old.md").write_text("history", encoding="utf-8")
+            (data_dir / "backend_events.jsonl").write_text("{}\n", encoding="utf-8")
+
+            result = clear_sidebar_history_data(data_dir)
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse((data_dir / "conversation_ledgers").exists())
+            self.assertFalse((data_dir / "backend_events.jsonl").exists())
+            self.assertTrue((data_dir / "config.json").exists())
+            self.assertEqual(state["config"]["mode"], "confirm")
 
     def test_sidebar_channel_state_hides_probe_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -428,6 +462,27 @@ class SidebarApiTest(unittest.TestCase):
             thread.join()
         self.assertEqual(overlap["max"], 1)
 
+    def test_weflow_pull_once_registers_requested_talker_in_local_library(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            fake_result = {
+                "status": "ok",
+                "source": {"status": "ok", "scanned_count": 1, "appended_count": 1},
+                "pull": {"status": "ok", "processed_count": 1, "processed": []},
+            }
+
+            with mock.patch.object(sidebar_api, "_run_sidebar_weflow_once", return_value=fake_result):
+                result = sidebar_api.sidebar_weflow_pull_once(data_dir, {"talkers": ["wxid_user"]})
+
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+            sessions = state["discovered_sessions"]["sessions"]
+            channels = build_sidebar_state(data_dir)["channels"]["items"]
+
+            self.assertEqual(result["session_store"]["status"], "ok")
+            self.assertIn("wxid_user", {item["id"] for item in sessions})
+            self.assertTrue(any(item["conversation_key"] == "wxid_user" for item in channels))
+
     def test_backend_event_ingest_rejects_event_file_outside_data_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -765,6 +820,31 @@ class SidebarKeyPoolApiTest(unittest.TestCase):
             self.assertEqual(removed["status"], "ok")
             self.assertEqual(removed["available_count"], 0)
 
+    def test_key_pool_entries_carry_independent_model_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            added = add_api_key(data_dir, {"value": "sk-relay-secret-1234"})
+            ref = added["ref"]
+            result = set_model_config(
+                data_dir,
+                {
+                    "ref": ref,
+                    "provider": "relay",
+                    "model": "gpt-5.5",
+                    "base_url": "https://relay.example/v1",
+                    "max_wait_seconds": 45,
+                },
+            )
+            listed = list_api_keys(data_dir)
+
+            self.assertEqual(result["status"], "ok")
+            item = next(item for item in listed["keys"] if item["ref"] == ref)
+            self.assertEqual(item["model_config"]["provider"], "relay")
+            self.assertEqual(item["model_config"]["model"], "gpt-5.5")
+            self.assertEqual(item["model_config"]["base_url"], "https://relay.example/v1")
+
 
 class SidebarModelConfigApiTest(unittest.TestCase):
     def test_get_and_set_model_config_roundtrip(self) -> None:
@@ -850,6 +930,20 @@ class SidebarModelConfigApiTest(unittest.TestCase):
             self.assertEqual(result["status"], "error")
             self.assertFalse(result["reachable"])
             self.assertTrue(result["error"].startswith("unsupported_url_scheme"))
+
+
+class SidebarDependencyStatusTest(unittest.TestCase):
+    def test_dependency_status_reports_deduplicated_runtime_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            result = sidebar_weflow_dependency_status(data_dir, record_history=False)
+
+            self.assertIn("document_runtime", {item["group"] for item in result["groups"]})
+            self.assertIn("ocr_runtime", {item["group"] for item in result["groups"]})
+            self.assertIn("asr_runtime", {item["group"] for item in result["groups"]})
+            self.assertEqual(result["duplicate_requirements"], {})
 
 
 class SidebarWorkspaceCleanupApiTest(unittest.TestCase):

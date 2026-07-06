@@ -145,7 +145,7 @@ class WeflowBackfillTest(unittest.TestCase):
         self.assertTrue(private_channel["trusted_channel_source"])
 
         cached = build_sidebar_weflow_state(self.data_dir)["discovered_sessions"]
-        self.assertEqual(cached["source"], "channel_store")
+        self.assertEqual(cached["source"], "weflow_session_store")
         self.assertEqual({item["id"] for item in cached["sessions"]}, {"wxid_history", "room@chatroom"})
 
         fallback = sidebar_weflow_discover_sessions(
@@ -153,7 +153,7 @@ class WeflowBackfillTest(unittest.TestCase):
             {"base_url": "http://127.0.0.1:1", "token": "test-token", "limit": 20},
         )
         self.assertEqual(fallback["status"], "ok", fallback)
-        self.assertEqual(fallback["source"], "channel_store_cache")
+        self.assertEqual(fallback["source"], "weflow_session_store_cache")
         self.assertEqual({item["id"] for item in fallback["sessions"]}, {"wxid_history", "room@chatroom"})
 
     def test_discover_sessions_survives_sidebar_state_write_failure(self) -> None:

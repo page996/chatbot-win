@@ -17,6 +17,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     build_sidebar_wechat_probe,
     build_sidebar_state,
     clear_sidebar_send_audit,
+    clear_sidebar_history_data,
     cleanup_sidebar_channels,
     cleanup_file_workspace,
     delete_sidebar_channel,
@@ -111,6 +112,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/audit/clear":
                     self._json(clear_sidebar_send_audit(data_dir))
+                    return
+                if parsed.path == "/api/history/clear":
+                    self._json(clear_sidebar_history_data(data_dir, payload))
                     return
                 if parsed.path == "/api/weflow/health":
                     self._json(sidebar_weflow_health(data_dir, payload))

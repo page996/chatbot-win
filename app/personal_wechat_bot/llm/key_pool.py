@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 import re
 import hashlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
+from typing import Any
 
+from app.personal_wechat_bot.config.loader import persistent_config_dir
 from app.personal_wechat_bot.config.schema import ProviderConfig
 
 
@@ -19,6 +22,17 @@ class ApiKeyRef:
     ref: str
     source: str
     available: bool
+
+
+@dataclass(frozen=True)
+class ApiKeyModelConfig:
+    provider: str = "deepseek"
+    model: str = "deepseek-v4-flash"
+    base_url: str = ""
+    api_key_env: str = ""
+    max_wait_seconds: int | None = None
+    capabilities: tuple[str, ...] = ("chat", "planning", "summarization", "relevance_filter")
+    enabled: bool = True
 
 
 def _mask_secret(value: str) -> str:
@@ -37,6 +51,7 @@ class ApiKeyPool:
     def __init__(self, provider: ProviderConfig, data_dir: str | Path = "data"):
         self.provider = provider
         self.data_dir = Path(data_dir)
+        self.config_dir = persistent_config_dir(self.data_dir)
 
     def refs(self) -> list[ApiKeyRef]:
         refs: list[ApiKeyRef] = []
@@ -57,7 +72,7 @@ class ApiKeyPool:
         Used by the client's per-request failover to enumerate keys it may try
         when the primary pick returns an auth/rate error.
         """
-        return [item.ref for item in self.refs() if self.key_for_ref(item.ref)]
+        return [item.ref for item in self.refs() if self.key_for_ref(item.ref) and self.config_for_ref(item.ref).enabled]
 
     def key_for_ref(self, ref: str) -> str | None:
         env_value = os.environ.get(ref)
@@ -70,10 +85,64 @@ class ApiKeyPool:
 
     def default_key(self) -> str | None:
         for item in self.refs():
+            if not self.config_for_ref(item.ref).enabled:
+                continue
             value = self.key_for_ref(item.ref)
             if value:
                 return value
         return None
+
+    def config_for_ref(self, ref: str) -> ApiKeyModelConfig:
+        meta = self._metadata().get(ref)
+        if isinstance(meta, dict):
+            return _model_config_from_payload(meta, self.provider)
+        return _model_config_from_provider(self.provider)
+
+    def provider_for_ref(self, ref: str) -> ProviderConfig:
+        key_config = self.config_for_ref(ref)
+        return ProviderConfig(
+            provider_id=self.provider.provider_id,
+            provider=key_config.provider,
+            model=key_config.model,
+            base_url=key_config.base_url,
+            api_key_env=key_config.api_key_env or self.provider.api_key_env,
+            api_key_env_pool=list(self.provider.api_key_env_pool),
+            api_key_file=self.provider.api_key_file,
+            stream=self.provider.stream,
+            max_wait_seconds=key_config.max_wait_seconds,
+            capabilities=list(key_config.capabilities),
+            max_concurrency=self.provider.max_concurrency,
+            cooldown_seconds=self.provider.cooldown_seconds,
+        )
+
+    def set_key_model_config(
+        self,
+        ref: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key_env: str | None = None,
+        max_wait_seconds: int | None = None,
+        enabled: bool | None = None,
+        capabilities: list[str] | tuple[str, ...] | None = None,
+    ) -> ApiKeyModelConfig:
+        if ref not in {item.ref for item in self.refs()}:
+            raise ValueError("key not found")
+        current = self.config_for_ref(ref)
+        updated = ApiKeyModelConfig(
+            provider=str(provider).strip().lower() if provider is not None else current.provider,
+            model=str(model).strip() if model is not None else current.model,
+            base_url=str(base_url).strip() if base_url is not None else current.base_url,
+            api_key_env=str(api_key_env).strip() if api_key_env is not None else current.api_key_env,
+            max_wait_seconds=max_wait_seconds if max_wait_seconds is not None else current.max_wait_seconds,
+            enabled=bool(enabled) if enabled is not None else current.enabled,
+            capabilities=tuple(str(item).strip() for item in (capabilities or current.capabilities) if str(item).strip()),
+        )
+        if not updated.model:
+            raise ValueError("model must not be empty")
+        self._write_metadata({**self._metadata(), ref: asdict(updated)})
+        return updated
 
     def _env_names(self) -> list[str]:
         names = list(self.provider.api_key_env_pool)
@@ -106,10 +175,9 @@ class ApiKeyPool:
     def key_file_path(self) -> Path | None:
         if not self.provider.api_key_file:
             # No explicit key file configured: fall back to a default location
-            # under the data dir so the sidebar add-key flow works out of the box
-            # on a fresh install. The file is only created when a key is actually
-            # added; reads tolerate its absence, so this is a no-op until used.
-            return self.data_dir / _DEFAULT_KEY_FILE_NAME
+            # under the persistent config dir so history cleanup can remove the
+            # data tree without losing sidebar credentials.
+            return self.config_dir / _DEFAULT_KEY_FILE_NAME
         path = Path(self.provider.api_key_file)
         if not path.is_absolute():
             path = self.data_dir / path
@@ -146,6 +214,7 @@ class ApiKeyPool:
                     "source": item.source,
                     "available": item.available,
                     "preview": preview,
+                    "model_config": asdict(self.config_for_ref(item.ref)),
                 }
             )
         return described
@@ -178,7 +247,9 @@ class ApiKeyPool:
             prefix = "" if not existing or existing.endswith("\n") else "\n"
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(f"{prefix}{name} = {value}\n")
-            return ApiKeyRef(ref=_secret_ref(name, value), source="file_secret", available=True)
+            ref = ApiKeyRef(ref=_secret_ref(name, value), source="file_secret", available=True)
+            self._write_metadata({**self._metadata(), ref.ref: asdict(_model_config_from_provider(self.provider))})
+            return ref
 
     def remove_key(self, ref: str) -> bool:
         """Remove the key file line whose parsed ref matches ``ref``.
@@ -205,7 +276,14 @@ class ApiKeyPool:
             if not removed:
                 return False
             path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            metadata = self._metadata()
+            if ref in metadata:
+                metadata.pop(ref, None)
+                self._write_metadata(metadata)
             return True
+
+    def metadata_file_path(self) -> Path:
+        return self.config_dir / "api_key_models.local.json"
 
     def _file_lock(self, path: Path):
         """Cross-process lock guarding read-modify-write of the key file."""
@@ -231,6 +309,29 @@ class ApiKeyPool:
                 prefix = match.group(1)
                 max_index = max(max_index, int(match.group(2)))
         return f"{prefix}_{max_index + 1:02d}"
+
+    def _metadata(self) -> dict[str, dict[str, Any]]:
+        path = self.metadata_file_path()
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        items = payload.get("keys") if isinstance(payload, dict) else None
+        if not isinstance(items, dict):
+            return {}
+        return {str(ref): value for ref, value in items.items() if isinstance(value, dict)}
+
+    def _write_metadata(self, items: dict[str, dict[str, Any]]) -> None:
+        path = self.metadata_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"version": 1, "keys": items}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
 
 
 class ConversationKeyAssigner:
@@ -288,3 +389,36 @@ def _stable_index(value: str, modulo: int) -> int:
         return 0
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return int(digest[:8], 16) % modulo
+
+
+def _model_config_from_provider(provider: ProviderConfig) -> ApiKeyModelConfig:
+    return ApiKeyModelConfig(
+        provider=provider.provider,
+        model=provider.model,
+        base_url=provider.base_url,
+        api_key_env=provider.api_key_env,
+        max_wait_seconds=provider.max_wait_seconds,
+        capabilities=tuple(provider.capabilities),
+        enabled=True,
+    )
+
+
+def _model_config_from_payload(payload: dict[str, Any], fallback: ProviderConfig) -> ApiKeyModelConfig:
+    default = _model_config_from_provider(fallback)
+    capabilities = payload.get("capabilities", default.capabilities)
+    if not isinstance(capabilities, (list, tuple)):
+        capabilities = default.capabilities
+    max_wait_raw = payload.get("max_wait_seconds", default.max_wait_seconds)
+    try:
+        max_wait = int(max_wait_raw) if max_wait_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        max_wait = default.max_wait_seconds
+    return ApiKeyModelConfig(
+        provider=str(payload.get("provider") or default.provider).strip().lower(),
+        model=str(payload.get("model") or default.model).strip(),
+        base_url=str(payload.get("base_url") or default.base_url).strip(),
+        api_key_env=str(payload.get("api_key_env") or default.api_key_env).strip(),
+        max_wait_seconds=max_wait,
+        capabilities=tuple(str(item).strip() for item in capabilities if str(item).strip()),
+        enabled=bool(payload.get("enabled", default.enabled)),
+    )

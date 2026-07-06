@@ -186,6 +186,57 @@ class KeyFailoverTest(unittest.TestCase):
             self.assertNotIn(refs[0], candidates)
             self.assertIn(refs[1], candidates)
 
+    def test_each_key_uses_its_own_provider_config(self) -> None:
+        import tempfile
+        import urllib.request
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / "keys.md"
+            key_file.write_text("K1 = key-one\nK2 = key-two\n", encoding="utf-8")
+            provider = ProviderConfig(
+                provider="relay",
+                model="fallback-model",
+                base_url="https://fallback.example/v1",
+                api_key_env="",
+                api_key_file="keys.md",
+            )
+            pool = ApiKeyPool(provider, tmp)
+            refs = pool.available_refs()
+            pool.set_key_model_config(refs[0], provider="relay", model="model-one", base_url="https://one.example/v1")
+            pool.set_key_model_config(refs[1], provider="deepseek", model="model-two", base_url="https://api.deepseek.com")
+            client = RelayOpenAIClient(provider, key_pool=pool)
+            seen: list[tuple[str, str, str]] = []
+
+            class _FakeResp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+            def fake_urlopen(req, timeout=None):
+                body = json.loads(req.data.decode("utf-8"))
+                seen.append((req.full_url, body["model"], req.headers["Authorization"]))
+                return _FakeResp()
+
+            orig = urllib.request.urlopen
+            urllib.request.urlopen = fake_urlopen
+            try:
+                client._chat_completion([{"role": "user", "content": "hi"}], conversation_id="conversation-a")
+                client._retire_key(refs[0])
+                client._chat_completion([{"role": "user", "content": "hi"}], conversation_id="conversation-a")
+            finally:
+                urllib.request.urlopen = orig
+
+            self.assertEqual(seen[0][0], "https://one.example/v1/chat/completions")
+            self.assertEqual(seen[0][1], "model-one")
+            self.assertEqual(seen[1][0], "https://api.deepseek.com/chat/completions")
+            self.assertEqual(seen[1][1], "model-two")
+
     def test_single_cooling_key_fails_without_network_retry(self) -> None:
         import tempfile
         import urllib.request

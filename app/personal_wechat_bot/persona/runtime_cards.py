@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import re
 import hashlib
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from app.personal_wechat_bot.config.loader import persistent_config_dir
 from app.personal_wechat_bot.domain.models import utc_now_iso
 
 
@@ -71,7 +73,9 @@ class RuntimeCardStore:
     """Persistent prompt cards that survive conversation session resets."""
 
     def __init__(self, data_dir: str | Path):
-        self.root = Path(data_dir) / "runtime_cards"
+        self.data_dir = Path(data_dir)
+        self.root = persistent_config_dir(self.data_dir) / "runtime_cards"
+        self._migrate_legacy_root()
         self.cards_dir = self.root / "cards"
         self.state_path = self.root / "state.json"
         self.cards_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +94,15 @@ class RuntimeCardStore:
             },
             "state": self._read_state(),
         }
+
+    def _migrate_legacy_root(self) -> None:
+        legacy = self.data_dir / "runtime_cards"
+        if not legacy.exists() or self.root.exists():
+            return
+        try:
+            shutil.copytree(legacy, self.root)
+        except OSError:
+            return
 
     def catalog(self) -> list[RuntimeCard]:
         cards = dict(BUILTIN_CARDS)

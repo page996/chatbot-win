@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -18,7 +19,7 @@ from uuid import uuid4
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
-from app.personal_wechat_bot.config.loader import load_config, migrate_file_allowed_extensions, set_model_provider
+from app.personal_wechat_bot.config.loader import ensure_config, load_config, migrate_file_allowed_extensions, set_model_provider
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
@@ -60,6 +61,31 @@ from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoi
 
 
 QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent", "failed")
+_HISTORY_RESET_DIRS = (
+    "agent_workspace",
+    "conversation_channels",
+    "conversation_ledgers",
+    "conversation_sessions",
+    "file_workspace",
+    "send_bridge",
+    "tool_outputs",
+)
+_HISTORY_RESET_FILES = (
+    "backend_events.jsonl",
+    "backend_file_watcher.sqlite",
+    "confirm_queue.jsonl",
+    "conversation_cooldowns.sqlite",
+    "file_index.sqlite",
+    "hook_events.jsonl",
+    "hook_events_state.json",
+    "logs.jsonl",
+    "processed_messages.sqlite",
+    "send_audit.jsonl",
+    "weflow_bridge_state.json",
+    "weflow_sessions.json",
+    "weflow_process.err.log",
+    "weflow_process.out.log",
+)
 logger = logging.getLogger(__name__)
 _WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
 _WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
@@ -87,7 +113,7 @@ _WEFLOW_CONSUMER_LOCK = threading.Lock()
 
 
 def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
-    config = load_config(data_dir)
+    config = ensure_config(data_dir)
     queues = {status: list_confirm_queue(data_dir, status=status) for status in QUEUE_STATUSES}
     channels = _channel_state(data_dir)
     send_bridge = _sidebar_bridge_state(data_dir, channels_state=channels, limit=12)
@@ -118,13 +144,49 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "driver_probe": probe_send_controls(data_dir)["probe"],
         "send_bridge": send_bridge,
         "weflow": build_sidebar_weflow_state(data_dir),
-        "wechat_window_probe": build_wechat_window_probe(max_children=80, max_controls=160, data_dir=data_dir),
+        "wechat_window_probe": _safe_wechat_window_probe(data_dir),
         "audit": list_send_audit(data_dir, limit=30),
     }
 
 
 def build_sidebar_wechat_probe(data_dir: str | Path = "data") -> dict[str, Any]:
-    return build_wechat_window_probe(data_dir=data_dir)
+    return _safe_wechat_window_probe(data_dir, max_children=200, max_controls=300)
+
+
+def _safe_wechat_window_probe(
+    data_dir: str | Path,
+    *,
+    max_children: int = 80,
+    max_controls: int = 160,
+) -> dict[str, Any]:
+    try:
+        probe = build_wechat_window_probe(max_children=max_children, max_controls=max_controls, data_dir=data_dir)
+        if isinstance(probe, dict) and probe:
+            probe.setdefault("windows", [])
+            probe.setdefault("active", {"status": "unknown", "source": "none"})
+            probe.setdefault("reason", probe.get("status", ""))
+            return probe
+    except Exception as exc:
+        return {
+            "status": "error",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "active": {"status": "probe_error", "source": "exception", "hwnd": 0, "title": ""},
+            "windows": [],
+            "ignored_windows": [],
+            "bindings": [],
+            "ui_automation": {"available": False, "reason": "probe_error"},
+            "raw_probe": {},
+        }
+    return {
+        "status": "empty",
+        "reason": "probe returned no structured payload",
+        "active": {"status": "empty_probe", "source": "none", "hwnd": 0, "title": ""},
+        "windows": [],
+        "ignored_windows": [],
+        "bindings": [],
+        "ui_automation": {"available": False, "reason": "empty_probe"},
+        "raw_probe": {},
+    }
 
 
 def delete_sidebar_channel(data_dir: str | Path, conversation_id: str) -> dict[str, Any]:
@@ -229,11 +291,50 @@ def clear_sidebar_send_audit(data_dir: str | Path) -> dict[str, Any]:
     return clear_send_audit(data_dir)
 
 
+def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Clear disposable conversation/runtime history while preserving config."""
+
+    root = Path(data_dir).resolve()
+    ensure_config(root)
+    removed: list[dict[str, Any]] = []
+    retained = _retained_config_paths(root)
+    for relative in _HISTORY_RESET_DIRS:
+        _remove_history_path(root, relative, removed, retained)
+    for relative in _HISTORY_RESET_FILES:
+        _remove_history_path(root, relative, removed, retained)
+    _write_weflow_sidebar_state(
+        root,
+        {
+            "last_health": {},
+            "last_discover": {},
+            "last_pull": {},
+            "last_backfill": {},
+            "backfill_job": {},
+            "operation_history": [],
+            "last_error": "",
+        },
+    )
+    return {
+        "status": "ok",
+        "policy": "history_only_preserve_sidebar_config",
+        "removed_count": len(removed),
+        "removed": removed,
+        "retained_config": [str(item) for item in sorted(retained)],
+    }
+
+
 def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
     root = Path(data_dir)
     persisted = _read_json(root / "weflow_sidebar_state.json", {})
     worker = _weflow_worker_state(root)
-    cached_sessions = _weflow_cached_sessions_from_channels(root, limit=200)
+    token_env = str(persisted.get("token_env") or "WEFLOW_API_TOKEN") if isinstance(persisted, dict) else "WEFLOW_API_TOKEN"
+    token_present = bool(persisted.get("token_present")) if isinstance(persisted, dict) else False
+    env_token_present = bool(_env_value(token_env) or _env_value("WEFLOW_API_TOKEN"))
+    if env_token_present:
+        token_present = True
+    token_source = "environment" if env_token_present else ("payload_or_state" if token_present else "missing")
+    cached_sessions = _weflow_cached_sessions(root, limit=200)
+    readiness = _weflow_readiness_snapshot(persisted if isinstance(persisted, dict) else {}, worker, token_present, token_source)
     try:
         migration = migrate_file_allowed_extensions(root)
     except Exception as exc:
@@ -241,8 +342,9 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
     return {
         "status": "ok",
         "base_url": str(persisted.get("base_url") or "http://127.0.0.1:5031"),
-        "token_env": str(persisted.get("token_env") or "WEFLOW_API_TOKEN"),
-        "token_present": bool(persisted.get("token_present")),
+        "token_env": token_env,
+        "token_present": token_present,
+        "token_source": token_source,
         "hook_event_file": str(root / "hook_events.jsonl"),
         "backend_event_file": str(root / "backend_events.jsonl"),
         "weflow_state_file": str(root / "weflow_bridge_state.json"),
@@ -255,13 +357,14 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         },
         "config_migration": migration,
         "worker": worker,
+        "readiness": readiness,
         "backfill_job": _weflow_backfill_job_state(root, persisted),
         "bridge_state": summarize_weflow_bridge_state(root / "weflow_bridge_state.json"),
         "last_health": persisted.get("last_health", {}) if isinstance(persisted, dict) else {},
         "last_discover": persisted.get("last_discover", {}) if isinstance(persisted, dict) else {},
         "discovered_sessions": {
             "status": "ok",
-            "source": "channel_store",
+            "source": "weflow_session_store",
             "count": len(cached_sessions),
             "sessions": cached_sessions,
         },
@@ -282,8 +385,8 @@ def sidebar_weflow_health(data_dir: str | Path, payload: dict[str, Any]) -> dict
         require_token=False,
         require_fork=True,
     )
-    _write_weflow_sidebar_state(data_dir, {"last_health": result, **_weflow_public_params(params)})
-    _append_weflow_operation_history(data_dir, "health", result)
+    result = {**result, "token_source": params["token_source"]}
+    _record_weflow_state_safely(data_dir, {"last_health": result, **_weflow_public_params(params)}, action="health", result=result)
     return result
 
 
@@ -313,12 +416,14 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
             if session.get("id") and not is_system_account(session.get("id"))
         ]
         registration = _register_weflow_sessions(data_dir, sessions)
+        session_store = _upsert_weflow_sessions(data_dir, sessions, source="weflow_live", registration=registration)
         result = {
             "status": "ok",
             "source": "weflow_live",
             "sessions": sessions,
             "count": len(sessions),
             **registration,
+            "session_store": session_store,
             "weflow_ready": weflow_ready,
         }
         _record_weflow_state_safely(
@@ -329,11 +434,11 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
         )
         return result
     except Exception as exc:
-        cached_sessions = _weflow_cached_sessions_from_channels(data_dir, limit=limit)
+        cached_sessions = _weflow_cached_sessions(data_dir, limit=limit)
         if cached_sessions:
             result = {
                 "status": "ok",
-                "source": "channel_store_cache",
+                "source": "weflow_session_store_cache",
                 "live_status": "error",
                 "live_error": f"{type(exc).__name__}: {exc}",
                 "message": "实时发现失败，已返回本地通道库中的 WeFlow 会话",
@@ -369,8 +474,9 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
 
 def sidebar_weflow_pull_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     result = _run_sidebar_weflow_once(data_dir, payload)
-    _write_weflow_sidebar_state(data_dir, {"last_pull": result, **_weflow_public_params(_weflow_params(data_dir, payload))})
-    _append_weflow_operation_history(data_dir, "pull-once", result)
+    params = _weflow_params(data_dir, payload)
+    result["session_store"] = _register_weflow_result_sessions(data_dir, payload, result)
+    _record_weflow_state_safely(data_dir, {"last_pull": result, **_weflow_public_params(params)}, action="pull-once", result=result)
     return result
 
 
@@ -413,15 +519,17 @@ def run_weflow_backfill_sync(data_dir: str | Path, payload: dict[str, Any]) -> d
     backfill_payload = _backfill_payload(payload, talkers)
     result = _run_sidebar_weflow_once(data_dir, backfill_payload)
     result = {**result, "backfill": True, "backfilled_talkers": talkers}
-    _write_weflow_sidebar_state(
+    result["session_store"] = _register_weflow_result_sessions(data_dir, backfill_payload, result)
+    _record_weflow_state_safely(
         data_dir,
         {
             "last_backfill": result,
             "last_error": "" if result.get("status") != "error" else str(result.get("error") or ""),
             **_weflow_public_params(_weflow_params(data_dir, backfill_payload)),
         },
+        action="backfill",
+        result=result,
     )
-    _append_weflow_operation_history(data_dir, "backfill", result)
     return result
 
 
@@ -501,11 +609,12 @@ def sidebar_weflow_backfill(data_dir: str | Path, payload: dict[str, Any]) -> di
         "backfill_job": job_snapshot,
         "backfilled_talkers": talkers,
     }
-    _write_weflow_sidebar_state(
+    _record_weflow_state_safely(
         data_dir,
         {"last_backfill": result, "backfill_job": result["backfill_job"], **_weflow_public_params(_weflow_params(data_dir, backfill_payload))},
+        action="backfill-start",
+        result=result,
     )
-    _append_weflow_operation_history(data_dir, "backfill-start", result)
     thread.start()
     return result
 
@@ -622,23 +731,64 @@ def _subprocess_module_available(python_executable: Path, module: str) -> bool:
 def sidebar_weflow_install_deps(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     if not bool(payload.get("confirm_install", False)):
         raise ValueError("confirm_install=true is required")
-    requirements = Path("requirements-ocr.txt").resolve()
+    requested_groups = set(_string_list(payload.get("groups") or payload.get("group") or []))
     with _weflow_exclusive_operation(data_dir, label="weflow_install_deps", wait_timeout_seconds=1200.0):
-        completed = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
-            capture_output=True,
-            text=True,
-            timeout=900,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-        )
+        before = _weflow_dependency_status_snapshot()
+        missing_groups = {
+            group["group"]
+            for group in before.get("groups", [])
+            if isinstance(group, dict) and not bool(group.get("available"))
+        }
+        target_groups = requested_groups or missing_groups
+        install_results = []
+        for spec in _dependency_specs():
+            if spec["group"] not in target_groups:
+                continue
+            group_status = next((item for item in before.get("groups", []) if item.get("group") == spec["group"]), {})
+            if group_status.get("available"):
+                install_results.append({"group": spec["group"], "status": "skipped_available"})
+                continue
+            python_executable = _dependency_python(spec)
+            if not _ensure_dependency_python(spec, python_executable):
+                install_results.append(
+                    {
+                        "group": spec["group"],
+                        "status": "runtime_missing",
+                        "python": str(python_executable),
+                    }
+                )
+                continue
+            command = [str(python_executable), "-m", "pip", "install"]
+            if spec.get("target"):
+                command.extend(["--target", str(Path(spec["target"]))])
+            command.extend(["-r", str(spec["requirements"].resolve())])
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                check=False,
+                encoding="utf-8",
+                errors="replace",
+            )
+            install_results.append(
+                {
+                    "group": spec["group"],
+                    "status": "ok" if completed.returncode == 0 else "failed",
+                    "returncode": completed.returncode,
+                    "stdout_tail": completed.stdout[-4000:],
+                    "stderr_tail": completed.stderr[-4000:],
+                    "python": str(python_executable),
+                    "requirements": str(spec["requirements"].resolve()),
+                    "target": str(spec.get("target") or ""),
+                }
+            )
+        after = _weflow_dependency_status_snapshot()
         result = {
-            "status": "ok" if completed.returncode == 0 else "failed",
-            "returncode": completed.returncode,
-            "stdout_tail": completed.stdout[-4000:],
-            "stderr_tail": completed.stderr[-4000:],
-            "dependencies": _weflow_dependency_status_snapshot(),
+            "status": "ok" if all(item.get("status") in {"ok", "skipped_available"} for item in install_results) else "failed",
+            "install_results": install_results,
+            "dependencies": after,
+            "before": before,
             "exclusive_operation": True,
         }
     _append_weflow_operation_history(data_dir, "install-deps", result)
@@ -646,30 +796,159 @@ def sidebar_weflow_install_deps(data_dir: str | Path, payload: dict[str, Any]) -
 
 
 def _weflow_dependency_status_snapshot() -> dict[str, Any]:
-    modules = {
-        "PyMuPDF": "fitz",
-        "pypdf": "pypdf",
-        "pdfminer.six": "pdfminer",
-        "openpyxl": "openpyxl",
-    }
-    items = [
-        {"package": package, "module": module, "runtime": "main_python", "available": find_spec(module) is not None}
-        for package, module in modules.items()
-    ]
-    rapidocr_python = Path("vendor/ocr-python/Scripts/python.exe")
-    items.append(
-        {
-            "package": "rapidocr-onnxruntime",
-            "module": "rapidocr_onnxruntime",
-            "runtime": str(rapidocr_python),
-            "available": _subprocess_module_available(rapidocr_python, "rapidocr_onnxruntime"),
-        }
-    )
+    groups = []
+    items = []
+    duplicate_packages = _dependency_requirement_duplicates()
+    for spec in _dependency_specs():
+        python_executable = _dependency_python(spec)
+        runtime_available = python_executable.exists()
+        group_items = []
+        for package, module in spec["modules"].items():
+            available = _dependency_module_available(spec, python_executable, module)
+            item = {
+                "group": spec["group"],
+                "package": package,
+                "module": module,
+                "runtime": spec["runtime"],
+                "python": str(python_executable),
+                "available": available,
+            }
+            group_items.append(item)
+            items.append(item)
+        groups.append(
+            {
+                "group": spec["group"],
+                "runtime": spec["runtime"],
+                "python": str(python_executable),
+                "runtime_available": runtime_available,
+                "available": bool(group_items) and all(item["available"] for item in group_items),
+                "requirements": str(spec["requirements"].resolve()),
+                "missing": [item["package"] for item in group_items if not item["available"]],
+                "items": group_items,
+            }
+        )
     return {
         "status": "ok" if all(item["available"] for item in items) else "missing_optional",
+        "groups": groups,
         "items": items,
-        "requirements": str(Path("requirements-ocr.txt").resolve()),
+        "requirements": {spec["group"]: str(spec["requirements"].resolve()) for spec in _dependency_specs()},
+        "duplicate_requirements": duplicate_packages,
+        "deduplicated": not duplicate_packages,
     }
+
+
+def _dependency_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            "group": "document_runtime",
+            "runtime": "main_python",
+            "python": Path(sys.executable),
+            "requirements": Path("requirements-document.txt"),
+            "modules": {
+                "PyMuPDF": "fitz",
+                "pypdf": "pypdf",
+                "pdfminer.six": "pdfminer",
+                "openpyxl": "openpyxl",
+            },
+        },
+        {
+            "group": "ocr_runtime",
+            "runtime": "vendor_ocr_python",
+            "python": Path("vendor/ocr-python/Scripts/python.exe"),
+            "venv": Path("vendor/ocr-python"),
+            "requirements": Path("requirements-ocr.txt"),
+            "modules": {
+                "rapidocr-onnxruntime": "rapidocr_onnxruntime",
+                "paddleocr": "paddleocr",
+                "paddlepaddle": "paddle",
+                "Pillow": "PIL",
+                "numpy": "numpy",
+            },
+        },
+        {
+            "group": "asr_runtime",
+            "runtime": "vendor_asr_python",
+            "python": Path("vendor/asr-python/Scripts/python.exe"),
+            "venv": Path("vendor/asr-python"),
+            "requirements": Path("requirements-asr.txt"),
+            "modules": {
+                "faster-whisper": "faster_whisper",
+                "funasr": "funasr",
+                "torch": "torch",
+                "torchaudio": "torchaudio",
+                "modelscope": "modelscope",
+                "soundfile": "soundfile",
+                "pocketsphinx": "pocketsphinx",
+                "SpeechRecognition": "speech_recognition",
+            },
+        },
+        {
+            "group": "windows_ui_runtime",
+            "runtime": "vendor_windows_ui",
+            "python": Path(sys.executable),
+            "target": Path("vendor/windows-ui"),
+            "requirements": Path("requirements-windows-ui.txt"),
+            "modules": {"comtypes": "comtypes"},
+        },
+    ]
+
+
+def _dependency_python(spec: dict[str, Any]) -> Path:
+    return Path(spec.get("python") or sys.executable)
+
+
+def _ensure_dependency_python(spec: dict[str, Any], python_executable: Path) -> bool:
+    if python_executable.exists():
+        return True
+    venv = spec.get("venv")
+    if not venv:
+        return False
+    completed = subprocess.run(
+        [sys.executable, "-m", "venv", str(Path(venv))],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    return completed.returncode == 0 and python_executable.exists()
+
+
+def _dependency_module_available(spec: dict[str, Any], python_executable: Path, module: str) -> bool:
+    if spec["runtime"] == "main_python":
+        return find_spec(module) is not None
+    target = spec.get("target")
+    if target:
+        completed = subprocess.run(
+            [str(python_executable), "-c", f"import sys; sys.path.insert(0, {str(Path(target).resolve())!r}); import {module}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        return completed.returncode == 0
+    return _subprocess_module_available(python_executable, module)
+
+
+def _dependency_requirement_duplicates() -> dict[str, list[str]]:
+    seen: dict[str, list[str]] = {}
+    for spec in _dependency_specs():
+        path = Path(spec["requirements"])
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            package = _normalize_requirement_name(line)
+            if not package:
+                continue
+            seen.setdefault(package, []).append(spec["group"])
+    return {package: groups for package, groups in seen.items() if len(groups) > 1}
+
+
+def _normalize_requirement_name(line: str) -> str:
+    value = line.strip()
+    if not value or value.startswith("#") or value.startswith("-"):
+        return ""
+    match = re.split(r"[<>=~!;\[]", value, maxsplit=1)[0].strip().lower()
+    return re.sub(r"[-_.]+", "-", match)
 
 
 def build_sidebar_runtime_cards(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -734,7 +1013,7 @@ def _build_weflow_pull_context(data_dir: str | Path, payload: dict[str, Any]) ->
     """
 
     params = _weflow_params(data_dir, payload)
-    config = load_config(data_dir)
+    config = ensure_config(data_dir)
     runtime = build_runtime(config)
     weflow_ready = require_weflow_ready(
         params["base_url"],
@@ -815,7 +1094,7 @@ def _refresh_weflow_send_controls(context: dict[str, Any]) -> bool:
         return False
     context["config_mtime"] = current_mtime
     try:
-        new_config = load_config(data_dir)
+        new_config = ensure_config(data_dir)
     except Exception:
         return False
     runtime.config = new_config
@@ -1308,13 +1587,17 @@ def _weflow_worker_loop(root: Path, payload: dict[str, Any], stop_event: threadi
 def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(data_dir)
     token_env = str(payload.get("token_env") or payload.get("tokenEnv") or "WEFLOW_API_TOKEN").strip()
-    token = str(payload.get("token") or "").strip() or _env_value(token_env) or _env_value("WEFLOW_API_TOKEN")
+    direct_token = str(payload.get("token") or "").strip()
+    env_token = _env_value(token_env) or _env_value("WEFLOW_API_TOKEN")
+    token = direct_token or env_token
+    token_source = "payload" if direct_token else ("environment" if env_token else "missing")
     since_value = payload.get("since")
     since = int(since_value) if since_value not in (None, "") else None
     return {
         "base_url": str(payload.get("base_url") or payload.get("baseUrl") or "http://127.0.0.1:5031").strip(),
         "token": token,
         "token_env": token_env,
+        "token_source": token_source,
         "allow_non_local": bool(payload.get("allow_non_local") or payload.get("allowNonLocal") or False),
         "hook_event_file": str(root / "hook_events.jsonl"),
         "backend_event_file": str(root / "backend_events.jsonl"),
@@ -1446,6 +1729,116 @@ def _register_weflow_sessions(data_dir: str | Path, sessions: list[dict[str, Any
     }
 
 
+def _register_weflow_result_sessions(data_dir: str | Path, payload: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    sessions = _weflow_sessions_from_payload_and_result(payload, result)
+    if not sessions:
+        return {"status": "empty", "updated_count": 0, "registered_count": 0}
+    registration = _register_weflow_sessions(data_dir, sessions)
+    return _upsert_weflow_sessions(data_dir, sessions, source="weflow_pull", registration=registration)
+
+
+def _weflow_sessions_from_payload_and_result(payload: dict[str, Any], result: dict[str, Any]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    sessions: list[dict[str, Any]] = []
+
+    def add(session_id: str, name: str = "", session_type: str = "") -> None:
+        session_id = str(session_id or "").strip()
+        if not session_id or is_system_account(session_id) or session_id in seen:
+            return
+        seen.add(session_id)
+        sessions.append(
+            _normalize_weflow_session(
+                {
+                    "id": session_id,
+                    "name": name or session_id,
+                    "type": session_type or ("group" if session_id.endswith("@chatroom") else "private"),
+                }
+            )
+        )
+
+    for talker in _string_list(payload.get("talkers") or payload.get("talker") or []):
+        add(talker)
+    source = result.get("source") if isinstance(result.get("source"), dict) else {}
+    for key in ("sessions", "pulled_sessions"):
+        values = source.get(key)
+        if isinstance(values, list):
+            for item in values:
+                if isinstance(item, dict):
+                    normalized = _normalize_weflow_session(item)
+                    add(str(normalized.get("id") or ""), str(normalized.get("name") or ""), str(normalized.get("type") or ""))
+                else:
+                    add(str(item))
+    errors = source.get("errors")
+    if isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, dict):
+                add(str(item.get("session") or item.get("talker") or ""))
+    state_path = str(source.get("state_path") or "").strip()
+    if state_path:
+        state_payload = _read_json(Path(state_path), {})
+        sessions_state = state_payload.get("sessions") if isinstance(state_payload, dict) else {}
+        if isinstance(sessions_state, dict):
+            for session_id in sessions_state:
+                add(str(session_id))
+    return sessions
+
+
+def _upsert_weflow_sessions(
+    data_dir: str | Path,
+    sessions: list[dict[str, Any]],
+    *,
+    source: str,
+    registration: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    root = Path(data_dir)
+    path = _weflow_session_store_path(root)
+    current = _read_json(path, {})
+    items = current.get("sessions") if isinstance(current, dict) else {}
+    if not isinstance(items, dict):
+        items = {}
+    channels = {
+        str(item.get("id") or ""): item
+        for item in (registration or {}).get("registered_channels", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    updated = 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for session in sessions:
+        normalized = _normalize_weflow_session(session)
+        session_id = str(normalized.get("id") or "").strip()
+        if not session_id or is_system_account(session_id):
+            continue
+        existing = items.get(session_id) if isinstance(items.get(session_id), dict) else {}
+        channel = channels.get(session_id, {})
+        merged = {
+            **existing,
+            **normalized,
+            "id": session_id,
+            "name": str(normalized.get("name") or existing.get("name") or session_id),
+            "type": str(normalized.get("type") or existing.get("type") or ("group" if session_id.endswith("@chatroom") else "private")),
+            "conversation_id": channel.get("conversation_id") or existing.get("conversation_id") or "",
+            "conversation_type": channel.get("conversation_type") or existing.get("conversation_type") or "",
+            "chat_title": channel.get("chat_title") or existing.get("chat_title") or normalized.get("name") or session_id,
+            "cached": True,
+            "source": source,
+            "updated_at": now,
+        }
+        items[session_id] = merged
+        updated += 1
+    payload = {
+        "version": 1,
+        "sessions": items,
+        "updated_at": now,
+    }
+    _write_json(path, payload)
+    return {
+        "status": "ok",
+        "store": str(path),
+        "updated_count": updated,
+        "registered_count": int((registration or {}).get("registered_count", 0) or 0),
+    }
+
+
 def _weflow_session_channel_message(session: dict[str, Any]) -> NormalizedMessage:
     session_id = str(session.get("id") or "").strip()
     if not session_id:
@@ -1498,6 +1891,31 @@ def _weflow_cached_sessions_from_channels(data_dir: str | Path, *, limit: int) -
     return sorted(sessions, key=lambda item: str(item.get("updated_at", "")), reverse=True)[:limit]
 
 
+def _weflow_cached_sessions(data_dir: str | Path, *, limit: int) -> list[dict[str, Any]]:
+    root = Path(data_dir)
+    stored = _weflow_cached_sessions_from_store(root, limit=limit)
+    by_id = {str(item.get("id") or ""): item for item in stored if str(item.get("id") or "").strip()}
+    for item in _weflow_cached_sessions_from_channels(root, limit=limit):
+        session_id = str(item.get("id") or "").strip()
+        if not session_id:
+            continue
+        by_id[session_id] = {**item, **by_id.get(session_id, {})}
+    return sorted(by_id.values(), key=lambda item: str(item.get("updated_at", "")), reverse=True)[:limit]
+
+
+def _weflow_cached_sessions_from_store(data_dir: str | Path, *, limit: int) -> list[dict[str, Any]]:
+    payload = _read_json(_weflow_session_store_path(data_dir), {})
+    items = payload.get("sessions") if isinstance(payload, dict) else {}
+    if not isinstance(items, dict):
+        return []
+    sessions = [item for item in items.values() if isinstance(item, dict) and str(item.get("id") or "").strip()]
+    return sorted(sessions, key=lambda item: str(item.get("updated_at", "")), reverse=True)[:limit]
+
+
+def _weflow_session_store_path(data_dir: str | Path) -> Path:
+    return Path(data_dir) / "weflow_sessions.json"
+
+
 def _weflow_session_is_group(session: dict[str, Any]) -> bool:
     session_id = str(session.get("id") or session.get("sessionId") or session.get("username") or "").strip()
     session_type = str(session.get("type") or session.get("sessionType") or session.get("session_type") or "").strip()
@@ -1513,6 +1931,7 @@ def _weflow_public_params(params: dict[str, Any]) -> dict[str, Any]:
         "base_url": params.get("base_url", ""),
         "token_env": params.get("token_env", "WEFLOW_API_TOKEN"),
         "token_present": bool(params.get("token")),
+        "token_source": params.get("token_source", "missing"),
         "allow_non_local": bool(params.get("allow_non_local")),
     }
 
@@ -1542,13 +1961,14 @@ def _weflow_backfill_job_loop(root: Path, payload: dict[str, Any], job_id: str, 
         _update_backfill_job(root, job_id, status="running", progress={"event": "started"}, force=True)
         result = _run_sidebar_weflow_once(root, payload, cancel_event=stop_event, progress_callback=progress)
         result = {**result, "backfill": True, "backfilled_talkers": payload.get("talkers", [])}
+        result["session_store"] = _register_weflow_result_sessions(root, payload, result)
         if stop_event.is_set() and result.get("status") != "cancelled":
             result = {**result, "status": "cancelled"}
         final_status = "cancelled" if result.get("status") == "cancelled" else "completed"
         _update_backfill_job(
             root,
             job_id,
-            status="finalizing",
+            status=final_status,
             result=result,
             progress={
                 "scanned_count": result.get("source", {}).get("scanned_count", 0),
@@ -1558,21 +1978,23 @@ def _weflow_backfill_job_loop(root: Path, payload: dict[str, Any], job_id: str, 
             },
             force=True,
         )
-        _write_weflow_sidebar_state(
+        _record_weflow_state_safely(
             root,
             {"last_backfill": result, "last_error": "", "backfill_job": _weflow_backfill_job_state(root), **_weflow_public_params(_weflow_params(root, payload))},
+            action="backfill",
+            result=result,
         )
-        _append_weflow_operation_history(root, "backfill", result)
         _update_backfill_job(root, job_id, status=final_status, progress={"event": final_status}, force=True)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         result = {"status": "error", "error": error, "backfill": True, "backfilled_talkers": payload.get("talkers", [])}
         _update_backfill_job(root, job_id, status="error", result=result, last_error=error, force=True)
-        _write_weflow_sidebar_state(
+        _record_weflow_state_safely(
             root,
             {"last_backfill": result, "last_error": error, "backfill_job": _weflow_backfill_job_state(root), **_weflow_public_params(_weflow_params(root, payload))},
+            action="backfill",
+            result=result,
         )
-        _append_weflow_operation_history(root, "backfill", result)
 
 
 def _update_backfill_job(
@@ -1700,6 +2122,42 @@ def _weflow_worker_state(root: Path) -> dict[str, Any]:
             state["loops"] = snapshot["loops"]
             state["metrics"] = snapshot
     return state
+
+
+def _weflow_readiness_snapshot(
+    persisted: dict[str, Any],
+    worker: dict[str, Any],
+    token_present: bool,
+    token_source: str,
+) -> dict[str, Any]:
+    last_health = persisted.get("last_health") if isinstance(persisted.get("last_health"), dict) else {}
+    health_ok = str(last_health.get("status") or "") == "ok"
+    fork_ok = bool(last_health.get("fork_ok"))
+    service_reachable = health_ok
+    running = bool(worker.get("running"))
+    if running and not service_reachable:
+        status = "worker_running_unchecked"
+    elif health_ok and token_present and fork_ok:
+        status = "ready"
+    elif health_ok and not token_present:
+        status = "token_missing"
+    elif health_ok and not fork_ok:
+        status = "fork_marker_missing"
+    elif last_health:
+        status = "error"
+    else:
+        status = "unchecked"
+    return {
+        "status": status,
+        "service_reachable": service_reachable,
+        "token_present": token_present,
+        "token_source": token_source,
+        "fork_ok": fork_ok,
+        "worker_running": running,
+        "last_health_status": str(last_health.get("status") or ""),
+        "message": str(last_health.get("message") or last_health.get("error") or ""),
+        "updated_at": persisted.get("updated_at", ""),
+    }
 
 
 def _write_weflow_sidebar_state(data_dir: str | Path, update: dict[str, Any]) -> None:
@@ -1873,6 +2331,40 @@ def _cleanup_note(cleanup: dict[str, Any]) -> str:
     return "通道不存在或已被清理"
 
 
+def _retained_config_paths(root: Path) -> set[Path]:
+    names = {
+        "config.json",
+        "accepted_contacts.json",
+        "accepted_groups.json",
+        "contacts_whitelist.json",
+        "groups_whitelist.json",
+        "topic_rules.json",
+        "search_blocklist.json",
+        "api_keys.local.md",
+        "api_key_models.local.json",
+    }
+    retained = {(root / name).resolve() for name in names}
+    retained.add((root / "runtime").resolve())
+    return retained
+
+
+def _remove_history_path(root: Path, relative: str, removed: list[dict[str, Any]], retained: set[Path]) -> None:
+    target = (root / relative).resolve()
+    if target in retained or any(parent in retained for parent in target.parents):
+        return
+    if target != root and root not in target.parents:
+        raise ValueError(f"history reset target escapes data_dir: {relative}")
+    if not target.exists():
+        return
+    if target.is_dir():
+        shutil.rmtree(target)
+        kind = "dir"
+    else:
+        target.unlink()
+        kind = "file"
+    removed.append({"relative_path": relative, "path": str(target), "kind": kind})
+
+
 def _bridge_worker_alive(data_dir: str | Path) -> bool:
     """True if a send-bridge worker holds a fresh single-instance lock.
 
@@ -1928,7 +2420,7 @@ def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> P
 
 
 def _key_pool(data_dir: str | Path) -> ApiKeyPool:
-    config = load_config(data_dir)
+    config = ensure_config(data_dir)
     root = Path(data_dir)
     chat_provider = config.providers.get("chat", config.llm)
     return ApiKeyPool(chat_provider, root)
@@ -1956,6 +2448,19 @@ def add_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]
         raise ValueError("value is required")
     pool = _key_pool(data_dir)
     ref = pool.add_key(value, name=name)
+    if any(key in payload for key in ("provider", "model", "base_url", "baseUrl", "max_wait_seconds", "enabled")):
+        pool.set_key_model_config(
+            ref.ref,
+            provider=str(payload.get("provider")).strip().lower() if payload.get("provider") is not None else None,
+            model=str(payload.get("model")).strip() if payload.get("model") is not None else None,
+            base_url=str(payload.get("base_url") or payload.get("baseUrl") or "").strip()
+            if payload.get("base_url") is not None or payload.get("baseUrl") is not None
+            else None,
+            max_wait_seconds=int(payload.get("max_wait_seconds"))
+            if payload.get("max_wait_seconds") not in (None, "")
+            else None,
+            enabled=bool(payload.get("enabled")) if payload.get("enabled") is not None else None,
+        )
     return {"status": "ok", "ref": ref.ref, "source": ref.source, **list_api_keys(data_dir)}
 
 
@@ -1978,9 +2483,10 @@ _MODEL_PROVIDER_FORMATS = ["deepseek", "relay"]
 
 def get_model_config(data_dir: str | Path) -> dict[str, Any]:
     """Return the current chat provider's model/endpoint/format for the panel."""
-    config = load_config(data_dir)
+    config = ensure_config(data_dir)
     provider = config.providers.get("chat", config.llm)
     pool = _key_pool(data_dir)
+    keys = pool.describe()
     return {
         "status": "ok",
         "provider": provider.provider,
@@ -1990,12 +2496,17 @@ def get_model_config(data_dir: str | Path) -> dict[str, Any]:
         "max_wait_seconds": provider.max_wait_seconds,
         "provider_formats": list(_MODEL_PROVIDER_FORMATS),
         "key_pool_available_count": pool.available_count(),
+        "keys": keys,
+        "key_model_configs": {str(item.get("ref")): item.get("model_config", {}) for item in keys},
+        "config_scope": "default_profile_and_per_key_overrides",
         "async_summary_follows_chat": True,
     }
 
 
 def set_model_config(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Persist edited model/endpoint/format for the chat provider."""
+    ensure_config(data_dir)
+    key_ref = str(payload.get("ref") or payload.get("key_ref") or payload.get("keyRef") or "").strip()
     provider = payload.get("provider")
     if provider is not None:
         provider = str(provider).strip().lower()
@@ -2007,6 +2518,24 @@ def set_model_config(data_dir: str | Path, payload: dict[str, Any]) -> dict[str,
     base_url = payload.get("base_url")
     api_key_env = payload.get("api_key_env")
     max_wait = payload.get("max_wait_seconds")
+    if key_ref:
+        pool = _key_pool(data_dir)
+        updated_key = pool.set_key_model_config(
+            key_ref,
+            provider=provider,
+            model=str(model).strip() if model is not None else None,
+            base_url=str(base_url).strip() if base_url is not None else None,
+            api_key_env=str(api_key_env).strip() if api_key_env is not None else None,
+            max_wait_seconds=int(max_wait) if max_wait not in (None, "") else None,
+            enabled=bool(payload.get("enabled")) if payload.get("enabled") is not None else None,
+        )
+        return {
+            "status": "ok",
+            "ref": key_ref,
+            "key_model_config": asdict(updated_key),
+            "model_config": get_model_config(data_dir),
+            "model": updated_key.model,
+        }
     updated = set_model_provider(
         data_dir,
         provider=provider,
@@ -2027,8 +2556,12 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
     """
     from app.personal_wechat_bot.llm.openai_client import DEFAULT_USER_AGENT, normalize_openai_base_url
 
-    config = load_config(data_dir)
+    config = ensure_config(data_dir)
     provider_cfg = config.providers.get("chat", config.llm)
+    key_ref = str(payload.get("ref") or payload.get("key_ref") or payload.get("keyRef") or "").strip()
+    pool = _key_pool(data_dir)
+    if key_ref:
+        provider_cfg = pool.provider_for_ref(key_ref)
     base_url = str(payload.get("base_url") or provider_cfg.base_url or "").strip()
     provider = str(payload.get("provider") or provider_cfg.provider or "relay").strip().lower()
     target_model = str(payload.get("model") or provider_cfg.model or "").strip()
@@ -2041,7 +2574,7 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
     url_error = _validate_probe_url(url)
     if url_error:
         return {"status": "error", "reachable": False, "error": url_error, "url": url}
-    api_key = _key_pool(data_dir).default_key()
+    api_key = pool.key_for_ref(key_ref) if key_ref else pool.default_key()
     if not api_key:
         return {
             "status": "error",
@@ -2115,7 +2648,7 @@ def _extract_model_ids(payload: Any) -> list[str]:
 
 
 def _channel_store(data_dir: str | Path) -> ConversationChannelStore:
-    config = load_config(data_dir)
+    config = ensure_config(data_dir)
     root = Path(data_dir)
     chat_provider = config.providers.get("chat", config.llm)
     key_pool = ApiKeyPool(chat_provider, root)
@@ -2128,7 +2661,7 @@ def _channel_store(data_dir: str | Path) -> ConversationChannelStore:
 
 
 def _channel_state(data_dir: str | Path) -> dict[str, Any]:
-    config = load_config(data_dir)
+    config = ensure_config(data_dir)
     root = Path(data_dir)
     store = _channel_store(root)
     visible_policy = _visible_channel_policy(root, config)

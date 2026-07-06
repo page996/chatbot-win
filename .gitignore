@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 data/
+.chatbot_sidebar_config/
 .env
 API key.md
 API keys.md

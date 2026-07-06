@@ -14,6 +14,16 @@ from app.personal_wechat_bot.domain.errors import ConfigError
 # config naming it would otherwise pass the send guard but resolve to no driver
 # (silent send_driver_missing). Normalizing at load time is self-healing.
 _DEPRECATED_SEND_DRIVERS = {"windows_guarded": "bridge_outbox"}
+_SIDEBAR_CONFIG_DIR = ".chatbot_sidebar_config"
+_CONFIG_FILE_NAMES = (
+    "config.json",
+    "accepted_contacts.json",
+    "accepted_groups.json",
+    "contacts_whitelist.json",
+    "groups_whitelist.json",
+    "topic_rules.json",
+    "search_blocklist.json",
+)
 
 
 def _normalize_send_driver(name: str) -> str:
@@ -36,17 +46,34 @@ def _write_json(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
+def persistent_config_dir(data_dir: str | Path = "data") -> Path:
+    """Stable sidebar/config storage outside the disposable history tree."""
+
+    root = Path(data_dir).resolve()
+    segment = _safe_config_segment(str(root))
+    return root.parent / _SIDEBAR_CONFIG_DIR / segment
+
+
+def ensure_config(data_dir: str | Path = "data") -> BotConfig:
+    """Load config, restoring from sidecar or creating defaults for the sidebar."""
+
+    try:
+        return load_config(data_dir)
+    except ConfigError:
+        return create_default_config(data_dir)
+
+
 def create_default_config(data_dir: str | Path = "data") -> BotConfig:
     root = Path(data_dir)
     root.mkdir(parents=True, exist_ok=True)
     config = BotConfig(data_dir=str(root))
-    _write_json(root / "config.json", _config_to_json(config))
-    _write_json(root / "accepted_contacts.json", [])
-    _write_json(root / "accepted_groups.json", [])
-    _write_json(root / "contacts_whitelist.json", [])
-    _write_json(root / "groups_whitelist.json", [])
-    _write_json(root / "topic_rules.json", {"topics": config.topics, "avoid_topics": []})
-    _write_json(root / "search_blocklist.json", config.search_blocklist)
+    _write_config_json(root, "config.json", _config_to_json(config))
+    _write_config_json(root, "accepted_contacts.json", [])
+    _write_config_json(root, "accepted_groups.json", [])
+    _write_config_json(root, "contacts_whitelist.json", [])
+    _write_config_json(root, "groups_whitelist.json", [])
+    _write_config_json(root, "topic_rules.json", {"topics": config.topics, "avoid_topics": []})
+    _write_config_json(root, "search_blocklist.json", config.search_blocklist)
     (root / "inbox").mkdir(exist_ok=True)
     (root / "tool_outputs").mkdir(exist_ok=True)
     return config
@@ -54,14 +81,14 @@ def create_default_config(data_dir: str | Path = "data") -> BotConfig:
 
 def load_config(data_dir: str | Path = "data") -> BotConfig:
     root = Path(data_dir)
-    raw = _read_json(root / "config.json", None)
+    raw = _read_config_json(root, "config.json", None)
     if raw is None:
         raise ConfigError(f"missing config: {root / 'config.json'}; run init first")
 
     contacts = _read_accept_list(root, "accepted_contacts.json", "contacts_whitelist.json")
     groups = _read_accept_list(root, "accepted_groups.json", "groups_whitelist.json")
-    topic_raw = _read_json(root / "topic_rules.json", {})
-    blocklist = _read_json(root / "search_blocklist.json", raw.get("search_blocklist", []))
+    topic_raw = _read_config_json(root, "topic_rules.json", {})
+    blocklist = _read_config_json(root, "search_blocklist.json", raw.get("search_blocklist", []))
 
     llm = _llm_from_json(raw.get("llm", {}))
     providers = _providers_from_json(raw.get("providers"), llm)
@@ -103,20 +130,20 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
 
 def save_config(config: BotConfig) -> None:
     root = Path(config.data_dir)
-    _write_json(root / "config.json", _config_to_json(config))
-    _write_json(root / "accepted_contacts.json", sorted(config.accepted_contacts))
-    _write_json(root / "accepted_groups.json", sorted(config.accepted_groups))
-    _write_json(root / "contacts_whitelist.json", sorted(config.accepted_contacts))
-    _write_json(root / "groups_whitelist.json", sorted(config.accepted_groups))
-    _write_json(root / "topic_rules.json", {"topics": config.topics, "avoid_topics": config.avoid_topics})
-    _write_json(root / "search_blocklist.json", config.search_blocklist)
+    _write_config_json(root, "config.json", _config_to_json(config))
+    _write_config_json(root, "accepted_contacts.json", sorted(config.accepted_contacts))
+    _write_config_json(root, "accepted_groups.json", sorted(config.accepted_groups))
+    _write_config_json(root, "contacts_whitelist.json", sorted(config.accepted_contacts))
+    _write_config_json(root, "groups_whitelist.json", sorted(config.accepted_groups))
+    _write_config_json(root, "topic_rules.json", {"topics": config.topics, "avoid_topics": config.avoid_topics})
+    _write_config_json(root, "search_blocklist.json", config.search_blocklist)
 
 
 def migrate_file_allowed_extensions(data_dir: str | Path = "data") -> dict[str, Any]:
     """Persist newly supported attachment suffixes into an existing config."""
 
     root = Path(data_dir)
-    raw = _read_json(root / "config.json", None)
+    raw = _read_config_json(root, "config.json", None)
     if not isinstance(raw, dict):
         raise ConfigError(f"missing config: {root / 'config.json'}; run init first")
     default_extensions = BotConfig().file_allowed_extensions
@@ -393,8 +420,59 @@ def _config_to_json(config: BotConfig) -> dict[str, Any]:
 def _read_accept_list(root: Path, preferred_name: str, legacy_name: str) -> set[str]:
     preferred = _read_json(root / preferred_name, None)
     if isinstance(preferred, list):
+        _mirror_config_file(root, preferred_name, preferred, from_primary=True)
         return {str(item) for item in preferred if str(item).strip()}
-    legacy = _read_json(root / legacy_name, [])
+    legacy = _read_json(root / legacy_name, None)
     if isinstance(legacy, list):
+        _write_config_json(root, preferred_name, legacy)
+        _mirror_config_file(root, legacy_name, legacy, from_primary=True)
+        return {str(item) for item in legacy if str(item).strip()}
+    preferred = _read_json(persistent_config_dir(root) / preferred_name, None)
+    if isinstance(preferred, list):
+        _write_json(root / preferred_name, preferred)
+        return {str(item) for item in preferred if str(item).strip()}
+    legacy = _read_json(persistent_config_dir(root) / legacy_name, [])
+    if isinstance(legacy, list):
+        _write_config_json(root, preferred_name, legacy)
         return {str(item) for item in legacy if str(item).strip()}
     return set()
+
+
+def _read_config_json(root: Path, name: str, default: Any) -> Any:
+    primary = root / name
+    value = _read_json(primary, None)
+    if value is not None:
+        _mirror_config_file(root, name, value, from_primary=True)
+        return value
+    sidecar = persistent_config_dir(root) / name
+    value = _read_json(sidecar, None)
+    if value is None:
+        return default
+    _write_json(primary, value)
+    return value
+
+
+def _write_config_json(root: Path, name: str, payload: Any) -> None:
+    _write_json(root / name, payload)
+    _write_json(persistent_config_dir(root) / name, payload)
+
+
+def _mirror_config_file(root: Path, name: str, payload: Any, *, from_primary: bool) -> None:
+    if name not in _CONFIG_FILE_NAMES:
+        return
+    target = persistent_config_dir(root) / name if from_primary else root / name
+    if target.exists():
+        return
+    try:
+        _write_json(target, payload)
+    except OSError:
+        return
+
+
+def _safe_config_segment(value: str) -> str:
+    import hashlib
+    import re
+
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(value).name).strip("._")
+    return f"{cleaned or 'data'}_{digest}"

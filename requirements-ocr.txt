@@ -3,7 +3,3 @@ paddleocr
 paddlepaddle
 Pillow
 numpy
-PyMuPDF
-pypdf
-pdfminer.six
-openpyxl

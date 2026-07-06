@@ -424,10 +424,14 @@ function renderWeFlow(weflow) {
   const backfillJob = weflow.backfill_job || {};
   const metrics = worker.metrics || {};
   const bridgeState = weflow.bridge_state || {};
+  const readiness = weflow.readiness || {};
   $("#weflowStatus").textContent = worker.running
     ? `后台运行中 / ${worker.loops || 0} 轮`
-    : (weflow.last_pull?.status || weflow.last_health?.status || "未运行");
+    : (readiness.status || weflow.last_pull?.status || weflow.last_health?.status || "未检查");
   $("#weflowDetail").textContent = [
+    readiness.token_present ? `token ${readiness.token_source === "environment" ? "存在（环境变量）" : "存在"}` : "token 缺失",
+    readiness.service_reachable ? "WeFlow 可达" : "",
+    readiness.fork_ok ? "fork marker 正常" : "",
     weflow.security?.primary_source || "weflow_local_fork",
     weflow.security?.requires_token_for_pull ? "正式拉取需要 token" : "",
     weflow.security?.requires_local_fork_marker ? "需要本地 fork marker" : "",
@@ -444,6 +448,7 @@ function renderWeFlow(weflow) {
   if (!$("#weflowTokenEnv").dataset.touched) $("#weflowTokenEnv").value = weflow.token_env || "WEFLOW_API_TOKEN";
   const statusPayload = {
     worker,
+    readiness,
     backfill_job: backfillJob,
     stability: {
       running: worker.running || false,
@@ -2031,8 +2036,13 @@ function renderKeyRow(item) {
   meta.className = `key-pool-meta ${item.available ? "ok" : "warn"}`;
   const sourceLabel = { file_secret: "文件密钥", file_env: "文件环境变量", env: "环境变量" }[item.source] || item.source;
   meta.textContent = `${sourceLabel} · ${item.available ? "可用" : "不可用"}`;
+  const model = item.model_config || {};
+  const modelMeta = document.createElement("span");
+  modelMeta.className = "key-pool-meta";
+  modelMeta.textContent = `${model.provider || "default"} · ${model.model || "未配置模型"} · ${model.base_url || "未配置 base_url"}`;
   info.appendChild(preview);
   info.appendChild(meta);
+  info.appendChild(modelMeta);
   row.appendChild(info);
   if (item.source === "file_secret") {
     row.appendChild(

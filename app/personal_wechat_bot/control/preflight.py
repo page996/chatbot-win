@@ -31,6 +31,7 @@ def build_preflight_report(
     chat_provider = config.providers.get("chat", config.llm)
     key_pool = ApiKeyPool(chat_provider, config.data_dir)
     key_refs = key_pool.refs()
+    key_descriptions = key_pool.describe()
     api_key_present = any(item.available for item in key_refs)
     file_roots = resolve_allowed_roots(config.data_dir, config.file_read_roots)
     voice_roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots)
@@ -100,8 +101,17 @@ def build_preflight_report(
             "api_key_file_configured": bool(chat_provider.api_key_file),
             "api_key_present": api_key_present,
             "key_pool_refs": [
-                {"ref": item.ref, "source": item.source, "available": item.available}
-                for item in key_refs
+                {
+                    "ref": item.ref,
+                    "source": item.source,
+                    "available": item.available,
+                    "model_config": key_descriptions[index].get("model_config", {}) if index < len(key_descriptions) else {},
+                }
+                for index, item in enumerate(key_refs)
+            ],
+            "key_model_configs": [
+                item.get("model_config", {})
+                for item in key_descriptions
             ],
             "key_pool_available_count": key_pool.available_count(),
             "max_concurrency": chat_provider.max_concurrency,
