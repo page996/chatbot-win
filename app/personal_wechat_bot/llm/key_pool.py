@@ -31,6 +31,7 @@ class ApiKeyModelConfig:
     base_url: str = ""
     api_key_env: str = ""
     max_wait_seconds: int | None = None
+    max_concurrency: int | None = None
     capabilities: tuple[str, ...] = ("chat", "planning", "summarization", "relevance_filter")
     enabled: bool = True
 
@@ -48,9 +49,10 @@ def _mask_secret(value: str) -> str:
 
 
 class ApiKeyPool:
-    def __init__(self, provider: ProviderConfig, data_dir: str | Path = "data"):
+    def __init__(self, provider: ProviderConfig, data_dir: str | Path | None = None):
         self.provider = provider
-        self.data_dir = Path(data_dir)
+        self._explicit_data_dir = data_dir is not None
+        self.data_dir = Path(data_dir) if data_dir is not None else Path("data")
         self.config_dir = persistent_config_dir(self.data_dir)
 
     def refs(self) -> list[ApiKeyRef]:
@@ -111,9 +113,18 @@ class ApiKeyPool:
             stream=self.provider.stream,
             max_wait_seconds=key_config.max_wait_seconds,
             capabilities=list(key_config.capabilities),
-            max_concurrency=self.provider.max_concurrency,
+            max_concurrency=key_config.max_concurrency or self.provider.max_concurrency,
             cooldown_seconds=self.provider.cooldown_seconds,
         )
+
+    def concurrency_limit(self) -> int:
+        refs = self.available_refs()
+        if not refs:
+            return max(1, int(self.provider.max_concurrency or 1))
+        return max(1, sum(max(1, int(self.provider_for_ref(ref).max_concurrency or 1)) for ref in refs))
+
+    def concurrency_limit_for_ref(self, ref: str) -> int:
+        return max(1, int(self.provider_for_ref(ref).max_concurrency or 1))
 
     def set_key_model_config(
         self,
@@ -124,25 +135,28 @@ class ApiKeyPool:
         base_url: str | None = None,
         api_key_env: str | None = None,
         max_wait_seconds: int | None = None,
+        max_concurrency: int | None = None,
         enabled: bool | None = None,
         capabilities: list[str] | tuple[str, ...] | None = None,
     ) -> ApiKeyModelConfig:
-        if ref not in {item.ref for item in self.refs()}:
-            raise ValueError("key not found")
-        current = self.config_for_ref(ref)
-        updated = ApiKeyModelConfig(
-            provider=str(provider).strip().lower() if provider is not None else current.provider,
-            model=str(model).strip() if model is not None else current.model,
-            base_url=str(base_url).strip() if base_url is not None else current.base_url,
-            api_key_env=str(api_key_env).strip() if api_key_env is not None else current.api_key_env,
-            max_wait_seconds=max_wait_seconds if max_wait_seconds is not None else current.max_wait_seconds,
-            enabled=bool(enabled) if enabled is not None else current.enabled,
-            capabilities=tuple(str(item).strip() for item in (capabilities or current.capabilities) if str(item).strip()),
-        )
-        if not updated.model:
-            raise ValueError("model must not be empty")
-        self._write_metadata({**self._metadata(), ref: asdict(updated)})
-        return updated
+        with self._metadata_lock():
+            if ref not in {item.ref for item in self.refs()}:
+                raise ValueError("key not found")
+            current = self.config_for_ref(ref)
+            updated = ApiKeyModelConfig(
+                provider=str(provider).strip().lower() if provider is not None else current.provider,
+                model=str(model).strip() if model is not None else current.model,
+                base_url=str(base_url).strip() if base_url is not None else current.base_url,
+                api_key_env=str(api_key_env).strip() if api_key_env is not None else current.api_key_env,
+                max_wait_seconds=max_wait_seconds if max_wait_seconds is not None else current.max_wait_seconds,
+                max_concurrency=max_concurrency if max_concurrency is not None else current.max_concurrency,
+                enabled=bool(enabled) if enabled is not None else current.enabled,
+                capabilities=tuple(str(item).strip() for item in (capabilities or current.capabilities) if str(item).strip()),
+            )
+            if not updated.model:
+                raise ValueError("model must not be empty")
+            self._write_metadata_locked({**self._metadata(), ref: asdict(updated)})
+            return updated
 
     def _env_names(self) -> list[str]:
         names = list(self.provider.api_key_env_pool)
@@ -176,7 +190,11 @@ class ApiKeyPool:
         if not self.provider.api_key_file:
             # No explicit key file configured: fall back to a default location
             # under the persistent config dir so history cleanup can remove the
-            # data tree without losing sidebar credentials.
+            # data tree without losing sidebar credentials. Only do this for a
+            # runtime pool that was explicitly bound to a data dir; ad-hoc pools
+            # used for env-only tests/probes should not read the app's real keys.
+            if not self._explicit_data_dir:
+                return None
             return self.config_dir / _DEFAULT_KEY_FILE_NAME
         path = Path(self.provider.api_key_file)
         if not path.is_absolute():
@@ -285,6 +303,16 @@ class ApiKeyPool:
     def metadata_file_path(self) -> Path:
         return self.config_dir / "api_key_models.local.json"
 
+    def _metadata_lock(self):
+        from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
+
+        return blocking_process_lock(
+            self.metadata_file_path().with_suffix(self.metadata_file_path().suffix + ".lock"),
+            label="api_key_metadata",
+            stale_after_seconds=30.0,
+            wait_timeout_seconds=15.0,
+        )
+
     def _file_lock(self, path: Path):
         """Cross-process lock guarding read-modify-write of the key file."""
         from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
@@ -324,9 +352,13 @@ class ApiKeyPool:
         return {str(ref): value for ref, value in items.items() if isinstance(value, dict)}
 
     def _write_metadata(self, items: dict[str, dict[str, Any]]) -> None:
+        with self._metadata_lock():
+            self._write_metadata_locked(items)
+
+    def _write_metadata_locked(self, items: dict[str, dict[str, Any]]) -> None:
         path = self.metadata_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
+        tmp = path.with_name(path.name + f".{os.getpid()}.{hashlib.sha256(json.dumps(items, sort_keys=True).encode('utf-8')).hexdigest()[:8]}.tmp")
         tmp.write_text(
             json.dumps({"version": 1, "keys": items}, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -398,6 +430,7 @@ def _model_config_from_provider(provider: ProviderConfig) -> ApiKeyModelConfig:
         base_url=provider.base_url,
         api_key_env=provider.api_key_env,
         max_wait_seconds=provider.max_wait_seconds,
+        max_concurrency=provider.max_concurrency,
         capabilities=tuple(provider.capabilities),
         enabled=True,
     )
@@ -413,12 +446,18 @@ def _model_config_from_payload(payload: dict[str, Any], fallback: ProviderConfig
         max_wait = int(max_wait_raw) if max_wait_raw not in (None, "") else None
     except (TypeError, ValueError):
         max_wait = default.max_wait_seconds
+    max_concurrency_raw = payload.get("max_concurrency", default.max_concurrency)
+    try:
+        max_concurrency = int(max_concurrency_raw) if max_concurrency_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        max_concurrency = default.max_concurrency
     return ApiKeyModelConfig(
         provider=str(payload.get("provider") or default.provider).strip().lower(),
         model=str(payload.get("model") or default.model).strip(),
         base_url=str(payload.get("base_url") or default.base_url).strip(),
         api_key_env=str(payload.get("api_key_env") or default.api_key_env).strip(),
         max_wait_seconds=max_wait,
+        max_concurrency=max_concurrency,
         capabilities=tuple(str(item).strip() for item in capabilities if str(item).strip()),
         enabled=bool(payload.get("enabled", default.enabled)),
     )

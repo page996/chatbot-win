@@ -17,7 +17,6 @@ UNTRUSTED_CHANNEL_SOURCES = frozenset(
     {
         "windows_snapshot",
         "ocr_file_card",
-        "wechat_builtin_voice_to_text_ocr",
         "poll_ocr_window",
         "ocr_snapshot",
     }
@@ -36,7 +35,7 @@ class Router:
         self.channel_store = channel_store
 
     def decide(self, message: NormalizedMessage) -> RouteDecision:
-        if self.deduper.seen(message.message_id):
+        if self.deduper.seen_any(_message_dedupe_ids(message)):
             return RouteDecision(message.message_id, message.conversation_id, "duplicate", "message already processed")
 
         trusted_channel = _trusted_channel_source(message)
@@ -56,6 +55,9 @@ class Router:
     def mark_done(self, message_id: str) -> None:
         self.deduper.mark(message_id)
 
+    def mark_message_done(self, message: NormalizedMessage) -> None:
+        self.deduper.mark_many(_message_dedupe_ids(message))
+
 
 def _trusted_channel_source(message: NormalizedMessage) -> bool:
     source = str(message.metadata.get("source", "")).strip()
@@ -66,3 +68,11 @@ def _trusted_channel_source(message: NormalizedMessage) -> bool:
     if source in UNTRUSTED_CHANNEL_SOURCES:
         return False
     return False
+
+
+def _message_dedupe_ids(message: NormalizedMessage) -> list[str]:
+    ids = [message.message_id]
+    dedupe_key = str(message.metadata.get("dedupe_key") or "").strip()
+    if dedupe_key:
+        ids.append(f"dedupe:{dedupe_key}")
+    return ids

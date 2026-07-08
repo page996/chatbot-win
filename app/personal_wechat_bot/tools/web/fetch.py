@@ -330,7 +330,7 @@ def _file_workflow_note(
     truncated: bool,
 ) -> str:
     task_line = f"Task: {_compact(task, 260)}\n" if task else ""
-    ai_summary = str(artifacts.get("ai_summary", "")).strip()
+    ai_summary = _usable_ai_summary(artifacts)
     summary = ai_summary or str(getattr(parse_result, "summary", "") or "").strip()
     preview = str(getattr(parse_result, "context_text", "") or "").strip()
     if not preview:
@@ -340,7 +340,6 @@ def _file_workflow_note(
     return (
         "Read file-like URL through the local file workflow.\n"
         f"{task_line}"
-        f"URL: {url}\n"
         f"Content-Type: {content_type or 'unknown'}\n"
         f"file_id: {file_id}\n"
         f"parse_status: {getattr(parse_result, 'status', '')} kind={getattr(parse_result, 'kind', '')}\n"
@@ -376,6 +375,7 @@ def _workspace_artifacts(staged: Any) -> dict[str, Any]:
         "full_text_path": str(derived_dir / "full_text.md") if (derived_dir / "full_text.md").is_file() else "",
         "analysis_path": str(derived_dir / "analysis.json"),
         "parse_result_path": str(derived_dir / "parse_result.json"),
+        "ai_analysis_status": str(analysis.get("ai_analysis_status", "")),
         "ai_summary": str(analysis.get("ai_summary", "")),
         "char_count": int(analysis.get("char_count", 0) or 0),
         "preview_char_count": int(analysis.get("preview_char_count", 0) or 0),
@@ -387,6 +387,15 @@ def _workspace_artifacts(staged: Any) -> dict[str, Any]:
         "media_asr_status": str(analysis.get("media_asr_status", "")),
         "media_asr_count": int(analysis.get("media_asr_count", 0) or 0),
     }
+
+
+def _usable_ai_summary(artifacts: dict[str, Any]) -> str:
+    if str(artifacts.get("ai_analysis_status", "")).strip() != "analyzed":
+        return ""
+    summary = str(artifacts.get("ai_summary", "")).strip()
+    if "fake_llm.completed" in summary or "PLAN:" in summary or "MONITOR:" in summary:
+        return ""
+    return summary
 
 
 def _read_json(path: Path, default: Any) -> Any:

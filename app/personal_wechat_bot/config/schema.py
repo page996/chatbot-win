@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 Mode = Literal["dry_run", "confirm", "auto"]
+DEFAULT_LLM_MAX_CONCURRENCY = 6
 
 
 @dataclass
@@ -20,7 +21,7 @@ class ProviderConfig:
     capabilities: list[str] = field(
         default_factory=lambda: ["chat", "planning", "summarization", "relevance_filter"]
     )
-    max_concurrency: int = 2
+    max_concurrency: int = DEFAULT_LLM_MAX_CONCURRENCY
     cooldown_seconds: int = 0
 
 
@@ -74,6 +75,8 @@ class BotConfig:
             ".bmp",
             ".webp",
             ".gif",
+            ".tif",
+            ".tiff",
             ".mp3",
             ".wav",
             ".m4a",
@@ -116,6 +119,9 @@ class BotConfig:
     # Integrity of the agent's own output takes priority over the inbound guard.
     outgoing_file_allowed_extensions: list[str] = field(default_factory=list)
     outgoing_file_max_bytes: int = 200 * 1024 * 1024
+    # auto/cpu stay on the light CPU path; gpu is explicit, strict, and queued.
+    ocr_mode: str = "auto"  # auto | cpu | gpu
+    asr_mode: str = "auto"  # auto | cpu | gpu
     search_blocklist: list[str] = field(
         default_factory=lambda: [
             "baidu.com",

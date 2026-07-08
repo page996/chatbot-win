@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 from app.personal_wechat_bot.domain.models import ToolCallRequest, ToolCallResult
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.base import ToolManifest
 from app.personal_wechat_bot.tools.permissions import validate_readable_file
-from app.personal_wechat_bot.vision.ocr import OcrEngine, RapidOcrSubprocessEngine
+from app.personal_wechat_bot.vision.ocr import OcrEngine, build_default_ocr_engine, ocr_rows_payload
 
 
 class OcrImageTool:
@@ -31,7 +32,7 @@ class OcrImageTool:
         self.file_index = file_index
         self.allowed_input_roots = allowed_input_roots
         self.max_input_bytes = max_input_bytes
-        self.ocr_engine = ocr_engine or RapidOcrSubprocessEngine()
+        self.ocr_engine = ocr_engine or build_default_ocr_engine()
 
     def run(self, request: ToolCallRequest) -> ToolCallResult:
         input_path = str(request.arguments.get("input_path") or request.arguments.get("path") or "").strip()
@@ -47,7 +48,7 @@ class OcrImageTool:
             safe_input = validate_readable_file(
                 input_path,
                 self.allowed_input_roots,
-                [".png", ".jpg", ".jpeg", ".bmp", ".webp"],
+                [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"],
                 self.max_input_bytes,
             )
         except (FileNotFoundError, PermissionError) as exc:
@@ -71,7 +72,9 @@ class OcrImageTool:
             )
 
         try:
-            text = self.ocr_engine.read_text(safe_input)
+            read_structured = getattr(self.ocr_engine, "read_structured", None)
+            ocr_result = read_structured(safe_input) if callable(read_structured) else None
+            text = ocr_result.text if ocr_result is not None else self.ocr_engine.read_text(safe_input)
         except Exception as exc:
             return ToolCallResult(
                 call_id=request.call_id,
@@ -82,8 +85,24 @@ class OcrImageTool:
             )
 
         output = self.output_dir / f"{_slug(safe_input)}_{request.call_id}.md"
+        rows = ocr_rows_payload(ocr_result.items) if ocr_result is not None else []
+        json_output = output.with_suffix(".json")
+        json_output.write_text(
+            json.dumps(
+                {
+                    "source_path": str(safe_input),
+                    "text": text,
+                    "metadata": dict(getattr(ocr_result, "metadata", {}) or {}) if ocr_result is not None else {},
+                    "item_count": len(getattr(ocr_result, "items", []) or []) if ocr_result is not None else 0,
+                    "rows": rows,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         output.write_text(
-            f"# OCR Result\n\nsource: {safe_input}\n\n{text.strip()}\n",
+            f"# OCR Result\n\nsource: {safe_input}\nstructured_json: {json_output}\n\n{text.strip()}\n",
             encoding="utf-8",
         )
         file_id = self.file_index.add(output, source=self.manifest.name, original_name=output.name)
@@ -93,8 +112,8 @@ class OcrImageTool:
             tool_name=self.manifest.name,
             status="completed",
             summary=f"OCR completed: {summary_text[:1000]}",
-            output_refs=[str(output)],
-            payload={"file_id": file_id, "text": text, "source_path": str(safe_input)},
+            output_refs=[str(output), str(json_output)],
+            payload={"file_id": file_id, "text": text, "source_path": str(safe_input), "rows": rows},
         )
 
 

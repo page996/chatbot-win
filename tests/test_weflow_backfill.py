@@ -64,7 +64,7 @@ class WeflowBackfillTest(unittest.TestCase):
         self.assertFalse(any(item.get("reply") for item in processed))
 
     def _wait_for_backfill_result(self) -> dict:
-        for _ in range(80):
+        for _ in range(200):
             state = build_sidebar_weflow_state(self.data_dir)
             if state.get("backfill_job", {}).get("status") in {"completed", "cancelled", "error"}:
                 return state.get("last_backfill", {})

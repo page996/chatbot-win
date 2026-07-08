@@ -11,6 +11,7 @@ from typing import Any
 from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
+from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
 
 
 CHANNEL_POLICY = "auto_accept_wechat_contacts_and_groups"
@@ -71,7 +72,7 @@ class ConversationChannelStore:
         self._segment_cache: dict[str, str] = {}
 
     def ensure_channel(self, message: NormalizedMessage) -> ConversationChannel:
-        with self._lock:
+        with self._lock, self._store_lock():
             existing_path = self._find_channel_path(message.conversation_id)
             existing = self._read_channel_payload(existing_path) if existing_path else {}
             segment = _payload_segment(existing, existing_path.parent.name if existing_path else "")
@@ -91,6 +92,13 @@ class ConversationChannelStore:
                 list(existing.get("sender_wechat_ids", [])) if existing else [],
                 message.sender_wechat_id or "",
             )
+            chat_title = _preferred_chat_title(
+                existing_title=str(existing.get("chat_title", "") or "") if existing else "",
+                incoming_title=message.chat_title,
+                segment=segment,
+                conversation_id=message.conversation_id,
+                sender_names=sender_names,
+            )
             source_name = str(message.metadata.get("source", "")).strip()
             source_names = _append_unique(list(existing.get("source_names", [])) if existing else [], source_name)
             # The conversation_key is the upstream talker id (wxid for private,
@@ -109,7 +117,7 @@ class ConversationChannelStore:
             payload = {
                 "conversation_id": message.conversation_id,
                 "conversation_type": message.conversation_type,
-                "chat_title": message.chat_title,
+                "chat_title": chat_title,
                 "segment": segment,
                 "status": "active",
                 "key_slots": key_slots,
@@ -170,7 +178,7 @@ class ConversationChannelStore:
         return self.key_pool.key_for_ref(ref) or self.key_pool.default_key()
 
     def ref_for_request(self, conversation_id: str) -> str | None:
-        with self._lock:
+        with self._lock, self._store_lock():
             path = self._find_channel_path(conversation_id)
             if not path:
                 return None
@@ -201,7 +209,7 @@ class ConversationChannelStore:
         return self.delete_channel_with_cleanup(conversation_id)["deleted"]
 
     def delete_channel_with_cleanup(self, conversation_id: str) -> dict[str, Any]:
-        with self._lock:
+        with self._lock, self._store_lock():
             path = self._find_channel_path(conversation_id)
             payload = self._read_channel_payload(path) if path else {}
             if not path or (not path.exists() and not payload):
@@ -272,6 +280,14 @@ class ConversationChannelStore:
         tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
+
+    def _store_lock(self):
+        return blocking_process_lock(
+            self.root / ".channel_store.lock",
+            label="conversation_channel_store",
+            stale_after_seconds=30.0,
+            wait_timeout_seconds=30.0,
+        )
 
     def _update_index(self, payload: dict[str, Any]) -> None:
         index_path = self.root / "index.json"
@@ -380,10 +396,70 @@ def _merge_key_refs(existing: list[str], assigned: list[str], slots: int) -> lis
 
 
 def _append_unique(values: list[str], value: str) -> list[str]:
-    cleaned = [str(item) for item in values if str(item).strip()]
-    if value and value not in cleaned:
+    cleaned = [
+        str(item).strip()
+        for item in values
+        if str(item).strip() and not _is_placeholder_title(str(item))
+    ]
+    value = str(value or "").strip()
+    if value and not _is_placeholder_title(value) and value not in cleaned:
         cleaned.append(value)
     return cleaned[-20:]
+
+
+def _preferred_chat_title(
+    *,
+    existing_title: str,
+    incoming_title: str,
+    segment: str,
+    conversation_id: str,
+    sender_names: list[str],
+) -> str:
+    existing = str(existing_title or "").strip()
+    incoming = str(incoming_title or "").strip()
+    segment_title = _title_from_segment(segment, conversation_id)
+    candidates = [incoming, existing, segment_title, *sender_names]
+    human_candidates = [item for item in candidates if _is_human_title(item)]
+    if _is_human_title(incoming):
+        return incoming
+    if _is_human_title(existing):
+        return existing
+    if _is_human_title(segment_title):
+        return segment_title
+    if human_candidates:
+        return human_candidates[0]
+    return incoming or existing or segment_title or conversation_id
+
+
+def _title_from_segment(segment: str, conversation_id: str) -> str:
+    text = str(segment or "").strip()
+    prefix = str(conversation_id or "")[:8]
+    suffix = f"_{prefix}" if prefix else ""
+    if suffix and text.endswith(suffix):
+        title = text[: -len(suffix)].strip()
+        return title or ""
+    if text and text != prefix:
+        return text
+    return ""
+
+
+def _looks_like_wechat_id(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text.startswith(("wxid_", "gh_")) or text.endswith("@chatroom"))
+
+
+def _is_human_title(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _is_placeholder_title(text):
+        return False
+    return not _looks_like_wechat_id(text)
+
+
+def _is_placeholder_title(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"unknown", "unknown contact", "未知", "未知联系人", "system", "none", "null"}
 
 
 def _stable_index(value: str, modulo: int) -> int:

@@ -27,11 +27,13 @@ from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
 from app.personal_wechat_bot.router.deduper import Deduper
 from app.personal_wechat_bot.router.cooldown import ConversationCooldown
 from app.personal_wechat_bot.router.router import Router
+from app.personal_wechat_bot.runtime.resource_scheduler import ResourceScheduler
 from app.personal_wechat_bot.tools.defaults import register_default_tools
 from app.personal_wechat_bot.tools.registry import ToolRegistry
 from app.personal_wechat_bot.tools.runtime import ToolRuntime
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
-from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
+from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.workspace.file_analysis import LLMFileAnalyzer
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -59,6 +61,7 @@ class BotRuntime:
     runtime_cards: RuntimeCardStore
     link_annotations: LinkAnnotationService
     file_workspace: FileWorkspace
+    resource_scheduler: ResourceScheduler | None = None
     active_driver: object | None = None
 
 
@@ -79,6 +82,11 @@ def build_runtime(config: BotConfig) -> BotRuntime:
     model_router = ModelRouter(config.providers)
     chat_provider = model_router.chat_provider().config
     key_pool = ApiKeyPool(chat_provider, data_root)
+    resource_scheduler = ResourceScheduler(
+        data_root,
+        key_pool=key_pool,
+        provider_max_concurrency=chat_provider.max_concurrency,
+    )
     key_assigner = ConversationKeyAssigner(key_pool)
     channel_store = ConversationChannelStore(
         data_root,
@@ -87,17 +95,26 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         context_root=data_root / "conversation_ledgers",
     )
     llm = (
-        RelayOpenAIClient(chat_provider, key_pool=key_pool, channel_store=channel_store)
+        RelayOpenAIClient(
+            chat_provider,
+            key_pool=key_pool,
+            channel_store=channel_store,
+            resource_scheduler=resource_scheduler,
+        )
         if chat_provider.base_url
         else FakeLLMClient(model=chat_provider.model)
     )
     memory_maintainer.llm = llm
     memory_maintainer.async_llm = True
-    # Give the shared file workspace an LLM-backed analyzer so analysis.json holds
-    # a real summary/key-points instead of only mechanical metadata. The driver
-    # and attachment pipeline both use this same instance.
-    file_workspace.analyzer = LLMFileAnalyzer(llm, model=chat_provider.model)
-    tool_attachment_parser = BackendAttachmentParser(RapidOcrSubprocessEngine())
+    # Give the shared file workspace an LLM-backed analyzer only when a real
+    # chat provider is configured. The fake chat client is for conversation
+    # smoke tests; using it here turns every file summary into a generic reply.
+    if isinstance(llm, RelayOpenAIClient):
+        file_workspace.analyzer = LLMFileAnalyzer(llm, model=chat_provider.model)
+    tool_attachment_parser = BackendAttachmentParser(
+        build_default_ocr_engine(mode=config.ocr_mode),
+        LocalAsrSubprocessEngine(mode=config.asr_mode),
+    )
     registry = ToolRegistry()
     register_default_tools(
         registry,
@@ -142,4 +159,5 @@ def build_runtime(config: BotConfig) -> BotRuntime:
         runtime_cards=runtime_cards,
         link_annotations=link_annotations,
         file_workspace=file_workspace,
+        resource_scheduler=resource_scheduler,
     )

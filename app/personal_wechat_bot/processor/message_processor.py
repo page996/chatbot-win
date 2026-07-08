@@ -7,8 +7,10 @@ from typing import Any
 
 from app.personal_wechat_bot.bootstrap import BotRuntime
 from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage, ReplyCandidate, SpeakDecision
+from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
-from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
+from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.workspace.attachment_pipeline import AttachmentPipeline, IncomingAttachment
 
@@ -37,7 +39,7 @@ class MessageProcessor:
 
         recall_item = self._handle_recall_event(message)
         if recall_item is not None:
-            self._mark_done(original_message_id, message.message_id)
+            self._mark_message_done(message, original_message_id)
             return recall_item
 
         raw = self._enrich_backend_media(raw, message.conversation_id, session_id)
@@ -54,27 +56,38 @@ class MessageProcessor:
         if pending_context_item is not None:
             item["context"] = pending_context_item
 
-        ledger_entry = self.runtime.ledger_store.append_message(message)
-        link_annotations = self._annotate_links(ledger_entry)
-        if link_annotations:
-            item["link_annotations"] = link_annotations
-        memory = self._maintain_memory(message.conversation_id, session_id)
-        if memory:
-            item["memory"] = memory
+        ledger_result = self.runtime.ledger_store.append_message_result(message)
+        ledger_entry = ledger_result.entry
+        item["ledger"] = {"status": ledger_result.status, "entry_id": ledger_entry.entry_id}
+        if ledger_result.status in {"created", "updated"}:
+            link_annotations = self._annotate_links(ledger_entry)
+            if link_annotations:
+                item["link_annotations"] = link_annotations
+            memory = self._maintain_memory(message.conversation_id, session_id)
+            if memory:
+                item["memory"] = memory
+            if _message_has_attachments(message):
+                self.runtime.ledger_store.refresh_file_refs(message.conversation_id)
+        if ledger_result.status != "created":
+            if not self._should_retry_existing_message(message, route):
+                item["context_only"] = True
+                self._mark_message_done(message, original_message_id)
+                return item
+            item["retry_existing"] = True
 
         if message.is_self:
             item["context_only"] = True
-            self.runtime.router.mark_done(message.message_id)
+            self._mark_message_done(message)
             return item
 
         if route.action != "process":
-            if route.action == "ignore":
-                self.runtime.router.mark_done(message.message_id)
+            if route.action in {"ignore", "duplicate"}:
+                self._mark_message_done(message)
             return item
 
         if message.metadata.get("context_only"):
             item["context_only"] = True
-            self._mark_done(original_message_id, message.message_id)
+            self._mark_message_done(message, original_message_id)
             return item
 
         speak = self.runtime.topic_classifier.decide(message)
@@ -87,18 +100,37 @@ class MessageProcessor:
         self.runtime.event_logger.log("topic.decision", speak, message_id=message.message_id)
         item["speak"] = asdict(speak)
 
+        reply_task_id = ""
+        if speak.decision == "speak":
+            reply_task_id = self._record_reply_task(message, session_id, speak)
+            self._transition_task(
+                reply_task_id,
+                "start",
+                {"progress": 15, "phase": "正在生成回复", "detail": speak.reason},
+            )
         try:
             reply = self.runtime.conversation.generate_reply(message, speak)
         except Exception as exc:
             error = {"type": type(exc).__name__, "message": str(exc)}
             self.runtime.event_logger.log("reply.error", error, message_id=message.message_id)
             item["error"] = error
+            self._transition_task(
+                reply_task_id,
+                "fail",
+                {"progress": 100, "phase": "回复生成失败", "detail": str(exc), "last_error": str(exc)},
+            )
             return item
 
         if reply is None:
-            self._mark_done(original_message_id, message.message_id)
+            self._transition_task(
+                reply_task_id,
+                "complete",
+                {"progress": 100, "phase": "无需生成回复", "detail": speak.reason},
+            )
+            self._mark_message_done(message, original_message_id)
             return item
 
+        self._update_task(reply_task_id, {"progress": 70, "phase": "回复候选已生成"})
         reply = self._enrich_reply_attachments(reply, session_id)
         reply_entry = self.runtime.ledger_store.append_reply(
             reply,
@@ -113,9 +145,15 @@ class MessageProcessor:
         send = self.runtime.reply_gate.handle(reply)
         self.runtime.ledger_store.update_reply_send_result(message.conversation_id, reply_entry.entry_id, send)
         self.runtime.event_logger.log("send.result", send, message_id=message.message_id)
+        self._transition_task(
+            reply_task_id,
+            "complete",
+            {"progress": 100, "phase": "回复候选已入账", "detail": reply.summary or reply.text[:200], "actual_cost": 1},
+        )
+        self._record_send_task(reply, session_id, send)
         item["reply"] = asdict(reply)
         item["send"] = asdict(send)
-        self._mark_done(original_message_id, message.message_id)
+        self._mark_message_done(message, original_message_id)
         return item
 
     def _apply_group_cooldown(
@@ -160,6 +198,95 @@ class MessageProcessor:
                 message_id=raw.raw_id,
             )
             return raw
+
+    def _record_reply_task(self, message: NormalizedMessage, session_id: str, speak: SpeakDecision) -> str:
+        task_id = _task_id("reply", message.message_id)
+        title = f"生成回复：{message.chat_title or message.sender_name or message.conversation_id}"
+        try:
+            TaskStatusStore(self.runtime.config.data_dir).create(
+                {
+                    "task_id": task_id,
+                    "title": title,
+                    "kind": "reply",
+                    "conversation_id": message.conversation_id,
+                    "session_id": session_id,
+                    "scope": f"conversation:{message.conversation_id}",
+                    "topic_id": _topic_id(message, speak),
+                    "topic_title": speak.topic or "回复生成",
+                    "resource_class": "llm_interactive",
+                    "priority": 80,
+                    "estimated_cost": 2,
+                    "external_id": message.message_id,
+                    "metadata": {
+                        "message_id": message.message_id,
+                        "sender": message.sender_name,
+                        "chat_title": message.chat_title,
+                    },
+                }
+            )
+        except Exception:
+            return task_id
+        return task_id
+
+    def _record_send_task(self, reply: ReplyCandidate, session_id: str, send: Any) -> None:
+        task_id = _task_id("send", reply.message_id)
+        status = str(getattr(send, "status", "") or "")
+        reason = str(getattr(send, "reason", "") or "")
+        bridge_id = _bridge_id_from_reason(reason)
+        try:
+            store = TaskStatusStore(self.runtime.config.data_dir)
+            store.create(
+                {
+                    "task_id": task_id,
+                    "title": "发送回复",
+                    "kind": "send",
+                    "conversation_id": reply.conversation_id,
+                    "session_id": session_id,
+                    "scope": f"conversation:{reply.conversation_id}",
+                    "topic_id": _task_id("reply", reply.message_id),
+                    "topic_title": "回复发送",
+                    "resource_class": "send_bridge",
+                    "priority": 85,
+                    "estimated_cost": 1,
+                    "external_id": bridge_id,
+                    "metadata": {
+                        "message_id": reply.message_id,
+                        "bridge_id": bridge_id,
+                        "send_status": status,
+                        "send_reason": reason,
+                    },
+                }
+            )
+            if status == "queued_for_confirm":
+                store.transition(
+                    task_id,
+                    "wait",
+                    {"progress": 45, "phase": "等待人工审核", "detail": reason, "blocker": "send_confirm_required"},
+                )
+            elif status == "queued_to_bridge":
+                store.update(task_id, {"status": "queued", "progress": 70, "phase": "等待非前台桥发送", "detail": reason})
+            elif status in {"sent", "skipped"}:
+                store.transition(task_id, "complete", {"progress": 100, "phase": "发送链路已完成", "detail": reason})
+            else:
+                store.transition(task_id, "fail", {"progress": 100, "phase": "发送失败", "detail": reason, "last_error": reason})
+        except Exception:
+            return
+
+    def _transition_task(self, task_id: str, action: str, patch: dict[str, Any]) -> None:
+        if not task_id:
+            return
+        try:
+            TaskStatusStore(self.runtime.config.data_dir).transition(task_id, action, patch)
+        except Exception:
+            return
+
+    def _update_task(self, task_id: str, patch: dict[str, Any]) -> None:
+        if not task_id:
+            return
+        try:
+            TaskStatusStore(self.runtime.config.data_dir).update(task_id, patch)
+        except Exception:
+            return
 
     def _handle_recall_event(self, message: NormalizedMessage) -> dict[str, Any] | None:
         if message.metadata.get("event_type") != "recall":
@@ -243,6 +370,24 @@ class MessageProcessor:
     def _mark_done(self, *message_ids: str) -> None:
         for message_id in dict.fromkeys(item for item in message_ids if item):
             self.runtime.router.mark_done(message_id)
+
+    def _mark_message_done(self, message: NormalizedMessage, *message_ids: str) -> None:
+        mark_message_done = getattr(self.runtime.router, "mark_message_done", None)
+        if mark_message_done is not None:
+            mark_message_done(message)
+        self._mark_done(*message_ids)
+
+    def _should_retry_existing_message(self, message: NormalizedMessage, route) -> bool:
+        if message.is_self or message.metadata.get("context_only") or route.action != "process":
+            return False
+        try:
+            entries = self.runtime.ledger_store.read_entries(message.conversation_id, include_removed=True)
+        except Exception:
+            return False
+        for entry in entries:
+            if entry.role == "assistant" and entry.message_id == message.message_id:
+                return False
+        return True
 
     def _with_session_id(self, message: NormalizedMessage, session_id: str) -> NormalizedMessage:
         metadata = dict(message.metadata)
@@ -373,7 +518,10 @@ class MessageProcessor:
             self._outgoing_attachment_pipeline = AttachmentPipeline(
                 file_index=self.runtime.file_index,
                 file_workspace=self.runtime.file_workspace,
-                attachment_parser=BackendAttachmentParser(RapidOcrSubprocessEngine()),
+                attachment_parser=BackendAttachmentParser(
+                    build_default_ocr_engine(mode=config.ocr_mode),
+                    LocalAsrSubprocessEngine(mode=config.asr_mode),
+                ),
                 allowed_input_roots=resolve_allowed_roots(config.data_dir, roots),
                 # Agent-produced files are trusted artifacts: use the relaxed
                 # outgoing limits (empty extension list = allow any type) so the
@@ -404,3 +552,30 @@ def _attachment_candidate(value: Any, *, source: str) -> dict[str, Any]:
         "kind": kind,
         "source": str(value.get("source") or source).strip(),
     }
+
+
+def _message_has_attachments(message: NormalizedMessage) -> bool:
+    attachments = message.metadata.get("attachments")
+    return isinstance(attachments, list) and any(isinstance(item, dict) for item in attachments)
+
+
+def _task_id(prefix: str, value: str) -> str:
+    cleaned = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in {"-", "_", "."})
+    return f"{prefix}-{cleaned[:64] or 'unknown'}"
+
+
+def _topic_id(message: NormalizedMessage, speak: SpeakDecision) -> str:
+    topic = str(speak.topic or "").strip()
+    if topic:
+        return _task_id("topic", topic)
+    return _task_id("message", message.message_id)
+
+
+def _bridge_id_from_reason(reason: str) -> str:
+    marker = "bridge:"
+    text = str(reason or "")
+    index = text.rfind(marker)
+    if index < 0:
+        return ""
+    candidate = text[index:].split()[0].strip("，,.;；")
+    return candidate if candidate.startswith(marker) else ""

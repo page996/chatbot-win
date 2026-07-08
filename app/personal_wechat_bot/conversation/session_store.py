@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
@@ -38,19 +41,20 @@ class ConversationSessionStore:
         self._segment_cache: dict[str, str] = {}
 
     def current_session_id(self, conversation_id: str) -> str:
-        state = self._read_state(conversation_id)
-        session_id = str(state.get("current_session_id", "")).strip()
-        if session_id:
-            return session_id
-        self._write_state(
-            conversation_id,
-            {
-                "conversation_id": conversation_id,
-                "current_session_id": DEFAULT_SESSION_ID,
-                "created_at": utc_now_iso(),
-            },
-        )
-        return DEFAULT_SESSION_ID
+        with self._conversation_lock(conversation_id):
+            state = self._read_state(conversation_id)
+            session_id = str(state.get("current_session_id", "")).strip()
+            if session_id:
+                return session_id
+            self._write_state(
+                conversation_id,
+                {
+                    "conversation_id": conversation_id,
+                    "current_session_id": DEFAULT_SESSION_ID,
+                    "created_at": utc_now_iso(),
+                },
+            )
+            return DEFAULT_SESSION_ID
 
     def current_session_id_for_conversation(self, conversation_id: str, chat_title: str = "") -> str:
         self._remember_segment(conversation_id, chat_title)
@@ -71,26 +75,27 @@ class ConversationSessionStore:
 
     def reset_session(self, conversation_id: str, *, reason: str, message_id: str = "") -> str:
         session_id = _new_session_id()
-        self._write_state(
-            conversation_id,
-            {
-                "conversation_id": conversation_id,
-                "current_session_id": session_id,
-                "previous_reset_reason": reason,
-                "previous_reset_message_id": message_id,
-            },
-        )
-        self._append_event(
-            conversation_id,
-            {
-                "type": "session.reset",
-                "conversation_id": conversation_id,
-                "session_id": session_id,
-                "reason": reason,
-                "message_id": message_id,
-                "created_at": utc_now_iso(),
-            },
-        )
+        with self._conversation_lock(conversation_id):
+            self._write_state(
+                conversation_id,
+                {
+                    "conversation_id": conversation_id,
+                    "current_session_id": session_id,
+                    "previous_reset_reason": reason,
+                    "previous_reset_message_id": message_id,
+                },
+            )
+            self._append_event(
+                conversation_id,
+                {
+                    "type": "session.reset",
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "reason": reason,
+                    "message_id": message_id,
+                    "created_at": utc_now_iso(),
+                },
+            )
         return session_id
 
     def _conversation_dir(self, conversation_id: str) -> Path:
@@ -127,10 +132,10 @@ class ConversationSessionStore:
         return candidate
 
     def _state_path(self, conversation_id: str) -> Path:
-        return self._conversation_dir(conversation_id) / "state.json"
+        return self._find_conversation_dir(conversation_id) / "state.json"
 
     def _events_path(self, conversation_id: str) -> Path:
-        return self._conversation_dir(conversation_id) / "events.jsonl"
+        return self._find_conversation_dir(conversation_id) / "events.jsonl"
 
     def _read_state(self, conversation_id: str) -> dict[str, Any]:
         path = self._find_conversation_dir(conversation_id) / "state.json"
@@ -147,7 +152,7 @@ class ConversationSessionStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         previous = self._read_state(conversation_id)
         merged = {**previous, **payload, "updated_at": utc_now_iso()}
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
 
@@ -156,6 +161,36 @@ class ConversationSessionStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    @contextmanager
+    def _conversation_lock(self, conversation_id: str) -> Iterator[None]:
+        lock_path = self._find_conversation_dir(conversation_id) / ".session.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 30.0
+        fd: int | None = None
+        while fd is None:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except (FileExistsError, PermissionError):
+                if _stale_lock(lock_path):
+                    try:
+                        lock_path.unlink()
+                        continue
+                    except OSError:
+                        pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for conversation session lock: {lock_path}")
+                time.sleep(0.025)
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def is_reset_command(text: str) -> bool:
@@ -175,3 +210,10 @@ def _new_session_id() -> str:
 
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", text).lower()
+
+
+def _stale_lock(path: Path, *, max_age_seconds: float = 60.0) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime > max_age_seconds
+    except OSError:
+        return False

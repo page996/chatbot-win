@@ -273,5 +273,93 @@ class KeyFailoverTest(unittest.TestCase):
             self.assertEqual(calls["n"], 0)
 
 
+class LlmResourceGateTest(unittest.TestCase):
+    def test_chat_completion_uses_workload_schedule_for_llm_gate(self) -> None:
+        import tempfile
+        import urllib.request
+        from pathlib import Path
+        from unittest import mock
+
+        from app.personal_wechat_bot.runtime.resource_scheduler import ResourceSchedule
+
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / "keys.md"
+            key_file.write_text("K1 = key-one\n", encoding="utf-8")
+            provider = ProviderConfig(
+                provider="relay",
+                model="m",
+                base_url="https://relay.example.com",
+                api_key_env="",
+                api_key_file="keys.md",
+            )
+            scheduler = _RecordingScheduler()
+            client = RelayOpenAIClient(provider, key_pool=ApiKeyPool(provider, tmp), resource_scheduler=scheduler)
+
+            class _FakeResp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+            def fake_urlopen(req, timeout=None):
+                return _FakeResp()
+
+            leases: list[tuple[str, int, int, str]] = []
+
+            class _Lease:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            def fake_acquire_llm(
+                *,
+                workload,
+                max_parallel=None,
+                total_max_parallel=None,
+                reason="",
+                root=None,
+                timeout_seconds=None,
+            ):
+                leases.append((workload, int(max_parallel or 0), int(total_max_parallel or 0), reason))
+                return _Lease()
+
+            orig = urllib.request.urlopen
+            urllib.request.urlopen = fake_urlopen
+            try:
+                with mock.patch("app.personal_wechat_bot.llm.openai_client.acquire_llm", side_effect=fake_acquire_llm):
+                    client._chat_completion([{"role": "user", "content": "hi"}], workload="background", conversation_id="c1")
+            finally:
+                urllib.request.urlopen = orig
+
+            self.assertEqual(scheduler.workloads, ["background"])
+            self.assertEqual(leases, [("background", 3, 10, "llm:background:c1")])
+
+
+class _RecordingScheduler:
+    def __init__(self):
+        self.workloads: list[str] = []
+
+    def conversation_parallelism(self, workload: str) -> object:
+        from app.personal_wechat_bot.runtime.resource_scheduler import ResourceSchedule
+
+        self.workloads.append(workload)
+        return ResourceSchedule(
+            workload="background" if workload == "background" else "interactive",
+            max_parallel_conversations=3 if workload == "background" else 7,
+            llm_total=10,
+            llm_interactive=7,
+            llm_background=3,
+            media_cpu=2,
+            file_io=1,
+            gpu_media=1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

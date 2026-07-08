@@ -14,6 +14,25 @@ from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 
 
 class ConversationChannelStoreTest(unittest.TestCase):
+    def test_unknown_sender_name_does_not_degrade_channel_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            key_pool = ApiKeyPool(ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"]), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            first = _message("conv-a", chat_title="Alice", sender_name="Alice")
+            second = _message("conv-a", chat_title="unknown", sender_name="unknown")
+
+            store.ensure_channel(first)
+            channel = store.ensure_channel(second)
+
+            self.assertEqual(channel.chat_title, "Alice")
+            self.assertNotIn("unknown", channel.sender_names)
+
     def test_private_channel_gets_one_sticky_key_and_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -121,6 +140,41 @@ class ConversationChannelStoreTest(unittest.TestCase):
             self.assertEqual(len(list((root / "conversation_channels").glob("*/channel.json"))), 1)
             self.assertEqual(index["channels"][0]["segment"], old_segment)
             self.assertEqual(index["channels"][0]["chat_title"], "Alice Renamed")
+
+    def test_wxid_title_does_not_overwrite_human_channel_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A", "KEY_B"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            conversation_id = "private-title-safe"
+            segment = conversation_segment(conversation_id, "Alice")
+
+            first = store.ensure_channel(
+                _message(conversation_id=conversation_id, conversation_type="private", chat_title="Alice")
+            )
+            second = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            ).ensure_channel(
+                _message(
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="wxid_alice",
+                )
+            )
+            index = json.loads((root / "conversation_channels" / "index.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(first.segment, segment)
+            self.assertEqual(second.segment, segment)
+            self.assertEqual(second.chat_title, "Alice")
+            self.assertEqual(index["channels"][0]["chat_title"], "Alice")
 
     def test_channel_key_selection_rotates_across_assigned_available_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,15 +315,17 @@ class ConversationChannelStoreTest(unittest.TestCase):
 
 def _message(
     conversation_id: str,
-    conversation_type: str,
+    conversation_type: str = "private",
     chat_title: str = "PAGE",
+    *,
+    sender_name: str | None = None,
 ) -> NormalizedMessage:
     return NormalizedMessage(
         message_id=f"msg-{conversation_id}",
         conversation_id=conversation_id,
         conversation_type=conversation_type,  # type: ignore[arg-type]
         chat_title=chat_title,
-        sender_name=chat_title,
+        sender_name=sender_name if sender_name is not None else chat_title,
         text="hello",
         is_self=False,
         received_at="2026-06-29T00:00:00+00:00",

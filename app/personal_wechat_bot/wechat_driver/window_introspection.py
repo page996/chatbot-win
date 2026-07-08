@@ -106,8 +106,8 @@ def build_wechat_window_probe(
 
 
 def _window_payload(window: WindowInfo, *, max_children: int, max_controls: int, max_depth: int) -> dict[str, Any]:
-    children = _child_windows(window.hwnd, max_children=max_children)
-    controls = _automation_controls(window.hwnd, max_controls=max_controls, max_depth=max_depth)
+    children = _child_windows(window.hwnd, max_children=max_children) if max_children > 0 else []
+    controls = _automation_controls(window.hwnd, max_controls=max_controls, max_depth=max_depth) if max_controls > 0 else []
     return {
         **asdict(window),
         "children": [asdict(item) for item in children],

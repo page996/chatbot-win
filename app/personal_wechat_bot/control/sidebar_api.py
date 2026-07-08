@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import wave
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from importlib.util import find_spec
@@ -17,9 +20,15 @@ from typing import Any
 from uuid import uuid4
 
 from app.personal_wechat_bot.bootstrap import build_runtime
+from app.personal_wechat_bot.config.schema import DEFAULT_LLM_MAX_CONCURRENCY
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
+from app.personal_wechat_bot.conversation.channel_state_store import (
+    ChannelStateStore,
+    build_channel_state_projection,
+    merge_channel_state_projection,
+)
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
-from app.personal_wechat_bot.config.loader import ensure_config, load_config, migrate_file_allowed_extensions, set_model_provider
+from app.personal_wechat_bot.config.loader import ensure_config, load_config, migrate_file_allowed_extensions, save_config, set_model_provider
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
@@ -28,8 +37,12 @@ from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError, blocking_process_lock
+from app.personal_wechat_bot.runtime.resource_governor import audit_local_resources
+from app.personal_wechat_bot.runtime.resource_gate import gpu_gate_snapshot, llm_gate_snapshot
+from app.personal_wechat_bot.runtime.resource_scheduler import ResourceScheduler
 from app.personal_wechat_bot.runtime.weflow_state_summary import summarize_weflow_bridge_state
 from app.personal_wechat_bot.runtime.weflow_worker_metrics import WeflowWorkerMetrics
+from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -40,6 +53,7 @@ from app.personal_wechat_bot.control.send_commands import (
     list_send_audit,
     probe_send_controls,
     reject_confirm_item,
+    remove_confirm_item,
     send_approved_confirm_item,
     set_send_controls,
     sync_bridge_ack_to_send_state,
@@ -49,6 +63,7 @@ from app.personal_wechat_bot.wechat_driver.window_introspection import build_wec
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state, is_terminal_bridge_ack_status
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
 from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
@@ -58,6 +73,8 @@ from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
     weflow_health_status,
 )
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
+from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
+from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 
 
 QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent", "failed")
@@ -69,26 +86,41 @@ _HISTORY_RESET_DIRS = (
     "file_workspace",
     "send_bridge",
     "tool_outputs",
+    "task_manager",
 )
 _HISTORY_RESET_FILES = (
     "backend_events.jsonl",
+    "backend_events.jsonl.raw_ids.json",
     "backend_file_watcher.sqlite",
     "confirm_queue.jsonl",
     "conversation_cooldowns.sqlite",
+    "channel_state.sqlite",
+    "channel_state.sqlite-shm",
+    "channel_state.sqlite-wal",
     "file_index.sqlite",
     "hook_events.jsonl",
     "hook_events_state.json",
     "logs.jsonl",
     "processed_messages.sqlite",
+    "scheduler.sqlite",
+    "scheduler.sqlite-shm",
+    "scheduler.sqlite-wal",
     "send_audit.jsonl",
     "weflow_bridge_state.json",
     "weflow_sessions.json",
     "weflow_process.err.log",
     "weflow_process.out.log",
 )
+_HISTORY_RESET_LOCK_TOLERANT_FILES = {
+    "weflow_process.err.log",
+    "weflow_process.out.log",
+}
 logger = logging.getLogger(__name__)
+_SIDEBAR_API_SCHEMA_VERSION = "20260707-runtime-probe-v2"
+_SIDEBAR_API_LOADED_AT = utc_now_iso()
 _WEFLOW_WORKERS: dict[str, dict[str, Any]] = {}
 _WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
+_WEFLOW_PULL_JOBS: dict[str, dict[str, Any]] = {}
 _WEFLOW_LOCK = threading.RLock()
 _WEFLOW_STATE_FILE_LOCK = threading.RLock()
 # Max times the supervisor auto-restarts a died worker loop before giving up.
@@ -119,6 +151,19 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
     send_bridge = _sidebar_bridge_state(data_dir, channels_state=channels, limit=12)
     return {
         "status": "ok",
+        "server": {
+            "schema_version": _SIDEBAR_API_SCHEMA_VERSION,
+            "pid": os.getpid(),
+            "loaded_at": _SIDEBAR_API_LOADED_AT,
+            "cwd": str(Path.cwd()),
+            "capabilities": {
+                "runtime_probe": True,
+                "resource_audit": True,
+                "queue_remove": True,
+                "task_manager": True,
+                "gpu_gate": True,
+            },
+        },
         "role": "visual_audit_console",
         "capture": {
             "owner": "backend_message_sources",
@@ -136,16 +181,253 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "send_confirm_required": config.send_confirm_required,
             "send_max_chars": config.send_max_chars,
             "send_min_interval_seconds": config.send_min_interval_seconds,
+            "ocr_mode": config.ocr_mode,
+            "asr_mode": config.asr_mode,
+            "file_max_bytes": config.file_max_bytes,
         },
         "channels": channels,
+        "channel_states": channels.get("states", []),
         "runtime_cards": build_sidebar_runtime_cards(data_dir),
+        "task_manager": build_sidebar_task_manager(data_dir),
+        "resource_audit": _last_resource_audit(data_dir),
+        "resource_scheduler": _resource_scheduler_snapshot(data_dir),
         "queues": queues,
         "readiness": build_send_readiness_report(data_dir),
         "driver_probe": probe_send_controls(data_dir)["probe"],
         "send_bridge": send_bridge,
         "weflow": build_sidebar_weflow_state(data_dir),
-        "wechat_window_probe": _safe_wechat_window_probe(data_dir),
+        "wechat_window_probe": _safe_wechat_window_probe(data_dir, max_children=0, max_controls=0),
         "audit": list_send_audit(data_dir, limit=30),
+    }
+
+
+def build_sidebar_task_manager(data_dir: str | Path = "data") -> dict[str, Any]:
+    state = TaskStatusStore(data_dir).state()
+    _inject_runtime_resource_limits(state, data_dir)
+    return state
+
+
+def sidebar_resource_audit(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run local resource audit and persist the latest recommendation."""
+
+    payload = payload if isinstance(payload, dict) else {}
+    result = audit_local_resources()
+    result["updated_at"] = utc_now_iso()
+    result["manual"] = bool(payload.get("manual", True))
+    path = _resource_audit_path(data_dir)
+    try:
+        _write_json(path, result)
+        result["storage"] = str(path)
+    except OSError as exc:
+        result["storage_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def _last_resource_audit(data_dir: str | Path = "data") -> dict[str, Any]:
+    payload = _read_json(_resource_audit_path(data_dir), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resource_audit_path(data_dir: str | Path) -> Path:
+    return Path(data_dir) / "runtime" / "resource_audit.json"
+
+
+def _resource_scheduler_snapshot(data_dir: str | Path) -> dict[str, Any]:
+    try:
+        config = ensure_config(data_dir)
+        chat_provider = config.providers.get("chat", config.llm)
+        scheduler = ResourceScheduler(
+            data_dir,
+            key_pool=ApiKeyPool(chat_provider, data_dir),
+            provider_max_concurrency=chat_provider.max_concurrency,
+        )
+        return scheduler.policy_snapshot()
+    except Exception as exc:
+        return {
+            "schema": "resource_scheduler_v1",
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _inject_runtime_resource_limits(state: dict[str, Any], data_dir: str | Path) -> None:
+    scheduler = state.get("scheduler") if isinstance(state.get("scheduler"), dict) else {}
+    pools = scheduler.get("resource_pools") if isinstance(scheduler.get("resource_pools"), dict) else {}
+    if not isinstance(pools, dict):
+        return
+    llm_limit = DEFAULT_LLM_MAX_CONCURRENCY
+    gpu_limit = 1
+    gpu_active = 0
+    gpu_policy = ""
+    llm_pool = pools.setdefault("llm", {"max_parallel": DEFAULT_LLM_MAX_CONCURRENCY, "active": 0, "queued": 0})
+    try:
+        llm_limit = _key_pool(data_dir).concurrency_limit()
+    except Exception:
+        llm_limit = max(1, int(llm_pool.get("max_parallel") or DEFAULT_LLM_MAX_CONCURRENCY))
+    llm_pool["max_parallel"] = llm_limit
+    gpu_pool = pools.setdefault("gpu", {"max_parallel": 1, "active": 0, "queued": 0})
+    try:
+        snapshot = gpu_gate_snapshot()
+        gpu_limit = int(snapshot.get("max_parallel") or 1)
+        gpu_active = int(snapshot.get("active_slots") or 0)
+        gpu_policy = str(snapshot.get("policy") or "")
+    except Exception:
+        gpu_limit = max(1, int(gpu_pool.get("max_parallel") or 1))
+    gpu_pool["max_parallel"] = gpu_limit
+    gpu_pool["active"] = max(int(gpu_pool.get("active") or 0), gpu_active)
+    if gpu_policy:
+        gpu_pool["policy"] = gpu_policy
+    audit = _last_resource_audit(data_dir)
+    resource_scheduler = _resource_scheduler_snapshot(data_dir)
+    interactive = resource_scheduler.get("interactive") if isinstance(resource_scheduler.get("interactive"), dict) else {}
+    background = resource_scheduler.get("background") if isinstance(resource_scheduler.get("background"), dict) else {}
+    if interactive or background:
+        cpu_pool = pools.setdefault("cpu_io", {"max_parallel": 2, "active": 0, "queued": 0})
+        media_pool = pools.setdefault("media_cpu", {"max_parallel": 1, "active": 0, "queued": 0})
+        file_pool = pools.setdefault("file_io", {"max_parallel": 1, "active": 0, "queued": 0})
+        llm_interactive = pools.setdefault("llm_interactive", {"max_parallel": llm_limit, "active": 0, "queued": 0})
+        llm_background = pools.setdefault("llm_background", {"max_parallel": max(1, llm_limit // 3), "active": 0, "queued": 0})
+        media_pool["max_parallel"] = max(1, int(interactive.get("media_cpu") or background.get("media_cpu") or media_pool.get("max_parallel") or 1))
+        file_pool["max_parallel"] = max(1, int(interactive.get("file_io") or background.get("file_io") or file_pool.get("max_parallel") or 1))
+        cpu_pool["max_parallel"] = max(int(cpu_pool.get("max_parallel") or 1), int(media_pool["max_parallel"]))
+        llm_interactive["max_parallel"] = max(1, int(interactive.get("llm_interactive") or interactive.get("max_parallel_conversations") or llm_limit))
+        llm_background["max_parallel"] = max(1, int(background.get("llm_background") or background.get("max_parallel_conversations") or 1))
+        try:
+            llm_snapshot = llm_gate_snapshot(
+                root=Path(data_dir) / "runtime_locks",
+                total_max=llm_limit,
+                interactive_max=int(llm_interactive["max_parallel"]),
+                background_max=int(llm_background["max_parallel"]),
+            )
+            total_gate = llm_snapshot.get("total") if isinstance(llm_snapshot.get("total"), dict) else {}
+            interactive_gate = llm_snapshot.get("interactive") if isinstance(llm_snapshot.get("interactive"), dict) else {}
+            background_gate = llm_snapshot.get("background") if isinstance(llm_snapshot.get("background"), dict) else {}
+            llm_pool["active"] = max(int(llm_pool.get("active") or 0), int(total_gate.get("active_slots") or 0))
+            llm_interactive["active"] = max(int(llm_interactive.get("active") or 0), int(interactive_gate.get("active_slots") or 0))
+            llm_background["active"] = max(int(llm_background.get("active") or 0), int(background_gate.get("active_slots") or 0))
+            scheduler["llm_gate"] = llm_snapshot
+        except Exception:
+            pass
+        scheduler["resource_scheduler"] = resource_scheduler
+        if audit:
+            scheduler["resource_audit"] = audit
+        try:
+            resource_limits = {
+                str(name): max(1, int((pool if isinstance(pool, dict) else {}).get("max_parallel") or 1))
+                for name, pool in pools.items()
+            }
+            scheduler["dispatch_preview"] = TaskStatusStore(data_dir).dispatch_preview(
+                resource_limits=resource_limits,
+                channel_limit=max(1, int(interactive.get("max_parallel_conversations") or 1)),
+            )
+        except Exception:
+            pass
+    for lane in state.get("channels", []) if isinstance(state.get("channels"), list) else []:
+        audit = lane.get("resource_audit") if isinstance(lane, dict) else {}
+        resources = audit.get("resources") if isinstance(audit, dict) else {}
+        if not isinstance(resources, dict):
+            continue
+        resources.setdefault("llm", {"max_parallel": llm_limit, "active": 0, "queued": 0})["max_parallel"] = llm_limit
+        resources.setdefault("gpu", {"max_parallel": gpu_limit, "active": 0, "queued": 0})["max_parallel"] = gpu_limit
+
+
+def sidebar_task_action(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    store = TaskStatusStore(data_dir)
+    action = str(payload.get("action") or "create").strip().lower()
+    if action == "list":
+        return build_sidebar_task_manager(data_dir)
+    if action == "preview":
+        resource_limits = payload.get("resource_limits") if isinstance(payload.get("resource_limits"), dict) else None
+        return {
+            "status": "ok",
+            "dispatch_preview": store.dispatch_preview(
+                resource_limits=resource_limits,
+                channel_limit=max(1, _bounded_int(payload.get("channel_limit"), 1, 1, 100)),
+                limit=max(1, _bounded_int(payload.get("limit"), 50, 1, 500)),
+            ),
+            "task_manager": build_sidebar_task_manager(data_dir),
+        }
+    if action == "events":
+        return {
+            "status": "ok",
+            "events": store.events(
+                task_id=str(payload.get("task_id") or payload.get("id") or ""),
+                limit=max(1, _bounded_int(payload.get("limit"), 200, 1, 1000)),
+            ),
+        }
+    if action == "claim":
+        resource_limits = payload.get("resource_limits") if isinstance(payload.get("resource_limits"), dict) else None
+        allowed_resources = payload.get("allowed_resources") if isinstance(payload.get("allowed_resources"), list) else None
+        claimed = store.claim_next(
+            worker_id=str(payload.get("worker_id") or payload.get("workerId") or "sidebar-worker"),
+            resource_limits=resource_limits,
+            channel_limit=max(1, _bounded_int(payload.get("channel_limit"), 1, 1, 100)),
+            allowed_resources=[str(item) for item in allowed_resources] if allowed_resources else None,
+            limit=max(1, _bounded_int(payload.get("limit"), 1, 1, 100)),
+        )
+        return {"status": "ok", "claimed": claimed, "task_manager": build_sidebar_task_manager(data_dir)}
+    if action == "create":
+        task = store.create(payload.get("task") if isinstance(payload.get("task"), dict) else payload)
+        return {"status": "ok", "task": task, "task_manager": build_sidebar_task_manager(data_dir)}
+    task_id = str(payload.get("task_id") or payload.get("id") or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
+    if action == "update":
+        task = store.update(task_id, patch)
+    else:
+        task = store.transition(task_id, action, patch)
+    return {"status": "ok", "task": task, "task_manager": build_sidebar_task_manager(data_dir)}
+
+
+def sidebar_channel_state_action(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    store = ChannelStateStore(data_dir)
+    action = str(payload.get("action") or "update_control").strip().lower()
+    conversation_id = str(payload.get("conversation_id") or payload.get("conversationId") or "").strip()
+    if not conversation_id:
+        raise ValueError("conversation_id is required")
+    patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else {}
+    control_patch: dict[str, Any] = {}
+    if action == "pause":
+        control_patch["mode"] = "paused"
+        if "wait_reason" in payload or "waitReason" in payload:
+            control_patch["wait_reason"] = payload.get("wait_reason") or payload.get("waitReason") or ""
+    elif action == "resume":
+        control_patch.update({"mode": "active", "wait_reason": "", "snoozed_until": ""})
+    elif action == "mute":
+        control_patch["mode"] = "muted"
+    elif action == "pin":
+        control_patch["pinned"] = True
+    elif action == "unpin":
+        control_patch["pinned"] = False
+    elif action == "snooze":
+        control_patch["mode"] = "snoozed"
+        control_patch["snoozed_until"] = payload.get("snoozed_until") or payload.get("snoozedUntil") or patch.get("snoozed_until") or ""
+    elif action == "set_priority":
+        control_patch["priority"] = payload.get("priority", patch.get("priority"))
+    elif action == "note":
+        control_patch["operator_note"] = payload.get("operator_note") or payload.get("operatorNote") or patch.get("operator_note") or ""
+    elif action in {"update", "update_control"}:
+        control_patch.update(patch)
+    else:
+        raise ValueError(f"unsupported channel state action: {action}")
+    if "priority" in payload and action not in {"set_priority", "update", "update_control"}:
+        control_patch["priority"] = payload.get("priority")
+    if "pinned" in payload and action not in {"pin", "unpin", "update", "update_control"}:
+        control_patch["pinned"] = payload.get("pinned")
+    if "operator_note" in payload or "operatorNote" in payload:
+        control_patch["operator_note"] = payload.get("operator_note") or payload.get("operatorNote") or ""
+    updated = store.patch_control(
+        conversation_id,
+        control_patch,
+        updated_by=str(payload.get("updated_by") or payload.get("updatedBy") or "sidebar"),
+    )
+    return {
+        "status": "ok",
+        "action": action,
+        "channel_state": updated,
+        "task_manager": build_sidebar_task_manager(data_dir),
+        "channels": _channel_state(data_dir),
     }
 
 
@@ -253,21 +535,228 @@ def cleanup_sidebar_channels(data_dir: str | Path, *, hidden_only: bool = True) 
 
 def update_sidebar_controls(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     mode = payload.get("mode")
-    enabled = payload.get("send_enabled")
+    enabled = _payload_bool(payload, "send_enabled")
     driver = payload.get("send_driver")
-    confirm_required = payload.get("send_confirm_required")
+    confirm_required = _payload_bool(payload, "send_confirm_required")
     max_chars = payload.get("send_max_chars")
     min_interval_seconds = payload.get("send_min_interval_seconds")
     controls = set_send_controls(
         data_dir,
         mode=str(mode) if mode is not None else None,
-        enabled=bool(enabled) if enabled is not None else None,
+        enabled=enabled,
         driver=str(driver) if driver is not None else None,
-        confirm_required=bool(confirm_required) if confirm_required is not None else None,
+        confirm_required=confirm_required,
         max_chars=int(max_chars) if max_chars is not None else None,
         min_interval_seconds=int(min_interval_seconds) if min_interval_seconds is not None else None,
     )
-    return {"status": "ok", "send_controls": controls}
+    runtime_config = _update_runtime_modes_from_payload(data_dir, payload)
+    return {"status": "ok", "send_controls": controls, "runtime_modes": runtime_config, "runtime_config": runtime_config}
+
+
+def _payload_bool(payload: dict[str, Any], key: str) -> bool | None:
+    if key not in payload or payload.get(key) is None:
+        return None
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off", ""}:
+        return False
+    raise ValueError(f"{key} must be a boolean")
+
+
+def sidebar_runtime_probe(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Probe OCR/ASR runtime using the same engine constructors as ingestion."""
+
+    payload = payload if isinstance(payload, dict) else {}
+    config = ensure_config(data_dir)
+    ocr_mode = _normalize_runtime_mode(payload.get("ocr_mode", config.ocr_mode))
+    asr_mode = _normalize_runtime_mode(payload.get("asr_mode", config.asr_mode))
+    result: dict[str, Any] = {
+        "status": "ok",
+        "same_path_as_ingest": True,
+        "ingest_path": "文件入库与探测使用同一路径；auto/cpu 走轻量 CPU，只有 gpu 档进入全局 GPU 队列。",
+        "config_modes": {"ocr_mode": config.ocr_mode, "asr_mode": config.asr_mode},
+        "effective_modes": {"ocr_mode": ocr_mode, "asr_mode": asr_mode},
+    }
+    errors: list[str] = []
+    try:
+        ocr_engine = build_default_ocr_engine(mode=ocr_mode)
+        ocr_health = ocr_engine.health()
+        result["ocr"] = {
+            "engine_class": type(ocr_engine).__name__,
+            "python_executable": str(getattr(ocr_engine, "python_executable", "")),
+            "health": _dataclass_payload(ocr_health),
+        }
+        if bool(payload.get("run_sample") or payload.get("live_probe")):
+            result["ocr"]["sample"] = _probe_ocr_worker_sample(ocr_engine)
+    except Exception as exc:
+        errors.append(f"ocr:{type(exc).__name__}: {exc}")
+        result["ocr"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "mode": ocr_mode}
+    try:
+        asr_engine = LocalAsrSubprocessEngine(mode=asr_mode)
+        asr_health = asr_engine.health()
+        result["asr"] = {
+            "engine_class": type(asr_engine).__name__,
+            "python_executable": str(getattr(asr_engine, "python_executable", "")),
+            "model": str(getattr(asr_engine, "model", "")),
+            "health": _dataclass_payload(asr_health),
+        }
+        if bool(payload.get("run_sample") or payload.get("live_probe")):
+            result["asr"]["sample"] = _probe_asr_worker_sample(asr_engine)
+    except Exception as exc:
+        errors.append(f"asr:{type(exc).__name__}: {exc}")
+        result["asr"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "mode": asr_mode}
+    ocr_sample = result.get("ocr", {}).get("sample") if isinstance(result.get("ocr"), dict) else {}
+    ocr_sample_metadata = ocr_sample.get("metadata") if isinstance(ocr_sample, dict) and isinstance(ocr_sample.get("metadata"), dict) else {}
+    ocr_sample_ran = isinstance(ocr_sample, dict) and str(ocr_sample.get("status") or "") == "ok"
+    asr_sample = result.get("asr", {}).get("sample") if isinstance(result.get("asr"), dict) else {}
+    asr_sample_metadata = asr_sample.get("metadata") if isinstance(asr_sample, dict) and isinstance(asr_sample.get("metadata"), dict) else {}
+    asr_sample_ran = isinstance(asr_sample, dict) and str(asr_sample.get("status") or "") == "ok"
+    result["gpu"] = {
+        "ocr_available": bool(result.get("ocr", {}).get("health", {}).get("gpu_available")),
+        "ocr_enabled": bool(ocr_sample_metadata.get("gpu_used")) if ocr_sample_ran else bool(result.get("ocr", {}).get("health", {}).get("gpu_used")),
+        "ocr_worker_checked": ocr_sample_ran,
+        "ocr_worker_backends": list(ocr_sample_metadata.get("backends") or []) if isinstance(ocr_sample_metadata.get("backends"), list) else [],
+        "ocr_required": ocr_mode == "gpu",
+        "asr_available": bool(result.get("asr", {}).get("health", {}).get("gpu_available")),
+        "asr_enabled": bool(asr_sample_metadata.get("gpu_used")) if asr_sample_ran else bool(result.get("asr", {}).get("health", {}).get("gpu_used")),
+        "asr_worker_checked": asr_sample_ran,
+        "asr_worker_backend": str(asr_sample_metadata.get("backend") or ""),
+        "asr_required": asr_mode == "gpu",
+    }
+    result["gpu_gate"] = gpu_gate_snapshot()
+    if errors:
+        result["status"] = "partial_error"
+        result["errors"] = errors
+    return result
+
+
+def _probe_ocr_worker_sample(ocr_engine: Any) -> dict[str, Any]:
+    """Run a tiny image through the exact OCR worker path used by ingestion."""
+
+    sample_png = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xfc\xff\xff?"
+        b"\x00\x05\xfe\x02\xfeA\xde\xfc\x82\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="chatbot_ocr_probe_") as tmp:
+            image = Path(tmp) / "gpu_probe.png"
+            image.write_bytes(sample_png)
+            read_structured = getattr(ocr_engine, "read_structured", None)
+            if not callable(read_structured):
+                return {"status": "skipped", "reason": "ocr_engine_has_no_read_structured"}
+            ocr_result = read_structured(image)
+            metadata = dict(getattr(ocr_result, "metadata", {}) or {})
+            return {
+                "status": "ok",
+                "text_length": len(str(getattr(ocr_result, "text", "") or "")),
+                "item_count": int(getattr(ocr_result, "item_count", 0) or 0),
+                "metadata": metadata,
+            }
+    except Exception as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _probe_asr_worker_sample(asr_engine: Any) -> dict[str, Any]:
+    """Run a tiny WAV through the exact ASR worker path used by ingestion."""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="chatbot_asr_probe_") as tmp:
+            audio = Path(tmp) / "gpu_probe.wav"
+            _write_silence_wav(audio, seconds=0.35, sample_rate=16000)
+            transcribe = getattr(asr_engine, "transcribe", None)
+            if not callable(transcribe):
+                return {"status": "skipped", "reason": "asr_engine_has_no_transcribe"}
+            transcript = transcribe(audio)
+            backend = str(getattr(transcript, "backend", "") or "")
+            status = str(getattr(transcript, "status", "") or "")
+            worker_ok = status in {"transcribed", "empty"}
+            return {
+                "status": "ok" if worker_ok else "error",
+                "transcript_status": status,
+                "text_length": len(str(getattr(transcript, "text", "") or "")),
+                "error": str(getattr(transcript, "error", "") or ""),
+                "metadata": {
+                    "backend": backend,
+                    "model": str(getattr(transcript, "model", "") or ""),
+                    "language": str(getattr(transcript, "language", "") or ""),
+                    "gpu_used": backend.endswith("_gpu") or backend.endswith(":gpu") or "_gpu" in backend,
+                },
+            }
+    except Exception as exc:
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _write_silence_wav(path: Path, *, seconds: float, sample_rate: int) -> None:
+    frame_count = max(1, int(seconds * sample_rate))
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * frame_count)
+
+
+def _update_runtime_modes_from_payload(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    config = load_config(data_dir)
+    changed = False
+    if "ocr_mode" in payload:
+        ocr_mode = _normalize_runtime_mode(payload.get("ocr_mode"))
+        if config.ocr_mode != ocr_mode:
+            config.ocr_mode = ocr_mode
+            changed = True
+    if "asr_mode" in payload:
+        asr_mode = _normalize_runtime_mode(payload.get("asr_mode"))
+        if config.asr_mode != asr_mode:
+            config.asr_mode = asr_mode
+            changed = True
+    file_max_bytes = _file_max_bytes_from_payload(payload)
+    if file_max_bytes is not None and config.file_max_bytes != file_max_bytes:
+        config.file_max_bytes = file_max_bytes
+        changed = True
+    if changed:
+        save_config(config)
+    return {"ocr_mode": config.ocr_mode, "asr_mode": config.asr_mode, "file_max_bytes": config.file_max_bytes}
+
+
+def _file_max_bytes_from_payload(payload: dict[str, Any]) -> int | None:
+    raw = payload.get("file_max_bytes")
+    if raw is None:
+        raw = payload.get("file_max_mb")
+        if raw is not None:
+            try:
+                raw = float(raw) * 1024 * 1024
+            except (TypeError, ValueError):
+                return None
+    if raw is None:
+        return None
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return max(1024, min(value, 2 * 1024 * 1024 * 1024))
+
+
+def _normalize_runtime_mode(value: Any) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode in {"gpu", "cuda", "gpu-only", "gpu_only"}:
+        return "gpu"
+    if mode in {"cpu", "cpu-only", "cpu_only", "rapidocr"}:
+        return "cpu"
+    return "auto"
+
+
+def _dataclass_payload(value: Any) -> dict[str, Any]:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return {"value": str(value)}
 
 
 def append_sidebar_backend_event(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -283,6 +772,132 @@ def append_sidebar_backend_event(data_dir: str | Path, payload: dict[str, Any]) 
     }
 
 
+def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one bounded dialog-agent tick over the backend event bus."""
+
+    payload = payload if isinstance(payload, dict) else {}
+    root = Path(data_dir).resolve()
+    config = ensure_config(root)
+    runtime = build_runtime(config)
+    event_file = _backend_event_file_path(root, payload)
+    event_file.parent.mkdir(parents=True, exist_ok=True)
+    event_file.touch(exist_ok=True)
+    loops = _bounded_int(payload.get("loops"), 1, 1, 20)
+    requested_conversations = _string_list(payload.get("conversation_ids") or payload.get("conversationIds") or [])
+    job_id = f"agent-tick-{uuid4().hex[:12]}"
+    task_id = job_id
+    store = TaskStatusStore(root)
+    store.create(
+        {
+            "task_id": task_id,
+            "title": "运行对话 Agent",
+            "kind": "Agent",
+            "status": "queued",
+            "priority": 90,
+            "progress": 5,
+            "phase": "等待读取会话文件",
+            "detail": str(event_file),
+            "concurrency_key": "agent:tick",
+            "resource_class": "llm_interactive",
+            "estimated_cost": 2,
+            "external_id": job_id,
+            "metadata": {
+                "event_file": str(event_file),
+                "scope_label": "对话 Agent",
+                "loops": loops,
+            },
+        }
+    )
+    store.transition(task_id, "start", {"progress": 15, "phase": "正在读取当前 session 对话文件"})
+    snapshot_before = _agent_session_snapshot(root, runtime=runtime, conversation_ids=requested_conversations)
+    result: dict[str, Any]
+    processed_conversations: list[str] = []
+    try:
+        driver = _build_agent_backend_driver(
+            config,
+            runtime,
+            event_file,
+            extra_roots=_string_list(payload.get("extra_roots") or payload.get("extraRoots") or []),
+        )
+        runtime.active_driver = driver
+        store.update(
+            task_id,
+            {
+                "progress": 35,
+                "phase": "正在运行消息聚合与接话管线",
+                "detail": f"会话快照 {snapshot_before.get('conversation_count', 0)} 个",
+            },
+        )
+        result = PollingRunner(
+            runtime,
+            driver,
+            poll_interval_seconds=0,
+            workload="interactive",
+        ).run_forever(max_loops=loops)
+        processed_conversations = _agent_processed_conversation_ids(result)
+        snapshot_after = _agent_session_snapshot(
+            root,
+            runtime=runtime,
+            conversation_ids=_dedupe_strings([*requested_conversations, *processed_conversations]),
+        )
+        processed_count = int(result.get("processed_count") or 0)
+        store.transition(
+            task_id,
+            "complete",
+            {
+                "progress": 100,
+                "phase": "一次接话管线已完成",
+                "detail": f"处理 {processed_count} 条消息；聚合 {snapshot_after.get('conversation_count', 0)} 个通道",
+                "actual_cost": max(1, processed_count),
+            },
+        )
+        status = "ok"
+        error = ""
+    except Exception as exc:
+        result = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "processed_count": 0, "processed": []}
+        snapshot_after = _agent_session_snapshot(root, runtime=runtime, conversation_ids=requested_conversations)
+        store.transition(
+            task_id,
+            "fail",
+            {
+                "progress": 100,
+                "phase": "对话 Agent 运行失败",
+                "detail": str(exc),
+                "last_error": str(exc),
+            },
+        )
+        status = "error"
+        error = str(exc)
+    channels = _channel_state(root)
+    task_manager = build_sidebar_task_manager(root)
+    queues = {queue_status: list_confirm_queue(root, status=queue_status) for queue_status in QUEUE_STATUSES}
+    response = {
+        "status": status,
+        "agent": {
+            "schema": "dialog_agent_tick_v1",
+            "job_id": job_id,
+            "task_id": task_id,
+            "event_file": str(event_file),
+            "loops": loops,
+            "processed_count": int(result.get("processed_count") or 0),
+            "processed": result.get("processed", []),
+            "runner_status": result.get("status", ""),
+            "processed_conversation_ids": processed_conversations,
+            "policy": "read_session_snapshot_then_poll_backend_events_then_reply_gate",
+        },
+        "session_snapshot": {
+            "before": snapshot_before,
+            "after": snapshot_after,
+        },
+        "task_manager": task_manager,
+        "channels": channels,
+        "queues": queues,
+    }
+    if error:
+        response["error"] = error
+    return response
+
+
 def build_sidebar_bridge_state(data_dir: str | Path = "data") -> dict[str, Any]:
     return _sidebar_bridge_state(data_dir, limit=50)
 
@@ -294,14 +909,23 @@ def clear_sidebar_send_audit(data_dir: str | Path) -> dict[str, Any]:
 def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Clear disposable conversation/runtime history while preserving config."""
 
+    payload = payload if isinstance(payload, dict) else {}
     root = Path(data_dir).resolve()
     ensure_config(root)
+    if bool(
+        payload.get("shutdown_processes")
+        or payload.get("shutdownProcesses")
+    ):
+        return _schedule_sidebar_history_reset_shutdown(root, payload)
     removed: list[dict[str, Any]] = []
+    retained_locked: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
     retained = _retained_config_paths(root)
     for relative in _HISTORY_RESET_DIRS:
-        _remove_history_path(root, relative, removed, retained)
+        _remove_history_path(root, relative, removed, retained_locked, errors, retained)
     for relative in _HISTORY_RESET_FILES:
-        _remove_history_path(root, relative, removed, retained)
+        _remove_history_path(root, relative, removed, retained_locked, errors, retained)
+    reinitialized = _reinitialize_history_runtime_files(root)
     _write_weflow_sidebar_state(
         root,
         {
@@ -309,17 +933,23 @@ def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | N
             "last_discover": {},
             "last_pull": {},
             "last_backfill": {},
+            "pull_job": {},
             "backfill_job": {},
             "operation_history": [],
             "last_error": "",
         },
     )
     return {
-        "status": "ok",
+        "status": "partial_error" if errors else "ok",
         "policy": "history_only_preserve_sidebar_config",
         "removed_count": len(removed),
         "removed": removed,
+        "retained_locked_count": len(retained_locked),
+        "retained_locked": retained_locked,
+        "error_count": len(errors),
+        "errors": errors,
         "retained_config": [str(item) for item in sorted(retained)],
+        "reinitialized": reinitialized,
     }
 
 
@@ -339,6 +969,14 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         migration = migrate_file_allowed_extensions(root)
     except Exception as exc:
         migration = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    pull_job = _weflow_pull_job_state(root, persisted)
+    backfill_job = _weflow_backfill_job_state(root, persisted)
+    last_pull = persisted.get("last_pull", {}) if isinstance(persisted, dict) else {}
+    if isinstance(pull_job.get("result"), dict) and pull_job.get("result"):
+        last_pull = pull_job["result"]
+    last_backfill = persisted.get("last_backfill", {}) if isinstance(persisted, dict) else {}
+    if isinstance(backfill_job.get("result"), dict) and backfill_job.get("result"):
+        last_backfill = backfill_job["result"]
     return {
         "status": "ok",
         "base_url": str(persisted.get("base_url") or "http://127.0.0.1:5031"),
@@ -358,7 +996,8 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "config_migration": migration,
         "worker": worker,
         "readiness": readiness,
-        "backfill_job": _weflow_backfill_job_state(root, persisted),
+        "pull_job": pull_job,
+        "backfill_job": backfill_job,
         "bridge_state": summarize_weflow_bridge_state(root / "weflow_bridge_state.json"),
         "last_health": persisted.get("last_health", {}) if isinstance(persisted, dict) else {},
         "last_discover": persisted.get("last_discover", {}) if isinstance(persisted, dict) else {},
@@ -368,8 +1007,8 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "count": len(cached_sessions),
             "sessions": cached_sessions,
         },
-        "last_pull": persisted.get("last_pull", {}) if isinstance(persisted, dict) else {},
-        "last_backfill": persisted.get("last_backfill", {}) if isinstance(persisted, dict) else {},
+        "last_pull": last_pull,
+        "last_backfill": last_backfill,
         "operation_history": persisted.get("operation_history", []) if isinstance(persisted, dict) else [],
         "last_error": persisted.get("last_error", "") if isinstance(persisted, dict) else "",
         "updated_at": persisted.get("updated_at", "") if isinstance(persisted, dict) else "",
@@ -473,11 +1112,69 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
 
 
 def sidebar_weflow_pull_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    if bool(payload.get("background") or payload.get("async")):
+        return _start_weflow_pull_job(data_dir, payload)
     result = _run_sidebar_weflow_once(data_dir, payload)
     params = _weflow_params(data_dir, payload)
     result["session_store"] = _register_weflow_result_sessions(data_dir, payload, result)
     _record_weflow_state_safely(data_dir, {"last_pull": result, **_weflow_public_params(params)}, action="pull-once", result=result)
     return result
+
+
+def _start_weflow_pull_job(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    key = str(root)
+    with _WEFLOW_LOCK:
+        existing = _WEFLOW_PULL_JOBS.get(key)
+        if existing and _thread_alive(existing.get("thread")):
+            result = {
+                "status": "running",
+                "message": "WeFlow pull is already running in background",
+                "pull_job": _public_pull_job(existing),
+            }
+            _append_weflow_operation_history(data_dir, "pull-once-already-running", result)
+            return result
+        job_id = f"pull-{uuid4().hex[:12]}"
+        job: dict[str, Any] = {
+            "job_id": job_id,
+            "status": "running",
+            "talkers": _string_list(payload.get("talkers") or payload.get("talker") or []),
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "progress": {
+                "session_count": 0,
+                "page_count": 0,
+                "scanned_count": 0,
+                "appended_count": 0,
+                "processed_count": 0,
+                "current_session_id": "",
+                "last_raw_id": "",
+            },
+            "result": {},
+            "last_error": "",
+        }
+        thread = threading.Thread(
+            target=_weflow_pull_job_loop,
+            args=(root, dict(payload), job_id),
+            name="sidebar-weflow-pull-once",
+            daemon=True,
+        )
+        job["thread"] = thread
+        _WEFLOW_PULL_JOBS[key] = job
+        thread.start()
+        job_snapshot = _public_pull_job(job)
+        result = {
+            "status": "started",
+            "message": "WeFlow pull started in background",
+            "pull_job": job_snapshot,
+        }
+        _record_weflow_state_safely(
+            data_dir,
+            {"last_pull": result, "pull_job": job_snapshot, **_weflow_public_params(_weflow_params(data_dir, payload))},
+            action="pull-once-start",
+            result=result,
+        )
+        return result
 
 
 def _backfill_payload(payload: dict[str, Any], talkers: list[str]) -> dict[str, Any]:
@@ -493,6 +1190,7 @@ def _backfill_payload(payload: dict[str, Any], talkers: list[str]) -> dict[str, 
         "talkers": talkers,
         "since": 0,
         "context_only": True,
+        "force_context_only": True,
         "max_pages": _bounded_int(payload.get("max_pages"), 0, 0, 10000),
         "max_messages": _bounded_int(payload.get("max_messages"), 0, 0, 1000000),
     }
@@ -601,22 +1299,21 @@ def sidebar_weflow_backfill(data_dir: str | Path, payload: dict[str, Any]) -> di
         )
         job["thread"] = thread
         _WEFLOW_BACKFILL_JOBS[key] = job
+        thread.start()
         job_snapshot = _public_backfill_job(job)
-
-    result = {
-        "status": "started",
-        "message": "WeFlow history backfill started",
-        "backfill_job": job_snapshot,
-        "backfilled_talkers": talkers,
-    }
-    _record_weflow_state_safely(
-        data_dir,
-        {"last_backfill": result, "backfill_job": result["backfill_job"], **_weflow_public_params(_weflow_params(data_dir, backfill_payload))},
-        action="backfill-start",
-        result=result,
-    )
-    thread.start()
-    return result
+        result = {
+            "status": "started",
+            "message": "WeFlow history backfill started",
+            "backfill_job": job_snapshot,
+            "backfilled_talkers": talkers,
+        }
+        _record_weflow_state_safely(
+            data_dir,
+            {"last_backfill": result, "backfill_job": result["backfill_job"], **_weflow_public_params(_weflow_params(data_dir, backfill_payload))},
+            action="backfill-start",
+            result=result,
+        )
+        return result
 
 
 def sidebar_weflow_cancel_backfill(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -693,13 +1390,31 @@ def sidebar_weflow_stop(data_dir: str | Path, payload: dict[str, Any]) -> dict[s
     # Stop the send-bridge worker together with the pull worker.
     _stop_bridge_worker(root)
     worker_state = _weflow_worker_state(root)
+    finished_tasks = _finish_weflow_worker_tasks(root, running=bool(worker_state.get("running")))
     result = {
         "status": "ok",
         "worker": worker_state,
+        "finished_tasks": finished_tasks,
+        "task_manager": build_sidebar_task_manager(root),
         "message": "WeFlow 后台拉取已停止" if not worker_state.get("running") else "WeFlow 后台拉取停止信号已发送，当前 tick 会先收尾",
     }
     _append_weflow_operation_history(data_dir, "stop", result)
     return result
+
+
+def _finish_weflow_worker_tasks(root: Path, *, running: bool) -> list[dict[str, Any]]:
+    status = "cancelled" if running else "completed"
+    phase = "停止信号已发送" if running else "后台拉取已停止"
+    return TaskStatusStore(root).finish_external(
+        "worker",
+        {
+            "status": status,
+            "progress": 100,
+            "phase": phase,
+            "detail": "user_requested_stop",
+            "actual_cost": 1,
+        },
+    )
 
 
 def sidebar_weflow_clear_history(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -718,13 +1433,16 @@ def sidebar_weflow_dependency_status(data_dir: str | Path = "data", *, record_hi
 def _subprocess_module_available(python_executable: Path, module: str) -> bool:
     if not python_executable.exists():
         return False
-    completed = subprocess.run(
-        [str(python_executable), "-c", f"import {module}"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [str(python_executable), "-c", f"import {module}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     return completed.returncode == 0
 
 
@@ -856,13 +1574,12 @@ def _dependency_specs() -> list[dict[str, Any]]:
             "runtime": "vendor_ocr_python",
             "python": Path("vendor/ocr-python/Scripts/python.exe"),
             "venv": Path("vendor/ocr-python"),
-            "requirements": Path("requirements-ocr.txt"),
+            "requirements": Path("requirements-ocr-light.txt"),
             "modules": {
                 "rapidocr-onnxruntime": "rapidocr_onnxruntime",
-                "paddleocr": "paddleocr",
-                "paddlepaddle": "paddle",
                 "Pillow": "PIL",
                 "numpy": "numpy",
+                "opencv-python": "cv2",
             },
         },
         {
@@ -870,16 +1587,10 @@ def _dependency_specs() -> list[dict[str, Any]]:
             "runtime": "vendor_asr_python",
             "python": Path("vendor/asr-python/Scripts/python.exe"),
             "venv": Path("vendor/asr-python"),
-            "requirements": Path("requirements-asr.txt"),
+            "requirements": Path("requirements-asr-light.txt"),
             "modules": {
                 "faster-whisper": "faster_whisper",
-                "funasr": "funasr",
-                "torch": "torch",
-                "torchaudio": "torchaudio",
-                "modelscope": "modelscope",
                 "soundfile": "soundfile",
-                "pocketsphinx": "pocketsphinx",
-                "SpeechRecognition": "speech_recognition",
             },
         },
         {
@@ -918,13 +1629,16 @@ def _dependency_module_available(spec: dict[str, Any], python_executable: Path, 
         return find_spec(module) is not None
     target = spec.get("target")
     if target:
-        completed = subprocess.run(
-            [str(python_executable), "-c", f"import sys; sys.path.insert(0, {str(Path(target).resolve())!r}); import {module}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [str(python_executable), "-c", f"import sys; sys.path.insert(0, {str(Path(target).resolve())!r}); import {module}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
         return completed.returncode == 0
     return _subprocess_module_available(python_executable, module)
 
@@ -996,7 +1710,10 @@ def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, paylo
         return approve_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
     if action == "reject":
         return reject_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
+    if action in {"remove", "delete"}:
+        return remove_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
     if action == "send-approved":
+        _start_bridge_worker(Path(data_dir).resolve(), dict(payload))
         return send_approved_confirm_item(data_dir, queue_id)
     raise ValueError(f"unknown queue action: {action}")
 
@@ -1028,6 +1745,10 @@ def _build_weflow_pull_context(data_dir: str | Path, payload: dict[str, Any]) ->
         allowed_input_roots=resolve_allowed_roots(config.data_dir, roots),
         allowed_extensions=config.file_allowed_extensions,
         max_input_bytes=config.file_max_bytes,
+        attachment_parser=BackendAttachmentParser(
+            build_default_ocr_engine(mode=config.ocr_mode),
+            LocalAsrSubprocessEngine(mode=config.asr_mode),
+        ),
         file_workspace=runtime.file_workspace,
         session_store=runtime.session_store,
         voice_cache_resolver=_voice_cache_resolver(config, extra_roots=params["extra_roots"] + media_roots),
@@ -1046,7 +1767,12 @@ def _build_weflow_pull_context(data_dir: str | Path, payload: dict[str, Any]) ->
             params["backend_event_file"],
             state_path=params["hook_state_file"],
         ),
-        PollingRunner(runtime, driver, poll_interval_seconds=0),
+        PollingRunner(
+            runtime,
+            driver,
+            poll_interval_seconds=0,
+            workload="background" if params["context_only"] else "interactive",
+        ),
         hook_event_file=params["hook_event_file"],
         backend_event_file=params["backend_event_file"],
         # Serialize the consume step across processes (background worker tick,
@@ -1115,6 +1841,7 @@ def _run_weflow_pull_tick(
     runner: HookMessagePullRunner = context["runner"]
     lock_root = Path(params.get("hook_state_file") or params.get("hook_event_file") or "data").parent
     with _weflow_exclusive_operation(lock_root, label="weflow_pull_tick"):
+        _emit_weflow_progress(progress_callback, event="source_started", phase="拉取 WeFlow 消息页")
         source = bridge.pull_once(
             talkers=params["talkers"],
             session_limit=params["session_limit"],
@@ -1129,6 +1856,13 @@ def _run_weflow_pull_tick(
             cancel_event=cancel_event,
             progress_callback=progress_callback,
         )
+        _emit_weflow_progress(
+            progress_callback,
+            event="source_completed",
+            phase="WeFlow 消息页拉取完成",
+            scanned_count=getattr(source, "scanned_count", 0),
+            appended_count=getattr(source, "appended_count", 0),
+        )
         if cancel_event is not None and cancel_event.is_set():
             pull = {
                 "status": "cancelled",
@@ -1142,7 +1876,14 @@ def _run_weflow_pull_tick(
             # Single-instance the consume step so a concurrent worker tick / backfill
             # / pull-once never race the shared hook offset and message deduper.
             with _WEFLOW_CONSUMER_LOCK:
+                _emit_weflow_progress(progress_callback, event="consume_started", phase="导入事件并运行 agent")
                 pull = runner.run_once()
+                _emit_weflow_progress(
+                    progress_callback,
+                    event="consume_completed",
+                    phase="事件导入与 agent 处理完成",
+                    processed_count=pull.get("processed_count", 0),
+                )
         status = "ok" if source.status == "ok" and pull.get("status") == "ok" else "partial_error"
         if source.status == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
             status = "cancelled"
@@ -1246,6 +1987,8 @@ def _maybe_recover_empty_weflow_pull(
 
 def _weflow_bootstrap_candidates(data_dir: str | Path, talkers: Any) -> list[dict[str, Any]]:
     requested = {str(item).strip() for item in _string_list(talkers) if str(item).strip()}
+    if not (Path(data_dir) / "conversation_channels").exists():
+        return []
     try:
         channels = _channel_store(data_dir).list_channels()
     except Exception:
@@ -1520,7 +2263,10 @@ def _weflow_worker_loop(root: Path, payload: dict[str, Any], stop_event: threadi
                     # send_driver / send_backend) without rebuilding the pull
                     # context, so the driver's dedup state survives.
                     _refresh_weflow_send_controls(context)
-                result = _run_weflow_pull_tick(context)
+                def worker_progress(update: dict[str, Any]) -> None:
+                    _update_weflow_task_progress(root, "worker", update)
+
+                result = _run_weflow_pull_tick(context, progress_callback=worker_progress)
                 duration = time.monotonic() - tick_started
                 source_status = str(result.get("source", {}).get("status") or "")
                 if source_status == "error":
@@ -1593,6 +2339,22 @@ def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
     token_source = "payload" if direct_token else ("environment" if env_token else "missing")
     since_value = payload.get("since")
     since = int(since_value) if since_value not in (None, "") else None
+    # Normal incremental pulls must never inherit a stale sidebar "context only"
+    # checkbox: that flag records messages but intentionally skips topic/reply
+    # generation. Only backfill / explicit forced history paths may set it.
+    force_context_only = bool(
+        payload.get("force_context_only")
+        or payload.get("forceContextOnly")
+        or payload.get("history_backfill")
+        or payload.get("historyBackfill")
+    )
+    allow_context_only = bool(payload.get("allow_context_only") or payload.get("allowContextOnly"))
+    requested_context_only = bool(payload.get("context_only") or payload.get("contextOnly"))
+    context_only = bool(
+        force_context_only
+        or (allow_context_only and requested_context_only)
+        or (since is not None and since <= 0)
+    )
     return {
         "base_url": str(payload.get("base_url") or payload.get("baseUrl") or "http://127.0.0.1:5031").strip(),
         "token": token,
@@ -1612,7 +2374,7 @@ def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
         "lookback_seconds": _bounded_int(payload.get("lookback_seconds"), 300, 0, 30 * 24 * 3600),
         "workers": _bounded_int(payload.get("workers"), 2, 1, 16),
         "media": not bool(payload.get("no_media") or payload.get("noMedia") or False),
-        "context_only": bool(payload.get("context_only") or payload.get("contextOnly") or (since is not None and since <= 0)),
+        "context_only": context_only,
         "extra_roots": _string_list(payload.get("extra_roots") or payload.get("extraRoots") or []),
     }
 
@@ -1667,17 +2429,18 @@ def _normalize_weflow_session(session: dict[str, Any]) -> dict[str, Any]:
         or session.get("session_id")
         or ""
     ).strip()
-    name = str(
-        session.get("name")
-        or session.get("displayName")
-        or session.get("display_name")
-        or session.get("remark")
-        or session.get("nickName")
-        or session.get("nickname")
-        or session.get("groupName")
-        or session.get("group_name")
-        or session_id
-    ).strip()
+    name = _preferred_weflow_display_name(
+        session.get("remark"),
+        session.get("displayName"),
+        session.get("display_name"),
+        session.get("nickName"),
+        session.get("nickname"),
+        session.get("groupName"),
+        session.get("group_name"),
+        session.get("name"),
+        session.get("username"),
+        session_id,
+    )
     session_type = str(session.get("type") or session.get("sessionType") or session.get("session_type") or "").strip()
     if not session_type:
         session_type = "group" if session_id.endswith("@chatroom") else "private"
@@ -1810,15 +2573,26 @@ def _upsert_weflow_sessions(
             continue
         existing = items.get(session_id) if isinstance(items.get(session_id), dict) else {}
         channel = channels.get(session_id, {})
+        display_name = _preferred_weflow_display_name(
+            normalized.get("name"),
+            existing.get("name") if isinstance(existing, dict) else "",
+            channel.get("chat_title") if isinstance(channel, dict) else "",
+            session_id,
+        )
         merged = {
             **existing,
             **normalized,
             "id": session_id,
-            "name": str(normalized.get("name") or existing.get("name") or session_id),
+            "name": display_name,
             "type": str(normalized.get("type") or existing.get("type") or ("group" if session_id.endswith("@chatroom") else "private")),
             "conversation_id": channel.get("conversation_id") or existing.get("conversation_id") or "",
             "conversation_type": channel.get("conversation_type") or existing.get("conversation_type") or "",
-            "chat_title": channel.get("chat_title") or existing.get("chat_title") or normalized.get("name") or session_id,
+            "chat_title": _preferred_weflow_display_name(
+                channel.get("chat_title") if isinstance(channel, dict) else "",
+                existing.get("chat_title") if isinstance(existing, dict) else "",
+                display_name,
+                session_id,
+            ),
             "cached": True,
             "source": source,
             "updated_at": now,
@@ -1836,6 +2610,31 @@ def _upsert_weflow_sessions(
         "store": str(path),
         "updated_count": updated,
         "registered_count": int((registration or {}).get("registered_count", 0) or 0),
+    }
+
+
+def _preferred_weflow_display_name(*values: Any) -> str:
+    fallback = ""
+    for value in values:
+        text = str(value or "").strip()
+        if not text or _looks_like_placeholder_display_name(text):
+            continue
+        if not fallback:
+            fallback = text
+        if not _looks_like_wechat_receiver(text):
+            return text
+    return fallback
+
+
+def _looks_like_placeholder_display_name(value: str) -> bool:
+    return str(value or "").strip().lower() in {
+        "unknown",
+        "unknown contact",
+        "未知",
+        "未知联系人",
+        "system",
+        "none",
+        "null",
     }
 
 
@@ -1866,6 +2665,8 @@ def _weflow_session_channel_message(session: dict[str, Any]) -> NormalizedMessag
 
 
 def _weflow_cached_sessions_from_channels(data_dir: str | Path, *, limit: int) -> list[dict[str, Any]]:
+    if not (Path(data_dir) / "conversation_channels").exists():
+        return []
     try:
         channels = _channel_store(data_dir).list_channels()
     except Exception:
@@ -1899,7 +2700,16 @@ def _weflow_cached_sessions(data_dir: str | Path, *, limit: int) -> list[dict[st
         session_id = str(item.get("id") or "").strip()
         if not session_id:
             continue
-        by_id[session_id] = {**item, **by_id.get(session_id, {})}
+        existing = by_id.get(session_id, {})
+        merged = {**item, **existing}
+        merged["name"] = _preferred_weflow_display_name(item.get("name"), existing.get("name"), session_id)
+        merged["chat_title"] = _preferred_weflow_display_name(
+            item.get("chat_title"),
+            existing.get("chat_title"),
+            merged.get("name"),
+            session_id,
+        )
+        by_id[session_id] = merged
     return sorted(by_id.values(), key=lambda item: str(item.get("updated_at", "")), reverse=True)[:limit]
 
 
@@ -1951,6 +2761,284 @@ def _voice_cache_resolver(config: Any, *, extra_roots: list[str] | None = None) 
         allowed_extensions=config.file_allowed_extensions,
         max_bytes=config.file_max_bytes,
     )
+
+
+def _weflow_pull_job_loop(root: Path, payload: dict[str, Any], job_id: str) -> None:
+    def progress(update: dict[str, Any]) -> None:
+        _update_pull_job(root, job_id, progress=update, force=False)
+        _update_weflow_task_progress(root, job_id, update)
+
+    try:
+        _update_pull_job(root, job_id, status="running", progress={"event": "started"}, force=True)
+        _update_weflow_task_progress(root, job_id, {"event": "started", "phase": "后台拉取任务已启动"})
+        result = _run_sidebar_weflow_once(root, payload, progress_callback=progress)
+        result["session_store"] = _register_weflow_result_sessions(root, payload, result)
+        final_status = "completed" if result.get("status") != "error" else "error"
+        _update_pull_job(
+            root,
+            job_id,
+            status=final_status,
+            result=result,
+            progress={
+                "scanned_count": result.get("source", {}).get("scanned_count", 0),
+                "appended_count": result.get("source", {}).get("appended_count", 0),
+                "processed_count": result.get("pull", {}).get("processed_count", 0),
+                "event": final_status,
+            },
+            force=True,
+        )
+        _record_weflow_state_safely(
+            root,
+            {"last_pull": result, "last_error": "" if result.get("status") != "error" else str(result.get("error") or ""), "pull_job": _weflow_pull_job_state(root), **_weflow_public_params(_weflow_params(root, payload))},
+            action="pull-once",
+            result=result,
+        )
+        _update_pull_job(root, job_id, status=final_status, progress={"event": final_status}, force=True)
+        _update_weflow_task_progress(root, job_id, {"event": final_status, "phase": "后台拉取任务结束"}, final=True)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        result = {"status": "error", "error": error}
+        _update_pull_job(root, job_id, status="error", result=result, last_error=error, force=True)
+        _update_weflow_task_progress(root, job_id, {"event": "error", "phase": error}, final=True)
+        _record_weflow_state_safely(
+            root,
+            {"last_pull": result, "last_error": error, "pull_job": _weflow_pull_job_state(root), **_weflow_public_params(_weflow_params(root, payload))},
+            action="pull-once",
+            result=result,
+        )
+
+
+def _update_weflow_task_progress(root: Path, job_id: str, update: dict[str, Any], *, final: bool = False) -> None:
+    event = str(update.get("event") or "update")
+    session_id = str(update.get("session_id") or "").strip()
+    task_id = _weflow_task_id(job_id, session_id)
+    conversation_id = _conversation_id_for_weflow_session(session_id)
+    progress = _weflow_task_progress(event, update, final=final)
+    status = "completed" if final and event in {"completed", "ok"} else ("failed" if final or event == "error" else "running")
+    phase = str(update.get("phase") or _weflow_event_phase(event))
+    detail = _weflow_progress_detail(update)
+    store = TaskStatusStore(root)
+    payload = {
+        "task_id": task_id,
+        "title": f"WeFlow 拉取：{session_id}" if session_id else "WeFlow 拉取任务",
+        "kind": "WeFlow",
+        "status": status,
+        "priority": 70,
+        "progress": progress,
+        "phase": phase,
+        "detail": detail,
+        "conversation_id": conversation_id,
+        "session_id": session_id or "system",
+        "concurrency_key": f"weflow:pull:{session_id or job_id}",
+        "resource_class": "wechat_io",
+        "external_id": job_id,
+        "metadata": {
+            "scope_label": "WeFlow后台拉取",
+            "job_id": job_id,
+            "session_id": session_id,
+            "event": event,
+        },
+    }
+    try:
+        store.create(payload)
+        if final:
+            store.finish_external(
+                job_id,
+                {
+                    "status": status,
+                    "progress": 100,
+                    "phase": phase,
+                    "detail": detail,
+                },
+            )
+    except Exception:
+        return
+
+
+def _weflow_task_id(job_id: str, session_id: str) -> str:
+    if not session_id:
+        return f"weflow-{job_id}"
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:10]
+    return f"weflow-{job_id}-{digest}"
+
+
+def _conversation_id_for_weflow_session(session_id: str) -> str:
+    talker = str(session_id or "").strip()
+    if not talker:
+        return ""
+    conversation_type = "group" if talker.endswith("@chatroom") else "private"
+    return conversation_id_for(conversation_type, talker)
+
+
+def _weflow_task_progress(event: str, update: dict[str, Any], *, final: bool) -> int:
+    if final:
+        return 100
+    if event == "started":
+        return 5
+    if event == "source_started":
+        return 10
+    if event == "page":
+        return min(45, 18 + int(update.get("page_count") or 0) * 6)
+    if event == "message":
+        return min(58, 35 + int(update.get("appended_count") or 0))
+    if event == "delete":
+        return 58
+    if event == "source_completed":
+        return 62
+    if event == "consume_started":
+        return 72
+    if event == "consume_completed":
+        return 92
+    return 50
+
+
+def _weflow_event_phase(event: str) -> str:
+    return {
+        "started": "后台拉取任务已启动",
+        "source_started": "正在读取 WeFlow 消息页",
+        "page": "正在扫描消息页",
+        "message": "正在写入新消息事件",
+        "delete": "正在同步本地删除/撤回",
+        "source_completed": "WeFlow 消息页读取完成",
+        "consume_started": "正在导入事件并运行 agent",
+        "consume_completed": "事件导入与 agent 处理完成",
+        "completed": "后台拉取完成",
+        "error": "后台拉取失败",
+    }.get(event, event or "更新中")
+
+
+def _weflow_progress_detail(update: dict[str, Any]) -> str:
+    parts = []
+    for key, label in (
+        ("session_id", "通道"),
+        ("page_count", "页"),
+        ("scanned_count", "扫描"),
+        ("appended_count", "写入"),
+        ("processed_count", "处理"),
+        ("last_raw_id", "消息"),
+    ):
+        value = update.get(key)
+        if value not in ("", None, 0):
+            parts.append(f"{label}={value}")
+    return " / ".join(parts)
+
+
+def _update_pull_job(
+    root: Path,
+    job_id: str,
+    *,
+    status: str | None = None,
+    progress: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    last_error: str | None = None,
+    force: bool = False,
+) -> None:
+    key = str(root.resolve())
+    should_write = force
+    with _WEFLOW_LOCK:
+        job = _WEFLOW_PULL_JOBS.get(key)
+        if not job or str(job.get("job_id")) != job_id:
+            return
+        now = time.time()
+        if status is not None:
+            job["status"] = status
+        if result is not None:
+            job["result"] = result
+        if last_error is not None:
+            job["last_error"] = last_error
+        if progress:
+            _merge_weflow_progress(job, progress)
+        job["updated_at"] = now
+        last_write = float(job.get("_last_state_write", 0) or 0)
+        if should_write or now - last_write >= 0.75:
+            job["_last_state_write"] = now
+            should_write = True
+        snapshot = _public_pull_job(job)
+    if should_write:
+        _write_weflow_sidebar_state(root, {"pull_job": snapshot})
+
+
+def _weflow_pull_job_state(root: Path, persisted: dict[str, Any] | None = None) -> dict[str, Any]:
+    key = str(root.resolve())
+    with _WEFLOW_LOCK:
+        job = _WEFLOW_PULL_JOBS.get(key)
+        if job:
+            return _public_pull_job(job)
+    persisted_job = (persisted or {}).get("pull_job") if isinstance(persisted, dict) else {}
+    if not isinstance(persisted_job, dict):
+        return {}
+    if bool(persisted_job.get("running")):
+        status = str(persisted_job.get("status") or "")
+        interrupted = status in {"running", ""}
+        return {**persisted_job, "running": False, "status": "interrupted" if interrupted else status}
+    return persisted_job
+
+
+def _public_pull_job(job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "")
+    age = max(0.0, time.time() - float(job.get("started_at") or time.time()))
+    running = _thread_alive(job.get("thread")) or (status == "running" and not job.get("result") and age < 3.0)
+    status = status or ("running" if running else "idle")
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "status": status,
+        "running": running,
+        "talkers": list(job.get("talkers") or []),
+        "started_at": job.get("started_at", 0),
+        "updated_at": job.get("updated_at", 0),
+        "seconds_running": round(max(0.0, time.time() - float(job.get("started_at") or time.time())), 3) if running else 0,
+        "progress": job.get("progress") if isinstance(job.get("progress"), dict) else {},
+        "last_error": str(job.get("last_error") or ""),
+        "result": _compact_weflow_history_payload(job.get("result") or {}),
+    }
+
+
+def _emit_weflow_progress(progress_callback: Any, **payload: Any) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback({key: value for key, value in payload.items() if value not in ("", None)})
+    except Exception:
+        return
+
+
+def _merge_weflow_progress(job: dict[str, Any], progress: dict[str, Any]) -> None:
+    current = job.get("progress")
+    if not isinstance(current, dict):
+        current = {}
+    event = str(progress.get("event") or "")
+    history = current.get("events")
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "event": event or "update",
+            "phase": str(progress.get("phase") or ""),
+            "session_id": str(progress.get("session_id") or ""),
+            "raw_id": str(progress.get("last_raw_id") or ""),
+            "at": time.time(),
+        }
+    )
+    current["events"] = history[-30:]
+    if event == "page":
+        current["page_count"] = int(progress.get("page_count") or current.get("page_count") or 0)
+        current["current_session_id"] = str(progress.get("session_id") or current.get("current_session_id") or "")
+        current["page_messages"] = int(progress.get("page_messages") or 0)
+        current["total_messages"] = int(progress.get("total_messages") or current.get("total_messages") or 0)
+        current["has_more"] = bool(progress.get("has_more"))
+    elif event in {"message", "delete"}:
+        current["current_session_id"] = str(progress.get("session_id") or current.get("current_session_id") or "")
+        current["scanned_count"] = max(int(current.get("scanned_count") or 0), int(progress.get("scanned_count") or 0))
+        current["appended_count"] = max(int(current.get("appended_count") or 0), int(progress.get("appended_count") or 0))
+        current["last_raw_id"] = str(progress.get("last_raw_id") or current.get("last_raw_id") or "")
+        if event == "delete":
+            current["delete_count"] = int(current.get("delete_count") or 0) + 1
+    elif event == "sessions":
+        current["session_count"] = int(progress.get("session_count") or current.get("session_count") or 0)
+    else:
+        current.update({key: value for key, value in progress.items() if value not in ("", None)})
+    current["event"] = event or str(current.get("event") or "")
+    job["progress"] = current
 
 
 def _weflow_backfill_job_loop(root: Path, payload: dict[str, Any], job_id: str, stop_event: threading.Event) -> None:
@@ -2009,12 +3097,13 @@ def _update_backfill_job(
 ) -> None:
     key = str(root.resolve())
     should_write = force
+    final_with_result = result is not None and str(status or "") in {"completed", "cancelled", "error"}
     with _WEFLOW_LOCK:
         job = _WEFLOW_BACKFILL_JOBS.get(key)
         if not job or str(job.get("job_id")) != job_id:
             return
         now = time.time()
-        if status is not None:
+        if status is not None and not final_with_result:
             job["status"] = status
         if result is not None:
             job["result"] = result
@@ -2047,9 +3136,20 @@ def _update_backfill_job(
         if should_write or now - last_write >= 0.75:
             job["_last_state_write"] = now
             should_write = True
-        snapshot = _public_backfill_job(job)
+        snapshot_job = {**job, "status": status} if final_with_result and status is not None else job
+        snapshot = _public_backfill_job(snapshot_job)
+        state_patch: dict[str, Any] = {"backfill_job": snapshot}
+        if final_with_result:
+            state_patch["last_backfill"] = result
+            state_patch["last_error"] = str(result.get("error") or "") if result.get("status") == "error" else ""
     if should_write:
-        _write_weflow_sidebar_state(root, {"backfill_job": snapshot})
+        _write_weflow_sidebar_state(root, state_patch)
+    if final_with_result and status is not None:
+        with _WEFLOW_LOCK:
+            job = _WEFLOW_BACKFILL_JOBS.get(key)
+            if job and str(job.get("job_id")) == job_id:
+                job["status"] = status
+                job["updated_at"] = time.time()
 
 
 def _weflow_backfill_job_state(root: Path, persisted: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2078,8 +3178,10 @@ def _weflow_backfill_job_state(root: Path, persisted: dict[str, Any] | None = No
 
 
 def _public_backfill_job(job: dict[str, Any]) -> dict[str, Any]:
-    running = _thread_alive(job.get("thread"))
-    status = str(job.get("status") or ("running" if running else "idle"))
+    status = str(job.get("status") or "")
+    age = max(0.0, time.time() - float(job.get("started_at") or time.time()))
+    running = _thread_alive(job.get("thread")) or (status == "running" and not job.get("result") and age < 3.0)
+    status = status or ("running" if running else "idle")
     return {
         "job_id": str(job.get("job_id") or ""),
         "status": status,
@@ -2348,7 +3450,14 @@ def _retained_config_paths(root: Path) -> set[Path]:
     return retained
 
 
-def _remove_history_path(root: Path, relative: str, removed: list[dict[str, Any]], retained: set[Path]) -> None:
+def _remove_history_path(
+    root: Path,
+    relative: str,
+    removed: list[dict[str, Any]],
+    retained_locked: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+    retained: set[Path],
+) -> None:
     target = (root / relative).resolve()
     if target in retained or any(parent in retained for parent in target.parents):
         return
@@ -2356,13 +3465,293 @@ def _remove_history_path(root: Path, relative: str, removed: list[dict[str, Any]
         raise ValueError(f"history reset target escapes data_dir: {relative}")
     if not target.exists():
         return
-    if target.is_dir():
-        shutil.rmtree(target)
-        kind = "dir"
-    else:
-        target.unlink()
-        kind = "file"
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+            kind = "dir"
+        else:
+            target.unlink()
+            kind = "file"
+    except OSError as exc:
+        if not target.is_dir() and relative in _HISTORY_RESET_LOCK_TOLERANT_FILES and _is_windows_locked_file_error(exc):
+            retained_locked.append(_locked_history_record(relative, target, exc))
+            _truncate_locked_history_file(target, relative, retained_locked[-1])
+            return
+        errors.append(
+            {
+                "relative_path": relative,
+                "path": str(target),
+                "kind": "dir" if target.is_dir() else "file",
+                "error": f"{type(exc).__name__}: {exc}",
+                "winerror": getattr(exc, "winerror", None),
+            }
+        )
+        return
     removed.append({"relative_path": relative, "path": str(target), "kind": kind})
+
+
+def _reinitialize_history_runtime_files(root: Path) -> list[str]:
+    """Recreate empty queue/bridge files after a history reset.
+
+    The reset may clear historical contents, but the sidebar should come back
+    with the send-review and bridge paths readable instead of looking as if the
+    feature was removed.
+    """
+
+    created: list[str] = []
+    for relative in ("confirm_queue.jsonl", "send_audit.jsonl"):
+        path = root / relative
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text("", encoding="utf-8")
+                created.append(relative)
+        except OSError:
+            continue
+    try:
+        bridge_snapshot = bridge_state(root, limit=1)
+        for key in ("outbox_path", "ack_path"):
+            value = str(bridge_snapshot.get(key) or "")
+            if value:
+                created.append(str(Path(value).relative_to(root)))
+    except Exception:
+        pass
+    try:
+        TaskStatusStore(root).state()
+    except Exception:
+        pass
+    return sorted(dict.fromkeys(created))
+
+
+def _is_windows_locked_file_error(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32}
+
+
+def _locked_history_record(relative: str, target: Path, exc: OSError) -> dict[str, Any]:
+    return {
+        "relative_path": relative,
+        "path": str(target),
+        "kind": "file",
+        "reason": "locked_by_running_process",
+        "error": f"{type(exc).__name__}: {exc}",
+        "winerror": getattr(exc, "winerror", None),
+    }
+
+
+def _truncate_locked_history_file(target: Path, relative: str, record: dict[str, Any]) -> None:
+    try:
+        target.write_bytes(b"")
+        record["fallback"] = "truncated"
+    except OSError as exc:
+        record["fallback"] = "retained"
+        record["fallback_error"] = f"{type(exc).__name__}: {exc}"
+        record["fallback_winerror"] = getattr(exc, "winerror", None)
+
+
+def _schedule_sidebar_history_reset_shutdown(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    runtime_dir = root / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    active = _active_sidebar_history_reset_shutdown(runtime_dir)
+    if active:
+        return active
+    lock_path = runtime_dir / "history_reset_shutdown.lock"
+    status_path = runtime_dir / "history_reset_shutdown.json"
+    if not _try_acquire_sidebar_history_reset_shutdown_lock(lock_path):
+        active = _active_sidebar_history_reset_shutdown(runtime_dir)
+        if active:
+            return active
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return _deduped_sidebar_history_reset_shutdown(lock_path, _read_json(status_path, {}))
+        if not _try_acquire_sidebar_history_reset_shutdown_lock(lock_path):
+            return _deduped_sidebar_history_reset_shutdown(lock_path, _read_json(status_path, {}))
+
+    launch_state = _read_json(root / "runtime" / "sidebar_launch.json", {})
+    launch_state = launch_state if isinstance(launch_state, dict) else {}
+    weflow_result = launch_state.get("weflow_result") if isinstance(launch_state.get("weflow_result"), dict) else {}
+    parent_pid = _int_value(payload.get("parent_pid") or payload.get("parentPid") or launch_state.get("pid"), os.getpid())
+    weflow_pid = _int_value(
+        payload.get("weflow_pid") or payload.get("weflowPid") or launch_state.get("weflow_pid") or weflow_result.get("pid"),
+        0,
+    )
+    weflow_mode = str(payload.get("weflow") or launch_state.get("weflow") or "auto")
+    if weflow_mode not in {"auto", "on", "off"}:
+        weflow_mode = "auto"
+    weflow_port = _int_value(payload.get("weflow_port") or payload.get("weflowPort") or launch_state.get("weflow_port"), 5031)
+    helper = Path(__file__).resolve().parents[3] / "scripts" / "sidebar_history_reset_shutdown.py"
+    command = [
+        sys.executable,
+        str(helper),
+        "--data-dir",
+        str(root),
+        "--parent-pid",
+        str(parent_pid),
+        "--weflow",
+        weflow_mode,
+        "--weflow-port",
+        str(weflow_port),
+        "--weflow-pid",
+        str(weflow_pid),
+    ]
+    status = {
+        "status": "shutdown_scheduled",
+        "phase": "scheduled",
+        "parent_pid": parent_pid,
+        "weflow_pid": weflow_pid,
+        "weflow": weflow_mode,
+        "weflow_port": weflow_port,
+        "manual_reopen_required": True,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _write_json(status_path, status)
+    stdout_path = runtime_dir / "history_reset_shutdown.out.log"
+    stderr_path = runtime_dir / "history_reset_shutdown.err.log"
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = 0x00000008 | 0x00000200 | 0x08000000
+    try:
+        with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path(__file__).resolve().parents[3]),
+                stdout=stdout,
+                stderr=stderr,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=creationflags,
+            )
+    except Exception:
+        _remove_sidebar_history_reset_shutdown_lock(lock_path)
+        raise
+    status["helper_pid"] = process.pid
+    _write_json(status_path, status)
+    _write_json(
+        lock_path,
+        {
+            "helper_pid": process.pid,
+            "owner_pid": os.getpid(),
+            "updated_at_epoch": time.time(),
+            "status_file": str(status_path),
+        },
+    )
+    return {
+        "status": "shutdown_scheduled",
+        "message": "Sidebar and WeFlow will stop and clear history. Reopen the sidebar manually after it closes.",
+        "helper_pid": process.pid,
+        "parent_pid": parent_pid,
+        "weflow_pid": weflow_pid,
+        "manual_reopen_required": True,
+        "shutdown_status_file": str(status_path),
+    }
+
+
+def _try_acquire_sidebar_history_reset_shutdown_lock(lock_path: Path) -> bool:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "helper_pid": 0,
+                "owner_pid": os.getpid(),
+                "updated_at_epoch": time.time(),
+            },
+            handle,
+            ensure_ascii=False,
+        )
+    return True
+
+
+def _active_sidebar_history_reset_shutdown(runtime_dir: Path) -> dict[str, Any] | None:
+    lock_path = runtime_dir / "history_reset_shutdown.lock"
+    if not lock_path.exists():
+        return None
+    lock = _read_json(lock_path, {})
+    status = _read_json(runtime_dir / "history_reset_shutdown.json", {})
+    helper_pid = _int_value(
+        (lock.get("helper_pid") if isinstance(lock, dict) else 0)
+        or (status.get("helper_pid") if isinstance(status, dict) else 0),
+        0,
+    )
+    lock_age = _shutdown_lock_age_seconds(lock if isinstance(lock, dict) else {})
+    if helper_pid > 0 and _pid_exists(helper_pid):
+        return _deduped_sidebar_history_reset_shutdown(lock_path, status if isinstance(status, dict) else {}, helper_pid=helper_pid)
+    if helper_pid <= 0 and lock_age <= 20.0:
+        return _deduped_sidebar_history_reset_shutdown(lock_path, status if isinstance(status, dict) else {}, helper_pid=0)
+    _remove_sidebar_history_reset_shutdown_lock(lock_path)
+    return None
+
+
+def _deduped_sidebar_history_reset_shutdown(
+    lock_path: Path,
+    status: dict[str, Any],
+    *,
+    helper_pid: int = 0,
+) -> dict[str, Any]:
+    return {
+        "status": "shutdown_scheduled",
+        "message": "Sidebar and WeFlow shutdown/cleanup is already in progress.",
+        "deduplicated": True,
+        "helper_pid": helper_pid or _int_value(status.get("helper_pid") if isinstance(status, dict) else 0, 0),
+        "parent_pid": _int_value(status.get("parent_pid") if isinstance(status, dict) else 0, 0),
+        "weflow_pid": _int_value(status.get("weflow_pid") if isinstance(status, dict) else 0, 0),
+        "phase": str(status.get("phase") or "scheduled") if isinstance(status, dict) else "scheduled",
+        "manual_reopen_required": True,
+        "shutdown_status_file": str(lock_path.with_name("history_reset_shutdown.json")),
+    }
+
+
+def _shutdown_lock_age_seconds(lock: dict[str, Any]) -> float:
+    try:
+        updated_at = float(lock.get("updated_at_epoch") or 0)
+    except Exception:
+        updated_at = 0.0
+    if updated_at <= 0:
+        return float("inf")
+    return max(0.0, time.time() - updated_at)
+
+
+def _remove_sidebar_history_reset_shutdown_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            completed = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return False
+        return str(pid) in completed.stdout
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _int_value(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def _bridge_worker_alive(data_dir: str | Path) -> bool:
@@ -2419,11 +3808,259 @@ def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> P
     return resolved
 
 
+def _build_agent_backend_driver(
+    config: Any,
+    runtime: Any,
+    event_file: Path,
+    *,
+    extra_roots: list[str] | None = None,
+) -> BackendEventJsonlDriver:
+    extra_roots = list(extra_roots or [])
+    roots = config.file_read_roots + config.wechat_voice_roots + extra_roots
+    return BackendEventJsonlDriver(
+        event_file,
+        runtime.file_index,
+        allowed_input_roots=resolve_allowed_roots(config.data_dir, roots),
+        allowed_extensions=config.file_allowed_extensions,
+        max_input_bytes=config.file_max_bytes,
+        attachment_parser=BackendAttachmentParser(
+            build_default_ocr_engine(mode=config.ocr_mode),
+            LocalAsrSubprocessEngine(mode=config.asr_mode),
+        ),
+        file_workspace=runtime.file_workspace,
+        session_store=runtime.session_store,
+        voice_cache_resolver=_voice_cache_resolver(config, extra_roots=extra_roots),
+    )
+
+
+def _agent_session_snapshot(
+    root: Path,
+    *,
+    runtime: Any,
+    conversation_ids: list[str] | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    ids = _agent_conversation_ids(root, runtime=runtime, requested=conversation_ids or [])
+    conversations = [_agent_conversation_snapshot(runtime, conversation_id, limit=limit) for conversation_id in ids[:50]]
+    conversations = [item for item in conversations if item]
+    return {
+        "schema": "dialog_agent_session_snapshot_v1",
+        "conversation_count": len(conversations),
+        "entry_count": sum(int(item.get("entry_count", 0) or 0) for item in conversations),
+        "pending_user_count": sum(int(item.get("pending_user_count_since_last_assistant", 0) or 0) for item in conversations),
+        "topic_candidates": _agent_merged_topics(conversations),
+        "conversations": conversations,
+    }
+
+
+def _agent_conversation_ids(root: Path, *, runtime: Any, requested: list[str]) -> list[str]:
+    ids: list[str] = []
+    ids.extend(requested)
+    try:
+        ids.extend(channel.conversation_id for channel in runtime.channel_store.list_channels())
+    except Exception:
+        pass
+    ids.extend(_agent_conversation_ids_from_ledgers(root))
+    return _dedupe_strings(ids)
+
+
+def _agent_conversation_ids_from_ledgers(root: Path) -> list[str]:
+    ids: list[str] = []
+    ledger_root = root / "conversation_ledgers"
+    if not ledger_root.exists():
+        return ids
+    for messages_jsonl in ledger_root.glob("*/messages.jsonl"):
+        try:
+            with messages_jsonl.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    if not raw_line.strip():
+                        continue
+                    payload = json.loads(raw_line)
+                    if isinstance(payload, dict) and payload.get("conversation_id"):
+                        ids.append(str(payload.get("conversation_id")))
+                    break
+        except (OSError, json.JSONDecodeError):
+            continue
+    return ids
+
+
+def _agent_conversation_snapshot(runtime: Any, conversation_id: str, *, limit: int) -> dict[str, Any]:
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id:
+        return {}
+    try:
+        entries = [_dataclass_payload(entry) for entry in runtime.ledger_store.read_entries(conversation_id)]
+    except Exception:
+        entries = []
+    try:
+        session_id = runtime.session_store.current_session_id(conversation_id)
+    except Exception:
+        session_id = "session_default"
+    session_entries = [
+        entry
+        for entry in entries
+        if str(entry.get("session_id") or "session_default") == session_id
+    ]
+    markdown_path = runtime.ledger_store.conversation_markdown_path(conversation_id)
+    recent = session_entries[-limit:]
+    user_texts = [_agent_entry_text(entry) for entry in session_entries if str(entry.get("role") or "user") == "user"]
+    assistant_texts = [_agent_entry_text(entry) for entry in session_entries if str(entry.get("role") or "") == "assistant"]
+    pending_user_count = 0
+    for entry in reversed(session_entries):
+        role = str(entry.get("role") or "user")
+        if role == "assistant":
+            break
+        if role == "user":
+            pending_user_count += 1
+    last_entry = session_entries[-1] if session_entries else {}
+    return {
+        "conversation_id": conversation_id,
+        "conversation_type": str(last_entry.get("conversation_type") or ""),
+        "chat_title": str(last_entry.get("chat_title") or ""),
+        "session_id": session_id,
+        "ledger_markdown": str(markdown_path),
+        "ledger_messages": str(markdown_path.with_name("messages.jsonl")),
+        "entry_count": len(session_entries),
+        "total_entry_count": len(entries),
+        "last_message_at": str(last_entry.get("received_at") or last_entry.get("updated_at") or ""),
+        "last_user_message": _agent_compact_text(user_texts[-1] if user_texts else "", 240),
+        "last_assistant_reply": _agent_compact_text(assistant_texts[-1] if assistant_texts else "", 240),
+        "pending_user_count_since_last_assistant": pending_user_count,
+        "topic_candidates": _agent_topic_candidates(user_texts[-10:]),
+        "recent_turns": [
+            {
+                "role": str(entry.get("role") or "user"),
+                "sender_name": str(entry.get("sender_name") or ""),
+                "received_at": str(entry.get("received_at") or ""),
+                "text": _agent_compact_text(_agent_entry_text(entry), 240),
+                "attachment_count": len(entry.get("attachments") if isinstance(entry.get("attachments"), list) else []),
+            }
+            for entry in recent
+        ],
+    }
+
+
+def _agent_processed_conversation_ids(result: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    processed = result.get("processed") if isinstance(result.get("processed"), list) else []
+    for item in processed:
+        if not isinstance(item, dict):
+            continue
+        message = item.get("message") if isinstance(item.get("message"), dict) else {}
+        conversation_id = str(message.get("conversation_id") or "").strip()
+        if conversation_id:
+            ids.append(conversation_id)
+    return _dedupe_strings(ids)
+
+
+def _agent_entry_text(entry: dict[str, Any]) -> str:
+    blocks = entry.get("text_blocks") if isinstance(entry.get("text_blocks"), list) else []
+    parts: list[str] = []
+    for block in blocks:
+        if isinstance(block, dict):
+            text = str(block.get("text") or "").strip()
+            if text:
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _agent_topic_candidates(texts: list[str]) -> list[dict[str, Any]]:
+    keyword_groups = [
+        ("通道与 Agent 控制", ("agent", "weflow", "通道", "总台", "管道", "模型", "启动", "停止")),
+        ("任务推进", ("任务", "计划", "推进", "残留", "下一步", "验收", "分发")),
+        ("缺陷修复", ("bug", "问题", "报错", "卡住", "修复", "失败", "异常")),
+        ("上下文与记忆", ("上下文", "记忆", "session", "会话", "聚合", "主题")),
+        ("文件与媒体", ("文件", "附件", "图片", "语音", "文档", "ocr", "asr")),
+    ]
+    scores: dict[str, dict[str, Any]] = {}
+    for text in texts:
+        compact = _agent_compact_text(text, 320)
+        lowered = compact.lower()
+        for title, keywords in keyword_groups:
+            hits = [keyword for keyword in keywords if keyword.lower() in lowered]
+            if not hits:
+                continue
+            item = scores.setdefault(
+                title,
+                {"topic_id": _agent_topic_id(title), "title": title, "score": 0, "evidence": []},
+            )
+            item["score"] = int(item["score"]) + len(hits)
+            if compact and len(item["evidence"]) < 2:
+                item["evidence"].append(compact)
+    if not scores and texts:
+        fallback = _agent_compact_text(texts[-1], 28) or "日常闲聊"
+        scores[fallback] = {
+            "topic_id": _agent_topic_id(fallback),
+            "title": fallback,
+            "score": 1,
+            "evidence": [_agent_compact_text(texts[-1], 160)],
+        }
+    return sorted(scores.values(), key=lambda item: int(item.get("score") or 0), reverse=True)[:5]
+
+
+def _agent_merged_topics(conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for conversation in conversations:
+        topics = conversation.get("topic_candidates")
+        if not isinstance(topics, list):
+            continue
+        for topic in topics:
+            title = str(topic.get("title") or "").strip()
+            if not title:
+                continue
+            current = merged.setdefault(
+                title,
+                {"topic_id": str(topic.get("topic_id") or _agent_topic_id(title)), "title": title, "score": 0, "conversations": []},
+            )
+            current["score"] = int(current["score"]) + int(topic.get("score") or 0)
+            conversation_id = str(conversation.get("conversation_id") or "")
+            if conversation_id and conversation_id not in current["conversations"]:
+                current["conversations"].append(conversation_id)
+    return sorted(merged.values(), key=lambda item: int(item.get("score") or 0), reverse=True)[:8]
+
+
+def _agent_topic_id(title: str) -> str:
+    return "topic-" + hashlib.sha256(str(title).encode("utf-8")).hexdigest()[:12]
+
+
+def _agent_compact_text(text: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
 def _key_pool(data_dir: str | Path) -> ApiKeyPool:
     config = ensure_config(data_dir)
     root = Path(data_dir)
     chat_provider = config.providers.get("chat", config.llm)
     return ApiKeyPool(chat_provider, root)
+
+
+def _optional_positive_int(payload: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        if name not in payload or payload.get(name) in (None, ""):
+            continue
+        try:
+            value = int(payload.get(name))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if value < 1 or value > 64:
+            raise ValueError(f"{name} must be between 1 and 64")
+        return value
+    return None
 
 
 def list_api_keys(data_dir: str | Path) -> dict[str, Any]:
@@ -2448,7 +4085,7 @@ def add_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]
         raise ValueError("value is required")
     pool = _key_pool(data_dir)
     ref = pool.add_key(value, name=name)
-    if any(key in payload for key in ("provider", "model", "base_url", "baseUrl", "max_wait_seconds", "enabled")):
+    if any(key in payload for key in ("provider", "model", "base_url", "baseUrl", "max_wait_seconds", "max_concurrency", "maxConcurrency", "enabled")):
         pool.set_key_model_config(
             ref.ref,
             provider=str(payload.get("provider")).strip().lower() if payload.get("provider") is not None else None,
@@ -2459,6 +4096,7 @@ def add_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]
             max_wait_seconds=int(payload.get("max_wait_seconds"))
             if payload.get("max_wait_seconds") not in (None, "")
             else None,
+            max_concurrency=_optional_positive_int(payload, "max_concurrency", "maxConcurrency"),
             enabled=bool(payload.get("enabled")) if payload.get("enabled") is not None else None,
         )
     return {"status": "ok", "ref": ref.ref, "source": ref.source, **list_api_keys(data_dir)}
@@ -2474,6 +4112,23 @@ def remove_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
     if not removed:
         raise ValueError("key not found or not file-backed")
     return {"status": "ok", "removed": ref, **list_api_keys(data_dir)}
+
+
+def _key_refs_inheriting_provider_concurrency(data_dir: str | Path) -> list[str]:
+    config = ensure_config(data_dir)
+    provider = config.providers.get("chat", config.llm)
+    old_limit = int(provider.max_concurrency or DEFAULT_LLM_MAX_CONCURRENCY)
+    refs: list[str] = []
+    for item in _key_pool(data_dir).describe():
+        model_config = item.get("model_config") if isinstance(item.get("model_config"), dict) else {}
+        raw_limit = model_config.get("max_concurrency")
+        try:
+            key_limit = int(raw_limit) if raw_limit not in (None, "") else old_limit
+        except (TypeError, ValueError):
+            key_limit = old_limit
+        if key_limit == old_limit:
+            refs.append(str(item.get("ref") or ""))
+    return [ref for ref in refs if ref]
 
 
 # Provider request formats the model-config panel can select. Both are
@@ -2494,6 +4149,9 @@ def get_model_config(data_dir: str | Path) -> dict[str, Any]:
         "base_url": provider.base_url,
         "api_key_env": provider.api_key_env,
         "max_wait_seconds": provider.max_wait_seconds,
+        "max_concurrency": provider.max_concurrency,
+        "effective_concurrency_limit": pool.concurrency_limit(),
+        "recommended_max_concurrency": DEFAULT_LLM_MAX_CONCURRENCY,
         "provider_formats": list(_MODEL_PROVIDER_FORMATS),
         "key_pool_available_count": pool.available_count(),
         "keys": keys,
@@ -2518,6 +4176,7 @@ def set_model_config(data_dir: str | Path, payload: dict[str, Any]) -> dict[str,
     base_url = payload.get("base_url")
     api_key_env = payload.get("api_key_env")
     max_wait = payload.get("max_wait_seconds")
+    max_concurrency = _optional_positive_int(payload, "max_concurrency", "maxConcurrency")
     if key_ref:
         pool = _key_pool(data_dir)
         updated_key = pool.set_key_model_config(
@@ -2527,6 +4186,7 @@ def set_model_config(data_dir: str | Path, payload: dict[str, Any]) -> dict[str,
             base_url=str(base_url).strip() if base_url is not None else None,
             api_key_env=str(api_key_env).strip() if api_key_env is not None else None,
             max_wait_seconds=int(max_wait) if max_wait not in (None, "") else None,
+            max_concurrency=max_concurrency,
             enabled=bool(payload.get("enabled")) if payload.get("enabled") is not None else None,
         )
         return {
@@ -2536,6 +4196,7 @@ def set_model_config(data_dir: str | Path, payload: dict[str, Any]) -> dict[str,
             "model_config": get_model_config(data_dir),
             "model": updated_key.model,
         }
+    key_refs_to_sync = _key_refs_inheriting_provider_concurrency(data_dir) if max_concurrency is not None else []
     updated = set_model_provider(
         data_dir,
         provider=provider,
@@ -2543,7 +4204,15 @@ def set_model_config(data_dir: str | Path, payload: dict[str, Any]) -> dict[str,
         base_url=str(base_url).strip() if base_url is not None else None,
         api_key_env=str(api_key_env).strip() if api_key_env is not None else None,
         max_wait_seconds=int(max_wait) if max_wait not in (None, "") else None,
+        max_concurrency=max_concurrency,
     )
+    if key_refs_to_sync and max_concurrency is not None:
+        pool = _key_pool(data_dir)
+        for ref in key_refs_to_sync:
+            try:
+                pool.set_key_model_config(ref, max_concurrency=max_concurrency)
+            except ValueError:
+                continue
     return {"status": "ok", "model_config": get_model_config(data_dir), "model": updated.model}
 
 
@@ -2663,11 +4332,36 @@ def _channel_store(data_dir: str | Path) -> ConversationChannelStore:
 def _channel_state(data_dir: str | Path) -> dict[str, Any]:
     config = ensure_config(data_dir)
     root = Path(data_dir)
-    store = _channel_store(root)
+    channel_root = root / "conversation_channels"
+    channel_items = _channel_store(root).list_channels() if channel_root.exists() else []
+    task_state = build_sidebar_task_manager(root)
+    task_groups = _tasks_by_conversation(task_state.get("tasks", []))
+    ledger_store = ConversationLedgerStore(root) if channel_items and (root / "conversation_ledgers").exists() else None
+    state_path = root / "channel_state.sqlite"
+    state_store = ChannelStateStore(root) if channel_items or state_path.exists() else None
+    if not channel_items:
+        persisted_states = state_store.list_states() if state_store is not None else []
+        return {
+            "status": "ok",
+            "policy": "auto_accept_wechat_contacts_and_groups",
+            "count": 0,
+            "total_count": 0,
+            "state_schema": "channel_state_v1",
+            "state_storage": str(state_path),
+            "states": sorted(persisted_states, key=lambda item: item.get("updated_at", ""), reverse=True),
+            "hidden_count": 0,
+            "hidden_reasons": {},
+            "private_count": 0,
+            "group_count": 0,
+            "items": [],
+            "hidden_items": [],
+            "hidden_items_all": [],
+        }
     visible_policy = _visible_channel_policy(root, config)
     channels = []
     hidden = []
-    for channel in store.list_channels():
+    state_records = []
+    for channel in channel_items:
         visible, reason = _sidebar_channel_visible(channel, visible_policy)
         payload = {
             "conversation_id": channel.conversation_id,
@@ -2688,15 +4382,28 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
             "trusted_channel_source": channel.trusted_channel_source,
             "updated_at": channel.updated_at,
         }
+        projected_state = build_channel_state_projection(
+            channel=payload,
+            tasks=task_groups.get(channel.conversation_id, []),
+            ledger_entries=_ledger_payloads(ledger_store, channel.conversation_id),
+        ).to_dict()
+        existing_state = state_store.get(channel.conversation_id) if state_store is not None else None
+        channel_state = merge_channel_state_projection(projected_state, existing_state)
+        state_records.append(channel_state)
+        payload["state"] = channel_state
         if visible:
             channels.append(payload)
         else:
             hidden.append({**payload, "hidden_reason": reason})
+    persisted_states = state_store.replace_all(state_records) if state_store is not None else []
     return {
         "status": "ok",
         "policy": "auto_accept_wechat_contacts_and_groups",
         "count": len(channels),
         "total_count": len(channels) + len(hidden),
+        "state_schema": "channel_state_v1",
+        "state_storage": str(state_path),
+        "states": sorted(persisted_states, key=lambda item: item.get("updated_at", ""), reverse=True),
         "hidden_count": len(hidden),
         "hidden_reasons": _reason_counts(hidden),
         "private_count": sum(1 for item in channels if item["conversation_type"] == "private"),
@@ -2705,6 +4412,60 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
         "hidden_items": sorted(hidden, key=lambda item: item.get("updated_at", ""), reverse=True)[:20],
         "hidden_items_all": sorted(hidden, key=lambda item: item.get("updated_at", ""), reverse=True),
     }
+
+
+def _tasks_by_conversation(tasks: Any) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(tasks, list):
+        return grouped
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if _is_non_channel_lane_task(task):
+            continue
+        conversation_id = str(task.get("conversation_id") or task.get("conversationId") or "").strip()
+        if not conversation_id:
+            continue
+        grouped.setdefault(conversation_id, []).append(dict(task))
+    return grouped
+
+
+def _is_non_channel_lane_task(task: dict[str, Any]) -> bool:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if metadata.get("local_ui") is True:
+        return True
+    scope = str(task.get("concurrency_key") or task.get("scope") or "")
+    return scope.startswith(
+        (
+            "diagnostic:",
+            "agent:",
+            "ui:",
+            "weflow:",
+            "queue:",
+            "send-review:",
+            "settings:",
+            "audit:",
+            "history:",
+            "channels:",
+        )
+    )
+
+
+def _ledger_payloads(ledger_store: ConversationLedgerStore | None, conversation_id: str) -> list[dict[str, Any]]:
+    if ledger_store is None:
+        return []
+    try:
+        entries = ledger_store.read_entries(conversation_id)
+    except Exception:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for entry in entries:
+        try:
+            payloads.append(asdict(entry))
+        except Exception:
+            if isinstance(entry, dict):
+                payloads.append(dict(entry))
+    return payloads
 
 
 def _sidebar_bridge_state(

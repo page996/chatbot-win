@@ -1,19 +1,40 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from app.personal_wechat_bot.config.loader import create_default_config
+from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.control.sidebar_server import _handler_factory
+from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.domain.models import ReplyCandidate
+from app.personal_wechat_bot.domain.models import NormalizedMessage
+from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxStore
+
+
+def _edge_executable() -> Path | None:
+    resolved = shutil.which("msedge")
+    if resolved:
+        return Path(resolved)
+    for candidate in (
+        Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"),
+        Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+        Path("C:/Program Files (x86)/Microsoft/EdgeCore/Optimized/msedge.exe"),
+    ):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 class SidebarServerTest(unittest.TestCase):
@@ -35,6 +56,22 @@ class SidebarServerTest(unittest.TestCase):
 
             self.assertEqual(state["status"], "ok")
             self.assertIn("微信 Agent 审计面板", index)
+            self.assertIn("清空历史数据", index)
+            self.assertIn('input id="modelName" type="text"', index)
+            self.assertIn('list="modelNameOptions"', index)
+            self.assertIn("gpt-5.4", index)
+            self.assertIn("gpt-5.4-mini", index)
+            self.assertIn("gpt-5.5", index)
+            self.assertIn("deepseek-v4-flash", index)
+            self.assertIn("deepseek-v4-pro", index)
+            self.assertIn("<strong>API 密钥池</strong>", index)
+            self.assertIn('id="agentTickButton"', index)
+            self.assertIn("对话 Agent", index)
+            self.assertIn("locked-note", index)
+            self.assertNotIn('id="weflowContextOnly"', index)
+            self.assertNotIn('<select id="modelName"', index)
+            self.assertNotIn("<h2>API 密钥池</h2>", index)
+            self.assertNotIn('id="refreshKeys"', index)
             self.assertIn("wechat_window_probe", state)
 
     def test_sidebar_server_serves_dirty_state_script(self) -> None:
@@ -65,8 +102,37 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("/api/bridge/ack", script)
             self.assertIn("renderRuntimeCards", script)
             self.assertIn("/api/runtime-cards/", script)
+            self.assertIn("probeRuntimeGpu", script)
+            self.assertIn("/api/runtime/probe", script)
+            self.assertIn("clearHistoryData", script)
+            self.assertIn("/api/history/clear", script)
+            self.assertIn("shutdown_processes", script)
+            self.assertIn("shutdown_scheduled", script)
+            self.assertNotIn("restart_processes", script)
+            self.assertNotIn("restart_scheduled", script)
+            self.assertIn("window.confirm", script)
+            self.assertIn("MODEL_QUICK_OPTIONS", script)
+            self.assertIn("setModelSuggestions", script)
+            self.assertIn("modelQuickSelect", script)
+            self.assertIn("await loadKeyPool()", script)
+            self.assertNotIn("#refreshKeys", script)
             self.assertIn("savePersonaCard", script)
             self.assertIn("queued_to_bridge", script)
+            self.assertIn("syncBackendTask", script)
+            self.assertIn("/api/tasks", script)
+            self.assertIn("renderLaneControl", script)
+            self.assertIn("/api/channel-state", script)
+            self.assertIn("lane-pin-input", script)
+            self.assertIn('"pin"', script)
+            self.assertIn("toggleTaskEvents", script)
+            self.assertIn("task-event-list", script)
+            self.assertIn("renderDispatchPreview", script)
+            self.assertIn("dispatch-preview-panel", script)
+            self.assertIn("channel_pinned", script)
+            self.assertIn("channelLaneOpenState", script)
+            self.assertIn("runAgentTick", script)
+            self.assertIn("/api/agent/tick", script)
+            self.assertIn("agent:tick", script)
 
     def test_sidebar_server_serves_wechat_probe_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,6 +152,34 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn(payload["status"], {"ok", "not_found"})
             self.assertIn("windows", payload)
             self.assertIn("ui_automation", payload)
+
+    def test_sidebar_server_routes_runtime_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                with mock.patch(
+                    "app.personal_wechat_bot.control.sidebar_server.sidebar_runtime_probe",
+                    return_value={"status": "ok", "same_path_as_ingest": True},
+                ):
+                    request = Request(
+                        f"http://{host}:{port}/api/runtime/probe",
+                        data=json.dumps({"ocr_mode": "gpu", "asr_mode": "gpu"}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertTrue(payload["same_path_as_ingest"])
 
     def test_sidebar_server_accepts_backend_event_ingest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,6 +303,363 @@ class SidebarServerTest(unittest.TestCase):
             self.assertEqual(state["status"], "ok")
             self.assertEqual(saved["status"], "ok")
             self.assertIn("通过 HTTP 装备", saved["runtime_cards"]["active"]["tasks"][0]["content"])
+
+    def test_sidebar_server_serves_task_manager_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/tasks",
+                    data=json.dumps(
+                        {
+                            "action": "create",
+                            "task": {
+                                "task_id": "http-task-1",
+                                "title": "HTTP task",
+                                "conversation_id": "conv-a",
+                            },
+                        }
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                created = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+                events_request = Request(
+                    f"http://{host}:{port}/api/tasks",
+                    data=json.dumps({"action": "events", "task_id": "http-task-1"}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                events = json.loads(urlopen(events_request, timeout=5).read().decode("utf-8"))
+                state = json.loads(urlopen(f"http://{host}:{port}/api/tasks", timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(created["status"], "ok")
+            self.assertEqual(created["task"]["task_id"], "http-task-1")
+            self.assertEqual(events["status"], "ok")
+            self.assertTrue(any(item["event"] == "created" for item in events["events"]))
+            self.assertEqual(state["counts"]["queued"], 1)
+
+    def test_sidebar_server_routes_channel_state_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            channel_store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            channel_store.ensure_channel(
+                NormalizedMessage(
+                    message_id="msg-http-channel",
+                    conversation_id="conv-http",
+                    conversation_type="private",
+                    chat_title="HTTP Channel",
+                    sender_name="HTTP Channel",
+                    sender_wechat_id="wxid_http_channel",
+                    text="hello",
+                    is_self=False,
+                    received_at="2026-07-08T10:00:00+08:00",
+                    metadata={"source": "test", "trusted_channel_source": True},
+                )
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/channel-state",
+                    data=json.dumps(
+                        {
+                            "action": "pause",
+                            "conversation_id": "conv-http",
+                            "wait_reason": "HTTP pause",
+                            "priority": 87,
+                            "updated_by": "server-test",
+                        }
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["channel_state"]["control"]["mode"], "paused")
+            self.assertEqual(payload["channel_state"]["control"]["priority"], 87)
+            self.assertEqual(payload["channel_state"]["control"]["wait_reason"], "HTTP pause")
+            self.assertIn("task_manager", payload)
+            self.assertEqual(payload["channels"]["items"][0]["state"]["effective_status"], "paused")
+
+    def test_sidebar_server_channel_controls_roundtrip_into_state_and_dispatch_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            channel_store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            channel_store.ensure_channel(
+                NormalizedMessage(
+                    message_id="msg-http-dynamic",
+                    conversation_id="conv-http-dynamic",
+                    conversation_type="private",
+                    chat_title="Dynamic Channel",
+                    sender_name="Dynamic Channel",
+                    sender_wechat_id="wxid_http_dynamic",
+                    text="hello",
+                    is_self=False,
+                    received_at="2026-07-08T10:00:00+08:00",
+                    metadata={"source": "test", "trusted_channel_source": True},
+                )
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                base_url = f"http://{host}:{port}"
+
+                def post(path: str, payload: dict[str, object]) -> dict[str, object]:
+                    request = Request(
+                        base_url + path,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    return json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+
+                post(
+                    "/api/tasks",
+                    {
+                        "action": "create",
+                        "task": {
+                            "task_id": "dyn-pinned",
+                            "title": "Pinned dynamic task",
+                            "conversation_id": "conv-http-dynamic",
+                            "scope": "conversation:conv-http-dynamic",
+                            "resource_class": "cpu_io",
+                            "priority": 10,
+                        },
+                    },
+                )
+                post(
+                    "/api/tasks",
+                    {
+                        "action": "create",
+                        "task": {
+                            "task_id": "dyn-normal",
+                            "title": "Normal dynamic task",
+                            "conversation_id": "conv-http-normal",
+                            "scope": "conversation:conv-http-normal",
+                            "resource_class": "cpu_io",
+                            "priority": 90,
+                        },
+                    },
+                )
+                pinned = post(
+                    "/api/channel-state",
+                    {"action": "pin", "conversation_id": "conv-http-dynamic", "updated_by": "server-test"},
+                )
+                state_after_pin = json.loads(urlopen(f"{base_url}/api/state", timeout=5).read().decode("utf-8"))
+                paused = post(
+                    "/api/channel-state",
+                    {
+                        "action": "pause",
+                        "conversation_id": "conv-http-dynamic",
+                        "wait_reason": "roundtrip pause",
+                        "updated_by": "server-test",
+                    },
+                )
+                state_after_pause = json.loads(urlopen(f"{base_url}/api/state", timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            channel_after_pin = state_after_pin["channels"]["items"][0]["state"]
+            preview_after_pin = state_after_pin["task_manager"]["scheduler"]["dispatch_preview"]
+            blocked_after_pause = {
+                item["task_id"]: item["reason"]
+                for item in state_after_pause["task_manager"]["scheduler"]["dispatch_preview"]["blocked"]
+            }
+
+            self.assertEqual(pinned["status"], "ok")
+            self.assertTrue(channel_after_pin["control"]["pinned"])
+            self.assertEqual(preview_after_pin["runnable"][0]["task_id"], "dyn-pinned")
+            self.assertTrue(preview_after_pin["runnable"][0]["channel_pinned"])
+            self.assertEqual(paused["channel_state"]["control"]["mode"], "paused")
+            self.assertEqual(state_after_pause["channels"]["items"][0]["state"]["effective_status"], "paused")
+            self.assertEqual(blocked_after_pause["dyn-pinned"], "channel_paused:conv-http-dynamic")
+
+    def test_sidebar_headless_edge_renders_channel_control_and_dispatch_preview(self) -> None:
+        edge = _edge_executable()
+        if edge is None:
+            self.skipTest("Microsoft Edge was not found for headless sidebar smoke")
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            channel_store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            channel_store.ensure_channel(
+                NormalizedMessage(
+                    message_id="msg-browser-smoke",
+                    conversation_id="conv-browser-smoke",
+                    conversation_type="private",
+                    chat_title="Browser Smoke Channel",
+                    sender_name="Browser Smoke Channel",
+                    sender_wechat_id="wxid_browser_smoke",
+                    text="hello",
+                    is_self=False,
+                    received_at="2026-07-08T10:00:00+08:00",
+                    metadata={"source": "test", "trusted_channel_source": True},
+                )
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                base_url = f"http://{host}:{port}"
+
+                def post(path: str, payload: dict[str, object]) -> dict[str, object]:
+                    request = Request(
+                        base_url + path,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    return json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+
+                post(
+                    "/api/tasks",
+                    {
+                        "action": "create",
+                        "task": {
+                            "task_id": "browser-smoke-task",
+                            "title": "Browser dynamic task",
+                            "conversation_id": "conv-browser-smoke",
+                            "scope": "conversation:conv-browser-smoke",
+                            "resource_class": "cpu_io",
+                            "priority": 80,
+                        },
+                    },
+                )
+                post(
+                    "/api/channel-state",
+                    {"action": "pin", "conversation_id": "conv-browser-smoke", "updated_by": "browser-smoke"},
+                )
+                completed = subprocess.run(
+                    [
+                        str(edge),
+                        "--headless=new",
+                        "--disable-gpu",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-extensions",
+                        f"--user-data-dir={Path(tmp) / 'edge-profile'}",
+                        "--virtual-time-budget=5000",
+                        "--dump-dom",
+                        base_url + "/",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            dom = completed.stdout or ""
+            self.assertEqual(completed.returncode, 0, completed.stderr[-1000:])
+            self.assertIn("Browser Smoke Channel", dom)
+            self.assertIn("Browser dynamic task", dom)
+            self.assertIn("dispatch-preview-panel", dom)
+            self.assertIn("lane-control-panel mode-active is-pinned", dom)
+            self.assertIn("lane-pin-input", dom)
+            self.assertIn('type="checkbox" checked=""', dom)
+
+    def test_sidebar_server_routes_resource_audit_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                with mock.patch(
+                    "app.personal_wechat_bot.control.sidebar_server.sidebar_resource_audit",
+                    return_value={"status": "ok", "schema": "local_resource_audit_v1"},
+                ):
+                    request = Request(
+                        f"http://{host}:{port}/api/resources/audit",
+                        data=json.dumps({"manual": True}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["schema"], "local_resource_audit_v1")
+
+    def test_sidebar_server_routes_agent_tick_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                with mock.patch(
+                    "app.personal_wechat_bot.control.sidebar_server.sidebar_agent_tick",
+                    return_value={"status": "ok", "agent": {"processed_count": 0}},
+                ):
+                    request = Request(
+                        f"http://{host}:{port}/api/agent/tick",
+                        data=json.dumps({"loops": 1}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["agent"]["processed_count"], 0)
 
     def test_sidebar_server_routes_weflow_backfill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

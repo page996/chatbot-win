@@ -62,6 +62,48 @@ class MessageNormalizerTest(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertNotEqual(first.message_id, second.message_id)
 
+    def test_dedupe_key_ignores_path_like_weflow_message_key(self) -> None:
+        normalizer = MessageNormalizer()
+        first = normalizer.normalize(
+            RawWeChatMessage(
+                raw_id="weflow:message:wxid_page:E%3A%5Cdb%5Cmessage_0.db:Msg_a:1",
+                chat_title="PAGE",
+                sender_name="PAGE",
+                sender_wechat_id="wxid_page",
+                text="hello",
+                observed_at="2026-06-28T01:00:00+00:00",
+                driver_meta={
+                    "conversation_key": "wxid_page",
+                    "message_key": "E%3A%5Cdb%5Cmessage_0.db:Msg_a:1",
+                    "local_id": "1",
+                    "create_time": "100",
+                    "sort_key": "100",
+                },
+            )
+        )
+        second = normalizer.normalize(
+            RawWeChatMessage(
+                raw_id="weflow:message:wxid_page:E%3A%5Cother%5Cmessage_0.db:Msg_b:1",
+                chat_title="PAGE",
+                sender_name="PAGE",
+                sender_wechat_id="wxid_page",
+                text="hello",
+                observed_at="2026-06-28T01:00:00+00:00",
+                driver_meta={
+                    "conversation_key": "wxid_page",
+                    "message_key": "E%3A%5Cother%5Cmessage_0.db:Msg_b:1",
+                    "local_id": "1",
+                    "create_time": "100",
+                    "sort_key": "100",
+                },
+            )
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first.message_id, second.message_id)
+        self.assertEqual(first.metadata["dedupe_key"], second.metadata["dedupe_key"])
+
     def test_self_message_is_normalized_for_ledger_recording(self) -> None:
         message = MessageNormalizer().normalize(
             RawWeChatMessage(

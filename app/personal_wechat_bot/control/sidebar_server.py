@@ -13,6 +13,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     append_sidebar_backend_event,
     build_sidebar_bridge_state,
     build_sidebar_runtime_cards,
+    build_sidebar_task_manager,
     build_sidebar_weflow_state,
     build_sidebar_wechat_probe,
     build_sidebar_state,
@@ -26,8 +27,13 @@ from app.personal_wechat_bot.control.sidebar_api import (
     probe_model_fetch,
     remove_api_key,
     set_model_config,
+    sidebar_agent_tick,
     sidebar_queue_action,
+    sidebar_channel_state_action,
+    sidebar_runtime_probe,
     sidebar_runtime_card_action,
+    sidebar_resource_audit,
+    sidebar_task_action,
     sidebar_weflow_dependency_status,
     sidebar_weflow_backfill,
     sidebar_weflow_cancel_backfill,
@@ -74,6 +80,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/runtime-cards":
                 self._json(build_sidebar_runtime_cards(data_dir))
+                return
+            if parsed.path == "/api/tasks":
+                self._json(build_sidebar_task_manager(data_dir))
                 return
             if parsed.path == "/api/weflow/status":
                 self._json(build_sidebar_weflow_state(data_dir))
@@ -157,6 +166,21 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/model-config/probe":
                     self._json(probe_model_fetch(data_dir, payload))
+                    return
+                if parsed.path == "/api/runtime/probe":
+                    self._json(sidebar_runtime_probe(data_dir, payload))
+                    return
+                if parsed.path == "/api/resources/audit":
+                    self._json(sidebar_resource_audit(data_dir, payload))
+                    return
+                if parsed.path == "/api/agent/tick":
+                    self._json(sidebar_agent_tick(data_dir, payload))
+                    return
+                if parsed.path == "/api/tasks":
+                    self._json(sidebar_task_action(data_dir, payload))
+                    return
+                if parsed.path == "/api/channel-state":
+                    self._json(sidebar_channel_state_action(data_dir, payload))
                     return
                 if parsed.path == "/api/workspace/cleanup":
                     self._json(cleanup_file_workspace(data_dir, payload))

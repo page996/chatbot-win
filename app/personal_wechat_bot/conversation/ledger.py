@@ -10,9 +10,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.personal_wechat_bot.conversation.segment import resolve_segment
+from app.personal_wechat_bot.conversation.segment import chat_title_from_index, resolve_segment
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, utc_now_iso
+from app.personal_wechat_bot.workspace.file_visibility import redact_file_internal_urls
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,8 @@ class LedgerTextBlock:
 class LedgerEntry:
     entry_id: str
     message_id: str
+    dedupe_key: str
+    message_ids: list[str]
     conversation_id: str
     session_id: str
     conversation_type: str
@@ -49,6 +52,12 @@ class LedgerEntry:
     updated_at: str = field(default_factory=utc_now_iso)
 
 
+@dataclass(frozen=True)
+class AppendMessageResult:
+    entry: LedgerEntry
+    status: str
+
+
 class ConversationLedgerStore:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
@@ -59,13 +68,16 @@ class ConversationLedgerStore:
         self._segment_cache: dict[str, str] = {}
 
     def append_message(self, message: NormalizedMessage) -> LedgerEntry:
+        return self.append_message_result(message).entry
+
+    def append_message_result(self, message: NormalizedMessage) -> AppendMessageResult:
         self._remember_segment(message.conversation_id, message.chat_title)
         with self._conversation_lock(message.conversation_id):
             conversation_dir = self._conversation_dir(message.conversation_id)
             entries = self._read_entries(message.conversation_id)
             existing = _find_entry_by_message_id(entries, message.message_id)
             if existing is not None:
-                return _entry_from_payload(existing)
+                return self._upsert_existing_message(message, existing, entries)
             # A pulled-back self message is WeChat echoing the agent's own reply.
             # If it matches a recent role=assistant entry (recorded when the reply
             # was generated), don't append a duplicate role=self line — instead
@@ -74,32 +86,82 @@ class ConversationLedgerStore:
                 echoed = _find_assistant_entry_for_self_echo(entries, message.text)
                 if echoed is not None:
                     self._confirm_self_echo(message, echoed, entries, conversation_dir)
-                    return _entry_from_payload(echoed)
-            entry = LedgerEntry(
-                entry_id=_entry_id(message.message_id, message.conversation_id),
-                message_id=message.message_id,
-                conversation_id=message.conversation_id,
-                session_id=_session_id_from_metadata(message.metadata),
-                conversation_type=message.conversation_type,
-                chat_title=message.chat_title,
-                sender_name=message.sender_name,
-                sender_wechat_id=message.sender_wechat_id,
-                is_self=message.is_self,
-                received_at=message.received_at,
-                sequence=self._next_sequence(entries),
-                status="active",
-                text_blocks=_text_blocks_from_message(message),
-                quote=_quote_from_metadata(message.metadata),
-                attachments=_attachments_from_metadata(message.metadata),
-                links=_links_from_text(message.text),
-                source=str(message.metadata.get("source", "")),
-                role="self" if message.is_self else "user",
-                send={},
-            )
+                    return AppendMessageResult(_entry_from_payload(echoed), "self_echo_confirmed")
+            dedupe_key = _message_dedupe_key(message)
+            if dedupe_key:
+                semantic = _find_entry_by_dedupe_key(entries, dedupe_key)
+                if semantic is not None:
+                    return self._upsert_existing_message(message, semantic, entries)
+            entry = self._new_message_entry(message, self._next_sequence(entries))
             self._append_entry(conversation_dir, entry)
             self._write_state(message.conversation_id, entry)
             self._render_conversation(message.conversation_id)
-            return entry
+            return AppendMessageResult(entry, "created")
+
+    def _upsert_existing_message(
+        self,
+        message: NormalizedMessage,
+        existing: dict[str, Any],
+        entries: list[dict[str, Any]],
+    ) -> AppendMessageResult:
+        updated = self._updated_message_payload(message, existing)
+        if not _message_payload_changed(existing, updated):
+            return AppendMessageResult(_entry_from_payload(existing), "duplicate")
+        rewritten: list[dict[str, Any]] = []
+        for item in entries:
+            if item.get("entry_id") == existing.get("entry_id"):
+                rewritten.append(updated)
+            else:
+                rewritten.append(item)
+        self._rewrite_entries(message.conversation_id, rewritten)
+        entry = _entry_from_payload(updated)
+        self._write_state(message.conversation_id, entry)
+        self._render_conversation(message.conversation_id)
+        return AppendMessageResult(entry, "updated")
+
+    def _new_message_entry(self, message: NormalizedMessage, sequence: int) -> LedgerEntry:
+        chat_title = _preferred_chat_title(
+            chat_title_from_index(self.data_dir, message.conversation_id),
+            message.chat_title,
+        )
+        return LedgerEntry(
+            entry_id=_entry_id(message.message_id, message.conversation_id),
+            message_id=message.message_id,
+            dedupe_key=_message_dedupe_key(message),
+            message_ids=_message_aliases(message),
+            conversation_id=message.conversation_id,
+            session_id=_session_id_from_metadata(message.metadata),
+            conversation_type=message.conversation_type,
+            chat_title=chat_title,
+            sender_name=message.sender_name,
+            sender_wechat_id=message.sender_wechat_id,
+            is_self=message.is_self,
+            received_at=message.received_at,
+            sequence=sequence,
+            status="active",
+            text_blocks=_text_blocks_from_message(message),
+            quote=_quote_from_metadata(message.metadata),
+            attachments=_attachments_from_metadata(message.metadata),
+            links=_links_from_text(_primary_message_text(message)),
+            source=str(message.metadata.get("source", "")),
+            role="self" if message.is_self else "user",
+            send={},
+        )
+
+    def _updated_message_payload(self, message: NormalizedMessage, existing: dict[str, Any]) -> dict[str, Any]:
+        sequence = int(existing.get("sequence", 0) or 0)
+        candidate = asdict(self._new_message_entry(message, sequence))
+        return {
+            **candidate,
+            "entry_id": str(existing.get("entry_id") or candidate["entry_id"]),
+            "message_id": str(existing.get("message_id") or candidate["message_id"]),
+            "message_ids": _merge_message_ids(existing, _message_aliases(message)),
+            "chat_title": _preferred_chat_title(str(existing.get("chat_title") or ""), candidate["chat_title"]),
+            "status": str(existing.get("status") or candidate["status"]),
+            "send": dict(existing.get("send", {})) if isinstance(existing.get("send"), dict) else {},
+            "created_at": str(existing.get("created_at") or candidate["created_at"]),
+            "updated_at": utc_now_iso(),
+        }
 
     def _confirm_self_echo(
         self,
@@ -147,39 +209,40 @@ class ConversationLedgerStore:
         source_path: str = "",
         error: str = "",
     ) -> bool:
-        entries = self._read_entries(conversation_id)
-        changed = False
-        updated: list[dict[str, Any]] = []
-        for item in entries:
-            if item.get("entry_id") != entry_id:
+        with self._conversation_lock(conversation_id):
+            entries = self._read_entries(conversation_id)
+            changed = False
+            updated: list[dict[str, Any]] = []
+            for item in entries:
+                if item.get("entry_id") != entry_id:
+                    updated.append(item)
+                    continue
+                item = dict(item)
+                item["links"] = _annotated_links(item.get("links", []), url_id, status, source_path, summary, error)
+                if text and status == "completed":
+                    annotation_path = self._write_annotation(
+                        conversation_id,
+                        entry_id,
+                        url_id,
+                        text=text,
+                        summary=summary,
+                        source_path=source_path,
+                    )
+                    item["text_blocks"] = _upsert_text_block(
+                        item.get("text_blocks", []),
+                        kind="annotation:web",
+                        source_ref=str(annotation_path),
+                        text=_web_annotation_text(summary, text),
+                        metadata={"url_id": url_id, "status": status},
+                    )
+                item["updated_at"] = utc_now_iso()
                 updated.append(item)
-                continue
-            item = dict(item)
-            item["links"] = _annotated_links(item.get("links", []), url_id, status, source_path, summary, error)
-            if text and status == "completed":
-                annotation_path = self._write_annotation(
-                    conversation_id,
-                    entry_id,
-                    url_id,
-                    text=text,
-                    summary=summary,
-                    source_path=source_path,
-                )
-                item["text_blocks"] = _upsert_text_block(
-                    item.get("text_blocks", []),
-                    kind="annotation:web",
-                    source_ref=str(annotation_path),
-                    text=_web_annotation_text(summary, text),
-                    metadata={"url_id": url_id, "status": status},
-                )
-            item["updated_at"] = utc_now_iso()
-            updated.append(item)
-            changed = True
-        if not changed:
-            return False
-        self._rewrite_entries(conversation_id, updated)
-        self._render_conversation(conversation_id)
-        return True
+                changed = True
+            if not changed:
+                return False
+            self._rewrite_entries(conversation_id, updated)
+            self._render_conversation(conversation_id)
+            return True
 
     def append_reply(
         self,
@@ -197,6 +260,8 @@ class ConversationLedgerStore:
             entry = LedgerEntry(
                 entry_id=_entry_id(f"reply:{reply.message_id}:{reply.created_at}", reply.conversation_id),
                 message_id=reply.message_id,
+                dedupe_key="",
+                message_ids=[reply.message_id],
                 conversation_id=reply.conversation_id,
                 session_id=session_id or DEFAULT_SESSION_ID,
                 conversation_type=conversation_type,
@@ -224,34 +289,35 @@ class ConversationLedgerStore:
             return entry
 
     def update_reply_send_result(self, conversation_id: str, entry_id: str, send_result: SendResult | dict[str, Any]) -> bool:
-        entries = self._read_entries(conversation_id)
-        payload = asdict(send_result) if isinstance(send_result, SendResult) else dict(send_result)
-        changed = False
-        updated: list[dict[str, Any]] = []
-        now = utc_now_iso()
-        for item in entries:
-            if item.get("entry_id") != entry_id:
+        with self._conversation_lock(conversation_id):
+            entries = self._read_entries(conversation_id)
+            payload = asdict(send_result) if isinstance(send_result, SendResult) else dict(send_result)
+            changed = False
+            updated: list[dict[str, Any]] = []
+            now = utc_now_iso()
+            for item in entries:
+                if item.get("entry_id") != entry_id:
+                    updated.append(item)
+                    continue
+                item = dict(item)
+                send = item.get("send") if isinstance(item.get("send"), dict) else {}
+                item["send"] = {
+                    **send,
+                    "status": str(payload.get("status") or ""),
+                    "reason": str(payload.get("reason") or ""),
+                    "message_id": str(payload.get("message_id") or item.get("message_id") or ""),
+                    "conversation_id": str(payload.get("conversation_id") or conversation_id),
+                    "sent_at": str(payload.get("sent_at") or ""),
+                    "updated_at": now,
+                }
+                item["updated_at"] = now
                 updated.append(item)
-                continue
-            item = dict(item)
-            send = item.get("send") if isinstance(item.get("send"), dict) else {}
-            item["send"] = {
-                **send,
-                "status": str(payload.get("status") or ""),
-                "reason": str(payload.get("reason") or ""),
-                "message_id": str(payload.get("message_id") or item.get("message_id") or ""),
-                "conversation_id": str(payload.get("conversation_id") or conversation_id),
-                "sent_at": str(payload.get("sent_at") or ""),
-                "updated_at": now,
-            }
-            item["updated_at"] = now
-            updated.append(item)
-            changed = True
-        if not changed:
-            return False
-        self._rewrite_entries(conversation_id, updated)
-        self._render_conversation(conversation_id)
-        return True
+                changed = True
+            if not changed:
+                return False
+            self._rewrite_entries(conversation_id, updated)
+            self._render_conversation(conversation_id)
+            return True
 
     def update_reply_send_result_for_candidate(self, reply: ReplyCandidate, send_result: SendResult | dict[str, Any]) -> bool:
         entries = self._read_entries(reply.conversation_id)
@@ -288,59 +354,77 @@ class ConversationLedgerStore:
         bridge_id = str(bridge_id or "").strip()
         if not bridge_id:
             return False
-        entries = self._read_entries(conversation_id)
-        changed = False
-        updated: list[dict[str, Any]] = []
-        now = utc_now_iso()
-        for item in entries:
-            send = item.get("send") if isinstance(item.get("send"), dict) else {}
-            send_reason = str(send.get("reason", ""))
-            send_message_id = str(send.get("message_id", ""))
-            if item.get("role") == "assistant" and (bridge_id == send_message_id or bridge_id in send_reason):
-                item = dict(item)
-                next_send = {
-                    **send,
-                    "status": status,
-                    "reason": reason or f"bridge_ack:{status}",
-                    "updated_at": now,
-                }
-                if external_message_id:
-                    next_send["external_message_id"] = external_message_id
-                if status == "sent":
-                    next_send["sent_at"] = now
-                item["send"] = next_send
-                item["updated_at"] = now
-                changed = True
-            updated.append(item)
-        if not changed:
-            return False
-        self._rewrite_entries(conversation_id, updated)
-        self._render_conversation(conversation_id)
-        return True
+        with self._conversation_lock(conversation_id):
+            entries = self._read_entries(conversation_id)
+            changed = False
+            updated: list[dict[str, Any]] = []
+            now = utc_now_iso()
+            for item in entries:
+                send = item.get("send") if isinstance(item.get("send"), dict) else {}
+                send_reason = str(send.get("reason", ""))
+                send_message_id = str(send.get("message_id", ""))
+                if item.get("role") == "assistant" and (bridge_id == send_message_id or bridge_id in send_reason):
+                    item = dict(item)
+                    next_send = {
+                        **send,
+                        "status": status,
+                        "reason": reason or f"bridge_ack:{status}",
+                        "updated_at": now,
+                    }
+                    if external_message_id:
+                        next_send["external_message_id"] = external_message_id
+                    if status == "sent":
+                        next_send["sent_at"] = now
+                    item["send"] = next_send
+                    item["updated_at"] = now
+                    changed = True
+                updated.append(item)
+            if not changed:
+                return False
+            self._rewrite_entries(conversation_id, updated)
+            self._render_conversation(conversation_id)
+            return True
 
     def mark_recalled(self, conversation_id: str, message_id: str, *, reason: str = "wechat_recall") -> bool:
-        entries = self._read_entries(conversation_id)
-        changed = False
-        updated: list[dict[str, Any]] = []
-        for item in entries:
-            if item.get("message_id") == message_id and item.get("status") == "active":
-                item = dict(item)
-                item["status"] = "recalled"
-                item["recall_reason"] = reason
-                item["updated_at"] = utc_now_iso()
-                changed = True
-            updated.append(item)
-        if not changed:
-            return False
-        self._rewrite_entries(conversation_id, updated)
-        self._render_conversation(conversation_id)
-        return True
+        with self._conversation_lock(conversation_id):
+            entries = self._read_entries(conversation_id)
+            changed = False
+            updated: list[dict[str, Any]] = []
+            for item in entries:
+                if message_id in _entry_message_ids(item) and item.get("status") == "active":
+                    item = dict(item)
+                    item["status"] = "recalled"
+                    item["recall_reason"] = reason
+                    item["updated_at"] = utc_now_iso()
+                    changed = True
+                updated.append(item)
+            if not changed:
+                return False
+            self._rewrite_entries(conversation_id, updated)
+            self._render_conversation(conversation_id)
+            return True
 
     def read_entries(self, conversation_id: str, *, include_removed: bool = False) -> list[LedgerEntry]:
         entries = self._read_entries(conversation_id)
         if not include_removed:
             entries = [item for item in entries if item.get("status") == "active"]
         return [_entry_from_payload(item) for item in entries]
+
+    def refresh_file_refs(self, conversation_id: str) -> bool:
+        with self._conversation_lock(conversation_id):
+            entries = self._read_entries(conversation_id)
+            updated: list[dict[str, Any]] = []
+            changed = False
+            for item in entries:
+                refreshed = _refresh_entry_file_refs(item)
+                if refreshed != item:
+                    changed = True
+                updated.append(refreshed)
+            if not changed:
+                return False
+            self._rewrite_entries(conversation_id, updated)
+            self._render_conversation(conversation_id)
+            return True
 
     def lookup_quote_context(
         self,
@@ -366,8 +450,9 @@ class ConversationLedgerStore:
             "status": "found",
             "quote": quote,
             "matched_entry_id": active[index].get("entry_id", ""),
+            "matched_attachments": _entry_attachments(active[index]),
             "entries": window,
-            "attachments": attachments,
+            "attachments": _dedupe_attachments(_entry_attachments(active[index]) + attachments),
         }
 
     def conversation_markdown_path(self, conversation_id: str) -> Path:
@@ -434,14 +519,14 @@ class ConversationLedgerStore:
         return candidate  # fallback: hash-only, will be empty on first read
 
     def _messages_path(self, conversation_id: str) -> Path:
-        return self._conversation_dir(conversation_id) / "messages.jsonl"
+        return self._find_conversation_dir(conversation_id) / "messages.jsonl"
 
     def _state_path(self, conversation_id: str) -> Path:
-        return self._conversation_dir(conversation_id) / "state.json"
+        return self._find_conversation_dir(conversation_id) / "state.json"
 
     @contextmanager
     def _conversation_lock(self, conversation_id: str) -> Iterator[None]:
-        lock_path = self._conversation_dir(conversation_id) / ".ledger.lock"
+        lock_path = self._find_conversation_dir(conversation_id) / ".ledger.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + 30.0
         fd: int | None = None
@@ -596,6 +681,12 @@ def _text_blocks_from_message(message: NormalizedMessage) -> list[dict[str, Any]
         parse = attachment.get("parse") if isinstance(attachment.get("parse"), dict) else {}
         parsed_text = str(parse.get("text", "")).strip()
         if parsed_text:
+            metadata = {
+                "file_id": attachment.get("file_id", ""),
+                "name": attachment.get("name", ""),
+                "visible_in_context": False,
+                "visibility": "file_content_hidden_use_file_read",
+            }
             blocks.append(
                 asdict(
                     LedgerTextBlock(
@@ -603,7 +694,25 @@ def _text_blocks_from_message(message: NormalizedMessage) -> list[dict[str, Any]
                         text=parsed_text,
                         source_ref=str(_attachment_source_ref(attachment)),
                         token_estimate=_estimate_tokens(parsed_text),
-                        metadata={"file_id": attachment.get("file_id", ""), "name": attachment.get("name", "")},
+                        metadata=metadata,
+                    )
+                )
+            )
+        brief = _file_analysis_brief_text(attachment)
+        if brief:
+            blocks.append(
+                asdict(
+                    LedgerTextBlock(
+                        kind="file:analysis",
+                        text=brief,
+                        source_ref=str(_attachment_source_ref(attachment)),
+                        token_estimate=_estimate_tokens(brief),
+                        metadata={
+                            "file_id": attachment.get("file_id", ""),
+                            "name": attachment.get("name", ""),
+                            "visible_in_context": True,
+                            "source": "content.md::AI Analysis+Key Points",
+                        },
                     )
                 )
             )
@@ -638,6 +747,8 @@ def _text_blocks_from_reply(reply: ReplyCandidate, attachments: list[dict[str, A
                         "name": attachment.get("name", ""),
                         "source": attachment.get("source", ""),
                         "direction": "outgoing",
+                        "visible_in_context": False,
+                        "visibility": "file_content_hidden_use_file_read",
                     },
                 )
             )
@@ -681,7 +792,7 @@ def _voice_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         return {}
     return {
         "status": str(raw.get("status") or "transcribed").strip(),
-        "source": str(raw.get("source") or "wechat_builtin_voice_to_text_ocr").strip(),
+        "source": str(raw.get("source") or "local_asr_fallback").strip(),
         "text": text,
         "duration": str(raw.get("duration", "")).strip(),
     }
@@ -715,6 +826,43 @@ def _attachments_from_metadata(metadata: dict[str, Any]) -> list[dict[str, Any]]
         _attach_parse_artifact_refs(attachment)
         attachments.append(attachment)
     return attachments
+
+
+def _file_analysis_brief_text(attachment: dict[str, Any]) -> str:
+    payload = _file_analysis_brief_payload(attachment)
+    if not payload:
+        return ""
+    key_points = payload.get("key_points", []) if isinstance(payload.get("key_points"), list) else []
+    lines = [
+        "[file_analysis]",
+        "AI Analysis:",
+        str(payload.get("summary", "")).strip(),
+        "Key Points:",
+    ]
+    lines.extend(f"- {point}" for point in key_points if str(point).strip())
+    lines.append("[/file_analysis]")
+    return "\n".join(lines)
+
+
+def _file_analysis_brief_payload(attachment: dict[str, Any]) -> dict[str, Any]:
+    parse = attachment.get("parse") if isinstance(attachment.get("parse"), dict) else {}
+    artifacts = attachment.get("artifacts") if isinstance(attachment.get("artifacts"), dict) else {}
+    status = str(artifacts.get("ai_analysis_status") or parse.get("ai_analysis_status") or "").strip()
+    if status != "analyzed":
+        return {}
+    summary = str(artifacts.get("ai_summary") or parse.get("ai_summary") or "").strip()
+    if not summary or "fake_llm.completed" in summary or "PLAN:" in summary or "MONITOR:" in summary:
+        return {}
+    raw_points = artifacts.get("ai_key_points") or parse.get("ai_key_points") or []
+    key_points = [redact_file_internal_urls(str(item).strip()) for item in raw_points if str(item).strip()][:12]
+    file_id = str(attachment.get("file_id", "")).strip()
+    return {
+        "file_id": file_id,
+        "name": str(attachment.get("name", "")).strip(),
+        "kind": str(parse.get("kind") or attachment.get("kind") or "").strip(),
+        "summary": redact_file_internal_urls(summary),
+        "key_points": key_points,
+    }
 
 
 def _reply_attachments(reply: ReplyCandidate) -> list[dict[str, Any]]:
@@ -805,6 +953,9 @@ def _attach_parse_artifact_refs(attachment: dict[str, Any]) -> None:
         "chunks_dir": artifacts.get("chunks_dir", str(Path(derived_dir) / "chunks")),
         "table_index_path": artifacts.get("table_index_path", ""),
         "table_chunk_count": artifacts.get("table_chunk_count", 0),
+        "ocr_tables_dir": artifacts.get("ocr_tables_dir", str(Path(derived_dir) / "ocr_tables")),
+        "ocr_table_index_path": artifacts.get("ocr_table_index_path", ""),
+        "ocr_table_chunk_count": artifacts.get("ocr_table_chunk_count", 0),
         "media_dir": artifacts.get("media_dir", str(Path(derived_dir) / "media")),
         "media_index_path": artifacts.get("media_index_path", str(Path(derived_dir) / "media" / "index.json")),
         "media_extract_count": artifacts.get("media_extract_count", 0),
@@ -820,12 +971,237 @@ def _attach_parse_artifact_refs(attachment: dict[str, Any]) -> None:
     }
 
 
+def _refresh_entry_file_refs(item: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(item)
+    changed = False
+
+    refreshed_blocks, blocks_changed = _refresh_text_block_visibility(updated.get("text_blocks", []))
+    if blocks_changed:
+        updated["text_blocks"] = refreshed_blocks
+        changed = True
+
+    refreshed_links = _refreshed_links_from_visible_text(updated)
+    if refreshed_links != (updated.get("links") if isinstance(updated.get("links"), list) else []):
+        updated["links"] = refreshed_links
+        changed = True
+
+    attachments = item.get("attachments")
+    if not isinstance(attachments, list) or not attachments:
+        if changed:
+            updated["updated_at"] = utc_now_iso()
+        return updated
+    refreshed_attachments: list[Any] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            refreshed_attachments.append(attachment)
+            continue
+        refreshed = _refresh_attachment_file_refs(attachment)
+        if refreshed != attachment:
+            changed = True
+        refreshed_attachments.append(refreshed)
+    refreshed_blocks, analysis_blocks_changed = _sync_file_analysis_blocks(updated.get("text_blocks", []), refreshed_attachments)
+    if analysis_blocks_changed:
+        updated["text_blocks"] = refreshed_blocks
+        changed = True
+    if not changed:
+        return dict(item)
+    updated["attachments"] = refreshed_attachments
+    updated["updated_at"] = utc_now_iso()
+    return updated
+
+
+def _refresh_text_block_visibility(blocks: Any) -> tuple[list[Any], bool]:
+    if not isinstance(blocks, list):
+        return [], bool(blocks)
+    changed = False
+    refreshed: list[Any] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            refreshed.append(block)
+            continue
+        kind = str(block.get("kind", ""))
+        if not kind.startswith("attachment:"):
+            refreshed.append(block)
+            continue
+        metadata = dict(block.get("metadata", {})) if isinstance(block.get("metadata"), dict) else {}
+        if metadata.get("visible_in_context") is False and metadata.get("visibility"):
+            refreshed.append(block)
+            continue
+        updated = dict(block)
+        metadata["visible_in_context"] = False
+        metadata.setdefault("visibility", "file_content_hidden_use_file_read")
+        updated["metadata"] = metadata
+        refreshed.append(updated)
+        changed = True
+    return refreshed, changed
+
+
+def _sync_file_analysis_blocks(blocks: Any, attachments: list[Any]) -> tuple[list[dict[str, Any]], bool]:
+    raw_blocks = [dict(item) for item in blocks if isinstance(item, dict)] if isinstance(blocks, list) else []
+    refreshed = [
+        block
+        for block in raw_blocks
+        if str(block.get("kind", "")) != "file:analysis"
+    ]
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        brief = _file_analysis_brief_text(attachment)
+        if not brief:
+            continue
+        refreshed.append(
+            asdict(
+                LedgerTextBlock(
+                    kind="file:analysis",
+                    text=brief,
+                    source_ref=str(_attachment_source_ref(attachment)),
+                    token_estimate=_estimate_tokens(brief),
+                    metadata={
+                        "file_id": attachment.get("file_id", ""),
+                        "name": attachment.get("name", ""),
+                        "visible_in_context": True,
+                        "source": "content.md::AI Analysis+Key Points",
+                    },
+                )
+            )
+        )
+    return refreshed, refreshed != raw_blocks
+
+
+def _entry_link_source_text(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for block in item.get("text_blocks", []):
+        if not isinstance(block, dict):
+            continue
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        kind = str(block.get("kind", ""))
+        if metadata.get("visible_in_context") is False or kind.startswith("attachment:"):
+            continue
+        text = str(block.get("text", "")).strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _refreshed_links_from_visible_text(item: dict[str, Any]) -> list[dict[str, Any]]:
+    fresh = _links_from_text(_entry_link_source_text(item))
+    existing = item.get("links", [])
+    existing_by_id = {
+        str(link.get("url_id", "")): dict(link)
+        for link in existing
+        if isinstance(link, dict) and str(link.get("url_id", ""))
+    } if isinstance(existing, list) else {}
+    merged: list[dict[str, Any]] = []
+    for link in fresh:
+        prior = existing_by_id.get(str(link.get("url_id", "")))
+        if prior and prior.get("url") == link.get("url"):
+            merged.append({**link, **prior})
+        else:
+            merged.append(link)
+    return merged
+
+
+def _refresh_attachment_file_refs(attachment: dict[str, Any]) -> dict[str, Any]:
+    workspace = attachment.get("workspace") if isinstance(attachment.get("workspace"), dict) else {}
+    manifest_raw = str(workspace.get("manifest_path", "")).strip()
+    if not manifest_raw:
+        return dict(attachment)
+    manifest_path = Path(manifest_raw)
+    if not manifest_path.is_file():
+        return dict(attachment)
+    manifest = _read_json_file(manifest_path, {})
+    if not isinstance(manifest, dict):
+        return dict(attachment)
+    parse_manifest = manifest.get("parse") if isinstance(manifest.get("parse"), dict) else {}
+    if not parse_manifest:
+        return dict(attachment)
+    updated = dict(attachment)
+    parse = dict(updated.get("parse", {})) if isinstance(updated.get("parse"), dict) else {}
+    for key in ("status", "kind", "summary", "error", "ai_analysis_status", "ai_summary", "ai_key_points"):
+        value = parse_manifest.get(key)
+        if value not in (None, "", [], {}):
+            parse[key] = value
+    updated["parse"] = parse
+    artifacts = dict(updated.get("artifacts", {})) if isinstance(updated.get("artifacts"), dict) else {}
+    artifacts.update(_artifact_snapshot_from_manifest(parse_manifest))
+    updated["artifacts"] = artifacts
+    return updated
+
+
+def _artifact_snapshot_from_manifest(parse_manifest: dict[str, Any]) -> dict[str, Any]:
+    analysis_path = Path(str(parse_manifest.get("analysis_path", "")).strip())
+    analysis = _read_json_file(analysis_path, {}) if analysis_path.is_file() else {}
+    if not isinstance(analysis, dict):
+        analysis = {}
+    snapshot = {
+        "content_path": str(parse_manifest.get("content_path", "")),
+        "full_text_path": str(parse_manifest.get("full_text_path", "")),
+        "analysis_path": str(parse_manifest.get("analysis_path", "")),
+        "parse_result_path": str(Path(str(parse_manifest.get("analysis_path", ""))).with_name("parse_result.json"))
+        if parse_manifest.get("analysis_path")
+        else "",
+        "ai_analysis_status": str(analysis.get("ai_analysis_status", parse_manifest.get("ai_analysis_status", ""))),
+        "ai_summary": str(analysis.get("ai_summary", parse_manifest.get("ai_summary", ""))),
+        "ai_key_points": _string_list(analysis.get("ai_key_points", parse_manifest.get("ai_key_points", []))),
+        "preview_char_count": int(analysis.get("preview_char_count", parse_manifest.get("preview_char_count", 0)) or 0),
+        "char_count": int(analysis.get("char_count", parse_manifest.get("char_count", 0)) or 0),
+        "chunks_dir": str(analysis.get("chunks_dir", parse_manifest.get("chunks_dir", ""))),
+        "chunk_count": int(analysis.get("chunk_count", parse_manifest.get("chunk_count", 0)) or 0),
+        "chunks": _dict_list(analysis.get("chunks", parse_manifest.get("chunks", []))),
+        "tables_dir": str(analysis.get("tables_dir", parse_manifest.get("tables_dir", ""))),
+        "table_index_path": str(analysis.get("table_index_path", parse_manifest.get("table_index_path", ""))),
+        "table_chunk_count": int(analysis.get("table_chunk_count", parse_manifest.get("table_chunk_count", 0)) or 0),
+        "table_chunks": _dict_list(analysis.get("table_chunks", parse_manifest.get("table_chunks", []))),
+        "ocr_tables_dir": str(analysis.get("ocr_tables_dir", parse_manifest.get("ocr_tables_dir", ""))),
+        "ocr_table_index_path": str(analysis.get("ocr_table_index_path", parse_manifest.get("ocr_table_index_path", ""))),
+        "ocr_table_chunk_count": int(analysis.get("ocr_table_chunk_count", parse_manifest.get("ocr_table_chunk_count", 0)) or 0),
+        "ocr_table_chunks": _dict_list(analysis.get("ocr_table_chunks", parse_manifest.get("ocr_table_chunks", []))),
+        "media_dir": str(analysis.get("media_dir", parse_manifest.get("media_dir", ""))),
+        "media_index_path": str(analysis.get("media_index_path", parse_manifest.get("media_index_path", ""))),
+        "media_extract_count": int(analysis.get("media_extract_count", parse_manifest.get("media_extract_count", 0)) or 0),
+        "media_ocr_status": str(analysis.get("media_ocr_status", parse_manifest.get("media_ocr_status", ""))),
+        "media_ocr_dir": str(analysis.get("media_ocr_dir", parse_manifest.get("media_ocr_dir", ""))),
+        "media_ocr_index_path": str(analysis.get("media_ocr_index_path", parse_manifest.get("media_ocr_index_path", ""))),
+        "media_ocr_count": int(analysis.get("media_ocr_count", parse_manifest.get("media_ocr_count", 0)) or 0),
+        "media_ocr_error_count": int(analysis.get("media_ocr_error_count", parse_manifest.get("media_ocr_error_count", 0)) or 0),
+        "media_asr_status": str(analysis.get("media_asr_status", parse_manifest.get("media_asr_status", ""))),
+        "media_asr_dir": str(analysis.get("media_asr_dir", parse_manifest.get("media_asr_dir", ""))),
+        "media_asr_count": int(analysis.get("media_asr_count", parse_manifest.get("media_asr_count", 0)) or 0),
+        "media_asr_error_count": int(analysis.get("media_asr_error_count", parse_manifest.get("media_asr_error_count", 0)) or 0),
+        "media_images": _dict_list(analysis.get("media_images", parse_manifest.get("media_images", []))),
+        "media_audio": _dict_list(analysis.get("media_audio", parse_manifest.get("media_audio", []))),
+    }
+    return {key: value for key, value in snapshot.items() if value not in ("", None, [], {})}
+
+
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _read_json_file(path: Path, default: Any) -> Any:
+    try:
+        if not path.is_file():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
 def _quote_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     raw = metadata.get("quote") or metadata.get("quoted_message") or {}
     if isinstance(raw, str):
         raw = {"text": raw}
     if not isinstance(raw, dict):
         return {}
+    aliases = _quote_aliases(raw)
     quote = {
         "message_id": str(raw.get("message_id") or raw.get("quoted_message_id") or "").strip(),
         "entry_id": str(raw.get("entry_id") or raw.get("quoted_entry_id") or "").strip(),
@@ -834,6 +1210,8 @@ def _quote_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "received_at": str(raw.get("received_at") or raw.get("quoted_received_at") or "").strip(),
         "source": str(raw.get("source") or "").strip(),
     }
+    if aliases:
+        quote["message_ids"] = aliases  # type: ignore[assignment]
     return {key: value for key, value in quote.items() if value}
 
 
@@ -971,8 +1349,21 @@ def _render_entry_markdown(item: dict[str, Any]) -> list[str]:
             if kind.startswith("attachment:"):
                 file_id = str(metadata.get("file_id", "")).strip()
                 name = str(metadata.get("name", "")).strip()
-                note = " ".join(part for part in (f"file_id={file_id}" if file_id else "", f"name={name}" if name else "") if part)
+                note = " ".join(
+                    part
+                    for part in (
+                        f"file_id={file_id}" if file_id else "",
+                        f"name={name}" if name else "",
+                        "hidden=true",
+                        "read=file.read" if file_id else "",
+                    )
+                    if part
+                )
                 lines.append(f"[block:{kind}{' ' + note if note else ''}]")
+                lines.append("")
+                continue
+            elif kind == "file:analysis":
+                pass
             else:
                 status = str(metadata.get("status", "")).strip()
                 url_id = str(metadata.get("url_id", "")).strip()
@@ -1009,9 +1400,19 @@ def _render_attachment_ref(attachment: dict[str, Any]) -> str:
         parts.append(f"kind={kind}")
     if status:
         parts.append(f"status={status}")
+    if file_id:
+        parts.append("read=file.read")
+    reason = str(attachment.get("reason", "")).strip()
+    if reason:
+        parts.append(f"reason={_compact(reason, 120)}")
+    parse = attachment.get("parse") if isinstance(attachment.get("parse"), dict) else {}
+    parse_summary = str(parse.get("summary", "")).strip()
+    if parse_summary and not file_id:
+        parts.append(f"summary={_compact(parse_summary, 180)}")
     for key, label in (
         ("chunk_count", "chunks"),
         ("table_chunk_count", "table_chunks"),
+        ("ocr_table_chunk_count", "ocr_tables"),
         ("media_extract_count", "media"),
         ("media_ocr_count", "ocr"),
         ("media_asr_count", "asr"),
@@ -1028,19 +1429,31 @@ def _render_attachment_ref(attachment: dict[str, Any]) -> str:
 
 def _find_entry_by_message_id(entries: list[dict[str, Any]], message_id: str) -> dict[str, Any] | None:
     for item in entries:
-        if item.get("message_id") == message_id:
+        if message_id in _entry_message_ids(item):
+            return item
+    return None
+
+
+def _find_entry_by_dedupe_key(entries: list[dict[str, Any]], dedupe_key: str) -> dict[str, Any] | None:
+    if not dedupe_key:
+        return None
+    for item in entries:
+        if item.get("role") == "assistant":
+            continue
+        if str(item.get("dedupe_key") or "") == dedupe_key:
             return item
     return None
 
 
 def _find_quote_index(entries: list[dict[str, Any]], quote: dict[str, Any]) -> int | None:
     entry_id = str(quote.get("entry_id", "")).strip()
-    message_id = str(quote.get("message_id", "")).strip()
+    quote_ids = _quote_aliases(quote)
     quote_text = str(quote.get("text", "")).strip()
     for index, item in enumerate(entries):
         if entry_id and item.get("entry_id") == entry_id:
             return index
-        if message_id and item.get("message_id") == message_id:
+        entry_ids = set(_entry_message_ids(item))
+        if quote_ids and entry_ids.intersection(quote_ids):
             return index
     if quote_text:
         normalized_quote = _normalize_for_match(quote_text)
@@ -1059,10 +1472,204 @@ def _find_quote_index(entries: list[dict[str, Any]], quote: dict[str, Any]) -> i
     return None
 
 
+def _message_dedupe_key(message: NormalizedMessage) -> str:
+    return str(message.metadata.get("dedupe_key") or "").strip()
+
+
+def _entry_message_ids(payload: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    primary = str(payload.get("message_id") or "").strip()
+    if primary:
+        ids.append(primary)
+    raw_ids = payload.get("message_ids")
+    if isinstance(raw_ids, list):
+        for item in raw_ids:
+            text = str(item or "").strip()
+            if text and text not in ids:
+                ids.append(text)
+    return ids
+
+
+def _merge_message_ids(existing: dict[str, Any], message_ids: list[str] | str) -> list[str]:
+    ids = _entry_message_ids(existing)
+    candidates = [message_ids] if isinstance(message_ids, str) else message_ids
+    for message_id in candidates:
+        for text in _alias_variants(str(message_id or "").strip()):
+            if text and text not in ids:
+                ids.append(text)
+    return ids[-20:]
+
+
+def _message_aliases(message: NormalizedMessage) -> list[str]:
+    aliases: list[str] = []
+
+    def add(value: Any) -> None:
+        for text in _alias_variants(str(value or "").strip()):
+            if text and text not in aliases:
+                aliases.append(text)
+
+    add(message.message_id)
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    for source in _metadata_alias_sources(metadata):
+        for key in (
+            "message_id",
+            "messageId",
+            "msg_id",
+            "msgId",
+            "msgid",
+            "server_id",
+            "serverId",
+            "platformMessageId",
+            "newmsgid",
+            "newMsgId",
+            "local_id",
+            "localId",
+            "message_key",
+            "messageKey",
+            "raw_id",
+            "rawId",
+        ):
+            add(source.get(key))
+    return aliases[-20:]
+
+
+def _quote_aliases(raw: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    for source in _metadata_alias_sources(raw):
+        for key in (
+            "message_id",
+            "messageId",
+            "quoted_message_id",
+            "quotedMessageId",
+            "platformMessageId",
+            "server_id",
+            "serverId",
+            "msg_id",
+            "msgId",
+            "msgid",
+            "raw_id",
+            "rawId",
+            "target_raw_id",
+            "targetRawId",
+            "local_id",
+            "localId",
+            "message_key",
+            "messageKey",
+        ):
+            for text in _alias_variants(str(source.get(key) or "").strip()):
+                if text and text not in aliases:
+                    aliases.append(text)
+        raw_ids = source.get("message_ids")
+        if isinstance(raw_ids, list):
+            for item in raw_ids:
+                for text in _alias_variants(str(item or "").strip()):
+                    if text and text not in aliases:
+                        aliases.append(text)
+    return aliases[-20:]
+
+
+def _metadata_alias_sources(root: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = [root]
+    for key in ("ordering", "hook", "source_payload", "raw", "message"):
+        value = root.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+            for nested_key in ("ordering", "hook", "raw", "message"):
+                nested = value.get(nested_key)
+                if isinstance(nested, dict):
+                    sources.append(nested)
+    return sources
+
+
+def _alias_variants(value: str) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    variants = [text]
+    if text.startswith("weflow:message:"):
+        variants.append(text.rsplit(":", 1)[-1])
+    if text.startswith(("hook:", "wcf:")) and ":" in text:
+        variants.append(text.rsplit(":", 1)[-1])
+    return [item for index, item in enumerate(variants) if item and item not in variants[:index]]
+
+
+def _entry_attachments(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return [dict(attachment) for attachment in item.get("attachments", []) if isinstance(attachment, dict)]
+
+
+def _dedupe_attachments(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for attachment in attachments:
+        key = (
+            str(attachment.get("file_id", "")).strip(),
+            str(attachment.get("path", "")).strip(),
+            str(attachment.get("name", "")).strip(),
+        )
+        if key != ("", "", "") and key in seen:
+            continue
+        seen.add(key)
+        deduped.append(attachment)
+    return deduped
+
+
+def _message_payload_changed(existing: dict[str, Any], updated: dict[str, Any]) -> bool:
+    keys = (
+        "dedupe_key",
+        "session_id",
+        "conversation_type",
+        "chat_title",
+        "sender_name",
+        "sender_wechat_id",
+        "is_self",
+        "received_at",
+        "status",
+        "text_blocks",
+        "quote",
+        "attachments",
+        "links",
+        "source",
+        "role",
+        "send",
+    )
+    for key in keys:
+        if existing.get(key) != updated.get(key):
+            return True
+    return False
+
+
+def _preferred_chat_title(existing: str, incoming: str) -> str:
+    old = str(existing or "").strip()
+    new = str(incoming or "").strip()
+    if not old:
+        return new
+    if not new:
+        return old
+    if not _is_human_title(new) and _is_human_title(old):
+        return old
+    return new
+
+
+def _looks_like_wechat_id(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text.startswith(("wxid_", "gh_")) or text.endswith("@chatroom"))
+
+
+def _is_human_title(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text.lower() in {"unknown", "system", "none", "null"}:
+        return False
+    return not _looks_like_wechat_id(text)
+
+
 def _entry_from_payload(payload: dict[str, Any]) -> LedgerEntry:
     return LedgerEntry(
         entry_id=str(payload.get("entry_id", "")),
         message_id=str(payload.get("message_id", "")),
+        dedupe_key=str(payload.get("dedupe_key", "")),
+        message_ids=_entry_message_ids(payload),
         conversation_id=str(payload.get("conversation_id", "")),
         session_id=str(payload.get("session_id") or DEFAULT_SESSION_ID),
         conversation_type=str(payload.get("conversation_type", "")),
@@ -1100,7 +1707,11 @@ def _entry_id(message_id: str, conversation_id: str) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4) if text else 0
+    if not text:
+        return 0
+    cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    non_cjk = max(0, len(text) - cjk)
+    return max(1, cjk + non_cjk // 4)
 
 
 def _safe_segment(value: str) -> str:

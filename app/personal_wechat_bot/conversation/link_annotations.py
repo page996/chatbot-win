@@ -104,6 +104,10 @@ def _entry_text(entry: LedgerEntry) -> str:
     for block in entry.text_blocks:
         if not isinstance(block, dict):
             continue
+        kind = str(block.get("kind", ""))
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        if kind.startswith("attachment:") or metadata.get("visible_in_context") is False:
+            continue
         text = str(block.get("text", "")).strip()
         if text:
             parts.append(text)
@@ -117,6 +121,13 @@ def _entry_from_payload(payload: Any) -> LedgerEntry | None:
         return LedgerEntry(
             entry_id=str(payload.get("entry_id", "")),
             message_id=str(payload.get("message_id", "")),
+            dedupe_key=str(payload.get("dedupe_key", "")),
+            message_ids=[
+                str(item)
+                for item in payload.get("message_ids", [])
+                if str(item).strip()
+            ]
+            or [str(payload.get("message_id", ""))],
             conversation_id=str(payload.get("conversation_id", "")),
             session_id=str(payload.get("session_id", "session_default")),
             conversation_type=str(payload.get("conversation_type", "private")),

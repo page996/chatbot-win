@@ -17,7 +17,7 @@ from urllib.parse import urlencode, urlparse, quote
 from urllib.request import Request, urlopen
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
-from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl
+from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl_once
 from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 
 
@@ -155,10 +155,15 @@ class HookEventJsonlWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
 
-    def append(self, payload: dict[str, Any]) -> None:
+    def append(self, payload: dict[str, Any]) -> bool:
         if not isinstance(payload, dict):
             raise ValueError("hook payload must be a JSON object")
-        append_jsonl(self.path, _sorted_payload(payload))
+        return append_jsonl_once(
+            self.path,
+            _sorted_payload(payload),
+            key_field="raw_id",
+            index_path=self.path.with_suffix(self.path.suffix + ".raw_ids.json"),
+        )
 
 
 class WeFlowHttpBridge:
@@ -229,6 +234,7 @@ class WeFlowHttpBridge:
             for session in sessions
             if not is_system_account(_session_id_from_meta(session))
         ]
+        sessions = _dedupe_weflow_sessions(sessions)
         _emit_progress(progress_callback, event="sessions", session_count=len(sessions), scanned_count=0, appended_count=0)
 
         worker_count = max(1, int(workers or 1))
@@ -323,6 +329,7 @@ class WeFlowHttpBridge:
         errors: list[dict[str, str]] = []
         appended_raw_ids: list[str] = []
         media_export_paths: set[str] = set()
+        current_recent_raw_ids: dict[str, int] = {}
         scanned = 0
         appended = 0
         now_since = int(time.time()) - max(0, lookback_seconds)
@@ -336,6 +343,7 @@ class WeFlowHttpBridge:
             if not isinstance(sessions_state, dict):
                 sessions_state = {}
             session_state = sessions_state.get(session_id, {}) if isinstance(sessions_state.get(session_id), dict) else {}
+            previous_recent_raw_ids = _recent_raw_id_map(session_state.get("recent_raw_ids"))
             session_since = since
             if session_since is None:
                 session_since = _safe_int(session_state.get("since"), now_since)
@@ -383,6 +391,7 @@ class WeFlowHttpBridge:
             messages = _weflow_sort_messages(messages)
             meta = {**session, **merged_api_meta}
             max_timestamp = session_since
+            complete_window = bool(messages) and not any(payload.get("hasMore") is True for payload in payloads)
             for message in messages:
                 _raise_if_cancelled(cancel_event)
                 scanned += 1
@@ -395,12 +404,16 @@ class WeFlowHttpBridge:
                 raw_id = str(normalized.get("raw_id") or "").strip()
                 if raw_id in seen:
                     continue
-                self.writer.append(normalized)
-                appended += 1
+                was_appended = self.writer.append(normalized)
+                if was_appended:
+                    appended += 1
                 if raw_id:
                     seen.add(raw_id)
                     appended_raw_ids.append(raw_id)
-                max_timestamp = max(max_timestamp, _epoch_seconds(message.get("timestamp") or message.get("createTime"), max_timestamp))
+                message_timestamp = _epoch_seconds(message.get("timestamp") or message.get("createTime"), max_timestamp)
+                max_timestamp = max(max_timestamp, message_timestamp)
+                if raw_id:
+                    current_recent_raw_ids[raw_id] = message_timestamp
                 _emit_progress(
                     progress_callback,
                     event="message",
@@ -409,11 +422,33 @@ class WeFlowHttpBridge:
                     appended_count=appended,
                     last_raw_id=raw_id,
                 )
+            if complete_window and not ignore_seen and not bool(history_context_only or cursor_recovery_context_only):
+                for recall_payload in _synthetic_recalls_for_missing_recent_messages(
+                    session_id=session_id,
+                    session_meta=meta,
+                    previous_recent_raw_ids=previous_recent_raw_ids,
+                    current_recent_raw_ids=current_recent_raw_ids,
+                    start_time=start_time,
+                ):
+                    raw_id = str(recall_payload.get("raw_id") or "").strip()
+                    if self.writer.append(recall_payload):
+                        appended += 1
+                        if raw_id:
+                            appended_raw_ids.append(raw_id)
+                    _emit_progress(
+                        progress_callback,
+                        event="delete",
+                        session_id=session_id,
+                        scanned_count=scanned,
+                        appended_count=appended,
+                        last_raw_id=raw_id,
+                    )
             _merge_weflow_state(
                 self.state_path,
                 session_id=session_id,
                 since=max_timestamp,
                 seen_raw_ids=appended_raw_ids,
+                recent_raw_ids=current_recent_raw_ids,
                 timeout_seconds=self.timeout_seconds,
             )
         return _WeFlowSessionPullResult(
@@ -472,9 +507,11 @@ class WeFlowHttpBridge:
                     normalized = normalize_weflow_push_event({**payload, "event": normalized_event or "message.new"})
                     if event_id:
                         normalized["event_id"] = event_id
-                    self.writer.append(normalized)
                     seen.add(dedupe_key)
-                    appended += 1
+                    if self.writer.append(normalized):
+                        appended += 1
+                    else:
+                        skipped += 1
                 remember_state()
             except Exception as exc:
                 skipped += 1
@@ -666,14 +703,14 @@ def append_hook_source_event(
     writer = HookEventJsonlWriter(hook_event_file)
     try:
         if source == "weflow-push":
-            writer.append(normalize_weflow_push_event(payload))
+            appended = writer.append(normalize_weflow_push_event(payload))
         elif source == "weflow-message":
             session_id = str(payload.get("sessionId") or payload.get("talker") or payload.get("session_id") or "").strip()
-            writer.append(normalize_weflow_message(payload, session_id=session_id, session_meta=payload))
+            appended = writer.append(normalize_weflow_message(payload, session_id=session_id, session_meta=payload))
         elif source == "wcf-callback":
-            writer.append(normalize_wcf_callback(payload))
+            appended = writer.append(normalize_wcf_callback(payload))
         else:
-            writer.append(payload)
+            appended = writer.append(payload)
     except Exception as exc:
         return HookSourceAppendResult(
             status="error",
@@ -681,7 +718,7 @@ def append_hook_source_event(
             appended_count=0,
             errors=({"type": type(exc).__name__, "message": str(exc)},),
         )
-    return HookSourceAppendResult(status="ok", hook_event_file=str(writer.path), appended_count=1)
+    return HookSourceAppendResult(status="ok", hook_event_file=str(writer.path), appended_count=1 if appended else 0)
 
 
 def normalize_weflow_push_event(payload: dict[str, Any]) -> dict[str, Any]:
@@ -697,7 +734,15 @@ def normalize_weflow_push_event(payload: dict[str, Any]) -> dict[str, Any]:
     recall_message_id = _weflow_recall_message_id(payload, fallback=rawid) if is_recall else ""
     raw_id_suffix = rawid or recall_message_id or str(timestamp)
     sender_name = _first_text(payload, "sourceName", "senderName", "accountName", "sender") or ("system" if is_recall else "unknown")
-    chat_title = _first_text(payload, "groupName", "sessionName", "talkerName", "displayName") or session_id
+    chat_title = _preferred_display_name(
+        _first_text(payload, "groupName"),
+        _first_text(payload, "sessionName"),
+        _first_text(payload, "displayName"),
+        _first_text(payload, "remark"),
+        _first_text(payload, "nickName"),
+        _first_text(payload, "talkerName"),
+        session_id,
+    )
     result: dict[str, Any] = {
         "source": "weflow_push",
         "event_type": "recall" if is_recall else "message",
@@ -742,11 +787,23 @@ def normalize_weflow_message(
     server_id = _server_id_text(_first_text(message, "platformMessageId", "serverId", "server_id"))
     local_id = _first_text(message, "localId", "local_id")
     message_key = _first_text(message, "messageKey", "message_key")
-    raw_id = f"weflow:message:{talker}:{server_id or message_key or local_id or _safe_int(message.get('timestamp'), 0)}"
+    raw_id = f"weflow:message:{talker}:{_weflow_stable_message_identity(message, server_id=server_id, local_id=local_id, message_key=message_key)}"
     text = _first_text(message, "parsedContent", "content", "rawContent", "text")
     sender_id = _first_text(message, "sender", "senderUsername", "sender_id")
     sender_name = _first_text(message, "accountName", "groupNickname", "senderName") or sender_id or "unknown"
-    chat_title = _first_text(meta, "name", "displayName", "groupName", "username", "api_talker") or talker
+    chat_title = _preferred_display_name(
+        _first_text(meta, "remark"),
+        _first_text(meta, "displayName"),
+        _first_text(meta, "display_name"),
+        _first_text(meta, "nickName"),
+        _first_text(meta, "nickname"),
+        _first_text(meta, "groupName"),
+        _first_text(meta, "group_name"),
+        _first_text(meta, "name"),
+        _first_text(meta, "username"),
+        _first_text(meta, "api_talker"),
+        talker,
+    )
     timestamp = _epoch_seconds(message.get("timestamp") or message.get("createTime"), int(time.time()))
     attachments = _weflow_attachments(message)
     media_meta = meta.get("media") if isinstance(meta.get("media"), dict) else {}
@@ -855,11 +912,11 @@ def run_wcf_callback_server(config: WcfCallbackServerConfig) -> None:
             try:
                 raw = self.rfile.read(length).decode("utf-8")
                 payload = json.loads(raw or "{}")
-                writer.append(normalize_wcf_callback(payload))
+                appended = writer.append(normalize_wcf_callback(payload))
             except Exception as exc:
                 self._send_json(400, {"status": "error", "type": type(exc).__name__, "message": str(exc)})
                 return
-            self._send_json(200, {"status": "ok", "appended_count": 1, "send_enabled": False})
+            self._send_json(200, {"status": "ok", "appended_count": 1 if appended else 0, "send_enabled": False})
 
         def _send_json(self, code: int, payload: dict[str, Any]) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -925,16 +982,14 @@ def _weflow_voice(message: dict[str, Any], attachments: list[dict[str, Any]]) ->
     if not looks_like_voice:
         return {}
     audio = next((item for item in attachments if str(item.get("kind") or "") in {"voice", "audio"}), {})
-    text = _first_text(message, "voiceText", "voice_text", "transcript")
     audio_path = str(audio.get("path") or _first_text(message, "mediaLocalPath", "voiceAudioPath", "voice_audio_path")).strip()
     audio_name = str(audio.get("name") or _first_text(message, "mediaFileName", "voiceAudioName", "voice_audio_name")).strip()
     duration = _first_text(message, "voiceDuration", "voice_duration", "voiceDurationSeconds", "voice_duration_seconds")
     return {
         key: value
         for key, value in {
-            "status": "transcribed" if text else "pending",
+            "status": "pending",
             "source": "weflow_http_raw",
-            "text": text,
             "duration": duration,
             "audio_path": audio_path,
             "audio_name": audio_name,
@@ -958,14 +1013,59 @@ def _weflow_quote(message: dict[str, Any]) -> dict[str, str]:
     quote_payload = message.get("quote")
     if not isinstance(quote_payload, dict):
         quote_payload = {}
+    aliases = [
+        value
+        for value in (
+            _first_text(message, "replyToMessageId"),
+            _first_text(quote_payload, "platformMessageId"),
+            _first_text(quote_payload, "serverId", "server_id"),
+            _first_text(quote_payload, "messageId", "message_id", "msgid", "msgId"),
+            _first_text(quote_payload, "localId", "local_id"),
+            _first_text(quote_payload, "messageKey", "message_key"),
+        )
+        if value
+    ]
     result = {
-        "message_id": _first_text(message, "replyToMessageId") or _first_text(quote_payload, "platformMessageId"),
+        "message_id": aliases[0] if aliases else "",
+        "message_ids": aliases,
         "sender_name": _first_text(quote_payload, "accountName", "sender"),
         "text": _first_text(quote_payload, "content", "text"),
         "type": _first_text(quote_payload, "type"),
         "source": "weflow_http_raw",
     }
     return {key: value for key, value in result.items() if value}
+
+
+def _weflow_stable_message_identity(
+    message: dict[str, Any],
+    *,
+    server_id: str,
+    local_id: str,
+    message_key: str,
+) -> str:
+    if server_id:
+        return server_id
+    if message_key and not _looks_like_path(message_key):
+        return message_key
+    create_time = _first_text(message, "createTime", "create_time")
+    sort_key = _first_text(message, "sortSeq", "sort_seq")
+    if local_id:
+        return ":".join(item for item in ("local", local_id, create_time, sort_key) if item)
+    sender = _first_text(message, "sender", "senderUsername", "sender_id")
+    text = _first_text(message, "parsedContent", "content", "rawContent", "text")
+    seed = json.dumps(
+        {
+            "create_time": create_time or _safe_int(message.get("timestamp"), 0),
+            "sort_key": sort_key,
+            "sender": sender,
+            "text": text,
+            "type": _first_text(message, "localType", "local_type", "mediaType", "type"),
+            "file": _first_text(message, "fileName", "file_name", "mediaFileName"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return "fingerprint:" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
 def _weflow_message_type(local_type: str, message: dict[str, Any]) -> str:
@@ -1063,6 +1163,20 @@ def _session_type_is_group(payload: dict[str, Any], session_id: str) -> bool:
 
 def _session_id_from_meta(session: dict[str, Any]) -> str:
     return str(session.get("id") or session.get("username") or session.get("talker") or session.get("sessionId") or "").strip()
+
+
+def _dedupe_weflow_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one worker lane per talker while preserving discovery order."""
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for session in sessions:
+        session_id = _session_id_from_meta(session)
+        if not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        deduped.append(session)
+    return deduped
 
 
 def _session_last_message_at(session: dict[str, Any]) -> int:
@@ -1219,6 +1333,24 @@ def _first_text(payload: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _preferred_display_name(*values: Any) -> str:
+    fallback = ""
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if not fallback:
+            fallback = text
+        if not _looks_like_wechat_receiver(text):
+            return text
+    return fallback
+
+
+def _looks_like_wechat_receiver(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text.startswith(("wxid_", "gh_")) or text.endswith("@chatroom"))
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -1245,7 +1377,19 @@ def _epoch_seconds(value: Any, default: int = 0) -> int:
 
 def _looks_like_path(value: str) -> bool:
     text = value.strip()
-    return bool(text and (":\\" in text or ":/" in text or "/" in text or "\\" in text))
+    lowered = text.lower()
+    return bool(
+        text
+        and (
+            ":\\" in text
+            or ":/" in text
+            or "/" in text
+            or "\\" in text
+            or "%5c" in lowered
+            or "%2f" in lowered
+            or "%3a" in lowered
+        )
+    )
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -1276,12 +1420,90 @@ def _read_weflow_state_locked(path: Path, *, timeout_seconds: float) -> dict[str
         return _read_json_object(path)
 
 
+def _recent_raw_id_map(value: Any) -> dict[str, int]:
+    if isinstance(value, dict):
+        result: dict[str, int] = {}
+        for key, raw_timestamp in value.items():
+            raw_id = str(key or "").strip()
+            if raw_id:
+                result[raw_id] = _safe_int(raw_timestamp, 0)
+        return result
+    if isinstance(value, list):
+        return {str(item).strip(): 0 for item in value if str(item).strip()}
+    return {}
+
+
+def _synthetic_recalls_for_missing_recent_messages(
+    *,
+    session_id: str,
+    session_meta: dict[str, Any],
+    previous_recent_raw_ids: dict[str, int],
+    current_recent_raw_ids: dict[str, int],
+    start_time: int,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    current = set(current_recent_raw_ids)
+    missing = [
+        raw_id
+        for raw_id, timestamp in sorted(previous_recent_raw_ids.items(), key=lambda item: item[1])
+        if raw_id and raw_id not in current and timestamp >= start_time
+    ]
+    if not missing:
+        return []
+    timestamp = int(time.time())
+    talker_name = _preferred_display_name(
+        _first_text(session_meta, "remark"),
+        _first_text(session_meta, "displayName"),
+        _first_text(session_meta, "display_name"),
+        _first_text(session_meta, "nickName"),
+        _first_text(session_meta, "nickname"),
+        _first_text(session_meta, "groupName"),
+        _first_text(session_meta, "group_name"),
+        _first_text(session_meta, "name"),
+        _first_text(session_meta, "username"),
+        session_id,
+    )
+    events: list[dict[str, Any]] = []
+    for raw_id in missing[: max(1, limit)]:
+        target_message_id = _message_id_from_raw_id(raw_id)
+        delete_id = hashlib.sha256(f"{session_id}:{raw_id}:local-delete".encode("utf-8")).hexdigest()[:16]
+        events.append(
+            {
+                "source": "weflow_http_raw",
+                "event_type": "recall",
+                "talker": session_id,
+                "talker_name": talker_name,
+                "sender_id": "",
+                "sender_name": "system",
+                "raw_id": f"weflow:delete:{session_id}:{delete_id}",
+                "msgid": f"delete:{target_message_id}",
+                "message_type": "recall",
+                "text": "",
+                "timestamp": timestamp,
+                "is_self": False,
+                "is_group": _session_type_is_group(session_meta, session_id),
+                "recall": {
+                    "target_raw_id": raw_id,
+                    "target_message_id": target_message_id,
+                    "reason": "weflow_local_missing_from_recent_window",
+                },
+                "raw": {
+                    "source": "recent_window_diff",
+                    "target_raw_id": raw_id,
+                    "session": session_meta,
+                },
+            }
+        )
+    return events
+
+
 def _merge_weflow_state(
     path: Path,
     *,
     session_id: str,
     since: int,
     seen_raw_ids: list[str],
+    recent_raw_ids: dict[str, int] | None = None,
     timeout_seconds: float,
 ) -> None:
     with _path_lock(path.with_suffix(path.suffix + ".lock"), timeout_seconds=timeout_seconds):
@@ -1292,7 +1514,15 @@ def _merge_weflow_state(
             state["sessions"] = sessions
         previous = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {}
         previous_since = _safe_int(previous.get("since"), 0) if isinstance(previous, dict) else 0
-        sessions[session_id] = {"since": max(previous_since, since)}
+        session_payload = dict(previous) if isinstance(previous, dict) else {}
+        session_payload["since"] = max(previous_since, since)
+        if recent_raw_ids is not None:
+            session_payload["recent_raw_ids"] = {
+                key: value
+                for key, value in sorted(recent_raw_ids.items(), key=lambda item: item[1])[-500:]
+                if key
+            }
+        sessions[session_id] = session_payload
         seen = set(_string_list(state.get("seen_raw_ids")))
         seen.update(item for item in seen_raw_ids if str(item).strip())
         state["seen_raw_ids"] = sorted(seen)[-50000:]

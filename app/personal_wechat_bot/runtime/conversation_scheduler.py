@@ -38,7 +38,7 @@ class ConversationScheduler:
             queues[normalized.conversation_id].append(raw)
 
         pending_conversations = deque(conversation_order)
-        running: dict[Future[dict[str, Any] | None], str] = {}
+        running: dict[Future[dict[str, Any] | None], tuple[str, RawWeChatMessage]] = {}
         processed: list[dict[str, Any]] = []
         max_running_seen = 0
 
@@ -49,8 +49,9 @@ class ConversationScheduler:
                     queue = queues[conversation_id]
                     if not queue:
                         continue
-                    future = executor.submit(self.handler, queue.popleft())
-                    running[future] = conversation_id
+                    raw = queue.popleft()
+                    future = executor.submit(self.handler, raw)
+                    running[future] = (conversation_id, raw)
                     max_running_seen = max(max_running_seen, len(running))
 
                 if not running:
@@ -58,8 +59,16 @@ class ConversationScheduler:
 
                 done, _ = wait(running.keys(), return_when=FIRST_COMPLETED)
                 for future in done:
-                    conversation_id = running.pop(future)
-                    item = future.result()
+                    conversation_id, raw = running.pop(future)
+                    try:
+                        item = future.result()
+                    except Exception as exc:
+                        item = {
+                            "error": {"type": type(exc).__name__, "message": str(exc)},
+                            "raw_id": raw.raw_id,
+                            "chat_title": raw.chat_title,
+                            "conversation_id": conversation_id,
+                        }
                     if item is not None:
                         processed.append(item)
                     if queues[conversation_id]:

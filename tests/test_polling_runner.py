@@ -30,6 +30,7 @@ class PollingRunnerTest(unittest.TestCase):
             self.assertEqual(len(result["processed"]), 1)
             self.assertEqual(result["processed"][0]["route"]["action"], "process")
             self.assertEqual(result["max_running_seen"], 1)
+            self.assertEqual(result["resource_schedule"]["workload"], "interactive")
 
     def test_run_forever_stops_after_max_loops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,6 +76,55 @@ class PollingRunnerTest(unittest.TestCase):
             result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_once()
 
             self.assertEqual(len(result["processed"]), 2)
+            self.assertLessEqual(result["max_running_seen"], 2)
+            self.assertEqual(result["resource_schedule"]["workload"], "interactive")
+            self.assertEqual(result["resource_schedule"]["max_parallel_conversations"], 4)
+
+    def test_context_only_batch_uses_background_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            driver = _ListDriver(
+                [
+                    RawWeChatMessage(
+                        raw_id=f"history-{index}",
+                        chat_title=f"C{index}",
+                        sender_name=f"C{index}",
+                        text="history",
+                        driver_meta={"context_only": True},
+                    )
+                    for index in range(5)
+                ]
+            )
+
+            result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_once()
+
+            self.assertEqual(result["resource_schedule"]["workload"], "background")
+            self.assertEqual(result["resource_schedule"]["max_parallel_conversations"], 2)
+            self.assertLessEqual(result["max_running_seen"], 2)
+
+    def test_explicit_background_workload_uses_background_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            driver = _ListDriver(
+                [
+                    RawWeChatMessage(
+                        raw_id=f"bg-{index}",
+                        chat_title=f"C{index}",
+                        sender_name=f"C{index}",
+                        text="background",
+                    )
+                    for index in range(5)
+                ]
+            )
+
+            result = PollingRunner(runtime, driver, poll_interval_seconds=0, workload="background").run_once()
+
+            self.assertEqual(result["resource_schedule"]["workload"], "background")
+            self.assertEqual(result["resource_schedule"]["max_parallel_conversations"], 2)
             self.assertLessEqual(result["max_running_seen"], 2)
 
 

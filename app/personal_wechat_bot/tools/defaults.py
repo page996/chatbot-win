@@ -5,6 +5,7 @@ from pathlib import Path
 from app.personal_wechat_bot.config.schema import BotConfig
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.document.translator import FakeDocumentTranslateTool
+from app.personal_wechat_bot.tools.file_read import FileReadTool
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.tools.registry import ToolRegistry
 from app.personal_wechat_bot.tools.search.external_search import FakeExternalSearchTool
@@ -12,6 +13,8 @@ from app.personal_wechat_bot.tools.search.model_relevance_filter import FakeMode
 from app.personal_wechat_bot.tools.vision.ocr_tool import OcrImageTool
 from app.personal_wechat_bot.tools.voice.asr_tool import LocalAsrTool
 from app.personal_wechat_bot.tools.web.fetch import WebFetchTool
+from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
+from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
@@ -31,6 +34,7 @@ def register_default_tools(
         (data_root / "file_workspace").resolve(),
         (data_root / "tool_outputs").resolve(),
     ]
+    registry.register(FileReadTool(data_root))
     registry.register(
         FakeDocumentTranslateTool(
             data_root / "tool_outputs",
@@ -47,6 +51,7 @@ def register_default_tools(
             file_index,
             allowed_input_roots=[*input_roots, *workspace_roots],
             max_input_bytes=config.file_max_bytes,
+            ocr_engine=build_default_ocr_engine(mode=config.ocr_mode),
         )
     )
     registry.register(
@@ -55,6 +60,7 @@ def register_default_tools(
             file_index,
             allowed_input_roots=[*input_roots, *workspace_roots],
             max_input_bytes=config.file_max_bytes,
+            asr_engine=LocalAsrSubprocessEngine(mode=config.asr_mode),
         )
     )
     registry.register(

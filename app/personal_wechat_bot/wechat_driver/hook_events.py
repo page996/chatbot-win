@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
-from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event
+from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_record
 
 
 @dataclass(frozen=True)
@@ -105,17 +105,23 @@ class HookEventJsonlImporter:
 
         size = self.source_path.stat().st_size
         offset = previous_offset if 0 <= previous_offset <= size else 0
+        if offset == 0 and previous_offset != 0:
+            state.pop(_source_line_state_key(self.source_path), None)
         scanned = 0
         appended = 0
         skipped = 0
         errors: list[dict[str, Any]] = []
         appended_raw_ids: list[str] = []
-        backend_event_count = _jsonl_line_count(self.backend_event_path)
+        backend_event_count = _state_int(state, "_backend_event_count")
+        if backend_event_count <= 0:
+            backend_event_count = _jsonl_line_count(self.backend_event_path)
         import_sequence = int(state.get("_import_sequence", 0) or 0)
         first_import_sequence = import_sequence + 1
         with self.source_path.open("r", encoding="utf-8") as f:
             f.seek(offset)
-            line_no = _jsonl_line_count_until(self.source_path, offset)
+            line_no = _state_int(state, _source_line_state_key(self.source_path))
+            if line_no <= 0 and offset > 0:
+                line_no = _jsonl_line_count_until(self.source_path, offset)
             while True:
                 line_offset = f.tell()
                 line = f.readline()
@@ -130,7 +136,7 @@ class HookEventJsonlImporter:
                     events = _hook_events_from_payload(payload)
                     for batch_index, event in enumerate(events):
                         import_sequence += 1
-                        raw_id = append_backend_event(
+                        raw_id, was_appended = append_backend_event_record(
                             self.backend_event_path,
                             chat_title=event.chat_title,
                             sender_name=event.sender_name,
@@ -155,9 +161,12 @@ class HookEventJsonlImporter:
                                 import_sequence=import_sequence,
                             ),
                         )
-                        appended += 1
-                        backend_event_count += 1
-                        appended_raw_ids.append(raw_id)
+                        if was_appended:
+                            appended += 1
+                            backend_event_count += 1
+                            appended_raw_ids.append(raw_id)
+                        else:
+                            skipped += 1
                 except json.JSONDecodeError as exc:
                     if not line.endswith("\n"):
                         scanned -= 1
@@ -171,7 +180,9 @@ class HookEventJsonlImporter:
             new_offset = f.tell()
 
         state[str(self.source_path)] = new_offset
+        state[_source_line_state_key(self.source_path)] = line_no
         state["_import_sequence"] = import_sequence
+        state["_backend_event_count"] = backend_event_count
         _write_state(self.state_path, state)
         return HookImportResult(
             status="ok",
@@ -426,7 +437,10 @@ def _attachments(payload: dict[str, Any]) -> list[HookAttachment]:
 
 def _voice_payload(payload: dict[str, Any], *, attachments: tuple[HookAttachment, ...]) -> dict[str, Any]:
     raw = payload.get("voice") if isinstance(payload.get("voice"), dict) else {}
-    voice_text = _first_text(raw, "text", "transcript") or _first_text(payload, "voice_text", "voiceText", "transcript")
+    source = _first_text(raw, "source") or _first_text(payload, "voice_source", "voiceSource")
+    voice_text = ""
+    if _trusted_voice_text_source(source):
+        voice_text = _first_text(raw, "text", "transcript") or _first_text(payload, "voice_text", "voiceText", "transcript")
     audio_path = _first_text(raw, "audio_path", "audioPath", "path") or _first_text(payload, "voice_audio_path", "voiceAudioPath", "mediaLocalPath")
     audio_name = _first_text(raw, "audio_name", "audioName", "name") or _first_text(payload, "voice_audio_name", "voiceAudioName")
     duration = _first_text(raw, "duration") or _first_text(payload, "voice_duration", "voiceDuration")
@@ -448,7 +462,7 @@ def _voice_payload(payload: dict[str, Any], *, attachments: tuple[HookAttachment
         key: value
         for key, value in {
             "status": status,
-            "source": "wechat_hook_event",
+            "source": source or "wechat_hook_event",
             "text": voice_text,
             "duration": duration,
             "audio_path": audio_path,
@@ -458,12 +472,34 @@ def _voice_payload(payload: dict[str, Any], *, attachments: tuple[HookAttachment
     }
 
 
+def _trusted_voice_text_source(source: str) -> bool:
+    value = str(source or "").strip().lower()
+    if not value:
+        return False
+    return value.startswith("local_asr") or value in {"manual_voice_transcript", "voice.local_asr", "file_workspace_local_asr"}
+
+
 def _quote_payload(payload: dict[str, Any]) -> dict[str, Any]:
     quote = payload.get("quote")
     if not isinstance(quote, dict):
         quote = {}
+    aliases = [
+        value
+        for value in (
+            _first_text(quote, "message_id", "messageId", "quoted_message_id", "quotedMessageId"),
+            _first_text(quote, "platformMessageId", "server_id", "serverId"),
+            _first_text(quote, "raw_id", "rawId"),
+            _first_text(quote, "local_id", "localId"),
+            _first_text(quote, "message_key", "messageKey"),
+        )
+        if value
+    ]
+    raw_aliases = quote.get("message_ids")
+    if isinstance(raw_aliases, list):
+        aliases.extend(str(item).strip() for item in raw_aliases if str(item).strip())
     result = {
-        "message_id": _first_text(quote, "message_id", "messageId", "quoted_message_id", "quotedMessageId"),
+        "message_id": aliases[0] if aliases else "",
+        "message_ids": aliases,
         "text": _first_text(quote, "text", "content", "quoted_text", "quotedText"),
         "sender_name": _first_text(quote, "sender_name", "senderName", "quoted_sender_name", "quotedSenderName"),
         "received_at": _first_text(quote, "received_at", "receivedAt", "create_time", "createTime"),
@@ -745,6 +781,17 @@ def _write_state(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _source_line_state_key(source_path: Path) -> str:
+    return f"{source_path}:line_no"
+
+
+def _state_int(state: dict[str, Any], key: str) -> int:
+    try:
+        return int(state.get(key, 0) or 0)
+    except Exception:
+        return 0
 
 
 @contextmanager

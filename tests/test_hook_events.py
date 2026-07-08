@@ -9,6 +9,7 @@ from pathlib import Path
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.memory.file_index import FileIndex
+from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
@@ -408,10 +409,36 @@ class HookEventsTest(unittest.TestCase):
         self.assertEqual(active, [])
         self.assertEqual(all_entries[0].status, "recalled")
 
+    def test_hook_runner_skips_poll_when_import_has_no_new_events(self) -> None:
+        polling = _CountingPollingRunner()
+        runner = HookMessagePullRunner(
+            HookEventJsonlImporter(self.hook_file, self.backend_file),
+            polling,
+            hook_event_file=self.hook_file,
+            backend_event_file=self.backend_file,
+        )
+
+        result = runner.run_once()
+
+        self.assertEqual(result["processed_count"], 0)
+        self.assertEqual(result["poll"]["skipped_reason"], "no_new_hook_imports")
+        self.assertEqual(polling.calls, 0)
+
     def _append_hook(self, payload: dict) -> None:
         self.hook_file.parent.mkdir(parents=True, exist_ok=True)
         with self.hook_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+class _CountingPollingRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.poll_interval_seconds = 0
+        self.driver = type("Driver", (), {"_seen_event_ids": set(), "_seen_message_raw_ids": set()})()
+
+    def run_once(self) -> dict:
+        self.calls += 1
+        return {"status": "ok", "processed": [{"message": {"text": "should not run"}}]}
 
 
 class _FakeOcr:

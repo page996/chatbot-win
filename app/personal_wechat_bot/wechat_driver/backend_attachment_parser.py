@@ -5,15 +5,16 @@ import json
 import subprocess
 import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree
 
-from app.personal_wechat_bot.vision.ocr import OcrEngine
+from app.personal_wechat_bot.vision.ocr import OcrEngine, OcrResult
 from app.personal_wechat_bot.voice.asr import AsrEngine, LocalAsrSubprocessEngine
 
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma", ".amr", ".silk"}
 PRESENTATION_SUFFIXES = {".ppt", ".pptx"}
 ARCHIVE_SUFFIXES = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz"}
@@ -29,6 +30,7 @@ class AttachmentParseResult:
     text: str = ""
     error: str = ""
     context_text: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class BackendAttachmentParser:
@@ -97,10 +99,30 @@ class BackendAttachmentParser:
     def _parse_image(self, path: Path) -> AttachmentParseResult:
         if self.ocr_engine is None:
             return _image_placeholder(path, "OCR 引擎未启用")
-        text = _normalize_text(self.ocr_engine.read_text(path))
+        ocr_result = _run_structured_ocr(self.ocr_engine, path)
+        text = _normalize_text(ocr_result.text)
         if not text:
+            filter_reason = str((getattr(ocr_result, "metadata", {}) or {}).get("filter_reason", "")).strip()
+            reason = "likely sticker/emoji image; OCR single-character false positive suppressed" if filter_reason else "OCR produced no usable text"
+            placeholder = _image_placeholder(path, reason, status="empty")
+            return AttachmentParseResult(
+                placeholder.status,
+                placeholder.kind,
+                placeholder.summary,
+                placeholder.text,
+                error=placeholder.error,
+                context_text=placeholder.context_text,
+                metadata={"ocr": _ocr_result_payload(ocr_result)},
+            )
             return _image_placeholder(path, "OCR 未识别到有效文本", status="empty")
-        return AttachmentParseResult("parsed", "image", "已完成图片 OCR", text, context_text=_preview(text, self.max_preview_chars))
+        return AttachmentParseResult(
+            "parsed",
+            "image",
+            "已完成图片 OCR",
+            text,
+            context_text=_preview(text, self.max_preview_chars),
+            metadata={"ocr": _ocr_result_payload(ocr_result)},
+        )
 
     def _parse_audio(self, path: Path) -> AttachmentParseResult:
         transcript = self.asr_engine.transcribe(path) if self.asr_engine is not None else None
@@ -111,6 +133,14 @@ class BackendAttachmentParser:
                 f"已完成本地 ASR 转写 backend={transcript.backend} model={transcript.model}".strip(),
                 _normalize_text(transcript.text),
                 context_text=_preview(transcript.text, self.max_preview_chars),
+                metadata={
+                    "asr": {
+                        "status": transcript.status,
+                        "backend": transcript.backend,
+                        "model": transcript.model,
+                        "language": transcript.language,
+                    }
+                },
             )
         error = transcript.error if transcript is not None else "local_asr_not_configured"
         backend = transcript.backend if transcript is not None else "local_asr_subprocess"
@@ -186,6 +216,31 @@ def _read_docx_text(path: Path) -> str:
         if line:
             paragraphs.append(line)
     return "\n".join(paragraphs)
+
+
+def _run_structured_ocr(engine: OcrEngine, image_path: Path) -> OcrResult:
+    read_structured = getattr(engine, "read_structured", None)
+    if callable(read_structured):
+        return read_structured(image_path)
+    return OcrResult(text=engine.read_text(image_path), items=[])
+
+
+def _ocr_result_payload(result: OcrResult) -> dict[str, object]:
+    return {
+        "cache_version": 3,
+        "text": result.text,
+        "item_count": result.item_count,
+        "metadata": dict(getattr(result, "metadata", {}) or {}),
+        "items": [
+            {
+                "text": item.text,
+                "score": round(float(item.score), 4),
+                "box": item.box,
+                "backend": getattr(item, "backend", ""),
+            }
+            for item in result.items
+        ],
+    }
 
 
 def _normalize_text(text: str) -> str:

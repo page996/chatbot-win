@@ -17,12 +17,14 @@ from app.personal_wechat_bot.control.send_commands import (
     list_send_audit,
     probe_send_controls,
     reject_confirm_item,
+    remove_confirm_item,
     send_approved_confirm_item,
     set_send_controls,
     sync_bridge_ack_to_send_state,
 )
 from app.personal_wechat_bot.domain.models import ReplyCandidate, SendResult
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, bridge_state
 
 
@@ -78,14 +80,14 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(pending["count"], 2)
             self.assertEqual(approved["item"]["status"], "approved")
             self.assertEqual(rejected["item"]["status"], "rejected")
-            self.assertEqual(send_result["status"], "failed")
+            self.assertEqual(send_result["status"], "blocked")
             self.assertEqual(send_result["send_result"]["reason"], "send_enabled_false")
-            self.assertEqual(queue.get(first_id)["status"], "failed")
+            self.assertEqual(queue.get(first_id)["status"], "approved")
             audit = list_send_audit(data_dir, limit=10)
             actions = [item["action"] for item in audit["items"]]
             self.assertIn("confirm_approve", actions)
             self.assertIn("confirm_reject", actions)
-            self.assertIn("confirm_send_attempt", actions)
+            self.assertIn("confirm_send_blocked", actions)
 
     def test_clear_send_audit_truncates_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -101,6 +103,23 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["cleared_count"], 1)
             self.assertEqual(list_send_audit(data_dir, limit=10)["items"], [])
+
+    def test_remove_confirm_item_deletes_only_queue_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            first_id = queue.enqueue(_reply("message-1", "hello"))
+            second_id = queue.enqueue(_reply("message-2", "bye"))
+
+            removed = remove_confirm_item(data_dir, first_id, reviewer="tester", note="cleanup")
+
+            self.assertEqual(removed["status"], "ok")
+            self.assertTrue(removed["removed"])
+            self.assertIsNone(queue.get(first_id))
+            self.assertIsNotNone(queue.get(second_id))
+            audit = list_send_audit(data_dir, limit=5)
+            self.assertIn("confirm_remove", [item["action"] for item in audit["items"]])
 
     def test_send_approved_confirm_item_calls_driver_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,9 +209,9 @@ class SendCommandsTest(unittest.TestCase):
 
             result = send_approved_confirm_item(data_dir, queue_id)
 
-            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["status"], "blocked")
             self.assertEqual(result["send_result"]["reason"], "send_driver_missing")
-            self.assertEqual(queue.get(queue_id)["status"], "failed")
+            self.assertEqual(queue.get(queue_id)["status"], "approved")
 
     def test_send_approved_confirm_item_can_queue_to_bridge_outbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,6 +230,29 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(queue.get(queue_id)["status"], "queued_to_bridge")
             self.assertEqual(bridge["pending_count"], 1)
             self.assertEqual(bridge["items"][0]["text"], "hello bridge")
+
+    def test_bridge_send_task_is_finished_by_terminal_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            reply = _reply("message-bridge-task", "hello bridge")
+            queue_id = queue.enqueue(reply)
+            queue.approve(queue_id, reviewer="tester")
+
+            result = send_approved_confirm_item(data_dir, queue_id)
+            bridge_id = result["send_result"]["message_id"]
+            queued = next(item for item in TaskStatusStore(data_dir).state()["tasks"] if item["task_id"] == "send-message-bridge-task")
+
+            self.assertEqual(queued["status"], "queued")
+            self.assertEqual(queued["external_id"], bridge_id)
+
+            sync_bridge_ack_to_send_state(data_dir, bridge_id, status=BridgeAckStatus.SENT, reason="wcf_sent")
+            completed = next(item for item in TaskStatusStore(data_dir).state()["tasks"] if item["task_id"] == "send-message-bridge-task")
+
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["progress"], 100)
 
     def test_send_approved_confirm_item_bridge_queues_without_manual_binding(self) -> None:
         # wcf delivers by wxid/roomid, so the bridge no longer requires a manual
@@ -412,13 +454,17 @@ class SendCommandsTest(unittest.TestCase):
                 )
             )
             failed = json.loads(self._run("--data-dir", str(data_dir), "confirm-list", "--status", "failed"))
+            approved_after_send = json.loads(
+                self._run("--data-dir", str(data_dir), "confirm-list", "--status", "approved")
+            )
 
             self.assertEqual(pending["count"], 2)
             self.assertEqual(approved["item"]["status"], "approved")
             self.assertEqual(rejected["item"]["status"], "rejected")
-            self.assertEqual(send_result["status"], "failed")
+            self.assertEqual(send_result["status"], "blocked")
             self.assertEqual(send_result["send_result"]["reason"], "send_enabled_false")
-            self.assertEqual(failed["count"], 1)
+            self.assertEqual(failed["count"], 0)
+            self.assertEqual(approved_after_send["count"], 1)
             audit = json.loads(self._run("--data-dir", str(data_dir), "send-audit", "--limit", "5"))
             self.assertGreaterEqual(audit["count"], 3)
 

@@ -10,6 +10,7 @@ from app.personal_wechat_bot.conversation.context_store import CLEAR_CONTEXT_PHR
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.domain.models import RawWeChatMessage
 from app.personal_wechat_bot.processor.message_processor import MessageProcessor
+from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver, append_backend_event
@@ -68,6 +69,39 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertEqual(entries[-1].send["status"], "skipped")
             self.assertEqual(entries[-1].send["reason"], "dry_run")
 
+    def test_processor_projects_reply_and_send_subtasks_to_channel_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            accept_contact(data_dir, "wxid_alice")
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+
+            result = processor.process(
+                RawWeChatMessage(
+                    raw_id="msg-task",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="帮我看下这个安排",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                )
+            )
+
+            self.assertIsNotNone(result)
+            message_id = result["message"]["message_id"]
+            state = TaskStatusStore(data_dir).state()
+            tasks = {item["task_id"]: item for item in state["tasks"]}
+
+            self.assertEqual(tasks[f"reply-{message_id}"]["status"], "completed")
+            self.assertEqual(tasks[f"reply-{message_id}"]["kind"], "reply")
+            self.assertEqual(tasks[f"send-{message_id}"]["status"], "completed")
+            self.assertEqual(tasks[f"send-{message_id}"]["kind"], "send")
+            self.assertEqual(state["channels"][0]["conversation_id"], result["message"]["conversation_id"])
+            lane_task_ids = {item["task_id"] for item in state["channels"][0]["history"]}
+            self.assertIn(f"reply-{message_id}", lane_task_ids)
+            self.assertIn(f"send-{message_id}", lane_task_ids)
+
     def test_processor_auto_registers_unknown_private_and_group_channels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -105,6 +139,52 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertEqual(group_result["route"]["action"], "process")
             self.assertEqual(channel_types, {"private", "group"})
             self.assertTrue((data_dir / "conversation_channels" / "index.json").exists())
+
+    def test_processor_skips_duplicate_dedupe_key_without_rewriting_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+            meta = {
+                "source": "backend_events_jsonl",
+                "conversation_key": "wxid_page",
+                "local_id": "1",
+                "create_time": "100",
+                "sort_key": "100",
+                "context_only": True,
+            }
+
+            first = processor.process(
+                RawWeChatMessage(
+                    raw_id="weflow:message:wxid_page:E%3A%5Cdb%5Cmessage_0.db:Msg_a:1",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    sender_wechat_id="wxid_page",
+                    text="hello",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={**meta, "message_key": "E%3A%5Cdb%5Cmessage_0.db:Msg_a:1"},
+                )
+            )
+            second = processor.process(
+                RawWeChatMessage(
+                    raw_id="weflow:message:wxid_page:E%3A%5Cother%5Cmessage_0.db:Msg_b:1",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    sender_wechat_id="wxid_page",
+                    text="hello",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={**meta, "message_key": "E%3A%5Cother%5Cmessage_0.db:Msg_b:1"},
+                )
+            )
+
+            self.assertEqual(first["ledger"]["status"], "created")
+            self.assertEqual(second["route"]["action"], "duplicate")
+            self.assertEqual(second["ledger"]["status"], "duplicate")
+            self.assertTrue(second["context_only"])
+            self.assertNotIn("reply", second)
+            entries = runtime.ledger_store.read_entries(first["message"]["conversation_id"])
+            self.assertEqual(len(entries), 1)
 
     def test_processor_runs_link_annotation_after_ledger_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

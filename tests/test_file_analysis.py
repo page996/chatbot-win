@@ -6,6 +6,8 @@ import time
 import unittest
 from pathlib import Path
 
+from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
+from app.personal_wechat_bot.domain.models import NormalizedMessage
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 from app.personal_wechat_bot.workspace.file_analysis import LLMFileAnalyzer
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -33,6 +35,11 @@ class _ProseLLM:
 class _BoomLLM:
     def generate_reply(self, prompt: str) -> str:
         raise RuntimeError("llm exploded")
+
+
+class _FakeChatLLM:
+    def generate_reply(self, prompt: str) -> str:
+        return "ok\nPLAN: reply\nMONITOR: fake_llm.completed\nSUMMARY: ok"
 
 
 class FileAnalyzerTest(unittest.TestCase):
@@ -72,6 +79,14 @@ class FileAnalyzerTest(unittest.TestCase):
 
         self.assertEqual(result.status, "error")
         self.assertIn("llm exploded", result.error)
+
+    def test_analyze_ignores_fake_chat_reply(self) -> None:
+        analyzer = LLMFileAnalyzer(_FakeChatLLM())
+
+        result = analyzer.analyze(name="a.txt", kind="text", text="body")
+
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.error, "fake_llm_output_ignored")
 
 
 class FileWorkspaceAnalysisTest(unittest.TestCase):
@@ -148,6 +163,59 @@ class FileWorkspaceAnalysisTest(unittest.TestCase):
             self.assertEqual(manifest["parse"]["ai_summary"], "async summary")
             self.assertIn("async summary", content)
 
+    def test_async_analysis_refreshes_conversation_file_analysis_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            source = Path(tmp) / "note.txt"
+            source.write_text("async parsed content", encoding="utf-8")
+            llm = _JsonLLM({"summary": "async ledger summary", "key_points": ["ledger point"]})
+            workspace = FileWorkspace(data_dir / "file_workspace", analyzer=LLMFileAnalyzer(llm), analysis_async=True)
+            staged = workspace.stage_file(source, conversation_id="conv1", session_id="s1", kind="file")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="m1",
+                    conversation_id="conv1",
+                    conversation_type="private",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    text="file incoming",
+                    is_self=False,
+                    received_at="2026-07-07T00:00:00+00:00",
+                    metadata={
+                        "session_id": "s1",
+                        "attachments": [
+                            {
+                                "status": "indexed",
+                                "file_id": staged.file_id,
+                                "name": "note.txt",
+                                "workspace": {"manifest_path": staged.manifest_path, "derived_dir": staged.derived_dir},
+                                "parse": {
+                                    "status": "parsed",
+                                    "kind": "text",
+                                    "summary": "summary",
+                                    "text": "async parsed content",
+                                    "ai_analysis_status": "pending",
+                                },
+                                "artifacts": {"ai_analysis_status": "pending"},
+                            }
+                        ],
+                    },
+                )
+            )
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "text", "summary", "async parsed content"),
+            )
+
+            markdown = _wait_for_markdown_text(
+                ledger.conversation_markdown_path("conv1"),
+                "async ledger summary",
+            )
+            self.assertIn("AI Analysis:\nasync ledger summary", markdown)
+            self.assertIn("- ledger point", markdown)
+
     def test_empty_ocr_placeholder_is_not_analyzed(self) -> None:
         # Regression: when OCR/ASR recognized nothing, the placeholder text must
         # NOT be fed to the analyzer as if it were real content. The analyzer
@@ -189,6 +257,18 @@ def _wait_for_manifest_ai_summary(path: Path, expected: str, *, timeout_seconds:
         parse = last.get("parse") if isinstance(last.get("parse"), dict) else {}
         if parse.get("ai_summary") == expected:
             return last
+        time.sleep(0.05)
+    return last
+
+
+def _wait_for_markdown_text(path: Path, expected: str, *, timeout_seconds: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    last = ""
+    while time.monotonic() < deadline:
+        if path.exists():
+            last = path.read_text(encoding="utf-8")
+            if expected in last:
+                return last
         time.sleep(0.05)
     return last
 

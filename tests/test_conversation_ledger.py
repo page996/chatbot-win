@@ -39,6 +39,36 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(entries[0].session_id, "session_new")
             self.assertIn("[session:session_new]", markdown)
 
+    def test_append_message_upserts_by_dedupe_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            first = store.append_message_result(_message("raw-path-a", "old text", metadata={"dedupe_key": "same-real-message"}))
+            second = store.append_message_result(_message("raw-path-b", "new text", metadata={"dedupe_key": "same-real-message"}))
+
+            entries = store.read_entries("conv1")
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+
+            self.assertEqual(first.status, "created")
+            self.assertEqual(second.status, "updated")
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].sequence, 1)
+            self.assertEqual(entries[0].message_id, "raw-path-a")
+            self.assertEqual(entries[0].text_blocks[0]["text"], "new text")
+            self.assertIn("new text", markdown)
+            self.assertNotIn("old text", markdown)
+
+    def test_append_message_duplicate_dedupe_key_does_not_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("raw-path-a", "same text", metadata={"dedupe_key": "same-real-message"}))
+            before = store.conversation_markdown_path("conv1").stat().st_mtime_ns
+            duplicate = store.append_message_result(_message("raw-path-b", "same text", metadata={"dedupe_key": "same-real-message"}))
+            after = store.conversation_markdown_path("conv1").stat().st_mtime_ns
+
+            self.assertEqual(duplicate.status, "duplicate")
+            self.assertEqual(len(store.read_entries("conv1")), 1)
+            self.assertEqual(after, before)
+
     def test_concurrent_appends_keep_per_conversation_sequence_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
@@ -179,9 +209,61 @@ class ConversationLedgerStoreTest(unittest.TestCase):
                 Path(entry.attachments[0]["artifacts"]["analysis_path"]),
                 Path("workspace/file123/derived/analysis.json"),
             )
-            self.assertIn("file parsed content", markdown)
-            self.assertIn("[file:file123 name=report.pdf kind=file status=indexed]", markdown)
+            attachment_block = next(block for block in entry.text_blocks if block["kind"] == "attachment:pdf")
+            self.assertEqual(attachment_block["text"], "file parsed content")
+            self.assertFalse(attachment_block["metadata"]["visible_in_context"])
+            self.assertNotIn("file parsed content", markdown)
+            self.assertIn("[block:attachment:pdf file_id=file123 name=report.pdf hidden=true read=file.read]", markdown)
+            self.assertIn("[file:file123 name=report.pdf kind=file status=indexed read=file.read]", markdown)
             self.assertNotIn("manifest=workspace/file123/manifest.json", markdown)
+
+    def test_attachment_ai_analysis_brief_is_visible_but_raw_file_body_is_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            message = _message(
+                "m1",
+                "please inspect",
+                metadata={
+                    "attachments": [
+                        {
+                            "status": "indexed",
+                            "file_id": "file123",
+                            "name": "report.pdf",
+                            "kind": "file",
+                            "workspace": {"manifest_path": "workspace/file123/manifest.json"},
+                            "parse": {
+                                "status": "parsed",
+                                "kind": "pdf",
+                                "summary": "parser summary",
+                                "text": "raw parsed file body should stay hidden",
+                                "ai_analysis_status": "analyzed",
+                                "ai_summary": "AI file summary",
+                                "ai_key_points": ["first point", "second point"],
+                            },
+                            "artifacts": {
+                                "ai_analysis_status": "analyzed",
+                                "ai_summary": "AI file summary",
+                                "ai_key_points": ["first point", "second point"],
+                            },
+                        }
+                    ]
+                },
+            )
+
+            store.append_message(message)
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+            rendered = LedgerContextAssembler(store, max_recent_entries=5, token_budget=800).build_snapshot(message).render_for_prompt()
+
+            self.assertIn("[file_analysis]", markdown)
+            self.assertIn("AI Analysis:", markdown)
+            self.assertIn("Key Points:", markdown)
+            self.assertNotIn('"summary": "AI file summary"', markdown)
+            self.assertIn("- first point", markdown)
+            self.assertIn("AI Analysis: AI file summary", rendered)
+            self.assertIn("Key Points:", rendered)
+            self.assertIn("- first point", rendered)
+            self.assertNotIn("raw parsed file body should stay hidden", markdown)
+            self.assertNotIn("raw parsed file body should stay hidden", rendered)
 
     def test_duplicate_attachment_metadata_collapses_to_single_block(self) -> None:
         # Voice messages can arrive with the same media emitted twice (a voice
@@ -232,6 +314,30 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(entry.text_blocks[0]["kind"], "text")
             self.assertEqual(entry.text_blocks[0]["text"], "request")
             self.assertEqual(entry.text_blocks[1]["text"], "parsed body")
+            self.assertFalse(entry.text_blocks[1]["metadata"]["visible_in_context"])
+
+    def test_links_are_extracted_only_from_original_message_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            entry = store.append_message(
+                _message(
+                    "m1",
+                    "request\n[file parsed] https://internal.example/from-file",
+                    metadata={
+                        "original_text": "request",
+                        "attachments": [
+                            {
+                                "status": "indexed",
+                                "file_id": "file123",
+                                "name": "note.txt",
+                                "parse": {"kind": "text", "text": "https://internal.example/from-file"},
+                            }
+                        ],
+                    },
+                )
+            )
+
+            self.assertEqual(entry.links, [])
 
     def test_voice_transcript_is_marked_in_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -243,7 +349,7 @@ class ConversationLedgerStoreTest(unittest.TestCase):
                     metadata={
                         "voice": {
                             "status": "transcribed",
-                            "source": "wechat_builtin_voice_to_text_ocr",
+                            "source": "local_asr_fallback",
                             "text": "请根据这条语音继续处理",
                             "duration": "8\"",
                         }
@@ -253,7 +359,7 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
 
             self.assertEqual(entry.text_blocks[0]["kind"], "voice:transcript")
-            self.assertEqual(entry.text_blocks[0]["metadata"]["source"], "wechat_builtin_voice_to_text_ocr")
+            self.assertEqual(entry.text_blocks[0]["metadata"]["source"], "local_asr_fallback")
             self.assertIn("[block:voice:transcript", markdown)
             self.assertIn("请根据这条语音继续处理", markdown)
 
@@ -396,7 +502,9 @@ class ConversationLedgerStoreTest(unittest.TestCase):
 
             self.assertEqual(entry.text_blocks[1]["kind"], "attachment:text")
             self.assertEqual(entry.text_blocks[1]["text"], "agent generated file body")
-            self.assertIn("agent generated file body", markdown)
+            self.assertFalse(entry.text_blocks[1]["metadata"]["visible_in_context"])
+            self.assertNotIn("agent generated file body", markdown)
+            self.assertIn("[block:attachment:text file_id=file123 name=result.md hidden=true read=file.read]", markdown)
 
 
 class LedgerContextAssemblerTest(unittest.TestCase):
@@ -470,6 +578,7 @@ class LedgerContextAssemblerTest(unittest.TestCase):
 
             self.assertIn("Available file refs", rendered)
             self.assertIn("chunks=3", rendered)
+            self.assertIn("read_tool=file.read", rendered)
             self.assertIn("summary=ok", rendered)
             self.assertNotIn("content=derived", rendered)
             self.assertNotIn("content.md", rendered)
@@ -504,6 +613,124 @@ class LedgerContextAssemblerTest(unittest.TestCase):
 
             self.assertIn("table_chunks=2", rendered)
             self.assertNotIn("table_index=derived/tables/index.json", rendered)
+
+    def test_file_section_refreshes_ai_summary_from_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationLedgerStore(root)
+            derived = root / "file_workspace" / "conv" / "s1" / "file123" / "derived"
+            derived.mkdir(parents=True)
+            analysis_path = derived / "analysis.json"
+            analysis_path.write_text(
+                json.dumps(
+                    {
+                        "ai_analysis_status": "analyzed",
+                        "ai_summary": "final file summary",
+                        "char_count": 42,
+                        "chunk_count": 2,
+                        "chunks": [{"index": 1, "path": str(derived / "chunks" / "chunk_0001.md")}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_path = derived.parent / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "parse": {
+                            "status": "parsed",
+                            "kind": "pdf",
+                            "summary": "parser summary",
+                            "analysis_path": str(analysis_path),
+                            "content_path": str(derived / "content.md"),
+                            "chunks_dir": str(derived / "chunks"),
+                            "chunk_count": 1,
+                            "ai_analysis_status": "pending",
+                            "ai_summary": "文件总结正在后台生成",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            message = _message(
+                "m1",
+                "file message",
+                metadata={
+                    "attachments": [
+                        {
+                            "status": "indexed",
+                            "file_id": "file123",
+                            "name": "report.pdf",
+                            "workspace": {"manifest_path": str(manifest_path), "derived_dir": str(derived)},
+                            "artifacts": {"ai_analysis_status": "pending", "ai_summary": "文件总结正在后台生成", "chunk_count": 1},
+                            "parse": {"status": "parsed", "summary": "parser summary", "text": "body"},
+                        }
+                    ]
+                },
+            )
+            store.append_message(message)
+
+            snapshot = LedgerContextAssembler(store, max_recent_entries=5, token_budget=500).build_snapshot(message)
+            rendered = snapshot.render_for_prompt()
+            refreshed = store.read_entries("conv1")[0]
+
+            self.assertIn("AI Analysis: final file summary", rendered)
+            self.assertNotIn("summary=final file summary", rendered)
+            self.assertIn("chunks=2", rendered)
+            self.assertEqual(refreshed.attachments[0]["artifacts"]["ai_summary"], "final file summary")
+
+    def test_refresh_file_refs_removes_legacy_file_analysis_schema_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationLedgerStore(root)
+            derived = root / "file_workspace" / "conv" / "s1" / "file123" / "derived"
+            derived.mkdir(parents=True)
+            message = _message(
+                "m1",
+                "file message",
+                metadata={
+                    "attachments": [
+                        {
+                            "status": "indexed",
+                            "file_id": "file123",
+                            "name": "report.pdf",
+                            "workspace": {"manifest_path": str(derived.parent / "manifest.json"), "derived_dir": str(derived)},
+                            "parse": {
+                                "status": "parsed",
+                                "kind": "pdf",
+                                "text": "body",
+                                "ai_analysis_status": "analyzed",
+                                "ai_summary": "clean summary",
+                                "ai_key_points": ["point one"],
+                            },
+                        }
+                    ]
+                },
+            )
+            store.append_message(message)
+            entries = store._read_entries("conv1")
+            for block in entries[0]["text_blocks"]:
+                if block.get("kind") == "file:analysis":
+                    block["text"] = (
+                        "[file_analysis]\n"
+                        "schema=file_analysis_brief_v2 source=content.md::AI Analysis+Key Points raw_content_hidden=true\n"
+                        '{"schema":"file_analysis_brief_v2","summary":"duplicate"}\n'
+                        "AI Analysis:\nclean summary\nKey Points:\n- point one\n[/file_analysis]"
+                    )
+            store._rewrite_entries("conv1", entries)
+            store._render_conversation("conv1")
+
+            changed = store.refresh_file_refs("conv1")
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+            refreshed = store._read_entries("conv1")[0]
+            analysis_blocks = [block for block in refreshed["text_blocks"] if block.get("kind") == "file:analysis"]
+
+            self.assertTrue(changed)
+            self.assertEqual(len(analysis_blocks), 1)
+            self.assertNotIn("schema=file_analysis_brief_v2", markdown)
+            self.assertNotIn('"schema"', markdown)
+            self.assertIn("AI Analysis:\nclean summary", markdown)
 
     def test_recent_context_is_scoped_to_current_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

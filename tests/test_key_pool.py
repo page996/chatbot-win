@@ -194,6 +194,22 @@ class ApiKeyPoolTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(first), 2)
 
+    def test_concurrency_limit_sums_available_key_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            key_file = data_dir / "keys.md"
+            key_file.write_text("K1 = key-one\nK2 = key-two\n", encoding="utf-8")
+            provider = ProviderConfig(api_key_env="", api_key_file="keys.md", max_concurrency=2)
+            pool = ApiKeyPool(provider, data_dir)
+            refs = pool.available_refs()
+
+            pool.set_key_model_config(refs[0], max_concurrency=3)
+            pool.set_key_model_config(refs[1], max_concurrency=4)
+
+            self.assertEqual(pool.concurrency_limit_for_ref(refs[0]), 3)
+            self.assertEqual(pool.concurrency_limit_for_ref(refs[1]), 4)
+            self.assertEqual(pool.concurrency_limit(), 7)
+
 
 if __name__ == "__main__":
     unittest.main()

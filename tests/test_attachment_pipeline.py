@@ -101,10 +101,39 @@ class AttachmentPipelineTest(unittest.TestCase):
             self.assertEqual(result["artifacts"]["table_chunk_count"], 1)
             self.assertTrue(Path(result["artifacts"]["table_index_path"]).exists())
             self.assertEqual(chunk_payload["rows"][0], {"name": "alpha", "value": "1"})
-            self.assertIn("[structured_table:first_chunk]", result["parse"]["text"])
-            self.assertIn('"name": "alpha"', result["parse"]["text"])
+            self.assertNotIn("[structured_table:first_chunk]", result["parse"]["text"])
+            self.assertNotIn('"name": "alpha"', result["parse"]["text"])
+            self.assertIn("tables=1", result["parse"]["text"])
             self.assertNotIn("raw_text", result["parse"])
             self.assertEqual(result["parse"]["context_text"], "name\tvalue\nalpha\t1")
+
+    def test_process_large_file_returns_placeholder_without_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inbox = root / "inbox"
+            inbox.mkdir()
+            source = inbox / "large.txt"
+            source.write_text("x" * 128, encoding="utf-8")
+            pipeline = AttachmentPipeline(
+                file_index=FileIndex(root / "file_index.sqlite"),
+                file_workspace=FileWorkspace(root / "file_workspace"),
+                attachment_parser=_Parser("should not parse"),
+                allowed_input_roots=[inbox],
+                allowed_extensions=[".txt"],
+                max_input_bytes=16,
+            )
+
+            result = pipeline.process(
+                IncomingAttachment(path="large.txt", original_name="large.txt", kind="file"),
+                conversation_id="conv1",
+                session_id="session1",
+            )
+
+            self.assertEqual(result["status"], "skipped_too_large")
+            self.assertEqual(result["parse"]["status"], "skipped_too_large")
+            self.assertTrue(result["parse"]["not_processed"])
+            self.assertIn("文件过大", result["parse"]["text"])
+            self.assertFalse(any((root / "file_workspace").rglob("large.txt")))
 
     def test_process_returns_embedded_media_ocr_artifacts_for_docx(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

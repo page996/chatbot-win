@@ -94,7 +94,10 @@ class HookMessagePullRunner:
 
     def _run_once_locked(self) -> dict[str, Any]:
         imported = self.importer.import_new()
-        poll_result = self.polling_runner.run_once()
+        if int(imported.appended_count or 0) <= 0:
+            poll_result = {"status": "ok", "processed": [], "skipped_reason": "no_new_hook_imports"}
+        else:
+            poll_result = self.polling_runner.run_once()
         processed = poll_result.get("processed", [])
         processed_count = len(processed) if isinstance(processed, list) else 0
         status = _tick_status(imported, poll_result, processed_count)

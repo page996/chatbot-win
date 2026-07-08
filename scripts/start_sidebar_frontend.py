@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 WEFLOW_DIR = ROOT / "vendor" / "reference" / "WeFlow-gitcode"
+WEFLOW_START_LOCK_STALE_SECONDS = 180.0
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -37,8 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     data_dir = Path(args.data_dir)
+    weflow_result: dict[str, object] = {"status": "skipped", "component": "weflow", "reason": "disabled"}
     if args.weflow != "off":
-        result = ensure_weflow_started(
+        weflow_result = ensure_weflow_started(
             data_dir=data_dir,
             host=args.weflow_host,
             port=args.weflow_port,
@@ -47,9 +49,10 @@ def main(argv: list[str] | None = None) -> int:
             required=args.weflow == "on",
             hidden=args.weflow_window == "hidden",
         )
-        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
-        if args.weflow == "on" and result.get("status") == "error":
+        print(json.dumps(weflow_result, ensure_ascii=False, indent=2), flush=True)
+        if args.weflow == "on" and weflow_result.get("status") == "error":
             return 2
+    _write_sidebar_launch_state(data_dir, args, weflow_result)
 
     if args.mode == "server":
         from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
@@ -111,6 +114,24 @@ def ensure_weflow_started(
     if not token:
         return {"status": "error" if required else "skipped", "component": "weflow", "reason": "WEFLOW_API_TOKEN is not configured"}
 
+    lock_path = _weflow_start_lock_path(data_dir)
+    existing_start = _existing_weflow_start(lock_path, base_url=base_url, token=token, wait_seconds=wait_seconds)
+    if existing_start is not None:
+        return existing_start
+    if not _try_acquire_weflow_start_lock(lock_path):
+        existing_start = _existing_weflow_start(lock_path, base_url=base_url, token=token, wait_seconds=wait_seconds)
+        if existing_start is not None:
+            return existing_start
+        _remove_weflow_start_lock(lock_path)
+        if not _try_acquire_weflow_start_lock(lock_path):
+            return {
+                "status": "starting",
+                "component": "weflow",
+                "state": "start_lock_contended",
+                "base_url": base_url,
+                "lock": str(lock_path),
+            }
+
     env = os.environ.copy()
     env.update(
         {
@@ -128,20 +149,45 @@ def ensure_weflow_started(
     )
     out = data_dir / "weflow_process.out.log"
     err = data_dir / "weflow_process.err.log"
-    with out.open("ab") as stdout, err.open("ab") as stderr:
-        process = subprocess.Popen(
-            [npm, "run", "electron:dev"],
-            cwd=str(WEFLOW_DIR),
-            env=env,
-            stdout=stdout,
-            stderr=stderr,
-            shell=False,
-        )
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = 0x08000000
+    try:
+        with out.open("ab") as stdout, err.open("ab") as stderr:
+            process = subprocess.Popen(
+                [npm, "run", "electron:dev"],
+                cwd=str(WEFLOW_DIR),
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                shell=False,
+                creationflags=creationflags,
+            )
+    except Exception as exc:
+        _remove_weflow_start_lock(lock_path)
+        return {
+            "status": "error" if required else "skipped",
+            "component": "weflow",
+            "reason": f"failed to launch WeFlow: {type(exc).__name__}: {exc}",
+            "stdout": str(out),
+            "stderr": str(err),
+        }
+    _write_weflow_start_lock(
+        lock_path,
+        {
+            "pid": process.pid,
+            "base_url": base_url,
+            "updated_at_epoch": time.time(),
+            "stdout": str(out),
+            "stderr": str(err),
+        },
+    )
 
     deadline = time.monotonic() + max(1.0, wait_seconds)
     last_health: dict[str, object] = {}
     while time.monotonic() < deadline:
         if process.poll() is not None:
+            _remove_weflow_start_lock(lock_path)
             return {
                 "status": "error" if required else "starting",
                 "component": "weflow",
@@ -153,6 +199,7 @@ def ensure_weflow_started(
             }
         last_health = weflow_health(base_url, token=token)
         if last_health.get("status") == "ok":
+            _remove_weflow_start_lock(lock_path)
             return {
                 "status": "ok",
                 "component": "weflow",
@@ -174,7 +221,159 @@ def ensure_weflow_started(
         "last_health": last_health,
         "stdout": str(out),
         "stderr": str(err),
+        "lock": str(lock_path),
     }
+
+
+def _weflow_start_lock_path(data_dir: Path) -> Path:
+    return data_dir / "runtime" / "weflow_start.lock"
+
+
+def _try_acquire_weflow_start_lock(lock_path: Path) -> bool:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"pid": 0, "updated_at_epoch": time.time()}, handle, ensure_ascii=False)
+    return True
+
+
+def _existing_weflow_start(
+    lock_path: Path,
+    *,
+    base_url: str,
+    token: str,
+    wait_seconds: float,
+) -> dict[str, object] | None:
+    if not lock_path.exists():
+        return None
+    lock = _read_json(lock_path, {})
+    pid = _int_value(lock.get("pid") if isinstance(lock, dict) else 0, 0)
+    age = _lock_age_seconds(lock if isinstance(lock, dict) else {})
+    health = weflow_health(base_url, token=token)
+    if health.get("status") == "ok":
+        _remove_weflow_start_lock(lock_path)
+        return {"status": "ok", "component": "weflow", "state": "already_running", "base_url": base_url, "health": health}
+    if pid <= 0 and age <= 20.0:
+        return {
+            "status": "starting",
+            "component": "weflow",
+            "state": "start_lock_pending",
+            "base_url": base_url,
+            "last_health": health,
+            "lock": str(lock_path),
+        }
+    if pid > 0 and _pid_exists(pid) and age <= WEFLOW_START_LOCK_STALE_SECONDS:
+        deadline = time.monotonic() + max(1.0, wait_seconds)
+        last_health = health
+        while time.monotonic() < deadline:
+            last_health = weflow_health(base_url, token=token)
+            if last_health.get("status") == "ok":
+                _remove_weflow_start_lock(lock_path)
+                return {
+                    "status": "ok",
+                    "component": "weflow",
+                    "state": "started_by_existing_launcher",
+                    "pid": pid,
+                    "base_url": base_url,
+                    "health": last_health,
+                }
+            if not _pid_exists(pid):
+                _remove_weflow_start_lock(lock_path)
+                return None
+            time.sleep(1.0)
+        return {
+            "status": "starting",
+            "component": "weflow",
+            "state": "start_in_progress",
+            "pid": pid,
+            "base_url": base_url,
+            "last_health": last_health,
+            "lock": str(lock_path),
+        }
+    if pid > 0 and _pid_exists(pid):
+        _terminate_pid(pid, tree=True)
+    _remove_weflow_start_lock(lock_path)
+    return None
+
+
+def _write_weflow_start_lock(lock_path: Path, payload: dict[str, object]) -> None:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _remove_weflow_start_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _read_json(path: Path, default: object) -> object:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _lock_age_seconds(lock: dict[str, object]) -> float:
+    try:
+        updated_at = float(lock.get("updated_at_epoch") or 0)
+    except Exception:
+        updated_at = 0.0
+    if updated_at <= 0:
+        return float("inf")
+    return max(0.0, time.time() - updated_at)
+
+
+def _int_value(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            completed = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return False
+        return str(pid) in completed.stdout
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_pid(pid: int, *, tree: bool) -> None:
+    if pid <= 0 or pid == os.getpid():
+        return
+    if os.name == "nt":
+        command = ["taskkill", "/PID", str(pid), "/F"]
+        if tree:
+            command.append("/T")
+        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False)
+        return
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        return
 
 
 def install_weflow_dependencies(npm: str, data_dir: Path) -> dict[str, object]:
@@ -240,6 +439,33 @@ def weflow_token() -> str:
     except Exception:
         return ""
     return ""
+
+
+def _write_sidebar_launch_state(data_dir: Path, args: argparse.Namespace, weflow_result: dict[str, object]) -> None:
+    runtime_dir = data_dir / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "python": sys.executable,
+        "script": str(Path(__file__).resolve()),
+        "root": str(ROOT),
+        "data_dir": str(data_dir.resolve()),
+        "argv": sys.argv[1:],
+        "mode": args.mode,
+        "host": args.host,
+        "port": args.port,
+        "interval_ms": args.interval_ms,
+        "weflow": args.weflow,
+        "weflow_port": args.weflow_port,
+        "weflow_host": args.weflow_host,
+        "install_weflow_deps": args.install_weflow_deps,
+        "weflow_wait_seconds": args.weflow_wait_seconds,
+        "weflow_window": args.weflow_window,
+        "weflow_result": weflow_result,
+        "weflow_pid": weflow_result.get("pid") if isinstance(weflow_result, dict) else None,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    (runtime_dir / "sidebar_launch.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

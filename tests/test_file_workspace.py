@@ -3,10 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import time
 import zipfile
 from pathlib import Path
 
 from app.personal_wechat_bot.conversation.segment import conversation_segment
+from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -126,11 +128,44 @@ class FileWorkspaceTest(unittest.TestCase):
             content = (derived / "content.md").read_text(encoding="utf-8")
 
             self.assertEqual(analysis["file_type"], "text")
-            self.assertEqual(analysis["external_links"], ["https://example.com"])
-            self.assertIn("hello https://example.com", content)
+            self.assertEqual(analysis["external_links"], [])
+            self.assertEqual(analysis["external_link_count"], 1)
+            self.assertTrue(analysis["external_links_hidden"])
+            self.assertNotIn("https://example.com", content)
+            self.assertIn("[file-internal-url-redacted]", content)
             self.assertEqual(manifest["parse"]["content_path"], str(derived / "content.md"))
             self.assertEqual(manifest["parse"]["analysis_path"], str(derived / "analysis.json"))
             self.assertEqual(manifest["parse"]["chunk_count"], 1)
+
+    def test_parse_and_async_ai_analysis_are_visible_as_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            source = Path(tmp) / "note.txt"
+            source.write_text("hello task visibility", encoding="utf-8")
+            workspace = FileWorkspace(data_dir / "file_workspace", analyzer=_CaptureAnalyzer(), analysis_async=True)
+            staged = workspace.stage_file(source, conversation_id="conv-task", session_id="s1")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "text", "summary", "hello task visibility"),
+            )
+
+            state = _wait_for_task_status(data_dir, f"file-ai-{staged.file_id}", "completed")
+            tasks = {item["task_id"]: item for item in state["tasks"]}
+
+            self.assertEqual(tasks[f"file-parse-{staged.file_id}"]["status"], "completed")
+            self.assertEqual(tasks[f"file-parse-{staged.file_id}"]["kind"], "file_parse")
+            self.assertEqual(tasks[f"file-ai-{staged.file_id}"]["status"], "completed")
+            self.assertEqual(tasks[f"file-ai-{staged.file_id}"]["kind"], "file_ai_analysis")
+            lane = state["channels"][0]
+            self.assertEqual(lane["conversation_id"], "conv-task")
+            self.assertTrue(any(item["task_id"] == f"file-ai-{staged.file_id}" for item in lane["history"]))
+            # Windows can hold SQLite/WAL handles for a brief moment after the
+            # background analysis thread records completion.
+            import gc
+
+            gc.collect()
+            time.sleep(0.2)
 
     def test_spreadsheet_parse_result_writes_structured_table_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -279,6 +314,55 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertIn("转写正文", asr_path.read_text(encoding="utf-8"))
             self.assertIn("first_audio_asr", content)
 
+    def test_standalone_audio_reuses_primary_transcript_without_second_asr_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "voice.m4a"
+            source.write_bytes(b"fake audio")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="audio")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "audio", "summary", "primary transcript"),
+                embedded_media_asr=_FailingAsr(),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            self.assertEqual(analysis["media_asr_count"], 1)
+            self.assertEqual(analysis["media_audio"][0]["asr_backend"], "primary_audio_parse")
+            self.assertEqual(analysis["media_audio"][0]["asr_text"], "primary transcript")
+
+    def test_audio_analysis_input_deduplicates_primary_and_media_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "voice.m4a"
+            source.write_bytes(b"fake audio")
+            analyzer = _CaptureAnalyzer()
+            workspace = FileWorkspace(Path(tmp) / "workspace", analyzer=analyzer)
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="audio")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "audio", "summary", "same transcript"),
+                embedded_media_asr=_FakeAsr("same transcript"),
+            )
+
+            self.assertEqual(analyzer.calls, 1)
+            self.assertEqual(analyzer.last_text, "same transcript")
+
+    def test_ai_analysis_cache_prevents_repeat_llm_call_for_same_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "note.txt"
+            source.write_text("hello", encoding="utf-8")
+            analyzer = _CaptureAnalyzer()
+            workspace = FileWorkspace(Path(tmp) / "workspace", analyzer=analyzer)
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+            result = AttachmentParseResult("parsed", "text", "summary", "hello")
+
+            workspace.write_parse_result(staged, result)
+            workspace.write_parse_result(staged, result)
+
+            self.assertEqual(analyzer.calls, 1)
+
     def test_audio_file_empty_transcript_is_not_counted_as_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "voice.m4a"
@@ -361,6 +445,109 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertEqual(analysis["chunk_count"], len(chunks))
             self.assertEqual(manifest["parse"]["chunk_count"], analysis["chunk_count"])
             self.assertTrue(all(path.read_text(encoding="utf-8").startswith("# Chunk") for path in chunks))
+
+    def test_medium_cjk_image_parse_result_is_chunked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "long.png"
+            source.write_bytes(b"\x89PNG\r\n\x1a\n")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+            long_text = "\u4e2d" * 7000
+
+            workspace.write_parse_result(staged, AttachmentParseResult("parsed", "image", "summary", long_text))
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            self.assertGreater(analysis["chunk_count"], 1)
+
+    def test_token_heavy_cjk_under_char_limit_is_chunked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "medium.txt"
+            source.write_text("seed", encoding="utf-8")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "text", "summary", "\u4e2d" * 2500),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            self.assertGreater(analysis["chunk_count"], 1)
+            self.assertLessEqual(max(item["token_estimate"] for item in analysis["chunks"]), 1800)
+
+    def test_standalone_image_ocr_layout_rows_are_structured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "table.png"
+            source.write_bytes(b"\x89PNG\r\n\x1a\n")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+            metadata = {
+                "ocr": {
+                    "items": [
+                        {"text": "Name", "score": 0.99, "box": _box(10, 10, 60, 30), "backend": "fake_gpu"},
+                        {"text": "Age", "score": 0.98, "box": _box(100, 10, 140, 30), "backend": "fake_gpu"},
+                        {"text": "Ava", "score": 0.97, "box": _box(10, 50, 60, 70), "backend": "fake_gpu"},
+                        {"text": "29", "score": 0.97, "box": _box(100, 50, 140, 70), "backend": "fake_gpu"},
+                    ]
+                }
+            }
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "image", "summary", "Name\tAge\nAva\t29", metadata=metadata),
+            )
+
+            derived = Path(staged.derived_dir)
+            analysis = json.loads((derived / "analysis.json").read_text(encoding="utf-8"))
+            manifest = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
+            chunk_path = Path(analysis["ocr_table_chunks"][0]["path"])
+            chunk = json.loads(chunk_path.read_text(encoding="utf-8"))
+            content = (derived / "content.md").read_text(encoding="utf-8")
+
+            self.assertEqual(analysis["ocr_table_chunk_count"], 1)
+            self.assertEqual(analysis["ocr_table_row_count"], 2)
+            self.assertEqual(manifest["parse"]["ocr_table_chunk_count"], 1)
+            self.assertEqual(chunk["rows"][0]["text"], "Name\tAge")
+            self.assertEqual(chunk["rows"][0]["cells"][0]["backend"], "fake_gpu")
+            self.assertIn("## OCR Layout Rows", content)
+
+    def test_embedded_media_ocr_text_contributes_to_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "media.docx"
+            _write_docx_with_media(source)
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+            ocr_text = "\u4e2d" * 7000
+
+            workspace.write_parse_result(
+                staged,
+                AttachmentParseResult("parsed", "docx", "summary", "body"),
+                embedded_media_ocr=_FakeOcr(ocr_text),
+            )
+
+            analysis = json.loads((Path(staged.derived_dir) / "analysis.json").read_text(encoding="utf-8"))
+            full_text = (Path(staged.derived_dir) / "full_text.md").read_text(encoding="utf-8")
+            self.assertGreater(analysis["chunk_count"], 1)
+            self.assertIn(ocr_text[:100], full_text)
+
+    def test_cached_parse_result_refreshes_stale_chunk_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "long.txt"
+            source.write_text("long", encoding="utf-8")
+            workspace = FileWorkspace(Path(tmp) / "workspace")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1")
+            long_text = "\u4e2d" * 7000
+            workspace.write_parse_result(staged, AttachmentParseResult("parsed", "text", "summary", long_text))
+            analysis_path = Path(staged.derived_dir) / "analysis.json"
+            analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+            analysis["chunk_count"] = 1
+            analysis["chunks"] = analysis["chunks"][:1]
+            analysis_path.write_text(json.dumps(analysis), encoding="utf-8")
+
+            workspace.parse_or_get_cached(staged, _CountingParser())
+
+            refreshed = json.loads(analysis_path.read_text(encoding="utf-8"))
+            self.assertGreater(refreshed["chunk_count"], 1)
 
     def test_staged_file_can_be_reloaded_from_manifest_for_later_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -503,6 +690,31 @@ class _FakeAsr:
         return AsrTranscript(self.status, self.text, backend="fake_asr", model="fake", source_path=str(audio_path))
 
 
+class _FailingAsr:
+    def health(self) -> AsrHealth:
+        return AsrHealth("failing_asr", True)
+
+    def transcribe(self, audio_path: str | Path) -> AsrTranscript:
+        raise AssertionError("standalone parsed audio should not be transcribed twice")
+
+
+class _CaptureAnalyzer:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_text = ""
+
+    def analyze(self, *, name: str, kind: str, text: str, extra: dict | None = None) -> dict:
+        self.calls += 1
+        self.last_text = text
+        return {
+            "status": "analyzed",
+            "summary": f"summary for {name}",
+            "key_points": ["point"],
+            "topics": [kind],
+            "model": "capture",
+        }
+
+
 def _write_docx_with_media(path: Path, *, include_audio: bool = False) -> None:
     document = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -515,6 +727,21 @@ def _write_docx_with_media(path: Path, *, include_audio: bool = False) -> None:
         docx.writestr("word/media/image1.png", b"fake image bytes")
         if include_audio:
             docx.writestr("word/media/audio1.mp3", b"fake audio bytes")
+
+
+def _box(left: float, top: float, right: float, bottom: float) -> list[list[float]]:
+    return [[left, top], [right, top], [right, bottom], [left, bottom]]
+
+
+def _wait_for_task_status(data_dir: Path, task_id: str, status: str) -> dict:
+    last_state: dict = {}
+    for _ in range(100):
+        last_state = TaskStatusStore(data_dir).state()
+        task = next((item for item in last_state["tasks"] if item["task_id"] == task_id), None)
+        if task is not None and task["status"] == status:
+            return last_state
+        time.sleep(0.05)
+    return last_state
 
 
 class FileWorkspaceCleanupTest(unittest.TestCase):

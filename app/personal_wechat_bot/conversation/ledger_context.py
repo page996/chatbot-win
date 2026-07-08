@@ -9,6 +9,7 @@ from typing import Any, Literal
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.domain.models import NormalizedMessage
+from app.personal_wechat_bot.workspace.file_visibility import redact_file_internal_urls
 
 
 SectionName = Literal["runtime_cards", "memory", "analysis", "quote", "recent", "files", "links"]
@@ -73,6 +74,7 @@ class LedgerContextAssembler:
 
     def build_snapshot(self, message: NormalizedMessage) -> LedgerContextSnapshot:
         session_id = _session_id_from_message(message)
+        self.ledger_store.refresh_file_refs(message.conversation_id)
         entries = [as_payload(item) for item in self.ledger_store.read_entries(message.conversation_id)]
         session_entries = _filter_entries_for_session(entries, session_id)
         quote = _quote_from_message(message)
@@ -83,7 +85,13 @@ class LedgerContextAssembler:
         )
         visible_entries = session_entries[-self.max_recent_entries :]
         quote_entries = quote_context.get("entries", []) if isinstance(quote_context, dict) else []
-        file_refs = _collect_file_refs([*visible_entries, *quote_entries])
+        matched_quote_files = quote_context.get("matched_attachments", []) if isinstance(quote_context, dict) else []
+        file_refs = _dedupe_file_refs(
+            [
+                *(dict(item) for item in matched_quote_files if isinstance(item, dict)),
+                *_collect_file_refs([*visible_entries, *quote_entries]),
+            ]
+        )
         link_refs = _collect_link_refs([*visible_entries, *quote_entries])
         conversation_dir = self.ledger_store.conversation_markdown_path(message.conversation_id).parent
         memory = _read_memory(memory_dir_for_conversation(conversation_dir, session_id))
@@ -305,10 +313,14 @@ def _file_lines(file_refs: list[dict[str, Any]]) -> list[str]:
             f"status={item.get('status', '')}",
             f"parse_status={parse.get('status', '')}",
         ]
+        if item.get("file_id"):
+            parts.append("read_tool=file.read")
+            parts.append(f"read_args=file_id={item.get('file_id', '')}")
         for key, label in (
             ("char_count", "chars"),
             ("chunk_count", "chunks"),
             ("table_chunk_count", "table_chunks"),
+            ("ocr_table_chunk_count", "ocr_tables"),
             ("media_extract_count", "media"),
             ("media_ocr_count", "ocr"),
             ("media_asr_count", "asr"),
@@ -316,12 +328,43 @@ def _file_lines(file_refs: list[dict[str, Any]]) -> list[str]:
             value = artifacts.get(key, "")
             if value not in ("", None, 0):
                 parts.append(f"{label}={value}")
-        ai_summary = str(artifacts.get("ai_summary", "")).strip()
-        summary = ai_summary or str(parse.get("summary", "")).strip()
+        ai_summary = _usable_ai_summary(artifacts)
+        summary = "" if ai_summary else str(parse.get("summary", "")).strip()
         if summary:
             parts.append(f"summary={_compact(summary, 300)}")
+        key_points = _file_key_points(artifacts, parse)
+        if key_points and not ai_summary:
+            parts.append("key_points=" + " / ".join(key_points[:5]))
         lines.append("- " + " ".join(part for part in parts if not part.endswith("=")))
+        if ai_summary:
+            lines.append(
+                "- [file_analysis "
+                f"file_id={item.get('file_id', '')} "
+                "source=content.md::AI Analysis+Key Points]"
+            )
+            lines.append(f"  AI Analysis: {_compact(ai_summary, 1200)}")
+            if key_points:
+                lines.append("  Key Points:")
+                lines.extend(f"  - {point}" for point in key_points[:12])
     return lines
+
+
+def _usable_ai_summary(artifacts: dict[str, Any]) -> str:
+    if str(artifacts.get("ai_analysis_status", "")).strip() != "analyzed":
+        return ""
+    summary = str(artifacts.get("ai_summary", "")).strip()
+    if "fake_llm.completed" in summary or "PLAN:" in summary or "MONITOR:" in summary:
+        return ""
+    return redact_file_internal_urls(summary)
+
+
+def _file_key_points(artifacts: dict[str, Any], parse: dict[str, Any]) -> list[str]:
+    raw = artifacts.get("ai_key_points") or parse.get("ai_key_points") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [_compact(redact_file_internal_urls(str(item).strip()), 180) for item in raw if str(item).strip()]
 
 
 def _link_lines(link_refs: list[dict[str, Any]]) -> list[str]:
@@ -341,7 +384,7 @@ def _render_entry_line(item: dict[str, Any], max_text_chars: int) -> str:
     text = "\n".join(
         str(block.get("text", ""))
         for block in item.get("text_blocks", [])
-        if isinstance(block, dict) and block.get("text")
+        if _visible_text_block(block)
     )
     quote = item.get("quote") if isinstance(item.get("quote"), dict) else {}
     quote_note = f" quote={_compact(str(quote.get('text', '')), 160)}" if quote else ""
@@ -349,6 +392,18 @@ def _render_entry_line(item: dict[str, Any], max_text_chars: int) -> str:
         f"- #{int(item.get('sequence', 0) or 0):06d} {item.get('received_at', '')} "
         f"{item.get('sender_name', '')} role={role}{quote_note}: {_compact(text, max_text_chars)}"
     )
+
+
+def _visible_text_block(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    if not block.get("text"):
+        return False
+    kind = str(block.get("kind", ""))
+    metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+    if kind.startswith("attachment:"):
+        return False
+    return metadata.get("visible_in_context") is not False
 
 
 def _quote_from_message(message: NormalizedMessage) -> dict[str, Any]:
@@ -372,6 +427,19 @@ def _collect_file_refs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 seen.add(key)
             refs.append(dict(attachment))
     return refs
+
+
+def _dedupe_file_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for item in refs:
+        key = str(item.get("file_id") or item.get("name") or item.get("path") or "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        kept.append(dict(item))
+    return kept
 
 
 def _collect_link_refs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -407,7 +475,7 @@ def _read_memory(memory_dir: Path) -> dict[str, Any]:
 
 
 def _analyze(entries: list[dict[str, Any]], message: NormalizedMessage) -> dict[str, Any]:
-    text = message.text
+    text = _primary_message_text(message)
     active_count = len(entries)
     files = _collect_file_refs(entries[-20:])
     links = _URL_RE.findall(text)
@@ -420,6 +488,13 @@ def _analyze(entries: list[dict[str, Any]], message: NormalizedMessage) -> dict[
     }
 
 
+def _primary_message_text(message: NormalizedMessage) -> str:
+    original = message.metadata.get("original_text")
+    if isinstance(original, str):
+        return original
+    return message.text
+
+
 def _compact(text: str, max_chars: int) -> str:
     normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())
     if len(normalized) <= max_chars:
@@ -428,7 +503,11 @@ def _compact(text: str, max_chars: int) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4) if text else 0
+    if not text:
+        return 0
+    cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    non_cjk = max(0, len(text) - cjk)
+    return max(1, cjk + non_cjk // 4)
 
 
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)

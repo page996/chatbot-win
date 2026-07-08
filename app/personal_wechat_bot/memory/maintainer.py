@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import hashlib
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import as_payload, memory_dir_for_conversation
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.llm.base import generate_reply_with_workload
 
 
 _MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-maintainer")
@@ -209,7 +211,7 @@ class MemoryMaintainer:
             return
         prompt = _memory_prompt(conversation_id, session_id, entries)
         try:
-            raw = self.llm.generate_reply(prompt)
+            raw = generate_reply_with_workload(self.llm, prompt, workload="background")
             parsed = _parse_json_object(raw)
         except Exception:
             return
@@ -442,14 +444,14 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
 

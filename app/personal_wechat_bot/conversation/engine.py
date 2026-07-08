@@ -117,11 +117,50 @@ class ConversationEngine:
                 requested_by="chatbot",
                 arguments={"url": arg},
             )
+        if text.startswith("#file ") or text.startswith("#read-file "):
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            return ToolCallRequest(
+                tool_name="file.read",
+                call_id=_call_id(message.message_id, "file.read"),
+                conversation_id=message.conversation_id,
+                requested_by="chatbot",
+                arguments=_file_read_arguments(arg),
+            )
         return None
 
 
 def _call_id(message_id: str, tool_name: str) -> str:
     return hashlib.sha256(f"{message_id}:{tool_name}".encode("utf-8")).hexdigest()[:24]
+
+
+def _file_read_arguments(text: str) -> dict[str, object]:
+    args: dict[str, object] = {}
+    parts = [part for part in text.split() if part.strip()]
+    if parts:
+        args["file_id"] = parts[0]
+    for part in parts[1:]:
+        if "=" not in part:
+            if part.isdigit():
+                args["chunk_index"] = int(part)
+            else:
+                args["artifact"] = part
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key in {"chunk", "chunk_index"}:
+            try:
+                args["chunk_index"] = int(value)
+            except ValueError:
+                args["chunk_index"] = value
+        elif key in {"artifact", "part"}:
+            args["artifact"] = value
+        elif key in {"file_id", "id"}:
+            args["file_id"] = value
+        elif key in {"pin_internal_urls", "include_internal_urls", "expose_internal_urls"}:
+            args["pin_internal_urls"] = value.lower() in {"1", "true", "yes", "on", "pin", "include", "expose"}
+    return args
 
 
 def _extract_summary(text: str) -> str:

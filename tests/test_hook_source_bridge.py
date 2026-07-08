@@ -120,6 +120,39 @@ class HookSourceBridgeTest(unittest.TestCase):
         self.assertTrue(event.is_self)
         self.assertEqual(event.voice["audio_name"], "voice_20.wav")
 
+    def test_weflow_path_like_message_key_falls_back_to_stable_local_identity(self) -> None:
+        first = normalize_weflow_message(
+            {
+                "localId": 20,
+                "serverId": "0",
+                "messageKey": "E%3A%5CWeChat%5Cmessage_0.db:Msg_a:20",
+                "localType": 1,
+                "createTime": 1719900000,
+                "sortSeq": 1719900000001,
+                "senderUsername": "wxid_page",
+                "content": "hello",
+            },
+            session_id="wxid_page",
+            session_meta={"name": "PAGE", "type": "private"},
+        )
+        second = normalize_weflow_message(
+            {
+                "localId": 20,
+                "serverId": "0",
+                "messageKey": "E%3A%5COtherPath%5Cmessage_0.db:Msg_b:20",
+                "localType": 1,
+                "createTime": 1719900000,
+                "sortSeq": 1719900000001,
+                "senderUsername": "wxid_page",
+                "content": "hello",
+            },
+            session_id="wxid_page",
+            session_meta={"name": "PAGE", "type": "private"},
+        )
+
+        self.assertEqual(first["raw_id"], "weflow:message:wxid_page:local:20:1719900000:1719900000001")
+        self.assertEqual(first["raw_id"], second["raw_id"])
+
     def test_weflow_message_recognizes_from_me_self_alias(self) -> None:
         normalized = normalize_weflow_message(
             {
@@ -135,6 +168,19 @@ class HookSourceBridgeTest(unittest.TestCase):
 
         self.assertTrue(normalized["is_self"])
         self.assertTrue(hook_event_from_payload(normalized).is_self)
+
+    def test_weflow_message_prefers_display_name_over_wxid_title(self) -> None:
+        normalized = normalize_weflow_message(
+            {
+                "platformMessageId": "wf-1",
+                "senderUsername": "wxid_page",
+                "content": "hello",
+            },
+            session_id="wxid_page",
+            session_meta={"name": "wxid_page", "displayName": "PAGE", "type": "private"},
+        )
+
+        self.assertEqual(normalized["talker_name"], "PAGE")
 
     def test_weflow_raw_pull_uses_messages_endpoint_and_keeps_talker_order_isolated(self) -> None:
         with _FakeWeFlowRawServer() as server:
@@ -199,12 +245,16 @@ class HookSourceBridgeTest(unittest.TestCase):
             texts_by_talker.setdefault(item["talker"], []).append(item["text"])
 
         self.assertEqual(result.status, "ok")
-        self.assertEqual(result.scanned_count, 6)
+        self.assertEqual(result.scanned_count, 4)
         self.assertEqual(result.appended_count, 4)
         self.assertEqual(texts_by_talker["wxid_a"], ["a-older", "a-newer"])
         self.assertEqual(texts_by_talker["wxid_b"], ["b-older", "[文件] report.pdf"])
         self.assertEqual(len({item["raw_id"] for item in lines}), 4)
         self.assertEqual(len(lines), 4)
+        self.assertCountEqual(
+            [(call["talker"], call["offset"]) for call in _FakeWeFlowRawServer.calls],
+            [("wxid_a", "0"), ("wxid_b", "0")],
+        )
 
     def test_weflow_recall_targets_previous_message_raw_id(self) -> None:
         normalized = normalize_weflow_push_event(
@@ -271,6 +321,18 @@ class HookSourceBridgeTest(unittest.TestCase):
         lines = self.hook_file.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual([json.loads(line)["text"] for line in lines], ["one", "two"])
+
+    def test_hook_writer_dedupes_stable_raw_id(self) -> None:
+        writer = HookEventJsonlWriter(self.hook_file)
+
+        first = writer.append({"raw_id": "same-raw", "talker": "wxid_page", "sender_name": "PAGE", "text": "one"})
+        second = writer.append({"raw_id": "same-raw", "talker": "wxid_page", "sender_name": "PAGE", "text": "two"})
+        lines = self.hook_file.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["text"], "one")
 
     def test_weflow_sse_skips_ready_saves_last_event_id_and_dedupes(self) -> None:
         with _FakeWeFlowSseServer() as server:

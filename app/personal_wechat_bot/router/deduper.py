@@ -30,6 +30,12 @@ class Deduper:
             return True
         return False
 
+    def seen_any(self, message_ids: list[str] | tuple[str, ...] | set[str]) -> bool:
+        for message_id in dict.fromkeys(str(item).strip() for item in message_ids if str(item).strip()):
+            if self.seen(message_id):
+                return True
+        return False
+
     def mark(self, message_id: str) -> None:
         self._seen.add(message_id)
         if self.db_path is None:
@@ -43,6 +49,10 @@ class Deduper:
                     """,
                     (message_id, utc_now_iso()),
                 )
+
+    def mark_many(self, message_ids: list[str] | tuple[str, ...] | set[str]) -> None:
+        for message_id in dict.fromkeys(str(item).strip() for item in message_ids if str(item).strip()):
+            self.mark(message_id)
 
     def _init_db(self) -> None:
         if self.db_path is None:

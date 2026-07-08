@@ -10,7 +10,7 @@ from app.personal_wechat_bot.wechat_driver.send_driver_factory import is_send_dr
 
 def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]:
     config = load_config(data_dir)
-    preflight = build_preflight_report(config, show_accepted=True)
+    preflight = build_preflight_report(config, show_accepted=True, include_tool_health=False)
     checks = _checks(preflight)
     blockers = [item for item in checks if item["status"] == "blocker"]
     warnings = [item for item in checks if item["status"] == "warn"]

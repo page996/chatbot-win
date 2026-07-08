@@ -10,6 +10,7 @@ from app.personal_wechat_bot.tools.permissions import validate_readable_file
 from app.personal_wechat_bot.vision.ocr import OcrEngine
 from app.personal_wechat_bot.voice.asr import AsrEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
+from app.personal_wechat_bot.workspace.file_visibility import redact_file_internal_urls
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
@@ -62,6 +63,14 @@ class AttachmentPipeline:
         session_id: str,
     ) -> dict[str, Any]:
         try:
+            oversized = _oversized_attachment_placeholder(
+                attachment,
+                allowed_input_roots=self.allowed_input_roots,
+                allowed_extensions=self.allowed_extensions,
+                max_input_bytes=self.max_input_bytes,
+            )
+            if oversized is not None:
+                return oversized
             safe_path = validate_readable_file(
                 attachment.path,
                 self.allowed_input_roots,
@@ -116,6 +125,9 @@ class AttachmentPipeline:
                     "text": parse_text,
                     "context_text": context_text,
                     "error": parse_result.error,
+                    "ai_analysis_status": artifacts.get("ai_analysis_status", ""),
+                    "ai_summary": artifacts.get("ai_summary", ""),
+                    "ai_key_points": artifacts.get("ai_key_points", []),
                 },
                 "artifacts": artifacts,
             }
@@ -135,6 +147,7 @@ def _artifact_refs(staged) -> dict[str, Any]:
     analysis = _read_json(derived_dir / "analysis.json", {})
     chunks = analysis.get("chunks", []) if isinstance(analysis, dict) else []
     table_chunks = analysis.get("table_chunks", []) if isinstance(analysis, dict) else []
+    ocr_table_chunks = analysis.get("ocr_table_chunks", []) if isinstance(analysis, dict) else []
     media_images = analysis.get("media_images", []) if isinstance(analysis, dict) else []
     media_audio = analysis.get("media_audio", []) if isinstance(analysis, dict) else []
     return {
@@ -143,7 +156,15 @@ def _artifact_refs(staged) -> dict[str, Any]:
         "full_text_path": str(derived_dir / "full_text.md") if (derived_dir / "full_text.md").is_file() else "",
         "analysis_path": str(derived_dir / "analysis.json"),
         "parse_result_path": str(derived_dir / "parse_result.json"),
+        "ai_analysis_status": str(analysis.get("ai_analysis_status", "")) if isinstance(analysis, dict) else "",
         "ai_summary": str(analysis.get("ai_summary", "")) if isinstance(analysis, dict) else "",
+        "ai_key_points": [
+            str(item)
+            for item in analysis.get("ai_key_points", [])
+            if str(item).strip()
+        ]
+        if isinstance(analysis, dict)
+        else [],
         "preview_char_count": int(analysis.get("preview_char_count", 0) or 0) if isinstance(analysis, dict) else 0,
         "char_count": int(analysis.get("char_count", 0) or 0) if isinstance(analysis, dict) else 0,
         "chunks_dir": str(derived_dir / "chunks"),
@@ -158,6 +179,16 @@ def _artifact_refs(staged) -> dict[str, Any]:
             if isinstance(item, dict)
         ]
         if isinstance(table_chunks, list)
+        else [],
+        "ocr_tables_dir": str(analysis.get("ocr_tables_dir", "")) if isinstance(analysis, dict) else "",
+        "ocr_table_index_path": str(analysis.get("ocr_table_index_path", "")) if isinstance(analysis, dict) else "",
+        "ocr_table_chunk_count": len(ocr_table_chunks) if isinstance(ocr_table_chunks, list) else 0,
+        "ocr_table_chunks": [
+            dict(item)
+            for item in ocr_table_chunks
+            if isinstance(item, dict)
+        ]
+        if isinstance(ocr_table_chunks, list)
         else [],
         "media_dir": str(analysis.get("media_dir", "")) if isinstance(analysis, dict) else "",
         "media_index_path": str(analysis.get("media_index_path", "")) if isinstance(analysis, dict) else "",
@@ -188,29 +219,96 @@ def _artifact_refs(staged) -> dict[str, Any]:
     }
 
 
+def _oversized_attachment_placeholder(
+    attachment: IncomingAttachment,
+    *,
+    allowed_input_roots: list[Path],
+    allowed_extensions: list[str],
+    max_input_bytes: int,
+) -> dict[str, Any] | None:
+    candidate = _resolve_candidate(attachment.path, allowed_input_roots)
+    if candidate is None or not candidate.exists() or not candidate.is_file():
+        return None
+    if not _is_within_any(candidate, allowed_input_roots):
+        return None
+    allowed = {item.lower() for item in allowed_extensions}
+    suffix = candidate.suffix.lower()
+    if allowed and suffix not in allowed:
+        return None
+    try:
+        size = candidate.stat().st_size
+    except OSError:
+        return None
+    if size <= max_input_bytes:
+        return None
+    name = attachment.original_name or candidate.name
+    reason = f"file_too_large:{size}>{max_input_bytes}"
+    human = (
+        f"文件过大，已占位但未处理：{name} "
+        f"size={_format_bytes(size)} threshold={_format_bytes(max_input_bytes)}。"
+        "请调高前端文件处理阈值，或让用户拆分/压缩后重新发送。"
+    )
+    return {
+        "status": "skipped_too_large",
+        "source": attachment.source,
+        "path": attachment.path,
+        "name": name,
+        "kind": attachment.kind,
+        "suffix": suffix,
+        "reason": reason,
+        "parse": {
+            "status": "skipped_too_large",
+            "kind": attachment.kind,
+            "summary": human,
+            "text": human,
+            "context_text": human,
+            "error": reason,
+            "not_processed": True,
+            "size_bytes": size,
+            "max_bytes": max_input_bytes,
+        },
+        "artifacts": {
+            "file_id": "",
+            "char_count": 0,
+            "chunk_count": 0,
+            "too_large": True,
+            "size_bytes": size,
+            "max_bytes": max_input_bytes,
+        },
+    }
+
+
+def _resolve_candidate(path: str | Path, roots: list[Path]) -> Path | None:
+    raw = Path(path)
+    if raw.is_absolute():
+        return raw.resolve()
+    for root in roots:
+        candidate = (root / raw).resolve()
+        if candidate.exists():
+            return candidate
+    if roots:
+        return (roots[0] / raw).resolve()
+    return raw.resolve()
+
+
+def _is_within_any(candidate: Path, roots: list[Path]) -> bool:
+    resolved = candidate.resolve()
+    return any(root.resolve() == resolved or root.resolve() in resolved.parents for root in roots)
+
+
+def _format_bytes(value: int) -> str:
+    number = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if number < 1024 or unit == "GB":
+            return f"{number:.1f}{unit}" if unit != "B" else f"{int(number)}B"
+        number /= 1024
+    return f"{value}B"
+
+
 def _conversation_parse_text(raw_text: str, kind: str, artifacts: dict[str, Any]) -> str:
-    if kind != "spreadsheet":
-        return _with_artifact_context(raw_text, artifacts)
-    table_chunks = artifacts.get("table_chunks", [])
-    first_chunk = table_chunks[0] if isinstance(table_chunks, list) and table_chunks else {}
-    if not isinstance(first_chunk, dict):
-        return _with_artifact_context(raw_text, artifacts)
-    chunk_path_raw = str(first_chunk.get("path", "")).strip()
-    if not chunk_path_raw:
-        return _with_artifact_context(raw_text, artifacts)
-    chunk_path = Path(chunk_path_raw)
-    chunk_payload = _read_json(chunk_path, {})
-    rows = chunk_payload.get("rows", []) if isinstance(chunk_payload, dict) else []
-    preview_json = json.dumps(rows, ensure_ascii=False, indent=2) if isinstance(rows, list) else "[]"
-    lines = [
-        "[structured_table:first_chunk]",
-        f"first_chunk_path={chunk_path}",
-        "rows_json=",
-        _compact(preview_json, 6000),
-    ]
-    # The flattened raw_text of a spreadsheet just repeats the rows above, so we
-    # keep only the structured chunk here and let the index point at the rest.
-    return _with_artifact_context("\n".join(lines).strip(), artifacts)
+    # Keep conversation-visible file content compact. Full table/OCR row schemas
+    # live in workspace artifacts and can be opened explicitly with file.read.
+    return _with_artifact_context(redact_file_internal_urls(raw_text), artifacts)
 
 
 def _with_artifact_context(raw_text: str, artifacts: dict[str, Any]) -> str:
@@ -236,6 +334,7 @@ def _file_index_line(artifacts: dict[str, Any]) -> str:
     counters = (
         ("chunk_count", "chunks"),
         ("table_chunk_count", "tables"),
+        ("ocr_table_chunk_count", "ocr_tables"),
         ("media_extract_count", "media"),
         ("media_ocr_count", "ocr"),
         ("media_asr_count", "asr"),
@@ -247,12 +346,21 @@ def _file_index_line(artifacts: dict[str, Any]) -> str:
     if not parts:
         return ""
     index_line = "[file_index] " + " ".join(parts)
-    summary = str(artifacts.get("ai_summary", "")).strip()
+    summary = _usable_ai_summary(artifacts)
     if summary:
         # A one-line AI gist right under the index so the reader grasps the file
         # without opening content.md; the full analysis lives in analysis.json.
-        index_line += "\n[ai_summary] " + _compact(summary.replace("\n", " "), 400)
+        index_line += "\n[ai_summary] " + _compact(redact_file_internal_urls(summary.replace("\n", " ")), 400)
     return index_line
+
+
+def _usable_ai_summary(artifacts: dict[str, Any]) -> str:
+    if str(artifacts.get("ai_analysis_status", "")).strip() != "analyzed":
+        return ""
+    summary = str(artifacts.get("ai_summary", "")).strip()
+    if "fake_llm.completed" in summary or "PLAN:" in summary or "MONITOR:" in summary:
+        return ""
+    return summary
 
 
 def _parse_context_text(parse_result: Any) -> str:

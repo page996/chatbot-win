@@ -58,6 +58,27 @@ class ConversationSchedulerTest(unittest.TestCase):
         self.assertLessEqual(max_running, 2)
         self.assertEqual(result.max_running_seen, 2)
 
+    def test_scheduler_isolates_single_message_failure(self) -> None:
+        def handle(raw: RawWeChatMessage) -> dict:
+            if raw.raw_id == "bad":
+                raise RuntimeError("boom")
+            return {"raw_id": raw.raw_id}
+
+        messages = [
+            RawWeChatMessage(raw_id="good-1", chat_title="A", sender_name="u", text="1"),
+            RawWeChatMessage(raw_id="bad", chat_title="B", sender_name="u", text="2"),
+            RawWeChatMessage(raw_id="good-2", chat_title="C", sender_name="u", text="3"),
+        ]
+
+        result = ConversationScheduler(handle, max_parallel_conversations=3).process_batch(messages)
+
+        raw_ids = {item.get("raw_id") for item in result.processed}
+        errors = [item for item in result.processed if item.get("error")]
+        self.assertIn("good-1", raw_ids)
+        self.assertIn("good-2", raw_ids)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["raw_id"], "bad")
+
 
 if __name__ == "__main__":
     unittest.main()

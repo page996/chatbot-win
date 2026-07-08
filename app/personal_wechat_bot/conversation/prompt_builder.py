@@ -18,6 +18,7 @@ class PromptBuilder:
         context_snapshot: PromptContextSnapshot | None = None,
     ) -> str:
         context_text = context_snapshot.render_for_prompt() if context_snapshot is not None else ""
+        message_text = _primary_message_text(message)
         return (
             "你是一个自然朋友聊天风格的微信聊天助手。\n"
             "只输出要发给对方看的微信消息，不要输出计划、监控、总结、标题或解释。\n"
@@ -33,5 +34,12 @@ class PromptBuilder:
             f"聊天: {message.chat_title}\n"
             f"发言人: {message.sender_name}\n"
             f"Topic决策: {speak_decision.decision} / {speak_decision.reason}\n"
-            f"消息: {message.text}\n"
+            f"消息: {message_text}\n"
         )
+
+
+def _primary_message_text(message: NormalizedMessage) -> str:
+    original = message.metadata.get("original_text")
+    if isinstance(original, str):
+        return original
+    return message.text

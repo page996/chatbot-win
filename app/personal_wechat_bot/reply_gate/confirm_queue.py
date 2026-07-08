@@ -79,6 +79,20 @@ class ConfirmQueue:
             raise ValueError("status must be queued_to_bridge, sent, or failed")
         return self._transition(queue_id, status, reviewer=reviewer, note=reason)
 
+    def remove(self, queue_id: str) -> dict[str, Any]:
+        records = self._read_all()
+        kept: list[dict[str, Any]] = []
+        removed: dict[str, Any] | None = None
+        for item in records:
+            if item.get("queue_id") == queue_id and removed is None:
+                removed = item
+                continue
+            kept.append(item)
+        if removed is None:
+            raise KeyError(f"queue_id not found: {queue_id}")
+        self._write_all(kept)
+        return removed
+
     def _transition(self, queue_id: str, status: str, *, reviewer: str, note: str) -> dict[str, Any]:
         records = self._read_all()
         changed: dict[str, Any] | None = None

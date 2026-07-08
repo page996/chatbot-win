@@ -11,9 +11,9 @@ from app.personal_wechat_bot.domain.models import RawWeChatMessage, SendResult, 
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
-from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
-from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl
+from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl_once
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
 from app.personal_wechat_bot.workspace.attachment_pipeline import AttachmentPipeline, IncomingAttachment
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -67,7 +67,7 @@ class BackendEventJsonlDriver:
         self.allowed_input_roots = allowed_input_roots
         self.allowed_extensions = allowed_extensions
         self.max_input_bytes = max_input_bytes
-        self.attachment_parser = attachment_parser or BackendAttachmentParser(RapidOcrSubprocessEngine())
+        self.attachment_parser = attachment_parser or BackendAttachmentParser(build_default_ocr_engine())
         self.file_workspace = file_workspace or FileWorkspace(self.event_path.parent / "file_workspace")
         self.attachment_pipeline = attachment_pipeline or AttachmentPipeline(
             file_index=self.file_index,
@@ -83,6 +83,8 @@ class BackendEventJsonlDriver:
         self.session_store = session_store or context_store
         self._seen_event_ids: set[str] = set()
         self._seen_message_raw_ids: set[str] = set()
+        self._read_offset = 0
+        self._line_no = 0
 
     def health_check(self) -> bool:
         return self.event_path.exists() and self.event_path.is_file()
@@ -92,16 +94,41 @@ class BackendEventJsonlDriver:
             return []
 
         messages: list[RawWeChatMessage] = []
-        for line_no, line in enumerate(self.event_path.read_text(encoding="utf-8").splitlines(), start=1):
-            event = _parse_event_line(line, line_no=line_no)
-            if event is None or event.raw_id in self._seen_event_ids:
-                continue
-            self._seen_event_ids.add(event.raw_id)
-            for raw in self._event_messages(event, line_no=line_no):
-                if raw.raw_id in self._seen_message_raw_ids:
-                    continue
-                self._seen_message_raw_ids.add(raw.raw_id)
-                messages.append(raw)
+        try:
+            size = self.event_path.stat().st_size
+        except OSError:
+            return []
+        if size < self._read_offset:
+            self._read_offset = 0
+            self._line_no = 0
+            self._seen_event_ids.clear()
+            self._seen_message_raw_ids.clear()
+        try:
+            with self.event_path.open("r", encoding="utf-8") as handle:
+                handle.seek(self._read_offset)
+                line_no = self._line_no
+                while True:
+                    line_offset = handle.tell()
+                    line = handle.readline()
+                    if line == "":
+                        break
+                    if not line.endswith("\n"):
+                        handle.seek(line_offset)
+                        break
+                    line_no += 1
+                    event = _parse_event_line(line, line_no=line_no)
+                    if event is None or event.raw_id in self._seen_event_ids:
+                        continue
+                    self._seen_event_ids.add(event.raw_id)
+                    for raw in self._event_messages(event, line_no=line_no):
+                        if raw.raw_id in self._seen_message_raw_ids:
+                            continue
+                        self._seen_message_raw_ids.add(raw.raw_id)
+                        messages.append(raw)
+                self._read_offset = handle.tell()
+                self._line_no = line_no
+        except OSError:
+            return messages
         return messages
 
     def _event_messages(self, event: BackendMessageEvent, line_no: int) -> list[RawWeChatMessage]:
@@ -312,9 +339,8 @@ class BackendEventJsonlDriver:
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if not voice or str(voice.get("text", "")).strip():
             return voice, None
-        # The old foreground WeChat voice-to-text bridge has been removed (it grabbed
-        # the foreground window). Pending voice is now transcribed non-invasively via
-        # the local ASR fallback over the resolved voice audio.
+        # Pending voice is transcribed non-invasively via local ASR over the
+        # resolved voice audio; no foreground client UI state is trusted here.
         fallback_attachment = self._local_asr_voice_fallback(
             conversation_id,
             session_id,
@@ -401,6 +427,46 @@ def append_backend_event(
     raw_id: str = "",
     source_payload: dict[str, Any] | None = None,
 ) -> str:
+    raw_id, _ = append_backend_event_record(
+        event_path,
+        chat_title=chat_title,
+        sender_name=sender_name,
+        text=text,
+        event_type=event_type,
+        sender_wechat_id=sender_wechat_id,
+        is_self=is_self,
+        is_group=is_group,
+        attachments=attachments,
+        voice=voice,
+        observed_at=observed_at,
+        quote=quote,
+        recall=recall,
+        history=history,
+        raw_id=raw_id,
+        source_payload=source_payload,
+    )
+    return raw_id
+
+
+def append_backend_event_record(
+    event_path: str | Path,
+    *,
+    chat_title: str,
+    sender_name: str,
+    text: str = "",
+    event_type: str = "message",
+    sender_wechat_id: str = "",
+    is_self: bool = False,
+    is_group: bool = False,
+    attachments: list[str | dict[str, Any]] | None = None,
+    voice: dict[str, Any] | None = None,
+    observed_at: str = "",
+    quote: dict[str, Any] | None = None,
+    recall: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+    raw_id: str = "",
+    source_payload: dict[str, Any] | None = None,
+) -> tuple[str, bool]:
     payload = {
         "event_type": event_type or "message",
         "chat_title": chat_title,
@@ -425,8 +491,13 @@ def append_backend_event(
         payload["source_payload"] = source_payload
     raw_id = raw_id.strip() or _event_raw_id(payload)
     payload["raw_id"] = raw_id
-    append_jsonl(event_path, payload)
-    return raw_id
+    appended = append_jsonl_once(
+        event_path,
+        payload,
+        key_field="raw_id",
+        index_path=Path(event_path).with_suffix(Path(event_path).suffix + ".raw_ids.json"),
+    )
+    return raw_id, appended
 
 
 def append_backend_event_payload(event_path: str | Path, payload: dict[str, Any]) -> str:
@@ -622,8 +693,24 @@ def _parse_quote(value: Any) -> dict[str, Any] | None:
         return {"text": text} if text else None
     if not isinstance(value, dict):
         return None
+    aliases = [
+        text
+        for text in (
+            str(value.get("message_id") or value.get("quoted_message_id") or "").strip(),
+            str(value.get("messageId") or value.get("quotedMessageId") or "").strip(),
+            str(value.get("platformMessageId") or value.get("server_id") or value.get("serverId") or "").strip(),
+            str(value.get("raw_id") or value.get("rawId") or "").strip(),
+            str(value.get("local_id") or value.get("localId") or "").strip(),
+            str(value.get("message_key") or value.get("messageKey") or "").strip(),
+        )
+        if text
+    ]
+    raw_aliases = value.get("message_ids")
+    if isinstance(raw_aliases, list):
+        aliases.extend(str(item).strip() for item in raw_aliases if str(item).strip())
     quote = {
-        "message_id": str(value.get("message_id") or value.get("quoted_message_id") or "").strip(),
+        "message_id": aliases[0] if aliases else "",
+        "message_ids": aliases,
         "sender_name": str(value.get("sender_name") or value.get("quoted_sender_name") or "").strip(),
         "text": str(value.get("text") or value.get("quoted_text") or value.get("content") or "").strip(),
         "received_at": str(value.get("received_at") or value.get("quoted_received_at") or "").strip(),
@@ -751,10 +838,13 @@ def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         voice = dict(raw)
     else:
         voice = {}
+    source = str(
+        voice.get("source")
+        or payload.get("voice_source")
+        or payload.get("voiceSource")
+        or ""
+    ).strip()
     explicit_voice_keys = {
-        "voice_text",
-        "voiceText",
-        "transcript",
         "voice_status",
         "voiceStatus",
         "voice_duration",
@@ -766,16 +856,22 @@ def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         "voice_audio_name",
         "voiceAudioName",
     }
-    has_voice_marker = bool(voice) or any(str(payload.get(key, "")).strip() for key in explicit_voice_keys)
+    text = ""
+    if _trusted_voice_text_source(source):
+        text = str(
+            voice.get("text")
+            or payload.get("voice_text")
+            or payload.get("voiceText")
+            or payload.get("transcript")
+            or ""
+        ).strip()
+    has_voice_marker = (
+        bool(text)
+        or _has_non_text_voice_marker(voice)
+        or any(str(payload.get(key, "")).strip() for key in explicit_voice_keys)
+    )
     if not has_voice_marker:
         return None
-    text = str(
-        voice.get("text")
-        or payload.get("voice_text")
-        or payload.get("voiceText")
-        or payload.get("transcript")
-        or ""
-    ).strip()
     status = str(voice.get("status") or payload.get("voice_status") or payload.get("voiceStatus") or ("transcribed" if text else "pending")).strip()
     duration = str(
         voice.get("duration")
@@ -805,6 +901,7 @@ def _voice_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
     return _normalize_voice(
         {
             **voice,
+            "source": source,
             "status": status,
             "text": text,
             "duration": duration,
@@ -820,13 +917,16 @@ def _normalize_voice(value: Any, *, allow_pending: bool = False) -> dict[str, An
         return {}
     if not value:
         return {}
-    text = str(value.get("text", "")).strip()
+    source = str(value.get("source") or "").strip()
+    text = str(value.get("text", "")).strip() if _trusted_voice_text_source(source) else ""
+    if not text and not _has_non_text_voice_marker(value):
+        return {}
     status = str(value.get("status") or ("transcribed" if text else "pending")).strip().lower()
     if not text and not (allow_pending and status in {"pending", "selected", "detected", "blocked", "failed"}):
         return {}
     return {
         "status": status,
-        "source": str(value.get("source") or "wechat_builtin_voice_to_text").strip(),
+        "source": source or ("local_asr_fallback" if text else "voice_audio_pending"),
         "text": text,
         "duration": str(value.get("duration", "")).strip(),
         **_optional_voice_fields(value),
@@ -841,7 +941,7 @@ def _message_text_with_voice(text: str, voice: dict[str, Any]) -> str:
     if clean_text and _normalize_for_match(clean_text) == _normalize_for_match(voice_text):
         return clean_text
     if clean_text:
-        return f"{clean_text}\n[微信语音转文字]\n{voice_text}"
+        return f"{clean_text}\n[本地 ASR 转写]\n{voice_text}"
     return voice_text
 
 
@@ -862,7 +962,7 @@ def _voice_status_text(voice: dict[str, Any]) -> str:
     status = str(voice.get("status") or "pending").strip()
     error = str(voice.get("error", "")).strip()
     suffix = f" error={error}" if error else ""
-    return f"[微信语音转文字未完成] status={status}{suffix}".strip()
+    return f"[本地 ASR 未完成] status={status}{suffix}".strip()
 
 
 def _voice_audio_path(voice: dict[str, Any]) -> str:
@@ -928,7 +1028,7 @@ def _voice_from_transcription_failure(
     return {
         **voice,
         "status": str(bridge_payload.get("status") or "blocked"),
-        "source": str(bridge_payload.get("source") or voice.get("source") or "wechat_builtin_voice_to_text"),
+        "source": str(bridge_payload.get("source") or voice.get("source") or "local_asr_fallback"),
         "text": "",
         "method": str(bridge_payload.get("method") or ""),
         "error": error,
@@ -948,17 +1048,34 @@ def _compose_message_text(
         workspace = item.get("workspace") or {}
         workspace_ref = str(workspace.get("workspace_dir", "")).strip()
         workspace_note = f" workspace_ref={workspace_ref}" if workspace_ref else ""
-        lines.append(f"[后台附件] {item['name']} file_id={item['file_id']} kind={item['kind']}{workspace_note}")
-        parsed = item.get("parse") or {}
-        summary = str(parsed.get("summary", "")).strip()
-        if summary:
-            lines.append(f"[后台附件解析] {item['name']} status={parsed.get('status', '')} summary={summary}")
-        parsed_text = str(parsed.get("text", "")).strip()
-        if parsed_text:
-            lines.append(f"[后台附件内容]\n{parsed_text}")
+        artifact_note = _attachment_artifact_note(item)
+        if artifact_note:
+            artifact_note = " " + artifact_note
+        lines.append(
+            f"[后台附件] {item['name']} file_id={item['file_id']} kind={item['kind']} read=file.read"
+            f"{artifact_note}{workspace_note}"
+        )
     for item in blocked_attachments:
         lines.append(f"[后台附件已阻止] {item['name']} kind={item['kind']}")
     return "\n".join(lines).strip()
+
+
+def _attachment_artifact_note(item: dict[str, Any]) -> str:
+    artifacts = item.get("artifacts") if isinstance(item.get("artifacts"), dict) else {}
+    parts: list[str] = []
+    for key, label in (
+        ("char_count", "chars"),
+        ("chunk_count", "chunks"),
+        ("table_chunk_count", "tables"),
+        ("ocr_table_chunk_count", "ocr_tables"),
+        ("media_extract_count", "media"),
+        ("media_ocr_count", "ocr"),
+        ("media_asr_count", "asr"),
+    ):
+        value = artifacts.get(key)
+        if value not in ("", None, 0):
+            parts.append(f"{label}={value}")
+    return " ".join(parts)
 
 
 def _attachment_pending(attachment: BackendAttachment) -> dict[str, Any]:
@@ -975,7 +1092,7 @@ def _compose_pending_message_text(text: str, attachments: list[dict[str, Any]], 
     if voice and _voice_needs_transcription(voice):
         duration = str(voice.get("duration", "")).strip()
         duration_note = f" duration={duration}" if duration else ""
-        lines.append(f"[微信语音待转文字]{duration_note}")
+        lines.append(f"[语音待本地 ASR]{duration_note}")
     for item in attachments:
         lines.append(f"[后台附件待处理] {item.get('name', '')} kind={item.get('kind', 'file')}")
     return "\n".join(lines).strip()
@@ -988,6 +1105,29 @@ def _optional_voice_fields(value: dict[str, Any]) -> dict[str, Any]:
         if item not in (None, "", [], {}):
             optional[key] = item
     return optional
+
+
+def _has_non_text_voice_marker(value: dict[str, Any]) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    text_only_keys = {"text", "transcript", "source"}
+    return any(key not in text_only_keys and value.get(key) not in (None, "", [], {}) for key in value)
+
+
+def _trusted_voice_text_source(source: str) -> bool:
+    value = str(source or "").strip().lower()
+    if not value:
+        return False
+    return (
+        value.startswith("local_asr")
+        or value in {
+            "manual_voice_transcript",
+            "voice.local_asr",
+            "file_workspace_local_asr",
+            "backend_attachment_audio",
+            "backend_event_voice_audio",
+        }
+    )
 
 
 def _event_raw_id(payload: dict[str, Any]) -> str:

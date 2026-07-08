@@ -7,11 +7,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from typing import Iterator
 
 from app.personal_wechat_bot.config.schema import ProviderConfig
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.domain.models import NormalizedMessage, SpeakDecision
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
+from app.personal_wechat_bot.runtime.resource_gate import acquire_llm
+from app.personal_wechat_bot.runtime.resource_scheduler import ResourceScheduler
 
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36"
@@ -69,20 +73,26 @@ class RelayOpenAIClient:
         config: ProviderConfig,
         key_pool: ApiKeyPool | None = None,
         channel_store: ConversationChannelStore | None = None,
+        resource_scheduler: ResourceScheduler | None = None,
     ):
         self.config = config
         self.model = config.model
         self.key_pool = key_pool or ApiKeyPool(config)
         self.channel_store = channel_store
+        self.resource_scheduler = resource_scheduler
         # ref -> monotonic timestamp until which the key is retired after an
         # auth/rate failure. Kept in-memory (per client); a restart clears it.
         self._bad_keys: dict[str, float] = {}
         self._bad_key_lock = threading.Lock()
+        self._key_semaphores: dict[str, threading.BoundedSemaphore] = {}
+        self._key_semaphore_limits: dict[str, int] = {}
+        self._key_semaphore_lock = threading.Lock()
 
-    def generate_reply(self, prompt: str) -> str:
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str:
         data = self._chat_completion(
             [{"role": "user", "content": prompt}],
             conversation_id=_conversation_id_from_prompt(prompt),
+            workload=workload,
         )
         return self._extract_content(data)
 
@@ -131,6 +141,7 @@ class RelayOpenAIClient:
             ],
             temperature=0,
             conversation_id=latest.conversation_id,
+            workload="interactive",
         )
         parsed = self._parse_json(self._extract_content(data))
         decision = str(parsed.get("decision", "silent"))
@@ -155,6 +166,7 @@ class RelayOpenAIClient:
         messages: list[dict[str, str]],
         temperature: float | None = None,
         conversation_id: str = "",
+        workload: str = "interactive",
     ) -> dict[str, object]:
         if not self.config.base_url and not any(
             bool(getattr(self.key_pool.config_for_ref(ref), "base_url", ""))
@@ -204,8 +216,10 @@ class RelayOpenAIClient:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=provider_config.max_wait_seconds) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                with self._llm_slot(workload, conversation_id):
+                    with self._key_slot(ref, provider_config.max_concurrency):
+                        with urllib.request.urlopen(req, timeout=provider_config.max_wait_seconds) as resp:
+                            return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 if exc.code in _KEY_FAILOVER_STATUSES:
                     self._retire_key(ref)
@@ -254,6 +268,61 @@ class RelayOpenAIClient:
     def _retire_key(self, ref: str) -> None:
         with self._bad_key_lock:
             self._bad_keys[ref] = time.monotonic() + _BAD_KEY_COOLDOWN_SECONDS
+
+    @contextmanager
+    def _key_slot(self, ref: str, max_concurrency: int | None) -> Iterator[None]:
+        limit = max(1, int(max_concurrency or 1))
+        semaphore = self._semaphore_for_ref(ref, limit)
+        semaphore.acquire()
+        try:
+            yield
+        finally:
+            semaphore.release()
+
+    @contextmanager
+    def _llm_slot(self, workload: str, conversation_id: str = "") -> Iterator[None]:
+        schedule = self._resource_schedule(workload)
+        reason = f"llm:{schedule.workload}:{conversation_id or 'global'}"
+        with acquire_llm(
+            workload=schedule.workload,
+            reason=reason,
+            max_parallel=schedule.max_parallel_conversations,
+            total_max_parallel=schedule.llm_total,
+            root=self._resource_gate_root(),
+        ):
+            yield
+
+    def _resource_schedule(self, workload: str):
+        scheduler = self.resource_scheduler
+        if scheduler is not None:
+            try:
+                return scheduler.conversation_parallelism(workload)
+            except Exception:
+                pass
+        fallback = ResourceScheduler(
+            self._resource_gate_data_dir(),
+            key_pool=self.key_pool,
+            provider_max_concurrency=self.config.max_concurrency,
+        )
+        return fallback.conversation_parallelism(workload)
+
+    def _resource_gate_data_dir(self):
+        return getattr(self.key_pool, "data_dir", None) or "data"
+
+    def _resource_gate_root(self):
+        from pathlib import Path
+
+        return Path(self._resource_gate_data_dir()) / "runtime_locks"
+
+    def _semaphore_for_ref(self, ref: str, limit: int) -> threading.BoundedSemaphore:
+        with self._key_semaphore_lock:
+            current = self._key_semaphores.get(ref)
+            current_limit = self._key_semaphore_limits.get(ref)
+            if current is None or current_limit != limit:
+                current = threading.BoundedSemaphore(limit)
+                self._key_semaphores[ref] = current
+                self._key_semaphore_limits[ref] = limit
+            return current
 
     def _api_key_for_conversation(self, conversation_id: str) -> str | None:
         if conversation_id and self.channel_store is not None:

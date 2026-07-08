@@ -71,7 +71,7 @@ class _FakeOcr:
         self.text = text
 
     def health(self) -> OcrHealth:
-        return OcrHealth("fake", True, False, "")
+        return OcrHealth(backend="fake", available=True, gpu_available=False, detail="")
 
     def read_text(self, image_path: str | Path) -> str:
         return self.text
@@ -79,7 +79,7 @@ class _FakeOcr:
 
 class _MissingOcr:
     def health(self) -> OcrHealth:
-        return OcrHealth("fake", False, False, "missing")
+        return OcrHealth(backend="fake", available=False, gpu_available=False, detail="missing")
 
     def read_text(self, image_path: str | Path) -> str:
         raise AssertionError("should not read")

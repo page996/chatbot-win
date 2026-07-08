@@ -7,7 +7,7 @@ class FakeLLMClient:
     def __init__(self, model: str = "fake-gpt-5.5"):
         self.model = model
 
-    def generate_reply(self, prompt: str) -> str:
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str:
         return "收到，我会自然地接一句。\nPLAN: 先理解上下文，再给自然朋友式回复。\nMONITOR: fake_llm.completed\nSUMMARY: 收到，我会自然地接一句。"
 
     def classify_topic(

@@ -1,15 +1,8 @@
 """LLM-backed analysis of parsed attachments.
 
-The file workspace parses attachments into raw text + structured artifacts, but
-that is mechanical: it never *understands* the file. This module adds an optional
-analysis pass that asks the chat LLM for a short summary, key points, and topic
-labels, which are merged into ``analysis.json`` so an agent reading the ledger's
-``[file_index]`` can grasp a file without re-reading the whole content.
-
-The analyzer is optional and degrades gracefully: if no LLM is wired in, or the
-call fails, or the file has no extractable text, it returns a ``skipped``/``error``
-payload and the workspace falls back to mechanical metadata only. It never raises
-into the parse path.
+The file workspace parses attachments into raw text plus structured artifacts.
+This module adds an optional analysis pass that asks the chat LLM for a short,
+strict JSON summary. It never raises into the parse path.
 """
 
 from __future__ import annotations
@@ -19,12 +12,14 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from app.personal_wechat_bot.llm.base import generate_reply_with_workload
+
 
 ANALYSIS_MODEL_MAX_INPUT_CHARS = 12000
 
 
 class SupportsGenerateReply(Protocol):
-    def generate_reply(self, prompt: str) -> str: ...
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str: ...
 
 
 @dataclass(frozen=True)
@@ -52,7 +47,7 @@ class FileAnalyzer(Protocol):
 
 
 class LLMFileAnalyzer:
-    """Analyze parsed file text with the chat LLM, returning a structured summary."""
+    """Analyze parsed file text with the chat LLM, returning structured JSON."""
 
     def __init__(self, llm: SupportsGenerateReply, *, model: str = "", max_input_chars: int = ANALYSIS_MODEL_MAX_INPUT_CHARS):
         self.llm = llm
@@ -65,13 +60,13 @@ class LLMFileAnalyzer:
             return FileAnalysis(status="skipped", model=self.model, error="no_text_to_analyze")
         prompt = self._build_prompt(name=name, kind=kind, text=body, extra=extra or {})
         try:
-            raw = self.llm.generate_reply(prompt)
-        except Exception as exc:  # never break the parse path on an LLM failure
+            raw = generate_reply_with_workload(self.llm, prompt, workload="background")
+        except Exception as exc:
             return FileAnalysis(status="error", model=self.model, error=f"{type(exc).__name__}: {exc}")
+        if _looks_like_fake_chat_reply(raw):
+            return FileAnalysis(status="skipped", model=self.model, error="fake_llm_output_ignored")
         parsed = _parse_analysis_json(raw)
         if not parsed:
-            # The model answered but not as JSON: keep its prose as the summary
-            # rather than throwing the work away.
             return FileAnalysis(status="analyzed", summary=_compact(raw.strip(), 1500), model=self.model)
         return FileAnalysis(
             status="analyzed",
@@ -83,21 +78,22 @@ class LLMFileAnalyzer:
 
     def _build_prompt(self, *, name: str, kind: str, text: str, extra: dict[str, Any]) -> str:
         clipped = text[: self.max_input_chars]
-        truncated = len(text) > self.max_input_chars
         context = {
             "file_name": name,
             "file_kind": kind,
-            "truncated": truncated,
+            "truncated": len(text) > self.max_input_chars,
             **({"hints": extra} if extra else {}),
         }
         return (
-            "你是一个文件分析助手。请阅读下面的文件解析文本，输出该文件的要点分析。"
-            "只返回 JSON，不要额外说明，格式：\n"
-            '{"summary": "两三句话的中文摘要", '
-            '"key_points": ["要点1", "要点2"], '
-            '"topics": ["主题标签1", "主题标签2"]}\n'
-            f"\n文件元信息：{json.dumps(context, ensure_ascii=False)}\n"
-            f"\n文件内容：\n{clipped}"
+            "You are analyzing parsed attachment content for a WeChat agent.\n"
+            "Return JSON only. Do not include markdown fences, PLAN, MONITOR, SUMMARY, or chat filler.\n"
+            "The JSON object must follow this exact schema:\n"
+            '{"summary":"2-3 sentence Chinese summary of this file",'
+            '"key_points":["specific point 1","specific point 2"],'
+            '"topics":["short topic label 1","short topic label 2"]}\n'
+            f"\nfile_metadata={json.dumps(context, ensure_ascii=False, sort_keys=True)}\n"
+            "\nparsed_file_text:\n"
+            f"{clipped}"
         )
 
 
@@ -125,7 +121,12 @@ def _parse_analysis_json(content: str) -> dict[str, Any]:
     return {}
 
 
+def _looks_like_fake_chat_reply(content: str) -> bool:
+    text = str(content or "")
+    return "fake_llm.completed" in text or ("PLAN:" in text and "MONITOR:" in text and "SUMMARY:" in text)
+
+
 def _compact(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
-    return text[: max_chars - 1].rstrip() + "…"
+    return text[: max_chars - 1].rstrip() + "..."

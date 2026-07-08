@@ -69,9 +69,60 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         )
 
         self.assertIn("[后台附件] note.txt file_id=", enriched.text)
-        self.assertIn("[后台附件内容]\nhello", enriched.text)
+        self.assertIn("read=file.read", enriched.text)
+        self.assertNotIn("[后台附件内容]\nhello", enriched.text)
+        self.assertNotIn("\nhello", enriched.text)
         self.assertEqual(enriched.driver_meta["attachments"][0]["status"], "indexed")
         self.assertEqual(enriched.driver_meta["attachments"][0]["parse"]["status"], "parsed")
+        self.assertTrue(enriched.driver_meta["attachments"][0]["parse"]["text"].startswith("hello"))
+
+    def test_append_backend_event_dedupes_raw_id(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="one",
+            raw_id="same-backend-raw-id",
+        )
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="one duplicate",
+            raw_id="same-backend-raw-id",
+        )
+
+        lines = self.event_file.read_text(encoding="utf-8").splitlines()
+        messages = self.driver.read_new_messages()
+
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].text, "one")
+        self.assertTrue((self.data_dir / "backend_events.jsonl.raw_ids.json").exists())
+
+    def test_read_new_messages_reads_only_new_appended_lines(self) -> None:
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="first",
+            raw_id="backend-first",
+        )
+
+        first = self.driver.read_new_messages()
+        empty = self.driver.read_new_messages()
+        append_backend_event(
+            self.event_file,
+            chat_title="PAGE",
+            sender_name="PAGE",
+            text="second",
+            raw_id="backend-second",
+        )
+        second = self.driver.read_new_messages()
+
+        self.assertEqual([item.text for item in first], ["first"])
+        self.assertEqual(empty, [])
+        self.assertEqual([item.text for item in second], ["second"])
 
     def test_blocks_attachment_outside_allowed_roots_but_keeps_message(self) -> None:
         outside = Path(self.tmp.name) / "outside.txt"
@@ -141,7 +192,9 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         )
 
         self.assertIn("[后台附件] screen.png file_id=", enriched.text)
-        self.assertIn("图片 OCR 内容", enriched.text)
+        self.assertIn("read=file.read", enriched.text)
+        self.assertNotIn("图片 OCR 内容", enriched.text)
+        self.assertTrue(enriched.driver_meta["attachments"][0]["parse"]["text"].startswith("图片 OCR 内容"))
 
     def test_audio_extensions_are_available_for_existing_configs(self) -> None:
         self.assertIn(".m4a", self.config.file_allowed_extensions)
@@ -162,20 +215,17 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(messages[0].driver_meta["quote"]["message_id"], "quoted-message-id")
         self.assertEqual(messages[0].driver_meta["quote"]["text"], "被引用内容")
 
-    def test_backend_event_voice_text_becomes_voice_metadata(self) -> None:
+    def test_backend_event_ignores_untrusted_voice_text_only_payload(self) -> None:
         append_backend_event(
             self.event_file,
             chat_title="PAGE",
             sender_name="PAGE",
-            voice={"text": "这是微信自带转文字", "duration": "6s"},
+            voice={"text": "这是客户端渲染的转文字"},
         )
 
         messages = self.driver.read_new_messages()
 
-        self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0].text, "这是微信自带转文字")
-        self.assertEqual(messages[0].driver_meta["voice"]["text"], "这是微信自带转文字")
-        self.assertEqual(messages[0].driver_meta["voice"]["source"], "wechat_builtin_voice_to_text")
+        self.assertEqual(messages, [])
 
     def test_plain_backend_message_does_not_create_recall_metadata(self) -> None:
         append_backend_event(
@@ -203,7 +253,7 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         messages = self.driver.read_new_messages()
 
         self.assertEqual(len(messages), 1)
-        self.assertIn("[微信语音待转文字]", messages[0].text)
+        self.assertIn("[语音待本地 ASR]", messages[0].text)
         self.assertTrue(messages[0].driver_meta["backend_voice_pending"])
 
     def test_pending_voice_falls_back_to_local_asr_when_audio_path_exists(self) -> None:
@@ -285,12 +335,12 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(enriched.driver_meta["attachments"][0]["source"], "wechat_voice_cache_resolver")
         self.assertEqual(enriched.driver_meta["attachments"][0]["voice_cache"]["status"], "resolved")
 
-    def test_polling_runner_writes_backend_voice_text_to_ledger(self) -> None:
+    def test_polling_runner_writes_manual_voice_transcript_to_ledger(self) -> None:
         append_backend_event(
             self.event_file,
             chat_title="PAGE",
             sender_name="PAGE",
-            voice={"text": "语音里安排一个任务"},
+            voice={"source": "manual_voice_transcript", "text": "语音里安排一个任务"},
         )
         runtime = build_runtime(self.config)
         driver = BackendEventJsonlDriver(
@@ -341,7 +391,7 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
 
         self.assertEqual(entry.text_blocks[0]["kind"], "voice:transcript")
         self.assertEqual(entry.text_blocks[0]["text"], "主路径语音进入对话文件")
-        self.assertNotIn("待转文字", entry.text_blocks[0]["text"])
+        self.assertNotIn("待本地 ASR", entry.text_blocks[0]["text"])
 
     def test_audio_attachment_is_staged_and_marked_asr_not_configured(self) -> None:
         audio = self.inbox / "voice.m4a"
@@ -477,7 +527,9 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_forever(max_loops=1)
 
         self.assertEqual(result["processed"][0]["route"]["action"], "process")
-        self.assertIn("[后台附件内容]\nhello", result["processed"][0]["message"]["text"])
+        self.assertIn("[后台附件] note.txt file_id=", result["processed"][0]["message"]["text"])
+        self.assertIn("read=file.read", result["processed"][0]["message"]["text"])
+        self.assertNotIn("[后台附件内容]\nhello", result["processed"][0]["message"]["text"])
         self.assertTrue((self.data_dir / "file_workspace").exists())
 
     def test_clear_context_with_attachment_stages_into_new_session(self) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from app.personal_wechat_bot.config.schema import BotConfig
@@ -9,7 +10,7 @@ from app.personal_wechat_bot.conversation.channel_store import CHANNEL_POLICY
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
-from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
 from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import voice_cache_capability
 from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
@@ -24,6 +25,7 @@ def build_preflight_report(
     config: BotConfig,
     show_accepted: bool = False,
     *,
+    include_tool_health: bool = True,
     show_whitelist: bool | None = None,
 ) -> dict[str, Any]:
     if show_whitelist is not None:
@@ -37,9 +39,12 @@ def build_preflight_report(
     voice_roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots)
     manual_bound_channels = manual_bridge_bindings(config.data_dir)
     warnings = _warnings(config, api_key_present, manual_bound_count=len(manual_bound_channels))
-    ocr_health = RapidOcrSubprocessEngine().health()
-    asr_health = LocalAsrSubprocessEngine().health()
-    office_health = LibreOfficeRuntime().health()
+    if include_tool_health:
+        ocr_health = build_default_ocr_engine(mode=config.ocr_mode).health()
+        asr_health = LocalAsrSubprocessEngine(mode=config.asr_mode).health()
+        office_health = LibreOfficeRuntime().health()
+    else:
+        ocr_health, asr_health, office_health = _skipped_tool_health(config)
     real_send_implemented = is_real_send_driver_implemented(config.send_driver)
     write_access_configured = config.send_enabled and real_send_implemented
     return {
@@ -173,6 +178,9 @@ def build_preflight_report(
                 "backend": ocr_health.backend,
                 "available": ocr_health.available,
                 "gpu_available": ocr_health.gpu_available,
+                "gpu_required": ocr_health.gpu_required,
+                "gpu_used": ocr_health.gpu_used,
+                "mode": ocr_health.mode,
                 "detail": ocr_health.detail,
             },
             "web_fetch": {
@@ -194,6 +202,9 @@ def build_preflight_report(
             "backend": ocr_health.backend,
             "available": ocr_health.available,
             "gpu_available": ocr_health.gpu_available,
+            "gpu_required": ocr_health.gpu_required,
+            "gpu_used": ocr_health.gpu_used,
+            "mode": ocr_health.mode,
             "detail": ocr_health.detail,
         },
         "libreoffice": {
@@ -211,6 +222,32 @@ def build_preflight_report(
         "wechat_voice_cache": voice_cache_capability(voice_roots, config.file_allowed_extensions),
         "warnings": warnings,
     }
+
+
+def _skipped_tool_health(config: BotConfig) -> tuple[Any, Any, Any]:
+    reason = "skipped_for_fast_readiness"
+    ocr = SimpleNamespace(
+        backend="not_checked",
+        available=False,
+        gpu_available=False,
+        gpu_required=config.ocr_mode == "gpu",
+        gpu_used=False,
+        mode=config.ocr_mode,
+        detail=reason,
+    )
+    asr = SimpleNamespace(
+        backend="not_checked",
+        available=False,
+        model="",
+        detail=reason,
+        install="",
+    )
+    office = SimpleNamespace(
+        available=False,
+        executable="",
+        version="",
+    )
+    return ocr, asr, office
 
 
 def _warnings(config: BotConfig, api_key_present: bool, *, manual_bound_count: int = 0) -> list[str]:

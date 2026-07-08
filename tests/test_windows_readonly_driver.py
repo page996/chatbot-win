@@ -67,16 +67,12 @@ class WindowsWeChatReadOnlyDriverTest(unittest.TestCase):
         self.assertEqual(messages[0].text, "[OCR附件卡片] Checklist.pdf kind=pdf size=2.4M")
         self.assertEqual(messages[0].driver_meta["attachments"][0]["name"], "Checklist.pdf")
 
-    def test_parser_marks_ocr_voice_transcripts(self) -> None:
+    def test_parser_ignores_ocr_voice_transcripts(self) -> None:
         snapshot = "[private] PAGE | PAGE |  | [OCR_VOICE_TRANSCRIPT] 请把语音转成文字入账 duration=8\""
 
         messages = SnapshotMessageParser().parse(snapshot, observed_at="2026-06-29T01:00:00+00:00")
 
-        self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0].text, "请把语音转成文字入账")
-        self.assertEqual(messages[0].driver_meta["voice"]["status"], "transcribed")
-        self.assertEqual(messages[0].driver_meta["voice"]["source"], "wechat_builtin_voice_to_text_ocr")
-        self.assertEqual(messages[0].driver_meta["voice"]["duration"], "8\"")
+        self.assertEqual(messages, [])
 
     def test_driver_never_sends(self) -> None:
         driver = WindowsWeChatReadOnlyDriver(text_provider=lambda: "")

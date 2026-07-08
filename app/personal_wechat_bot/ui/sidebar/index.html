@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 审计面板</title>
-    <link rel="stylesheet" href="/styles.css?v=20260703-task-queue" />
+    <link rel="stylesheet" href="/styles.css?v=20260708-light-runtime" />
   </head>
   <body>
     <main class="shell">
@@ -16,14 +16,34 @@
             <p id="readinessLine">正在读取运行状态</p>
           </div>
         </div>
-        <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+        <div class="topbar-actions">
+          <label class="runtime-mode-select" data-tooltip="OCR 自动档走轻量 CPU；只有 GPU 档会进入 CUDA OCR 队列。">
+            <span>OCR</span>
+            <select id="ocrModeSelect" aria-label="OCR mode">
+              <option value="auto">自动</option>
+              <option value="gpu">GPU</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+          <label class="runtime-mode-select" data-tooltip="ASR 自动档走轻量 CPU；只有 GPU 档会进入 CUDA ASR 队列。">
+            <span>ASR</span>
+            <select id="asrModeSelect" aria-label="ASR mode">
+              <option value="auto">自动</option>
+              <option value="gpu">GPU</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+          <button id="runtimeProbeButton" class="ghost small" data-tooltip="使用与文件入库相同的路径审查 OCR/ASR 模式和 GPU 队列。">审查</button>
+          <button id="refreshButton" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+        </div>
       </header>
 
       <nav class="page-tabs" role="tablist" aria-label="主页面">
         <button class="active" data-page="overview">概览</button>
         <button data-page="send">发送</button>
         <button data-page="weflow">WeFlow</button>
-        <button data-page="tasks">任务/历史</button>
+        <button data-page="tasks">任务与资源</button>
+        <button data-page="history">历史</button>
         <button data-page="diagnostics">诊断</button>
       </nav>
 
@@ -51,31 +71,41 @@
           <div id="channelList" class="channel-list"></div>
         </section>
 
-        <section class="controls">
-          <div class="control-title">
-            <strong>发送控制</strong>
-            <span>决定候选回复如何进入微信。</span>
-          </div>
-          <div class="segmented" role="radiogroup" aria-label="send mode">
-            <button data-mode="dry_run">演练</button>
-            <button data-mode="confirm">审核</button>
-            <button data-mode="auto">自动</button>
-          </div>
-          <label class="switch">
-            <input id="sendEnabled" type="checkbox" />
-            <span></span>
-            允许真实发送
-          </label>
-          <label class="driver-select">
-            <span>发送驱动</span>
-            <select id="driverSelect"></select>
-          </label>
-          <button id="saveControls" class="primary">保存</button>
-        </section>
       </section>
 
       <section id="sendPage" class="page-panel" hidden>
         <section class="send-console">
+          <section class="controls send-controls">
+            <div class="control-title">
+              <strong>发送控制</strong>
+              <span>决定候选回复如何进入微信。</span>
+            </div>
+            <div id="sendModeSegment" class="segmented send-mode-segment" role="radiogroup" aria-label="发送模式">
+              <button data-mode="dry_run" role="radio" aria-checked="false">演练</button>
+              <button data-mode="confirm" role="radio" aria-checked="false">审核</button>
+              <button data-mode="auto" role="radio" aria-checked="false">自动</button>
+            </div>
+            <div class="send-control-status" aria-live="polite">
+              <span id="sendModeSummary" class="send-status-pill is-muted">模式：读取中</span>
+              <span id="sendRealSendSummary" class="send-status-pill is-muted">真实发送：读取中</span>
+              <span id="sendDriverSummary" class="send-status-pill is-muted">驱动：读取中</span>
+              <span id="sendBridgeSummary" class="send-status-pill is-muted">非前台桥：读取中</span>
+            </div>
+            <label class="switch">
+              <input id="sendEnabled" type="checkbox" />
+              <span></span>
+              允许真实发送
+            </label>
+            <label class="driver-select">
+              <span>发送驱动</span>
+              <select id="driverSelect"></select>
+            </label>
+            <label class="driver-select">
+              <span>文件处理上限（MB）</span>
+              <input id="fileMaxMb" type="number" min="1" max="2048" step="1" value="20" />
+            </label>
+            <button id="saveControls" class="primary">保存</button>
+          </section>
           <div class="bookmark-tabs" role="tablist" aria-label="send console">
             <button class="active" data-panel="queue">发送审核</button>
             <button data-panel="bridge">非前台桥</button>
@@ -178,50 +208,74 @@
               <strong id="weflowStatus">未检查</strong>
               <p id="weflowDetail">本地 token 与 fork marker 校验后才会正式拉取。</p>
             </div>
+            <button id="weflowHelpButton" class="ghost small" type="button" aria-expanded="false" aria-controls="weflowHelpPopover">参数说明</button>
+          </div>
+          <div id="weflowHelpPopover" class="weflow-help-popover" hidden>
+            <div class="weflow-help-head">
+              <strong>WeFlow 参数说明</strong>
+              <button id="weflowHelpCloseButton" class="ghost mini" type="button">关闭</button>
+            </div>
+            <dl>
+              <dt>Base URL</dt>
+              <dd>本地 WeFlow fork 服务地址，只允许本机地址作为正式拉取入口。</dd>
+              <dt>Token Env / Token</dt>
+              <dd>鉴权来源；Token 留空时优先读取 Token Env 指向的环境变量。</dd>
+              <dt>Talkers</dt>
+              <dd>要拉取或回填的会话 ID；多个用逗号分隔，空值用于发现会话。</dd>
+              <dt>Workers</dt>
+              <dd>拉取媒体和消息的并发数；过高会增加磁盘、GPU/ASR/OCR 和模型摘要排队压力。</dd>
+              <dt>Message Limit / Max Pages</dt>
+              <dd>单页消息数与最多翻页数；常规 5 秒轮询建议小批量，历史回填再放大。</dd>
+              <dt>Lookback Seconds</dt>
+              <dd>初次或游标不完整时向前补看的时间窗，用于避免漏掉刚发生的消息。</dd>
+              <dt>Interval</dt>
+              <dd>后台循环拉取间隔秒数；越小越及时，但会更频繁触发文件解析和模型任务。</dd>
+              <dt>回填历史只写上下文</dt>
+              <dd>历史消息进入对话文件和记忆，不触发回复，避免对旧消息逐条接话。</dd>
+            </dl>
           </div>
           <div class="weflow-form">
             <label>
-              <span>Base URL</span>
+              <span>服务地址 Base URL</span>
               <input id="weflowBaseUrl" type="text" value="http://127.0.0.1:5031" />
             </label>
             <label>
-              <span>Token Env</span>
+              <span>令牌环境变量</span>
               <input id="weflowTokenEnv" type="text" value="WEFLOW_API_TOKEN" />
             </label>
             <label>
-              <span>Token</span>
+              <span>临时 Token</span>
               <input id="weflowToken" type="password" placeholder="可留空，优先读取环境变量" />
             </label>
             <label>
-              <span>Talkers</span>
+              <span>会话 Talkers</span>
               <input id="weflowTalkers" type="text" placeholder="空=会话列表；多个用逗号分隔" />
             </label>
             <div id="weflowTalkerChips" class="talker-chip-list" hidden></div>
             <label>
-              <span>Workers</span>
+              <span>并发 Workers</span>
               <input id="weflowWorkers" type="number" min="1" max="16" value="2" />
             </label>
             <label>
-              <span>Message Limit</span>
+              <span>单页消息数</span>
               <input id="weflowMessageLimit" type="number" min="1" max="10000" value="100" />
             </label>
             <label>
-              <span>Max Pages</span>
+              <span>最多页数</span>
               <input id="weflowMaxPages" type="number" min="0" max="10000" value="1" />
             </label>
             <label>
-              <span>Lookback Seconds</span>
+              <span>补看秒数</span>
               <input id="weflowLookback" type="number" min="0" value="300" />
             </label>
             <label>
-              <span>Interval</span>
+              <span>后台间隔</span>
               <input id="weflowInterval" type="number" min="1" value="5" />
             </label>
-            <label class="switch compact">
-              <input id="weflowContextOnly" type="checkbox" />
-              <span></span>
-              只回填上下文
-            </label>
+            <div class="locked-note" role="note" aria-label="回填历史只写上下文">
+              <span>锁定</span>
+              回填历史只写上下文
+            </div>
           </div>
 
           <div class="weflow-action-grid">
@@ -261,7 +315,7 @@
               <span>环境</span>
               <div class="action-row">
                 <button id="weflowDepsButton" class="ghost small" data-tooltip="检查 OCR、PDF、表格等可选依赖是否可用。">依赖检查</button>
-                <button id="weflowInstallButton" class="ghost small" data-tooltip="执行 pip install -r requirements-ocr.txt 安装可选依赖。">安装依赖</button>
+                <button id="weflowInstallButton" class="ghost small" data-tooltip="安装轻量 OCR/ASR 与文档依赖；GPU 依赖需按 GPU 档单独安装。">安装依赖</button>
               </div>
             </section>
           </div>
@@ -278,21 +332,63 @@
       </section>
 
       <section id="tasksPage" class="page-panel" hidden>
-        <section class="task-queue-panel">
+        <section class="task-queue-panel command-center-panel">
           <div class="section-head">
-            <h2>任务队列</h2>
+            <h2>总台</h2>
             <span id="taskActiveCount">0</span>
           </div>
-          <p class="section-copy">同一会话内的操作按顺序排队；不同会话可并行。WeFlow 拉取和历史回填共享消费锁，避免游标和去重状态互相踩踏。</p>
-          <div id="taskQueueList" class="task-list"></div>
+          <p class="section-copy">总台只看资源池和非会话级进程；会话内任务下放到各自 Channel Lane，避免单一混杂队列。</p>
+          <div class="resource-audit-panel">
+            <div class="resource-audit-head">
+              <div>
+                <strong>本机资源审计</strong>
+                <span>按当前 CPU / 内存 / GPU 重新估算媒体解析与模型并发</span>
+              </div>
+              <button id="resourceAuditButton" class="ghost small">开始审计</button>
+            </div>
+            <div id="resourceAuditSummary" class="resource-audit-summary"></div>
+          </div>
+          <div class="agent-command-panel">
+            <div>
+              <strong>对话 Agent</strong>
+              <span>读取会话文件、聚合主题并运行一次接话管线</span>
+            </div>
+            <button id="agentTickButton" class="primary small">运行一次接话</button>
+          </div>
+          <div id="resourceSchedulerSummary" class="resource-scheduler-summary"></div>
+          <div id="resourcePoolGrid" class="resource-grid"></div>
+          <div class="central-task-head">
+            <span>总台进程</span>
+            <small id="centralTaskCount">0</small>
+          </div>
+          <div id="centralTaskList" class="central-task-list"></div>
         </section>
 
+        <section class="task-queue-panel">
+          <div class="section-head">
+            <h2>通道状态管理器</h2>
+            <span id="channelLaneCount">0</span>
+          </div>
+          <p class="section-copy">每个通道维护自己的主题、任务队列、等待/暂停状态和资源审计；展开后查看该通道内部任务。</p>
+          <div id="channelTaskList" class="task-list"></div>
+        </section>
+      </section>
+
+      <section id="historyPage" class="page-panel" hidden>
         <section class="history-box task-history-box">
           <div class="history-header">
             <span>操作历史</span>
             <span id="operationHistoryCount">0</span>
           </div>
           <div id="operationHistoryList" class="history-content"></div>
+        </section>
+
+        <section class="maintenance-panel">
+          <div class="section-head">
+            <h2>历史数据</h2>
+            <button id="clearHistoryDataButton" class="danger small">清空历史数据</button>
+          </div>
+          <p class="section-copy">清空对话、队列、文件中间层和 WeFlow 运行历史；保留侧边栏配置、模型配置、密钥池和技能/人设。清理后请手动重新打开 sidebar。</p>
         </section>
 
         <section class="audit">
@@ -321,9 +417,9 @@
         <section class="inspector">
           <div class="section-head">
             <h2>模型配置</h2>
-            <button id="refreshModelConfig" class="ghost small">刷新</button>
+            <button id="refreshModelConfig" class="ghost small">刷新配置</button>
           </div>
-          <p class="diagnostic-copy">主对话模型；异步摘要沿用同一模型。密钥仍走上方密钥池轮询，此处只配置请求格式/地址/模型。</p>
+          <p class="diagnostic-copy">主对话模型；异步摘要沿用同一模型。请求格式、地址、模型和 API 密钥池在此统一维护。</p>
           <form id="modelConfigForm" class="model-config-form" autocomplete="off">
             <label class="model-field">
               <span>请求格式</span>
@@ -331,9 +427,22 @@
             </label>
             <label class="model-field">
               <span>模型 model</span>
-              <input id="modelName" type="text" list="modelNameOptions" placeholder="deepseek-v4-flash / gpt-5.5 …" spellcheck="false" />
-              <datalist id="modelNameOptions"></datalist>
+              <input id="modelName" type="text" list="modelNameOptions" placeholder="deepseek-v4-flash / gpt-5.5，也可自行输入" spellcheck="false" />
+              <datalist id="modelNameOptions">
+                <option value="gpt-5.4" label="gpt 5.4"></option>
+                <option value="gpt-5.4-mini" label="gpt 5.4 mini"></option>
+                <option value="gpt-5.5" label="gpt 5.5"></option>
+                <option value="deepseek-v4-flash" label="deepseek v4 flash"></option>
+                <option value="deepseek-v4-pro" label="deepseek v4 pro"></option>
+              </datalist>
             </label>
+            <div id="modelQuickSelect" class="model-quick-select" aria-label="快捷选择模型">
+              <button type="button" class="model-chip" data-model-value="gpt-5.4">gpt 5.4</button>
+              <button type="button" class="model-chip" data-model-value="gpt-5.4-mini">gpt 5.4 mini</button>
+              <button type="button" class="model-chip" data-model-value="gpt-5.5">gpt 5.5</button>
+              <button type="button" class="model-chip" data-model-value="deepseek-v4-flash">deepseek v4 flash</button>
+              <button type="button" class="model-chip" data-model-value="deepseek-v4-pro">deepseek v4 pro</button>
+            </div>
             <label class="model-field">
               <span>请求地址 base_url</span>
               <input id="modelBaseUrl" type="text" placeholder="https://api.deepseek.com" spellcheck="false" />
@@ -342,6 +451,10 @@
               <span>超时秒数 (可选)</span>
               <input id="modelMaxWait" type="number" min="1" placeholder="60" />
             </label>
+            <label class="model-field">
+              <span>每 key 并发上限</span>
+              <input id="modelMaxConcurrency" type="number" min="1" max="64" placeholder="6" />
+            </label>
             <div class="model-config-actions">
               <button id="probeModelButton" class="ghost small" type="button">试拉取模型</button>
               <button id="saveModelConfig" class="primary small" type="submit">保存</button>
@@ -349,13 +462,12 @@
           </form>
           <p id="modelConfigMessage" class="key-pool-message" hidden></p>
           <div id="modelProbeResult" class="model-probe-result" hidden></div>
-        </section>
-        <section class="inspector">
-          <div class="section-head">
-            <h2>API 密钥池</h2>
-            <button id="refreshKeys" class="ghost small">刷新</button>
+          <div class="model-config-subhead">
+            <div>
+              <strong>API 密钥池</strong>
+              <p class="diagnostic-copy">多个 DeepSeek key 会按会话轮询分摊额度。密钥只显示末位，不回传明文。</p>
+            </div>
           </div>
-          <p class="diagnostic-copy">多个 DeepSeek key 会按会话轮询分摊额度。密钥只显示末位，不回传明文。</p>
           <div id="keyPoolSummary" class="key-pool-summary"></div>
           <div id="keyPoolList" class="key-pool-list"></div>
           <div class="key-pool-add">
@@ -366,6 +478,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js?v=20260704-model-config"></script>
+    <script src="/app.js?v=20260708-light-runtime"></script>
   </body>
 </html>

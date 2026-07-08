@@ -54,7 +54,7 @@ from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
 from app.personal_wechat_bot.domain.errors import ConfigError
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
-from app.personal_wechat_bot.vision.ocr import RapidOcrSubprocessEngine
+from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
 from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.vision.window_capture import Win32WindowCapture
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
@@ -63,6 +63,7 @@ from app.personal_wechat_bot.wechat_driver.backend_events import (
     BackendEventJsonlDriver,
     append_backend_event,
 )
+from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state
 from app.personal_wechat_bot.wechat_driver.backend_file_watcher import BackendFileWatcher
 from app.personal_wechat_bot.wechat_driver.snapshot_provider import (
@@ -930,9 +931,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "capabilities":
         config = _load_config_or_default(args.data_dir)
-        ocr = RapidOcrSubprocessEngine().health()
+        ocr = build_default_ocr_engine(mode=config.ocr_mode).health()
         office = LibreOfficeRuntime().health()
-        asr = LocalAsrSubprocessEngine().health()
+        asr = LocalAsrSubprocessEngine(mode=config.asr_mode).health()
         voice_roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots)
         result = {
             "ocr": ocr.__dict__,
@@ -944,7 +945,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "ocr-image":
-        engine = RapidOcrSubprocessEngine()
+        engine = build_default_ocr_engine(mode=config.ocr_mode)
         try:
             text = engine.read_text(args.image)
             result = {"status": "ok", "text": text}
@@ -953,7 +954,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "local-asr":
-        engine = LocalAsrSubprocessEngine(model=args.model, language=args.language)
+        engine = LocalAsrSubprocessEngine(model=args.model, language=args.language, mode=config.asr_mode)
         transcript = engine.transcribe(args.audio)
         result = {
             "status": transcript.status,
@@ -998,7 +999,7 @@ def _voice_payload(args: argparse.Namespace) -> dict[str, str] | None:
     duration = str(getattr(args, "voice_duration", "")).strip()
     voice = {
         "status": "transcribed" if text else "pending",
-        "source": "wechat_builtin_voice_to_text",
+        "source": "manual_voice_transcript" if text else "voice_audio_pending",
         "text": text,
         "duration": duration,
         "audio_path": audio_path,
@@ -1246,6 +1247,10 @@ def _backend_event_driver(
         allowed_input_roots=resolve_allowed_roots(config.data_dir, roots),
         allowed_extensions=config.file_allowed_extensions,
         max_input_bytes=config.file_max_bytes,
+        attachment_parser=BackendAttachmentParser(
+            build_default_ocr_engine(mode=config.ocr_mode),
+            LocalAsrSubprocessEngine(mode=config.asr_mode),
+        ),
         file_workspace=runtime.file_workspace,
         session_store=runtime.session_store,
         voice_cache_resolver=_voice_cache_resolver(config, extra_roots=extra_roots),

@@ -5,7 +5,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from app.personal_wechat_bot.config.schema import BotConfig, LLMConfig, ProviderConfig
+from app.personal_wechat_bot.config.schema import (
+    DEFAULT_LLM_MAX_CONCURRENCY,
+    BotConfig,
+    LLMConfig,
+    ProviderConfig,
+)
 from app.personal_wechat_bot.domain.errors import ConfigError
 
 
@@ -29,6 +34,22 @@ _CONFIG_FILE_NAMES = (
 def _normalize_send_driver(name: str) -> str:
     cleaned = str(name or "").strip()
     return _DEPRECATED_SEND_DRIVERS.get(cleaned, cleaned)
+
+
+def _bool_from_json(raw: dict[str, Any], name: str, default: bool) -> bool:
+    value = raw.get(name, default)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off", ""}:
+        return False
+    raise ConfigError(f"invalid boolean for {name}: {value!r}")
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -98,13 +119,13 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
     return BotConfig(
         mode=mode,
         data_dir=str(root),
-        send_enabled=bool(raw.get("send_enabled", False)),
+        send_enabled=_bool_from_json(raw, "send_enabled", False),
         send_driver=_normalize_send_driver(raw.get("send_driver", "not_implemented")),
         send_backend=str(raw.get("send_backend", "dry_run")),
         wcf_host=str(raw.get("wcf_host", "127.0.0.1")),
         wcf_port=int(raw.get("wcf_port", 10086)),
         wcf_send_timeout_seconds=float(raw.get("wcf_send_timeout_seconds", 15.0)),
-        send_confirm_required=bool(raw.get("send_confirm_required", True)),
+        send_confirm_required=_bool_from_json(raw, "send_confirm_required", True),
         send_max_chars=int(raw.get("send_max_chars", 800)),
         send_min_interval_seconds=int(raw.get("send_min_interval_seconds", 5)),
         accepted_contacts=contacts,
@@ -116,14 +137,16 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         llm=llm,
         providers=providers,
         key_assignment_policy=str(raw.get("key_assignment_policy", "conversation_sticky")),
-        save_full_chat=bool(raw.get("save_full_chat", True)),
-        save_raw_and_summary=bool(raw.get("save_raw_and_summary", True)),
+        save_full_chat=_bool_from_json(raw, "save_full_chat", True),
+        save_raw_and_summary=_bool_from_json(raw, "save_raw_and_summary", True),
         file_read_roots=list(raw.get("file_read_roots", ["inbox"])),
         wechat_voice_roots=list(raw.get("wechat_voice_roots", [])),
         file_allowed_extensions=_file_allowed_extensions_from_json(raw),
         file_max_bytes=int(raw.get("file_max_bytes", 20 * 1024 * 1024)),
         outgoing_file_allowed_extensions=_outgoing_extensions_from_json(raw),
         outgoing_file_max_bytes=int(raw.get("outgoing_file_max_bytes", 200 * 1024 * 1024)),
+        ocr_mode=_ocr_mode_from_json(raw),
+        asr_mode=_asr_mode_from_json(raw),
         search_blocklist=list(blocklist),
     )
 
@@ -198,6 +221,7 @@ def set_model_provider(
     base_url: str | None = None,
     api_key_env: str | None = None,
     max_wait_seconds: int | None = None,
+    max_concurrency: int | None = None,
 ) -> ProviderConfig:
     """Update the chat provider's model/endpoint/format in place.
 
@@ -219,7 +243,7 @@ def set_model_provider(
         stream=current.stream,
         max_wait_seconds=max_wait_seconds if max_wait_seconds is not None else current.max_wait_seconds,
         capabilities=list(current.capabilities),
-        max_concurrency=current.max_concurrency,
+        max_concurrency=_bounded_positive_int(max_concurrency, current.max_concurrency),
         cooldown_seconds=current.cooldown_seconds,
     )
     config.llm = updated
@@ -234,6 +258,7 @@ def set_chat_provider(
     model: str = "gpt-5.5",
     api_key_env: str = "OPENAI_API_KEY",
     max_wait_seconds: int | None = None,
+    max_concurrency: int = DEFAULT_LLM_MAX_CONCURRENCY,
 ) -> None:
     config = load_config(data_dir)
     provider = LLMConfig(
@@ -247,7 +272,7 @@ def set_chat_provider(
         stream=False,
         max_wait_seconds=max_wait_seconds,
         capabilities=["chat", "planning", "summarization", "relevance_filter"],
-        max_concurrency=2,
+        max_concurrency=_bounded_positive_int(max_concurrency, DEFAULT_LLM_MAX_CONCURRENCY),
         cooldown_seconds=0,
     )
     config.llm = provider
@@ -261,6 +286,7 @@ def set_deepseek_provider(
     model: str = "deepseek-v4-flash",
     api_key_env: str = "DEEPSEEK_API_KEY",
     max_wait_seconds: int | None = 60,
+    max_concurrency: int = DEFAULT_LLM_MAX_CONCURRENCY,
 ) -> None:
     config = load_config(data_dir)
     provider = LLMConfig(
@@ -274,7 +300,7 @@ def set_deepseek_provider(
         stream=False,
         max_wait_seconds=max_wait_seconds,
         capabilities=["chat", "planning", "summarization", "relevance_filter"],
-        max_concurrency=2,
+        max_concurrency=_bounded_positive_int(max_concurrency, DEFAULT_LLM_MAX_CONCURRENCY),
         cooldown_seconds=0,
     )
     config.llm = provider
@@ -291,10 +317,10 @@ def _llm_from_json(raw: dict[str, Any]) -> LLMConfig:
         api_key_env=raw.get("api_key_env", "DEEPSEEK_API_KEY"),
         api_key_env_pool=list(raw.get("api_key_env_pool", [])),
         api_key_file=raw.get("api_key_file", ""),
-        stream=bool(raw.get("stream", False)),
+        stream=_bool_from_json(raw, "stream", False),
         max_wait_seconds=raw.get("max_wait_seconds"),
         capabilities=list(raw.get("capabilities", ["chat", "planning", "summarization", "relevance_filter"])),
-        max_concurrency=int(raw.get("max_concurrency", 2)),
+        max_concurrency=_bounded_positive_int(raw.get("max_concurrency"), DEFAULT_LLM_MAX_CONCURRENCY),
         cooldown_seconds=int(raw.get("cooldown_seconds", 0)),
     )
 
@@ -351,6 +377,24 @@ def _outgoing_extensions_from_json(raw: dict[str, Any]) -> list[str]:
     return normalized
 
 
+def _ocr_mode_from_json(raw: dict[str, Any]) -> str:
+    mode = str(raw.get("ocr_mode", "auto") or "auto").strip().lower()
+    if mode in {"gpu", "cuda", "gpu-only", "gpu_only"}:
+        return "gpu"
+    if mode in {"cpu", "rapidocr", "cpu-only", "cpu_only"}:
+        return "cpu"
+    return "auto"
+
+
+def _asr_mode_from_json(raw: dict[str, Any]) -> str:
+    mode = str(raw.get("asr_mode", "auto") or "auto").strip().lower()
+    if mode in {"gpu", "cuda", "gpu-only", "gpu_only"}:
+        return "gpu"
+    if mode in {"cpu", "cpu-only", "cpu_only"}:
+        return "cpu"
+    return "auto"
+
+
 def _normalize_extension(value: Any) -> str:
     suffix = str(value).strip().lower()
     if not suffix:
@@ -358,6 +402,14 @@ def _normalize_extension(value: Any) -> str:
     if not suffix.startswith("."):
         suffix = "." + suffix
     return suffix
+
+
+def _bounded_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(1, min(64, parsed))
 
 
 def _provider_from_json(name: str, raw: dict[str, Any]) -> ProviderConfig:
@@ -369,24 +421,10 @@ def _provider_from_json(name: str, raw: dict[str, Any]) -> ProviderConfig:
         api_key_env=raw.get("api_key_env", "DEEPSEEK_API_KEY"),
         api_key_env_pool=list(raw.get("api_key_env_pool", [])),
         api_key_file=raw.get("api_key_file", ""),
-        stream=bool(raw.get("stream", False)),
+        stream=_bool_from_json(raw, "stream", False),
         max_wait_seconds=raw.get("max_wait_seconds"),
         capabilities=list(raw.get("capabilities", ["chat", "planning", "summarization", "relevance_filter"])),
-        max_concurrency=int(raw.get("max_concurrency", 2)),
-        cooldown_seconds=int(raw.get("cooldown_seconds", 0)),
-    )
-    return ProviderConfig(
-        provider_id=raw.get("provider_id", name),
-        provider=raw.get("provider", "deepseek"),
-        model=raw.get("model", "deepseek-v4-flash"),
-        base_url=raw.get("base_url", ""),
-        api_key_env=raw.get("api_key_env", "DEEPSEEK_API_KEY"),
-        api_key_env_pool=list(raw.get("api_key_env_pool", [])),
-        api_key_file=raw.get("api_key_file", ""),
-        stream=bool(raw.get("stream", False)),
-        max_wait_seconds=raw.get("max_wait_seconds"),
-        capabilities=list(raw.get("capabilities", ["chat", "planning", "summarization", "relevance_filter"])),
-        max_concurrency=int(raw.get("max_concurrency", 2)),
+        max_concurrency=_bounded_positive_int(raw.get("max_concurrency"), DEFAULT_LLM_MAX_CONCURRENCY),
         cooldown_seconds=int(raw.get("cooldown_seconds", 0)),
     )
 
