@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.personal_wechat_bot.conversation.segment import chat_title_from_index, resolve_segment
+from app.personal_wechat_bot.conversation.segment import chat_title_from_registry, resolve_segment
 from app.personal_wechat_bot.conversation.ledger_database import ConversationLedgerDatabase
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, utc_now_iso
@@ -85,7 +85,7 @@ class ConversationLedgerStore:
             # was generated), don't append a duplicate role=self line; instead
             # confirm delivery on the existing assistant entry.
             if message.is_self:
-                echoed = _find_assistant_entry_for_self_echo(entries, message.text)
+                echoed = _find_assistant_entry_for_self_echo(entries, message.text, message_id=message.message_id)
                 if echoed is not None:
                     self._confirm_self_echo(message, echoed, entries, conversation_dir)
                     return AppendMessageResult(_entry_from_payload(echoed), "self_echo_confirmed")
@@ -123,7 +123,7 @@ class ConversationLedgerStore:
 
     def _new_message_entry(self, message: NormalizedMessage, sequence: int) -> LedgerEntry:
         chat_title = _preferred_chat_title(
-            chat_title_from_index(self.data_dir, message.conversation_id),
+            chat_title_from_registry(self.data_dir, message.conversation_id),
             message.chat_title,
         )
         return LedgerEntry(
@@ -315,37 +315,94 @@ class ConversationLedgerStore:
         self._remember_segment(reply.conversation_id, chat_title)
         with self._conversation_lock(reply.conversation_id):
             entries = self._read_entries(reply.conversation_id)
-            attachments = _reply_attachments(reply)
-            entry = LedgerEntry(
-                entry_id=_entry_id(f"reply:{reply.message_id}:{reply.created_at}", reply.conversation_id),
-                message_id=reply.message_id,
-                dedupe_key="",
-                message_ids=[reply.message_id],
-                conversation_id=reply.conversation_id,
-                session_id=session_id or DEFAULT_SESSION_ID,
-                conversation_type=conversation_type,
+            entry = self._new_reply_entry(
+                reply,
+                sequence=self._next_sequence(entries),
                 chat_title=chat_title,
                 sender_name=sender_name,
-                sender_wechat_id=None,
-                is_self=True,
-                received_at=reply.created_at,
-                sequence=self._next_sequence(entries),
-                status="active",
-                text_blocks=_text_blocks_from_reply(reply, attachments),
-                quote={},
-                attachments=attachments,
-                links=_links_from_text(reply.text),
-                source="reply_candidate",
-                role="assistant",
-                send=_reply_send_payload(reply),
-                created_at=reply.created_at,
-                updated_at=reply.created_at,
+                conversation_type=conversation_type,
+                session_id=session_id,
             )
-            conversation_dir = self._conversation_dir(reply.conversation_id)
-            self._append_entry(conversation_dir, entry)
-            self._write_state(reply.conversation_id, entry)
-            self._render_conversation(reply.conversation_id)
+            self._persist_reply_entry(entry)
             return entry
+
+    def append_reply_if_latest(
+        self,
+        reply: ReplyCandidate,
+        *,
+        expected_latest_sequence: int,
+        chat_title: str = "",
+        sender_name: str = "agent",
+        conversation_type: str = "private",
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> LedgerEntry | None:
+        """Append only while the source snapshot is still the ledger tail."""
+
+        self._remember_segment(reply.conversation_id, chat_title)
+        with self._conversation_lock(reply.conversation_id):
+            entries = self._read_entries(reply.conversation_id)
+            latest_sequence = max((int(item.get("sequence", 0) or 0) for item in entries), default=0)
+            if latest_sequence != max(0, int(expected_latest_sequence or 0)):
+                return None
+            if any(
+                str(item.get("role") or "") == "assistant"
+                and str(item.get("message_id") or "") == reply.message_id
+                for item in entries
+            ):
+                return None
+            entry = self._new_reply_entry(
+                reply,
+                sequence=self._next_sequence(entries),
+                chat_title=chat_title,
+                sender_name=sender_name,
+                conversation_type=conversation_type,
+                session_id=session_id,
+            )
+            self._persist_reply_entry(entry)
+            return entry
+
+    def _new_reply_entry(
+        self,
+        reply: ReplyCandidate,
+        *,
+        sequence: int,
+        chat_title: str,
+        sender_name: str,
+        conversation_type: str,
+        session_id: str,
+    ) -> LedgerEntry:
+        attachments = _reply_attachments(reply)
+        return LedgerEntry(
+            entry_id=_entry_id(f"reply:{reply.message_id}:{reply.created_at}", reply.conversation_id),
+            message_id=reply.message_id,
+            dedupe_key="",
+            message_ids=[reply.message_id],
+            conversation_id=reply.conversation_id,
+            session_id=session_id or DEFAULT_SESSION_ID,
+            conversation_type=conversation_type,
+            chat_title=chat_title,
+            sender_name=sender_name,
+            sender_wechat_id=None,
+            is_self=True,
+            received_at=reply.created_at,
+            sequence=sequence,
+            status="active",
+            text_blocks=_text_blocks_from_reply(reply, attachments),
+            quote={},
+            attachments=attachments,
+            links=_links_from_text(reply.text),
+            source="reply_candidate",
+            role="assistant",
+            send=_reply_send_payload(reply),
+            created_at=reply.created_at,
+            updated_at=reply.created_at,
+        )
+
+    def _persist_reply_entry(self, entry: LedgerEntry) -> None:
+        conversation_dir = self._conversation_dir(entry.conversation_id)
+        self._append_entry(conversation_dir, entry)
+        self._write_state(entry.conversation_id, entry)
+        self._render_conversation(entry.conversation_id)
 
     def update_reply_send_result(self, conversation_id: str, entry_id: str, send_result: SendResult | dict[str, Any]) -> bool:
         with self._conversation_lock(conversation_id):
@@ -531,23 +588,7 @@ class ConversationLedgerStore:
         return [_entry_from_payload(item) for item in entries]
 
     def list_conversation_ids(self) -> list[str]:
-        ids = set(self.database.list_conversation_ids())
-        # Compatibility only: a pre-SQLite projection may be imported lazily on
-        # first read. New runtime data is always discovered from the database.
-        for messages_path in self.root.glob("*/messages.jsonl"):
-            try:
-                with messages_path.open("r", encoding="utf-8") as handle:
-                    for line in handle:
-                        if not line.strip():
-                            continue
-                        payload = json.loads(line)
-                        conversation_id = str(payload.get("conversation_id") or "") if isinstance(payload, dict) else ""
-                        if conversation_id:
-                            ids.add(conversation_id)
-                        break
-            except (OSError, json.JSONDecodeError):
-                continue
-        return sorted(ids)
+        return self.database.list_conversation_ids()
 
     def refresh_file_refs(self, conversation_id: str) -> bool:
         with self._conversation_lock(conversation_id):
@@ -615,54 +656,20 @@ class ConversationLedgerStore:
         return self.root / resolve_segment(self.data_dir, conversation_id)
 
     def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
-        if not chat_title:
-            cached_segment = self._segment_cache.get(conversation_id, "")
-            if cached_segment:
-                return cached_segment
-            existing_dir = self._find_conversation_dir(conversation_id)
-            if existing_dir.exists():
-                self._segment_cache[conversation_id] = existing_dir.name
-                self.database.set_segment(conversation_id, existing_dir.name)
-                return existing_dir.name
+        cached_segment = self._segment_cache.get(conversation_id, "")
+        if cached_segment:
+            return cached_segment
+        database_segment = self.database.segment_for(conversation_id)
+        if database_segment:
+            self._segment_cache[conversation_id] = database_segment
+            return database_segment
         segment = resolve_segment(self.data_dir, conversation_id, chat_title)
         self._segment_cache[conversation_id] = segment
         self.database.set_segment(conversation_id, segment)
         return segment
 
     def _find_conversation_dir(self, conversation_id: str) -> Path:
-        """Locate the actual directory for a conversation_id.
-
-        Because dirs are now named chat_title_hashPrefix, a fresh store
-        instance (no cache) can't reconstruct the path from conversation_id
-        alone. Strategy:
-        1. Cache / channel-index resolution (via _conversation_dir).
-        2. Scan existing dirs for a messages.jsonl whose first entry carries
-           the matching conversation_id, then populate the cache for future
-           calls. Fallback to the resolved segment so read_entries returns
-           an empty list rather than crashing.
-        """
-        # Fast path: cache or channel index.
-        candidate = self._conversation_dir(conversation_id)
-        if candidate.exists():
-            return candidate
-        # Slow path: scan.
-        if self.root.exists():
-            for messages_jsonl in self.root.glob("*/messages.jsonl"):
-                try:
-                    with messages_jsonl.open("r", encoding="utf-8") as fh:
-                        for raw_line in fh:
-                            raw_line = raw_line.strip()
-                            if not raw_line:
-                                continue
-                            payload = json.loads(raw_line)
-                            if isinstance(payload, dict) and payload.get("conversation_id") == conversation_id:
-                                self._segment_cache[conversation_id] = messages_jsonl.parent.name
-                                self.database.set_segment(conversation_id, messages_jsonl.parent.name)
-                                return messages_jsonl.parent
-                            break  # only need the first entry for the id check
-                except (OSError, json.JSONDecodeError):
-                    continue
-        return candidate  # fallback: hash-only, will be empty on first read
+        return self._conversation_dir(conversation_id)
 
     def _messages_path(self, conversation_id: str) -> Path:
         return self._find_conversation_dir(conversation_id) / "messages.jsonl"
@@ -701,27 +708,7 @@ class ConversationLedgerStore:
                 pass
 
     def _read_entries(self, conversation_id: str) -> list[dict[str, Any]]:
-        database_entries = self.database.list_entries(conversation_id)
-        if database_entries:
-            return database_entries
-        path = self._find_conversation_dir(conversation_id) / "messages.jsonl"
-        if not path.exists():
-            return []
-        entries: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(payload, dict):
-                    entries.append(payload)
-        if entries:
-            self.database.set_segment(conversation_id, path.parent.name)
-            self.database.replace_entries(conversation_id, entries)
-        return entries
+        return self.database.list_entries(conversation_id)
 
     def _append_entry(self, conversation_dir: Path, entry: LedgerEntry) -> None:
         conversation_dir.mkdir(parents=True, exist_ok=True)
@@ -969,6 +956,9 @@ def _primary_text_metadata(voice: dict[str, Any], message: NormalizedMessage | N
             "deferred_reply",
             "deferred_reply_reason",
             "deferred_reply_anchor_raw_id",
+            "capture_phase",
+            "history_index",
+            "source",
         ):
             if key in message.metadata:
                 metadata[key] = message.metadata[key]
@@ -2229,6 +2219,7 @@ def _find_assistant_entry_for_self_echo(
     entries: list[dict[str, Any]],
     text: str,
     *,
+    message_id: str = "",
     lookback: int = 40,
 ) -> dict[str, Any] | None:
     """Find a recent role=assistant entry whose text matches a pulled-back self message.
@@ -2244,6 +2235,12 @@ def _find_assistant_entry_for_self_echo(
         return None
     for item in reversed(entries[-max(1, lookback):]):
         if str(item.get("role", "")) != "assistant":
+            continue
+        send = item.get("send") if isinstance(item.get("send"), dict) else {}
+        if str(send.get("status") or "") not in {"queued_to_bridge", "accepted", "sent"}:
+            continue
+        echo_message_id = str(send.get("echo_message_id") or "")
+        if echo_message_id and echo_message_id != str(message_id or ""):
             continue
         if _normalize_for_match(_entry_primary_text(item)) == normalized:
             return item

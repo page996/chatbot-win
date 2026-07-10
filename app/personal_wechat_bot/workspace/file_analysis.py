@@ -12,7 +12,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from app.personal_wechat_bot.llm.base import generate_reply_with_workload
 
 
 ANALYSIS_MODEL_MAX_INPUT_CHARS = 12000
@@ -60,7 +59,7 @@ class LLMFileAnalyzer:
             return FileAnalysis(status="skipped", model=self.model, error="no_text_to_analyze")
         prompt = self._build_prompt(name=name, kind=kind, text=body, extra=extra or {})
         try:
-            raw = generate_reply_with_workload(self.llm, prompt, workload="background")
+            raw = self.llm.generate_reply(prompt, workload="background")
         except Exception as exc:
             return FileAnalysis(status="error", model=self.model, error=f"{type(exc).__name__}: {exc}")
         if _looks_like_fake_chat_reply(raw):

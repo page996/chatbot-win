@@ -95,32 +95,31 @@ class ReplyGateTest(unittest.TestCase):
             self.assertEqual({item["status"] for item in records}, {"queued_to_bridge"})
             self.assertTrue(all("queued_to_non_foreground_bridge:" in item.get("note", "") for item in records))
 
-    def test_confirm_queue_imports_legacy_jsonl_into_sqlite_authority(self) -> None:
+    def test_confirm_queue_projection_does_not_repopulate_sqlite_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             queue_path = Path(tmp) / "confirm_queue.jsonl"
-            legacy = {
-                "queue_id": "legacy-message:2026-07-10T00:00:00Z",
+            projection_only = {
+                "queue_id": "projection-message:2026-07-10T00:00:00Z",
                 "status": "pending",
                 "created_at": "2026-07-10T00:00:00Z",
                 "reply": {
-                    "message_id": "legacy-message",
+                    "message_id": "projection-message",
                     "conversation_id": "private-1",
-                    "text": "legacy hello",
+                    "text": "projection only",
                     "send_mode": "confirm",
                     "model": "fake",
                 },
             }
-            queue_path.write_text(json.dumps(legacy, ensure_ascii=False) + "\n", encoding="utf-8")
+            queue_path.write_text(json.dumps(projection_only, ensure_ascii=False) + "\n", encoding="utf-8")
 
             queue = ConfirmQueue(queue_path)
             pending = queue.list_pending()
-            approved = queue.approve(legacy["queue_id"], reviewer="migration-test")
+            current_id = queue.enqueue(_reply("current-message", "current"))
             projection = [json.loads(line) for line in queue_path.read_text(encoding="utf-8").splitlines() if line]
 
             self.assertTrue((Path(tmp) / "confirm_queue.sqlite").exists())
-            self.assertEqual(pending[0]["queue_id"], legacy["queue_id"])
-            self.assertEqual(approved["status"], "approved")
-            self.assertEqual(projection[0]["status"], "approved")
+            self.assertEqual(pending, [])
+            self.assertEqual([item["queue_id"] for item in projection], [current_id])
 
     def test_guarded_send_executor_blocks_when_send_disabled(self) -> None:
         config = BotConfig(send_enabled=False, send_driver="fake")

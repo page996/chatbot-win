@@ -53,32 +53,6 @@ class ChannelRegistryStore:
             )
         return item
 
-    def insert_if_missing(self, payload: dict[str, Any]) -> bool:
-        item = dict(payload)
-        conversation_id = str(item.get("conversation_id") or "").strip()
-        if not conversation_id:
-            return False
-        item.setdefault("updated_at", utc_now_iso())
-        self._ensure_schema()
-        with self._connection() as db:
-            cursor = db.execute(
-                """
-                INSERT OR IGNORE INTO conversation_channels(
-                  conversation_id, conversation_type, chat_title, segment, status, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    conversation_id,
-                    str(item.get("conversation_type") or ""),
-                    str(item.get("chat_title") or ""),
-                    str(item.get("segment") or ""),
-                    str(item.get("status") or "active"),
-                    str(item.get("updated_at") or utc_now_iso()),
-                    json.dumps(item, ensure_ascii=False, sort_keys=True),
-                ),
-            )
-        return bool(cursor.rowcount)
-
     def get(self, conversation_id: str) -> dict[str, Any] | None:
         self._ensure_schema()
         with self._connection() as db:

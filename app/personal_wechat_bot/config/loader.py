@@ -1,39 +1,30 @@
 from __future__ import annotations
 
 import json
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from app.personal_wechat_bot.config.schema import (
     DEFAULT_LLM_MAX_CONCURRENCY,
     BotConfig,
-    LLMConfig,
     ProviderConfig,
+    default_providers,
 )
 from app.personal_wechat_bot.domain.errors import ConfigError
+from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
 
 
-# Deprecated/removed send drivers mapped to their replacement. windows_guarded
-# was removed in favour of the non-foreground bridge_outbox driver; a stale
-# config naming it would otherwise pass the send guard but resolve to no driver
-# (silent send_driver_missing). Normalizing at load time is self-healing.
-_DEPRECATED_SEND_DRIVERS = {"windows_guarded": "bridge_outbox"}
 _SIDEBAR_CONFIG_DIR = ".chatbot_sidebar_config"
 _CONFIG_FILE_NAMES = (
     "config.json",
     "accepted_contacts.json",
     "accepted_groups.json",
-    "contacts_whitelist.json",
-    "groups_whitelist.json",
     "topic_rules.json",
     "search_blocklist.json",
 )
-
-
-def _normalize_send_driver(name: str) -> str:
-    cleaned = str(name or "").strip()
-    return _DEPRECATED_SEND_DRIVERS.get(cleaned, cleaned)
 
 
 def _normalize_send_backend(name: str) -> str:
@@ -65,10 +56,16 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def persistent_config_dir(data_dir: str | Path = "data") -> Path:
@@ -77,6 +74,28 @@ def persistent_config_dir(data_dir: str | Path = "data") -> Path:
     root = Path(data_dir).resolve()
     segment = _safe_config_segment(str(root))
     return root.parent / _SIDEBAR_CONFIG_DIR / segment
+
+
+@contextmanager
+def config_update_lock(data_dir: str | Path = "data") -> Iterator[None]:
+    root = Path(data_dir)
+    with blocking_process_lock(
+        persistent_config_dir(root) / ".config-update.lock",
+        label="bot_config_update",
+        stale_after_seconds=60.0,
+        wait_timeout_seconds=30.0,
+    ):
+        yield
+
+
+def update_config(data_dir: str | Path, updater: Callable[[BotConfig], Any]) -> BotConfig:
+    """Atomically apply a read-modify-write config update across UI threads."""
+
+    with config_update_lock(data_dir):
+        config = load_config(data_dir)
+        updater(config)
+        _save_config_unlocked(config)
+        return config
 
 
 def ensure_config(data_dir: str | Path = "data") -> BotConfig:
@@ -90,18 +109,13 @@ def ensure_config(data_dir: str | Path = "data") -> BotConfig:
 
 def create_default_config(data_dir: str | Path = "data") -> BotConfig:
     root = Path(data_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    config = BotConfig(data_dir=str(root))
-    _write_config_json(root, "config.json", _config_to_json(config))
-    _write_config_json(root, "accepted_contacts.json", [])
-    _write_config_json(root, "accepted_groups.json", [])
-    _write_config_json(root, "contacts_whitelist.json", [])
-    _write_config_json(root, "groups_whitelist.json", [])
-    _write_config_json(root, "topic_rules.json", {"topics": config.topics, "avoid_topics": []})
-    _write_config_json(root, "search_blocklist.json", config.search_blocklist)
-    (root / "inbox").mkdir(exist_ok=True)
-    (root / "tool_outputs").mkdir(exist_ok=True)
-    return config
+    with config_update_lock(root):
+        root.mkdir(parents=True, exist_ok=True)
+        config = BotConfig(data_dir=str(root))
+        _save_config_unlocked(config)
+        (root / "inbox").mkdir(exist_ok=True)
+        (root / "tool_outputs").mkdir(exist_ok=True)
+        return config
 
 
 def load_config(data_dir: str | Path = "data") -> BotConfig:
@@ -110,13 +124,12 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
     if raw is None:
         raise ConfigError(f"missing config: {root / 'config.json'}; run init first")
 
-    contacts = _read_accept_list(root, "accepted_contacts.json", "contacts_whitelist.json")
-    groups = _read_accept_list(root, "accepted_groups.json", "groups_whitelist.json")
+    contacts = _read_accept_list(root, "accepted_contacts.json")
+    groups = _read_accept_list(root, "accepted_groups.json")
     topic_raw = _read_config_json(root, "topic_rules.json", {})
     blocklist = _read_config_json(root, "search_blocklist.json", raw.get("search_blocklist", []))
 
-    llm = _llm_from_json(raw.get("llm", {}))
-    providers = _providers_from_json(raw.get("providers"), llm)
+    providers = _providers_from_json(raw.get("providers"))
     mode = raw.get("mode", "dry_run")
     if mode not in {"dry_run", "confirm", "auto"}:
         raise ConfigError(f"invalid mode: {mode}")
@@ -124,7 +137,7 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         mode=mode,
         data_dir=str(root),
         send_enabled=_bool_from_json(raw, "send_enabled", False),
-        send_driver=_normalize_send_driver(raw.get("send_driver", "not_implemented")),
+        send_driver=str(raw.get("send_driver", "not_implemented") or "").strip(),
         send_backend=_normalize_send_backend(raw.get("send_backend", "dry_run")),
         weflow_base_url=str(raw.get("weflow_base_url", "http://127.0.0.1:5031") or "http://127.0.0.1:5031"),
         weflow_token_env=str(raw.get("weflow_token_env", "WEFLOW_API_TOKEN") or "WEFLOW_API_TOKEN"),
@@ -148,7 +161,6 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         context_window_messages=int(raw.get("context_window_messages", 20)),
         topics=list(topic_raw.get("topics", raw.get("topics", ["日常闲聊", "学习", "AI"]))),
         avoid_topics=list(topic_raw.get("avoid_topics", raw.get("avoid_topics", []))),
-        llm=llm,
         providers=providers,
         key_assignment_policy=str(raw.get("key_assignment_policy", "conversation_sticky")),
         save_full_chat=_bool_from_json(raw, "save_full_chat", True),
@@ -166,65 +178,33 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
 
 
 def save_config(config: BotConfig) -> None:
+    with config_update_lock(config.data_dir):
+        _save_config_unlocked(config)
+
+
+def _save_config_unlocked(config: BotConfig) -> None:
     root = Path(config.data_dir)
     _write_config_json(root, "config.json", _config_to_json(config))
     _write_config_json(root, "accepted_contacts.json", sorted(config.accepted_contacts))
     _write_config_json(root, "accepted_groups.json", sorted(config.accepted_groups))
-    _write_config_json(root, "contacts_whitelist.json", sorted(config.accepted_contacts))
-    _write_config_json(root, "groups_whitelist.json", sorted(config.accepted_groups))
     _write_config_json(root, "topic_rules.json", {"topics": config.topics, "avoid_topics": config.avoid_topics})
     _write_config_json(root, "search_blocklist.json", config.search_blocklist)
 
 
-def migrate_file_allowed_extensions(data_dir: str | Path = "data") -> dict[str, Any]:
-    """Persist newly supported attachment suffixes into an existing config."""
-
-    root = Path(data_dir)
-    raw = _read_config_json(root, "config.json", None)
-    if not isinstance(raw, dict):
-        raise ConfigError(f"missing config: {root / 'config.json'}; run init first")
-    default_extensions = BotConfig().file_allowed_extensions
-    configured = raw.get("file_allowed_extensions", [])
-    values = configured if isinstance(configured, list) else []
-    normalized = {_normalize_extension(item) for item in values}
-    normalized.discard("")
-    missing = [item for item in default_extensions if item not in normalized]
-    config = load_config(root)
-    if missing:
-        save_config(config)
-    return {
-        "status": "updated" if missing else "ok",
-        "added_extensions": missing,
-        "file_allowed_extensions": config.file_allowed_extensions,
-    }
-
-
 def accept_contact(data_dir: str | Path, wechat_id: str) -> None:
-    config = load_config(data_dir)
-    config.accepted_contacts.add(wechat_id)
-    save_config(config)
+    update_config(data_dir, lambda config: config.accepted_contacts.add(wechat_id))
 
 
 def accept_group(data_dir: str | Path, group_name: str) -> None:
-    config = load_config(data_dir)
-    config.accepted_groups.add(group_name)
-    save_config(config)
-
-
-def add_contact(data_dir: str | Path, wechat_id: str) -> None:
-    accept_contact(data_dir, wechat_id)
-
-
-def add_group(data_dir: str | Path, group_name: str) -> None:
-    accept_group(data_dir, group_name)
+    update_config(data_dir, lambda config: config.accepted_groups.add(group_name))
 
 
 def rename_group(data_dir: str | Path, old_name: str, new_name: str) -> None:
-    config = load_config(data_dir)
-    if old_name in config.accepted_groups:
-        config.accepted_groups.remove(old_name)
-    config.accepted_groups.add(new_name)
-    save_config(config)
+    def apply(config: BotConfig) -> None:
+        config.accepted_groups.discard(old_name)
+        config.accepted_groups.add(new_name)
+
+    update_config(data_dir, apply)
 
 
 def set_model_provider(
@@ -244,25 +224,29 @@ def set_model_provider(
     The async-summary path shares the chat provider, so it follows the same
     model automatically. Returns the updated chat provider config.
     """
-    config = load_config(data_dir)
-    current = config.providers.get("chat", config.llm)
-    updated = LLMConfig(
-        provider_id="chat",
-        provider=str(provider) if provider is not None else current.provider,
-        model=str(model) if model is not None else current.model,
-        base_url=str(base_url) if base_url is not None else current.base_url,
-        api_key_env=str(api_key_env) if api_key_env is not None else current.api_key_env,
-        api_key_env_pool=list(current.api_key_env_pool),
-        api_key_file=current.api_key_file,
-        stream=current.stream,
-        max_wait_seconds=max_wait_seconds if max_wait_seconds is not None else current.max_wait_seconds,
-        capabilities=list(current.capabilities),
-        max_concurrency=_bounded_positive_int(max_concurrency, current.max_concurrency),
-        cooldown_seconds=current.cooldown_seconds,
-    )
-    config.llm = updated
-    config.providers["chat"] = updated
-    save_config(config)
+    updated: ProviderConfig | None = None
+
+    def apply(config: BotConfig) -> None:
+        nonlocal updated
+        current = config.providers.get("chat", ProviderConfig())
+        updated = ProviderConfig(
+            provider_id="chat",
+            provider=str(provider) if provider is not None else current.provider,
+            model=str(model) if model is not None else current.model,
+            base_url=str(base_url) if base_url is not None else current.base_url,
+            api_key_env=str(api_key_env) if api_key_env is not None else current.api_key_env,
+            api_key_env_pool=list(current.api_key_env_pool),
+            api_key_file=current.api_key_file,
+            stream=current.stream,
+            max_wait_seconds=max_wait_seconds if max_wait_seconds is not None else current.max_wait_seconds,
+            capabilities=list(current.capabilities),
+            max_concurrency=_bounded_positive_int(max_concurrency, current.max_concurrency),
+            cooldown_seconds=current.cooldown_seconds,
+        )
+        config.providers["chat"] = updated
+
+    update_config(data_dir, apply)
+    assert updated is not None
     return updated
 
 
@@ -274,8 +258,7 @@ def set_chat_provider(
     max_wait_seconds: int | None = None,
     max_concurrency: int = DEFAULT_LLM_MAX_CONCURRENCY,
 ) -> None:
-    config = load_config(data_dir)
-    provider = LLMConfig(
+    provider = ProviderConfig(
         provider_id="chat",
         provider="relay",
         model=model,
@@ -289,9 +272,10 @@ def set_chat_provider(
         max_concurrency=_bounded_positive_int(max_concurrency, DEFAULT_LLM_MAX_CONCURRENCY),
         cooldown_seconds=0,
     )
-    config.llm = provider
-    config.providers["chat"] = provider
-    save_config(config)
+    def apply(config: BotConfig) -> None:
+        config.providers["chat"] = provider
+
+    update_config(data_dir, apply)
 
 
 def set_deepseek_provider(
@@ -302,8 +286,7 @@ def set_deepseek_provider(
     max_wait_seconds: int | None = 60,
     max_concurrency: int = DEFAULT_LLM_MAX_CONCURRENCY,
 ) -> None:
-    config = load_config(data_dir)
-    provider = LLMConfig(
+    provider = ProviderConfig(
         provider_id="chat",
         provider="deepseek",
         model=model,
@@ -317,38 +300,22 @@ def set_deepseek_provider(
         max_concurrency=_bounded_positive_int(max_concurrency, DEFAULT_LLM_MAX_CONCURRENCY),
         cooldown_seconds=0,
     )
-    config.llm = provider
-    config.providers["chat"] = provider
-    save_config(config)
+    def apply(config: BotConfig) -> None:
+        config.providers["chat"] = provider
+
+    update_config(data_dir, apply)
 
 
-def _llm_from_json(raw: dict[str, Any]) -> LLMConfig:
-    return LLMConfig(
-        provider_id=raw.get("provider_id", "chat"),
-        provider=raw.get("provider", "deepseek"),
-        model=raw.get("model", "deepseek-v4-flash"),
-        base_url=raw.get("base_url", ""),
-        api_key_env=raw.get("api_key_env", "DEEPSEEK_API_KEY"),
-        api_key_env_pool=list(raw.get("api_key_env_pool", [])),
-        api_key_file=raw.get("api_key_file", ""),
-        stream=_bool_from_json(raw, "stream", False),
-        max_wait_seconds=raw.get("max_wait_seconds"),
-        capabilities=list(raw.get("capabilities", ["chat", "planning", "summarization", "relevance_filter"])),
-        max_concurrency=_bounded_positive_int(raw.get("max_concurrency"), DEFAULT_LLM_MAX_CONCURRENCY),
-        cooldown_seconds=int(raw.get("cooldown_seconds", 0)),
-    )
-
-
-def _providers_from_json(raw: Any, fallback_llm: LLMConfig) -> dict[str, ProviderConfig]:
+def _providers_from_json(raw: Any) -> dict[str, ProviderConfig]:
     if not isinstance(raw, dict):
-        return {"chat": _provider_from_llm(fallback_llm)}
+        return default_providers()
     providers = {
         name: _provider_from_json(name, value)
         for name, value in raw.items()
         if isinstance(name, str) and isinstance(value, dict)
     }
     if "chat" not in providers:
-        providers["chat"] = _provider_from_llm(fallback_llm)
+        providers["chat"] = ProviderConfig()
     return providers
 
 
@@ -443,51 +410,18 @@ def _provider_from_json(name: str, raw: dict[str, Any]) -> ProviderConfig:
     )
 
 
-def _provider_from_llm(llm: LLMConfig) -> ProviderConfig:
-    return ProviderConfig(
-        provider_id=llm.provider_id,
-        provider=llm.provider,
-        model=llm.model,
-        base_url=llm.base_url,
-        api_key_env=llm.api_key_env,
-        api_key_env_pool=list(llm.api_key_env_pool),
-        api_key_file=llm.api_key_file,
-        stream=llm.stream,
-        max_wait_seconds=llm.max_wait_seconds,
-        capabilities=list(llm.capabilities),
-        max_concurrency=llm.max_concurrency,
-        cooldown_seconds=llm.cooldown_seconds,
-    )
-
-
 def _config_to_json(config: BotConfig) -> dict[str, Any]:
     payload = asdict(config)
-    payload["accepted_contacts"] = sorted(config.accepted_contacts)
-    payload["accepted_groups"] = sorted(config.accepted_groups)
-    payload["contacts_whitelist"] = sorted(config.accepted_contacts)
-    payload["groups_whitelist"] = sorted(config.accepted_groups)
+    payload.pop("accepted_contacts", None)
+    payload.pop("accepted_groups", None)
     return payload
 
 
-def _read_accept_list(root: Path, preferred_name: str, legacy_name: str) -> set[str]:
-    preferred = _read_json(root / preferred_name, None)
-    if isinstance(preferred, list):
-        _mirror_config_file(root, preferred_name, preferred, from_primary=True)
-        return {str(item) for item in preferred if str(item).strip()}
-    legacy = _read_json(root / legacy_name, None)
-    if isinstance(legacy, list):
-        _write_config_json(root, preferred_name, legacy)
-        _mirror_config_file(root, legacy_name, legacy, from_primary=True)
-        return {str(item) for item in legacy if str(item).strip()}
-    preferred = _read_json(persistent_config_dir(root) / preferred_name, None)
-    if isinstance(preferred, list):
-        _write_json(root / preferred_name, preferred)
-        return {str(item) for item in preferred if str(item).strip()}
-    legacy = _read_json(persistent_config_dir(root) / legacy_name, [])
-    if isinstance(legacy, list):
-        _write_config_json(root, preferred_name, legacy)
-        return {str(item) for item in legacy if str(item).strip()}
-    return set()
+def _read_accept_list(root: Path, name: str) -> set[str]:
+    values = _read_config_json(root, name, [])
+    if not isinstance(values, list):
+        return set()
+    return {str(item) for item in values if str(item).strip()}
 
 
 def _read_config_json(root: Path, name: str, default: Any) -> Any:

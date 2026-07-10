@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from app.personal_wechat_bot.config.loader import load_config, save_config
+from app.personal_wechat_bot.config.loader import load_config, update_config
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.domain.models import ReplyCandidate, ToolCallResult, utc_now_iso
 from app.personal_wechat_bot.reply_gate.send_audit import SendAuditLog
@@ -47,55 +47,56 @@ def set_send_controls(
     max_chars: int | None = None,
     min_interval_seconds: int | None = None,
 ) -> dict[str, Any]:
-    config = load_config(data_dir)
-    if mode is not None:
-        if mode not in {"dry_run", "confirm", "auto"}:
-            raise ValueError("mode must be dry_run, confirm, or auto")
-        config.mode = mode
-        if confirm_required is None:
-            config.send_confirm_required = mode != "auto"
-    if enabled is not None:
-        config.send_enabled = enabled
-    if driver is not None:
-        config.send_driver = driver
-    if backend is not None:
-        normalized_backend = str(backend or "").strip().lower()
-        if normalized_backend not in {"dry_run", "weflow_http", "wechat_native_http"}:
-            raise ValueError("send_backend must be dry_run, weflow_http, or wechat_native_http")
-        config.send_backend = normalized_backend
-    if weflow_base_url is not None:
-        config.weflow_base_url = str(weflow_base_url or "").strip() or "http://127.0.0.1:5031"
-    if weflow_token_env is not None:
-        config.weflow_token_env = str(weflow_token_env or "").strip() or "WEFLOW_API_TOKEN"
-    if weflow_send_text_path is not None:
-        config.weflow_send_text_path = str(weflow_send_text_path or "").strip() or "/send/text"
-    if weflow_send_file_path is not None:
-        config.weflow_send_file_path = str(weflow_send_file_path or "").strip() or "/send/file"
-    if weflow_send_timeout_seconds is not None:
-        config.weflow_send_timeout_seconds = max(1.0, float(weflow_send_timeout_seconds))
-    if wechat_native_base_url is not None:
-        config.wechat_native_base_url = str(wechat_native_base_url or "").strip() or "http://127.0.0.1:30001"
-    if wechat_native_send_text_path is not None:
-        config.wechat_native_send_text_path = str(wechat_native_send_text_path or "").strip() or "/SendTextMsg"
-    if wechat_native_send_image_path is not None:
-        config.wechat_native_send_image_path = str(wechat_native_send_image_path or "").strip() or "/SendImgMsg"
-    if wechat_native_send_file_path is not None:
-        config.wechat_native_send_file_path = str(wechat_native_send_file_path or "").strip() or "/send_file_msg"
-    if wechat_native_status_path is not None:
-        config.wechat_native_status_path = str(wechat_native_status_path or "").strip() or "/QueryDB/status"
-    if wechat_native_timeout_seconds is not None:
-        config.wechat_native_timeout_seconds = max(1.0, float(wechat_native_timeout_seconds))
-    if wechat_native_verify_timeout_seconds is not None:
-        config.wechat_native_verify_timeout_seconds = max(0.0, float(wechat_native_verify_timeout_seconds))
-    if wechat_native_file_verify_timeout_seconds is not None:
-        config.wechat_native_file_verify_timeout_seconds = max(0.0, float(wechat_native_file_verify_timeout_seconds))
-    if confirm_required is not None:
-        config.send_confirm_required = confirm_required
-    if max_chars is not None:
-        config.send_max_chars = max_chars
-    if min_interval_seconds is not None:
-        config.send_min_interval_seconds = min_interval_seconds
-    save_config(config)
+    def apply(config) -> None:
+        if mode is not None:
+            if mode not in {"dry_run", "confirm", "auto"}:
+                raise ValueError("mode must be dry_run, confirm, or auto")
+            config.mode = mode
+            if confirm_required is None:
+                config.send_confirm_required = mode != "auto"
+        if enabled is not None:
+            config.send_enabled = enabled
+        if driver is not None:
+            config.send_driver = driver
+        if backend is not None:
+            normalized_backend = str(backend or "").strip().lower()
+            if normalized_backend not in {"dry_run", "weflow_http", "wechat_native_http"}:
+                raise ValueError("send_backend must be dry_run, weflow_http, or wechat_native_http")
+            config.send_backend = normalized_backend
+        if weflow_base_url is not None:
+            config.weflow_base_url = str(weflow_base_url or "").strip() or "http://127.0.0.1:5031"
+        if weflow_token_env is not None:
+            config.weflow_token_env = str(weflow_token_env or "").strip() or "WEFLOW_API_TOKEN"
+        if weflow_send_text_path is not None:
+            config.weflow_send_text_path = str(weflow_send_text_path or "").strip() or "/send/text"
+        if weflow_send_file_path is not None:
+            config.weflow_send_file_path = str(weflow_send_file_path or "").strip() or "/send/file"
+        if weflow_send_timeout_seconds is not None:
+            config.weflow_send_timeout_seconds = max(1.0, float(weflow_send_timeout_seconds))
+        if wechat_native_base_url is not None:
+            config.wechat_native_base_url = str(wechat_native_base_url or "").strip() or "http://127.0.0.1:30001"
+        if wechat_native_send_text_path is not None:
+            config.wechat_native_send_text_path = str(wechat_native_send_text_path or "").strip() or "/SendTextMsg"
+        if wechat_native_send_image_path is not None:
+            config.wechat_native_send_image_path = str(wechat_native_send_image_path or "").strip() or "/SendImgMsg"
+        if wechat_native_send_file_path is not None:
+            config.wechat_native_send_file_path = str(wechat_native_send_file_path or "").strip() or "/send_file_msg"
+        if wechat_native_status_path is not None:
+            config.wechat_native_status_path = str(wechat_native_status_path or "").strip() or "/QueryDB/status"
+        if wechat_native_timeout_seconds is not None:
+            config.wechat_native_timeout_seconds = max(1.0, float(wechat_native_timeout_seconds))
+        if wechat_native_verify_timeout_seconds is not None:
+            config.wechat_native_verify_timeout_seconds = max(0.0, float(wechat_native_verify_timeout_seconds))
+        if wechat_native_file_verify_timeout_seconds is not None:
+            config.wechat_native_file_verify_timeout_seconds = max(0.0, float(wechat_native_file_verify_timeout_seconds))
+        if confirm_required is not None:
+            config.send_confirm_required = confirm_required
+        if max_chars is not None:
+            config.send_max_chars = max_chars
+        if min_interval_seconds is not None:
+            config.send_min_interval_seconds = min_interval_seconds
+
+    config = update_config(data_dir, apply)
     return _send_config_payload(config)
 
 

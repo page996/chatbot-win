@@ -32,6 +32,36 @@ _SQLITE_AUTHORITY_CONTRACTS = (
         "meta_table": "session_meta",
         "expected_tables": ("session_meta", "conversation_session_states", "conversation_session_events"),
     },
+    {
+        "component_id": "confirm_queue",
+        "filename": "confirm_queue.sqlite",
+        "meta_table": "confirm_queue_meta",
+        "expected_tables": ("confirm_queue_meta", "confirm_queue_items"),
+    },
+    {
+        "component_id": "send_audit",
+        "filename": "send_audit.sqlite",
+        "meta_table": "send_audit_meta",
+        "expected_tables": ("send_audit_meta", "send_audit_events"),
+    },
+    {
+        "component_id": "task_manager",
+        "filename": "scheduler.sqlite",
+        "meta_table": "scheduler_meta",
+        "expected_tables": ("scheduler_meta", "tasks", "task_events"),
+    },
+    {
+        "component_id": "sidebar_state",
+        "filename": "sidebar_state.sqlite",
+        "meta_table": "sidebar_state_meta",
+        "expected_tables": ("sidebar_state_meta", "sidebar_state_values", "weflow_operation_history"),
+    },
+    {
+        "component_id": "channel_state",
+        "filename": "channel_state.sqlite",
+        "meta_table": "channel_state_meta",
+        "expected_tables": ("channel_state_meta", "channel_states"),
+    },
 )
 
 
@@ -121,10 +151,8 @@ _DISPOSABLE_DIRECTORIES = {
 
 _RETAINED_ARTIFACTS = {
     "config.json": "runtime configuration",
-    "accepted_contacts.json": "accepted private-channel compatibility state",
-    "accepted_groups.json": "accepted group-channel compatibility state",
-    "contacts_whitelist.json": "legacy accepted-contact compatibility state",
-    "groups_whitelist.json": "legacy accepted-group compatibility state",
+    "accepted_contacts.json": "accepted private-channel state",
+    "accepted_groups.json": "accepted group-channel state",
     "topic_rules.json": "conversation policy state",
     "search_blocklist.json": "search safety policy",
     "backend_events.jsonl": "default backend event stream; may contain replay evidence",
@@ -161,15 +189,13 @@ _STORAGE_COMPONENTS = [
             "config.json",
             "accepted_contacts.json",
             "accepted_groups.json",
-            "contacts_whitelist.json",
-            "groups_whitelist.json",
             "topic_rules.json",
             "search_blocklist.json",
             "api_key_models.local.json",
             "api_keys.local.md",
         ],
         "clear_history": "preserve",
-        "migration_action": "retain as small portable config files; mirrored sidecar survives history reset",
+        "migration_action": "retain small portable config files; the mirrored sidecar survives history reset",
     },
     {
         "component_id": "runtime_cards",
@@ -177,7 +203,7 @@ _STORAGE_COMPONENTS = [
         "authority": "file_with_persistent_config_root",
         "paths": ["runtime_cards"],
         "clear_history": "preserve",
-        "migration_action": "already moved to persistent_config_dir when available; keep channel overrides there",
+        "migration_action": "persistent_config_dir is authoritative for runtime cards; keep channel overrides there",
     },
     {
         "component_id": "conversation_ledgers",
@@ -217,15 +243,15 @@ _STORAGE_COMPONENTS = [
         "authority": "sqlite_authority_with_jsonl_projection",
         "paths": ["confirm_queue.sqlite", "confirm_queue.jsonl"],
         "clear_history": "reset",
-        "migration_action": "already database-backed; keep JSONL projection for compatibility until consumers are removed",
+        "migration_action": "SQLite is authoritative; JSONL is a regenerated readable projection and is never imported",
     },
     {
         "component_id": "send_audit",
         "kind": "send_review_evidence",
-        "authority": "jsonl_evidence_with_sqlite_index",
+        "authority": "sqlite_authority_with_jsonl_forensic_projection",
         "paths": ["send_audit.jsonl", "send_audit.sqlite"],
         "clear_history": "reset",
-        "migration_action": "retain JSONL as forensic stream; SQLite remains read/index projection",
+        "migration_action": "SQLite is the operational/read authority; JSONL is an append-only forensic projection and is never imported",
     },
     {
         "component_id": "send_bridge",
@@ -247,7 +273,7 @@ _STORAGE_COMPONENTS = [
         "authority": "scheduler_sqlite_authority_with_json_projection",
         "paths": ["scheduler.sqlite", "task_manager/tasks.json"],
         "clear_history": "reset",
-        "migration_action": "already database-backed; JSON projection is compatibility output",
+        "migration_action": "SQLite is authoritative; JSON is a regenerated readable projection and is never imported",
     },
     {
         "component_id": "sidebar_state",
@@ -255,7 +281,7 @@ _STORAGE_COMPONENTS = [
         "authority": "sqlite_authority_with_json_projection",
         "paths": ["sidebar_state.sqlite", "weflow_sidebar_state.json"],
         "clear_history": "reset",
-        "migration_action": "already database-backed for WeFlow console state; JSON is compatibility projection",
+        "migration_action": "SQLite is authoritative for WeFlow console state; JSON is a regenerated readable projection",
     },
     {
         "component_id": "channel_state",
@@ -276,7 +302,7 @@ _STORAGE_COMPONENTS = [
             "conversation_cooldowns.sqlite",
         ],
         "clear_history": "reset",
-        "migration_action": "already database-backed runtime indexes; safe to rebuild after context reset",
+        "migration_action": "runtime indexes are SQLite-backed and safe to rebuild after context reset",
     },
     {
         "component_id": "backend_and_hook_events",
@@ -535,7 +561,7 @@ def build_storage_migration_status(
         "recommended_sequence": [
             "stop history-writing workers and use the guarded history-clear path",
             "preserve configuration, runtime cards, and the complete send-bridge evidence chain",
-            "start conversation channels, ledgers, and sessions from empty SQLite authorities instead of importing old projections",
+            "start conversation channels, ledgers, and sessions from empty SQLite authorities; never import old projections",
             "verify integrity, schema version, tables, indexes, row counts, and regenerated readable projections",
             "continue using cleanup-artifacts as dry-run first for disposable diagnostics/cache",
         ],
@@ -674,7 +700,7 @@ def _storage_state(authority: str, kind: str) -> str:
     if kind in _FILE_TRUTH_KINDS:
         return "file_truth_not_migrated"
     if "projection" in text:
-        return "projection_or_compatibility"
+        return "projection"
     return "file_backed"
 
 
@@ -801,6 +827,7 @@ def _current_truth(preflight: dict[str, Any] | None, data_root: Path) -> dict[st
         "real_send_implemented": bool(send_policy.get("real_send_implemented")),
         "wechat_read_only": bool(wechat_access.get("read_only")),
         "primary_inputs": list(wechat_access.get("primary_inputs", [])),
+        "context_only_inputs": list(wechat_access.get("context_only_inputs", [])),
         "fallback_inputs": list(wechat_access.get("fallback_inputs", [])),
         "ocr": dict(preflight.get("ocr", {})),
         "libreoffice": dict(preflight.get("libreoffice", {})),
@@ -818,7 +845,7 @@ def _cleanup_order(
             "priority": 1,
             "item": "plan-current-state-audit",
             "status": "implemented",
-            "action": "run audit-plan after major changes; historical stale lines stay as dated notes",
+            "action": "run audit-plan after major changes and keep the residual count at zero",
             "evidence": {"plan_residual_count": len(plan_residuals)},
         },
         {

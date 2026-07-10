@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -39,7 +40,7 @@ from app.personal_wechat_bot.conversation.channel_state_store import (
     merge_channel_state_projection,
 )
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
-from app.personal_wechat_bot.config.loader import ensure_config, load_config, migrate_file_allowed_extensions, save_config, set_model_provider
+from app.personal_wechat_bot.config.loader import ensure_config, load_config, set_model_provider, update_config
 from app.personal_wechat_bot.control.audit import build_storage_migration_status
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SpeakDecision, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
@@ -87,7 +88,6 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.control.sidebar_state_store import SidebarStateStore
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
-from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
@@ -291,7 +291,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "send_bridge": send_bridge,
         "weflow": build_sidebar_weflow_state(data_dir),
         "native_migration": build_sidebar_native_migration_state(data_dir),
-        "wechat_window_probe": _safe_wechat_window_probe(data_dir, max_children=0, max_controls=0),
+        "wechat_window_probe": _safe_wechat_window_probe(max_children=0, max_controls=0),
         "audit": audit,
     }
 
@@ -817,7 +817,7 @@ def _resource_audit_path(data_dir: str | Path) -> Path:
 def _resource_scheduler_snapshot(data_dir: str | Path) -> dict[str, Any]:
     try:
         config = ensure_config(data_dir)
-        chat_provider = config.providers.get("chat", config.llm)
+        chat_provider = config.providers["chat"]
         scheduler = ResourceScheduler(
             data_dir,
             key_pool=ApiKeyPool(chat_provider, data_dir),
@@ -1014,7 +1014,7 @@ def sidebar_channel_state_action(data_dir: str | Path, payload: dict[str, Any]) 
 
 
 def build_sidebar_wechat_probe(data_dir: str | Path = "data") -> dict[str, Any]:
-    return _safe_wechat_window_probe(data_dir, max_children=200, max_controls=300)
+    return _safe_wechat_window_probe(max_children=200, max_controls=300)
 
 
 def build_sidebar_native_migration_state(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -2233,13 +2233,12 @@ def _repo_root() -> Path:
 
 
 def _safe_wechat_window_probe(
-    data_dir: str | Path,
     *,
     max_children: int = 80,
     max_controls: int = 160,
 ) -> dict[str, Any]:
     try:
-        probe = build_wechat_window_probe(max_children=max_children, max_controls=max_controls, data_dir=data_dir)
+        probe = build_wechat_window_probe(max_children=max_children, max_controls=max_controls)
         if isinstance(probe, dict) and probe:
             probe.setdefault("windows", [])
             probe.setdefault("active", {"status": "unknown", "source": "none"})
@@ -2252,7 +2251,6 @@ def _safe_wechat_window_probe(
             "active": {"status": "probe_error", "source": "exception", "hwnd": 0, "title": ""},
             "windows": [],
             "ignored_windows": [],
-            "bindings": [],
             "ui_automation": {"available": False, "reason": "probe_error"},
             "raw_probe": {},
         }
@@ -2262,7 +2260,6 @@ def _safe_wechat_window_probe(
         "active": {"status": "empty_probe", "source": "none", "hwnd": 0, "title": ""},
         "windows": [],
         "ignored_windows": [],
-        "bindings": [],
         "ui_automation": {"available": False, "reason": "empty_probe"},
         "raw_probe": {},
     }
@@ -2544,24 +2541,16 @@ def _write_silence_wav(path: Path, *, seconds: float, sample_rate: int) -> None:
 
 
 def _update_runtime_modes_from_payload(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
-    config = load_config(data_dir)
-    changed = False
-    if "ocr_mode" in payload:
-        ocr_mode = _normalize_runtime_mode(payload.get("ocr_mode"))
-        if config.ocr_mode != ocr_mode:
-            config.ocr_mode = ocr_mode
-            changed = True
-    if "asr_mode" in payload:
-        asr_mode = _normalize_runtime_mode(payload.get("asr_mode"))
-        if config.asr_mode != asr_mode:
-            config.asr_mode = asr_mode
-            changed = True
-    file_max_bytes = _file_max_bytes_from_payload(payload)
-    if file_max_bytes is not None and config.file_max_bytes != file_max_bytes:
-        config.file_max_bytes = file_max_bytes
-        changed = True
-    if changed:
-        save_config(config)
+    def apply(config) -> None:
+        if "ocr_mode" in payload:
+            config.ocr_mode = _normalize_runtime_mode(payload.get("ocr_mode"))
+        if "asr_mode" in payload:
+            config.asr_mode = _normalize_runtime_mode(payload.get("asr_mode"))
+        file_max_bytes = _file_max_bytes_from_payload(payload)
+        if file_max_bytes is not None:
+            config.file_max_bytes = file_max_bytes
+
+    config = update_config(data_dir, apply)
     return {"ocr_mode": config.ocr_mode, "asr_mode": config.asr_mode, "file_max_bytes": config.file_max_bytes}
 
 
@@ -2803,8 +2792,15 @@ def _sidebar_channel_send_scope_error(channel: Any, payload: dict[str, Any], *, 
 
 
 def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
     with _AGENT_TICK_LOCK:
-        return _sidebar_agent_tick_unlocked(data_dir, payload)
+        with blocking_process_lock(
+            root / "runtime_locks" / "sidebar_agent_tick.lock",
+            label="sidebar_agent_tick",
+            stale_after_seconds=3600,
+            wait_timeout_seconds=600,
+        ):
+            return _sidebar_agent_tick_unlocked(root, payload)
 
 
 def _sidebar_agent_tick_unlocked(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3553,14 +3549,36 @@ def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | N
     if not bool(payload.get("force") or payload.get("forceClear")) and str(payload.get("source") or "") != "shutdown_helper":
         blockers = _history_clear_active_runtime_blockers(root)
         if blockers:
-            return {
-                "status": "blocked",
-                "reason": "history_clear_runtime_active",
-                "message": "Stop running Agent/WeFlow history writers first, or use shutdown_processes so cleanup runs after shutdown.",
-                "active_workers": blockers,
-                "policy": "history_clear_requires_idle_history_writers",
-                "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
-            }
+            return _history_clear_blocked_result(root, blockers)
+    if not _AGENT_TICK_LOCK.acquire(blocking=False):
+        return _history_clear_blocked_result(root, [{"worker": "dialog_agent_tick", "source": "in_process"}])
+    try:
+        try:
+            with blocking_process_lock(
+                root / "runtime_locks" / "sidebar_agent_tick.lock",
+                label="history_clear",
+                stale_after_seconds=3600,
+                wait_timeout_seconds=0.0,
+            ):
+                return _clear_sidebar_history_data_locked(root)
+        except ProcessLockError as exc:
+            holder = exc.holder if isinstance(exc.holder, dict) else {}
+            return _history_clear_blocked_result(
+                root,
+                [
+                    {
+                        "worker": "dialog_agent_tick",
+                        "source": "process_lock",
+                        "pid": int(holder.get("pid", 0) or 0),
+                        "label": str(holder.get("label") or ""),
+                    }
+                ],
+            )
+    finally:
+        _AGENT_TICK_LOCK.release()
+
+
+def _clear_sidebar_history_data_locked(root: Path) -> dict[str, Any]:
     removed: list[dict[str, Any]] = []
     retained_locked: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -3595,6 +3613,17 @@ def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | N
         "retained_config": [str(item) for item in sorted(retained)],
         "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
         "reinitialized": reinitialized,
+    }
+
+
+def _history_clear_blocked_result(root: Path, blockers: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "reason": "history_clear_runtime_active",
+        "message": "Stop running Agent, WeFlow, and send-bridge history writers first, or use shutdown_processes so cleanup runs after shutdown.",
+        "active_workers": blockers,
+        "policy": "history_clear_requires_idle_history_writers",
+        "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
     }
 
 
@@ -3643,6 +3672,42 @@ def _history_clear_active_runtime_blockers(root: Path) -> list[dict[str, Any]]:
                     "status": str(backfill_job.get("status") or ""),
                 }
             )
+    managed_bridge_running = False
+    with _BRIDGE_LOCK:
+        worker = _BRIDGE_WORKERS.get(key, {})
+        managed_bridge_running = _thread_alive(worker.get("thread") if isinstance(worker, dict) else None)
+        if managed_bridge_running:
+            blockers.append(
+                {
+                    "worker": "send_bridge",
+                    "source": "sidebar_managed",
+                    "last_status": str(worker.get("last_status") or ""),
+                    "last_error": str(worker.get("last_error") or ""),
+                }
+            )
+    if not managed_bridge_running and bridge_worker_lock_alive(root):
+        lock = _bridge_worker_lock_snapshot(root)
+        pid = int(lock.get("pid", 0) or 0)
+        lock_data_dir = str(lock.get("data_dir") or "").strip()
+        same_data_dir = False
+        if lock_data_dir:
+            try:
+                same_data_dir = Path(lock_data_dir).resolve() == root
+            except OSError:
+                same_data_dir = False
+        # A preserved legacy evidence lock can contain this process's PID and a
+        # fresh timestamp without representing a live worker. Modern workers
+        # identify their data dir; a different live PID remains fail-closed.
+        if same_data_dir or (pid > 0 and pid != os.getpid()):
+            blockers.append(
+                {
+                    "worker": "send_bridge",
+                    "source": "external_process",
+                    "pid": pid,
+                    "label": str(lock.get("label") or ""),
+                    "backend_name": str(lock.get("backend_name") or ""),
+                }
+            )
     return blockers
 
 
@@ -3658,10 +3723,6 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
     token_source = "environment" if env_token_present else ("payload_or_state" if token_present else "missing")
     cached_sessions = _weflow_cached_sessions(root, limit=200)
     readiness = _weflow_readiness_snapshot(persisted if isinstance(persisted, dict) else {}, worker, token_present, token_source)
-    try:
-        migration = migrate_file_allowed_extensions(root)
-    except Exception as exc:
-        migration = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     pull_job = _weflow_pull_job_state(root, persisted)
     backfill_job = _weflow_backfill_job_state(root, persisted)
     last_pull = persisted.get("last_pull", {}) if isinstance(persisted, dict) else {}
@@ -3688,7 +3749,6 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "allows_non_local_by_default": False,
             "native_send_bridge_primary": True,
         },
-        "config_migration": migration,
         "worker": worker,
         "readiness": readiness,
         "pull_job": pull_job,
@@ -6360,35 +6420,20 @@ def _weflow_readiness_snapshot(
 
 
 def _read_weflow_sidebar_state(data_dir: str | Path) -> dict[str, Any]:
-    path = Path(data_dir) / "weflow_sidebar_state.json"
     with _WEFLOW_STATE_FILE_LOCK:
-        legacy = _read_json(path, {})
-        try:
-            return SidebarStateStore(data_dir).read_weflow_state(
-                legacy_state=legacy if isinstance(legacy, dict) else {},
-                history_limit=50,
-            )
-        except Exception:
-            return legacy if isinstance(legacy, dict) else {}
+        return SidebarStateStore(data_dir).read_weflow_state(history_limit=50)
 
 
 def _write_weflow_sidebar_state(data_dir: str | Path, update: dict[str, Any]) -> None:
     path = Path(data_dir) / "weflow_sidebar_state.json"
     with _WEFLOW_STATE_FILE_LOCK:
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            store = SidebarStateStore(data_dir)
-            legacy = _read_json(path, {})
-            current = store.read_weflow_state(legacy_state=legacy if isinstance(legacy, dict) else {}, history_limit=50)
-            payload = current if isinstance(current, dict) else {}
-            payload.update(update)
-            payload["updated_at"] = now
-            payload = store.update_weflow_state(payload)
-        except Exception:
-            current = _read_json(path, {})
-            payload = current if isinstance(current, dict) else {}
-            payload.update(update)
-            payload["updated_at"] = now
+        store = SidebarStateStore(data_dir)
+        current = store.read_weflow_state(history_limit=50)
+        payload = current if isinstance(current, dict) else {}
+        payload.update(update)
+        payload["updated_at"] = now
+        payload = store.update_weflow_state(payload)
         _write_json(path, payload)
 
 
@@ -6424,18 +6469,8 @@ def _append_weflow_operation_history(data_dir: str | Path, action: str, result: 
             "summary": _weflow_operation_summary(result),
             "result": _compact_weflow_history_payload(result),
         }
-        try:
-            store = SidebarStateStore(data_dir)
-            legacy = _read_json(path, {})
-            store.read_weflow_state(legacy_state=legacy if isinstance(legacy, dict) else {}, history_limit=50)
-            payload = store.append_weflow_operation_entry(entry, limit=50)
-        except Exception:
-            current = _read_json(path, {})
-            payload = current if isinstance(current, dict) else {}
-            existing = payload.get("operation_history")
-            history = existing if isinstance(existing, list) else []
-            payload["operation_history"] = [entry, *[item for item in history if isinstance(item, dict)]][:50]
-            payload["updated_at"] = entry["time"]
+        store = SidebarStateStore(data_dir)
+        payload = store.append_weflow_operation_entry(entry, limit=50)
         _write_json(path, payload)
 
 
@@ -6662,8 +6697,6 @@ def _retained_config_paths(root: Path) -> set[Path]:
         "config.json",
         "accepted_contacts.json",
         "accepted_groups.json",
-        "contacts_whitelist.json",
-        "groups_whitelist.json",
         "topic_rules.json",
         "search_blocklist.json",
         "api_keys.local.md",
@@ -6702,10 +6735,10 @@ def _remove_history_path(
         return
     try:
         if target.is_dir():
-            shutil.rmtree(target)
+            _remove_history_tree(target)
             kind = "dir"
         else:
-            target.unlink()
+            _remove_history_file(target)
             kind = "file"
     except OSError as exc:
         if not target.is_dir() and relative in _HISTORY_RESET_LOCK_TOLERANT_FILES and _is_windows_locked_file_error(exc):
@@ -6723,6 +6756,36 @@ def _remove_history_path(
         )
         return
     removed.append({"relative_path": relative, "path": str(target), "kind": kind})
+
+
+def _remove_history_tree(target: Path) -> None:
+    """Remove resettable trees that may contain immutable workspace artifacts."""
+
+    try:
+        paths = list(target.rglob("*"))
+    except OSError:
+        paths = []
+    for path in paths:
+        if path.is_symlink():
+            continue
+        _make_history_path_writable(path)
+    _make_history_path_writable(target)
+    shutil.rmtree(target)
+
+
+def _remove_history_file(target: Path) -> None:
+    try:
+        target.unlink()
+    except PermissionError:
+        _make_history_path_writable(target)
+        target.unlink()
+
+
+def _make_history_path_writable(path: Path) -> None:
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IWUSR)
+    except OSError:
+        return
 
 
 def _reinitialize_history_runtime_files(root: Path) -> list[str]:
@@ -7510,12 +7573,21 @@ def _agent_generate_one_proactive_reply(root: Path, *, runtime: Any, candidate: 
             "kind": kind,
             "source_watermark": int(candidate.get("source_watermark") or 0),
         }
-    entry = runtime.ledger_store.append_reply(
+    entry = runtime.ledger_store.append_reply_if_latest(
         reply,
+        expected_latest_sequence=_bounded_int(candidate.get("source_watermark"), 0, 0, 1_000_000_000),
         chat_title=str(conversation.get("chat_title") or ""),
         conversation_type=str(conversation.get("conversation_type") or "private"),
         session_id=str(conversation.get("session_id") or "session_default"),
     )
+    if entry is None:
+        return {
+            "status": "skipped",
+            "reason": "stale_linear_context:ledger_changed_before_reply_commit",
+            "conversation_id": conversation_id,
+            "kind": kind,
+            "source_watermark": int(candidate.get("source_watermark") or 0),
+        }
     send = runtime.reply_gate.handle(reply)
     runtime.ledger_store.update_reply_send_result(conversation_id, entry.entry_id, send)
     try:
@@ -7884,12 +7956,31 @@ def _agent_entry_is_control_event(entry: dict[str, Any]) -> bool:
 
 
 def _agent_entry_has_actionable_user_content(entry: dict[str, Any]) -> bool:
-    if _agent_entry_is_control_event(entry):
+    if _agent_entry_is_control_event(entry) or _agent_entry_is_historical_context(entry):
         return False
     if _agent_entry_text(entry):
         return True
     attachments = entry.get("attachments") if isinstance(entry.get("attachments"), list) else []
     return any(isinstance(item, dict) for item in attachments)
+
+
+def _agent_entry_is_historical_context(entry: dict[str, Any]) -> bool:
+    blocks = entry.get("text_blocks") if isinstance(entry.get("text_blocks"), list) else []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        if not metadata.get("context_only"):
+            continue
+        capture_phase = str(metadata.get("capture_phase") or "").strip().lower()
+        source = str(metadata.get("source") or "").strip()
+        if capture_phase in {"history", "history_backfill", "backfill"}:
+            return True
+        if metadata.get("history_index") is not None:
+            return True
+        if source in {"windows_snapshot", "ocr_file_card", "poll_ocr_window", "ocr_snapshot"}:
+            return True
+    return False
 
 
 def _agent_pending_user_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -8289,7 +8380,7 @@ def _dedupe_strings(values: list[str]) -> list[str]:
 def _key_pool(data_dir: str | Path) -> ApiKeyPool:
     config = ensure_config(data_dir)
     root = Path(data_dir)
-    chat_provider = config.providers.get("chat", config.llm)
+    chat_provider = config.providers["chat"]
     return ApiKeyPool(chat_provider, root)
 
 
@@ -8360,7 +8451,7 @@ def remove_api_key(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
 
 def _key_refs_inheriting_provider_concurrency(data_dir: str | Path) -> list[str]:
     config = ensure_config(data_dir)
-    provider = config.providers.get("chat", config.llm)
+    provider = config.providers["chat"]
     old_limit = int(provider.max_concurrency or DEFAULT_LLM_MAX_CONCURRENCY)
     refs: list[str] = []
     for item in _key_pool(data_dir).describe():
@@ -8383,7 +8474,7 @@ _MODEL_PROVIDER_FORMATS = ["deepseek", "relay"]
 def get_model_config(data_dir: str | Path) -> dict[str, Any]:
     """Return the current chat provider's model/endpoint/format for the panel."""
     config = ensure_config(data_dir)
-    provider = config.providers.get("chat", config.llm)
+    provider = config.providers["chat"]
     pool = _key_pool(data_dir)
     keys = pool.describe()
     return {
@@ -8470,7 +8561,7 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
     from app.personal_wechat_bot.llm.openai_client import DEFAULT_USER_AGENT, normalize_openai_base_url
 
     config = ensure_config(data_dir)
-    provider_cfg = config.providers.get("chat", config.llm)
+    provider_cfg = config.providers["chat"]
     key_ref = str(payload.get("ref") or payload.get("key_ref") or payload.get("keyRef") or "").strip()
     pool = _key_pool(data_dir)
     if key_ref:
@@ -8563,7 +8654,7 @@ def _extract_model_ids(payload: Any) -> list[str]:
 def _channel_store(data_dir: str | Path) -> ConversationChannelStore:
     config = ensure_config(data_dir)
     root = Path(data_dir)
-    chat_provider = config.providers.get("chat", config.llm)
+    chat_provider = config.providers["chat"]
     key_pool = ApiKeyPool(chat_provider, root)
     return ConversationChannelStore(
         root,
@@ -8606,7 +8697,7 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
             "hidden_items": [],
             "hidden_items_all": [],
         }
-    visible_policy = _visible_channel_policy(root, config)
+    visible_policy = _visible_channel_policy(config)
     channels = []
     hidden = []
     state_records = []
@@ -8820,23 +8911,10 @@ def _looks_like_wechat_receiver(value: str) -> bool:
     return bool(text.startswith("wxid_") or text.startswith("gh_") or text.endswith("@chatroom"))
 
 
-def _visible_channel_policy(root: Path, config: Any) -> dict[str, set[str]]:
-    bindings = WeChatWindowBindingStore(root).list_bindings()
-    bound_ids = {
-        str(item.get("conversation_id", "")).strip()
-        for item in bindings
-        if str(item.get("conversation_id", "")).strip() and str(item.get("status", "active")) == "active"
-    }
-    bound_titles = {
-        str(item.get("chat_title", "")).strip()
-        for item in bindings
-        if str(item.get("chat_title", "")).strip() and str(item.get("status", "active")) == "active"
-    }
+def _visible_channel_policy(config: Any) -> dict[str, set[str]]:
     return {
         "accepted_contacts": {str(item).strip() for item in config.accepted_contacts if str(item).strip()},
         "accepted_groups": {str(item).strip() for item in config.accepted_groups if str(item).strip()},
-        "bound_ids": bound_ids,
-        "bound_titles": bound_titles,
     }
 
 
@@ -8854,7 +8932,7 @@ def _sidebar_channel_visible(channel: Any, policy: dict[str, set[str]] | None = 
         return False, "probe_fragment"
     if _looks_like_mojibake(title):
         return False, "mojibake"
-    return False, "untrusted_legacy_channel"
+    return False, "untrusted_channel"
 
 
 def _channel_is_unidentified_private(channel: Any, policy: dict[str, set[str]]) -> bool:
@@ -8867,8 +8945,6 @@ def _channel_is_unidentified_private(channel: Any, policy: dict[str, set[str]]) 
     if not identity and sender_ids:
         identity = sender_ids[0]
     sender_names = [str(item).strip() for item in getattr(channel, "sender_names", []) if str(item).strip()]
-    if conversation_id in policy.get("bound_ids", set()) or title in policy.get("bound_titles", set()):
-        return False
     accepted_contacts = policy.get("accepted_contacts", set())
     accepted_candidates = {identity, title, *sender_ids, *sender_names}
     accepted_candidates.discard("")
@@ -8907,8 +8983,6 @@ def _channel_has_visible_trust(channel: Any, policy: dict[str, set[str]]) -> boo
     title = str(getattr(channel, "chat_title", "")).strip()
     sender_names = {str(item).strip() for item in getattr(channel, "sender_names", []) if str(item).strip()}
     sender_ids = {str(item).strip() for item in getattr(channel, "sender_wechat_ids", []) if str(item).strip()}
-    if conversation_id in policy.get("bound_ids", set()) or title in policy.get("bound_titles", set()):
-        return True
     if title in policy.get("accepted_contacts", set()) or sender_names.intersection(policy.get("accepted_contacts", set())):
         return True
     if title in policy.get("accepted_groups", set()):

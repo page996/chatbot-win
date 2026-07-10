@@ -13,7 +13,6 @@ from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import as_payload, memory_dir_for_conversation
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import utc_now_iso
-from app.personal_wechat_bot.llm.base import generate_reply_with_workload
 
 
 _MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-maintainer")
@@ -215,7 +214,7 @@ class MemoryMaintainer:
             return
         prompt = _memory_prompt(conversation_id, session_id, entries)
         try:
-            raw = generate_reply_with_workload(self.llm, prompt, workload="background")
+            raw = self.llm.generate_reply(prompt, workload="background")
             parsed = _parse_json_object(raw)
         except Exception:
             return

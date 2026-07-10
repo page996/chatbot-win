@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage
+from app.personal_wechat_bot.conversation.session_store import is_reset_command
 from app.personal_wechat_bot.normalizer.normalizer import MessageNormalizer
 
 
@@ -119,7 +120,11 @@ def _is_live_timeline_message(message: NormalizedMessage) -> bool:
 
 
 def _is_reply_candidate(message: NormalizedMessage) -> bool:
-    return _is_live_timeline_message(message) and not message.is_self
+    return (
+        _is_live_timeline_message(message)
+        and not message.is_self
+        and not is_reset_command(message.text, metadata=message.metadata)
+    )
 
 
 def _defer_reply(raw: RawWeChatMessage, *, anchor_raw_id: str) -> RawWeChatMessage:

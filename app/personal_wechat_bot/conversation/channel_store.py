@@ -13,7 +13,9 @@ from app.personal_wechat_bot.conversation.channel_admission import (
     private_contact_is_explicit_non_friend,
 )
 from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
+from app.personal_wechat_bot.conversation.ledger_database import ConversationLedgerDatabase
 from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
+from app.personal_wechat_bot.conversation.session_database import ConversationSessionDatabase
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
@@ -78,15 +80,11 @@ class ConversationChannelStore:
         # Cache conversation_id -> stable directory segment. The display title
         # may change; the segment must not, or ledgers/sessions/workspaces split.
         self._segment_cache: dict[str, str] = {}
-        self._import_legacy_channels()
 
     def ensure_channel(self, message: NormalizedMessage) -> ConversationChannel:
         with self._lock, self._store_lock():
-            existing_path = self._find_channel_path(message.conversation_id)
-            existing = self.registry.get(message.conversation_id) or (
-                self._read_channel_payload(existing_path) if existing_path else {}
-            )
-            segment = _payload_segment(existing, existing_path.parent.name if existing_path else "")
+            existing = self.registry.get(message.conversation_id) or {}
+            segment = _payload_segment(existing, "")
             if not segment:
                 segment = conversation_segment(message.conversation_id, message.chat_title)
             self._segment_cache[message.conversation_id] = segment
@@ -166,42 +164,6 @@ class ConversationChannelStore:
                 self._segment_cache[conversation_id] = segment
             self._restore_readable_projection(payload)
             return _channel_from_payload(payload)
-        path = self._find_channel_path(conversation_id)
-        payload = self._read_channel_payload(path) if path else {}
-        if payload and path:
-            self._segment_cache[conversation_id] = _payload_segment(payload, path.parent.name)
-            payload.setdefault("segment", path.parent.name)
-            self.registry.insert_if_missing(payload)
-        return _channel_from_payload(payload) if payload else None
-
-    def _find_channel_path(self, conversation_id: str) -> Path | None:
-        """Locate the channel.json for a given conversation_id.
-
-        Because channel dirs now use human-readable segments (chat_title + hash
-        prefix), we can't reconstruct the segment from conversation_id alone
-        without the chat_title. Strategy:
-        1. Try the cache (fast path for already-open sessions).
-        2. Scan existing dirs (slow path for a fresh store instance after restart).
-        """
-        registered = self.registry.get(conversation_id) or {}
-        registered_segment = _payload_segment(registered, "") if registered else ""
-        if registered_segment:
-            self._segment_cache[conversation_id] = registered_segment
-            return self.root / registered_segment / "channel.json"
-        cached_segment = self._segment_cache.get(conversation_id, "")
-        candidate = self.root / cached_segment / "channel.json" if cached_segment else self.root / resolve_segment(self.data_dir, conversation_id) / "channel.json"
-        if candidate.exists():
-            return candidate
-        # Scan: look for any channel.json whose payload has matching conversation_id.
-        if self.root.exists():
-            for channel_json in self.root.glob("*/channel.json"):
-                try:
-                    payload = json.loads(channel_json.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if isinstance(payload, dict) and payload.get("conversation_id") == conversation_id:
-                    self._segment_cache[conversation_id] = _payload_segment(payload, channel_json.parent.name)
-                    return channel_json
         return None
 
     def api_key_for_request(self, conversation_id: str) -> str | None:
@@ -212,12 +174,12 @@ class ConversationChannelStore:
 
     def ref_for_request(self, conversation_id: str) -> str | None:
         with self._lock, self._store_lock():
-            path = self._find_channel_path(conversation_id)
-            if not path:
-                return None
-            payload = self._read_channel_payload(path)
+            payload = self.registry.get(conversation_id) or {}
             if not payload:
                 return None
+            segment = _payload_segment(payload, resolve_segment(self.data_dir, conversation_id))
+            self._segment_cache[conversation_id] = segment
+            path = self.root / segment / "channel.json"
             refs = [str(item) for item in payload.get("api_key_refs", []) if item]
             available_refs = [ref for ref in refs if self.key_pool.key_for_ref(ref)]
             if not available_refs:
@@ -242,25 +204,26 @@ class ConversationChannelStore:
 
     def delete_channel_with_cleanup(self, conversation_id: str) -> dict[str, Any]:
         with self._lock, self._store_lock():
-            path = self._find_channel_path(conversation_id)
-            payload = self.registry.get(conversation_id) or (self._read_channel_payload(path) if path else {})
-            if not path or (not path.exists() and not payload):
+            payload = self.registry.get(conversation_id) or {}
+            if not payload:
                 return {
                     "deleted": False,
                     "cleanup_policy": "missing",
                     "removed": [],
                     "retained": [],
                 }
+            segment = _payload_segment(payload, resolve_segment(self.data_dir, conversation_id))
+            path = self.root / segment / "channel.json"
             cleanup_policy = _cleanup_policy_for(payload)
             removed: list[str] = []
             retained: list[str] = []
             if cleanup_policy == "non_wechat_purge":
-                segment = _payload_segment(payload, path.parent.name)
                 for target in self._associated_paths(conversation_id, segment):
                     if _remove_path(target):
                         removed.append(str(target))
+                ConversationLedgerDatabase(self.data_dir).delete_conversation(conversation_id)
+                ConversationSessionDatabase(self.data_dir).delete_conversation(conversation_id)
             else:
-                segment = _payload_segment(payload, path.parent.name)
                 retained.extend(str(target) for target in self._associated_paths(conversation_id, segment))
             channel_dir = path.parent
             if _remove_path(channel_dir):
@@ -284,13 +247,6 @@ class ConversationChannelStore:
         start = _stable_index(conversation_id, len(candidates))
         return [candidates[(start + offset) % len(candidates)] for offset in range(size)]
 
-    def _channel_dir(self, conversation_id: str, chat_title: str = "") -> Path:
-        segment = self._segment_cache.get(conversation_id) or resolve_segment(self.data_dir, conversation_id, chat_title)
-        return self.root / segment
-
-    def _channel_path(self, conversation_id: str, chat_title: str = "") -> Path:
-        return self._channel_dir(conversation_id, chat_title) / "channel.json"
-
     def _associated_paths(self, conversation_id: str, segment: str = "") -> list[Path]:
         segment = segment or self._segment_cache.get(conversation_id) or resolve_segment(self.data_dir, conversation_id)
         return [
@@ -299,7 +255,7 @@ class ConversationChannelStore:
             self.data_dir / "conversation_sessions" / segment,
         ]
 
-    def _read_channel_payload(self, path: Path) -> dict[str, Any]:
+    def _read_json(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
         try:
@@ -307,14 +263,6 @@ class ConversationChannelStore:
         except (OSError, json.JSONDecodeError):
             return {}
         return payload if isinstance(payload, dict) else {}
-
-    def _import_legacy_channels(self) -> None:
-        for path in sorted(self.root.glob("*/channel.json")):
-            payload = self._read_channel_payload(path)
-            if not payload:
-                continue
-            payload.setdefault("segment", path.parent.name)
-            self.registry.insert_if_missing(payload)
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,7 +280,7 @@ class ConversationChannelStore:
         )
         channel_path = self.root / segment / "channel.json"
         index_path = self.root / "index.json"
-        index = self._read_channel_payload(index_path)
+        index = self._read_json(index_path)
         indexed = any(
             isinstance(item, dict) and str(item.get("conversation_id") or "") == conversation_id
             for item in (index.get("channels", []) if isinstance(index.get("channels"), list) else [])
@@ -342,7 +290,7 @@ class ConversationChannelStore:
         with self._lock, self._store_lock():
             if not channel_path.exists():
                 self._write_json(channel_path, payload)
-            index = self._read_channel_payload(index_path)
+            index = self._read_json(index_path)
             indexed = any(
                 isinstance(item, dict) and str(item.get("conversation_id") or "") == conversation_id
                 for item in (index.get("channels", []) if isinstance(index.get("channels"), list) else [])
@@ -360,7 +308,7 @@ class ConversationChannelStore:
 
     def _update_index(self, payload: dict[str, Any]) -> None:
         index_path = self.root / "index.json"
-        index = self._read_channel_payload(index_path)
+        index = self._read_json(index_path)
         channels = index.get("channels", []) if isinstance(index.get("channels"), list) else []
         kept = [
             item
@@ -394,7 +342,7 @@ class ConversationChannelStore:
 
     def _remove_from_index(self, conversation_id: str) -> None:
         index_path = self.root / "index.json"
-        index = self._read_channel_payload(index_path)
+        index = self._read_json(index_path)
         channels = index.get("channels", []) if isinstance(index.get("channels"), list) else []
         kept = [
             item

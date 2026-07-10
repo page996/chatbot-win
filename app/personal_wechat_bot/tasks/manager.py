@@ -316,7 +316,6 @@ class TaskStatusStore:
         return self.scheduler_store.list_events(task_id=task_id, limit=limit)
 
     def _read_tasks(self) -> list[dict[str, Any]]:
-        self._migrate_json_projection_if_needed()
         tasks = self.scheduler_store.list_tasks()
         if tasks:
             filtered = [dict(item) for item in tasks if isinstance(item, dict) and not _is_ephemeral_ui_task(item)]
@@ -325,13 +324,7 @@ class TaskStatusStore:
                 repaired = self.scheduler_store.update_tasks_atomically(self._repair_tasks_atomically)
                 self._write_projection_from_sqlite()
             return repaired
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        raw = payload.get("tasks", []) if isinstance(payload, dict) else []
-        tasks = [dict(item) for item in raw if isinstance(item, dict) and not _is_ephemeral_ui_task(item)]
-        return _repair_stale_external_tasks(tasks, data_dir=self.data_dir)
+        return []
 
     def _write_tasks(self, tasks: list[dict[str, Any]]) -> None:
         self._persist_tasks(tasks)
@@ -361,9 +354,15 @@ class TaskStatusStore:
             "sqlite": str(self.scheduler_store.path),
             "tasks": tasks,
         }
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        tmp = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self.path)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     def _write_event(self, task_id: str, event: str, payload: dict[str, Any]) -> None:
         task_id = str(task_id or "").strip()
@@ -373,19 +372,6 @@ class TaskStatusStore:
             self.scheduler_store.append_event(task_id, event, payload)
         except Exception:
             pass
-
-    def _migrate_json_projection_if_needed(self) -> None:
-        if not self.scheduler_store.is_empty():
-            return
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        raw = payload.get("tasks", []) if isinstance(payload, dict) else []
-        tasks = [dict(item) for item in raw if isinstance(item, dict)]
-        if tasks:
-            self.scheduler_store.replace_tasks(tasks)
-
 
 def task_priority_score(task: dict[str, Any]) -> float:
     status = str(task.get("status", "queued"))

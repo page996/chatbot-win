@@ -13,9 +13,8 @@ SCHEMA_VERSION = 1
 class SchedulerStore:
     """SQLite-backed scheduler state.
 
-    The first rollout keeps task payloads as JSON while indexing the fields the
-    scheduler and sidebar need to query. That gives us transactional writes and
-    a migration path without forcing every task producer to change at once.
+    Task payloads stay JSON-shaped while query-critical fields are indexed for
+    transactional scheduler and sidebar access.
     """
 
     def __init__(self, data_dir: str | Path):

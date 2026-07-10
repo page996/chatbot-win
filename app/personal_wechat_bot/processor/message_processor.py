@@ -31,7 +31,7 @@ class MessageProcessor:
 
         route = self.runtime.router.decide(message)
         self.runtime.event_logger.log("route.decision", route, message_id=message.message_id)
-        if _channel_admission_blocked(route):
+        if _channel_admission_blocked(route) or _untrusted_channel_source_blocked(route):
             self._mark_message_done(message, original_message_id)
             return {
                 "message": asdict(message),
@@ -40,7 +40,12 @@ class MessageProcessor:
                 "blocked": True,
             }
 
-        reset_session_id = self.runtime.session_store.maybe_reset_for_message(message)
+        if _untrusted_channel_source_context_only(route):
+            message = self._with_metadata(message, {"context_only": True})
+
+        reset_session_id = None
+        if route.action == "process" and not message.is_self and not message.metadata.get("context_only"):
+            reset_session_id = self.runtime.session_store.maybe_reset_for_message(message)
         if reset_session_id:
             pending_context_item = {"session_id": reset_session_id, "reset": True}
         else:
@@ -99,6 +104,8 @@ class MessageProcessor:
             return item
 
         if route.action != "process":
+            if message.metadata.get("context_only"):
+                item["context_only"] = True
             if route.action in {"ignore", "duplicate"}:
                 self._mark_message_done(message)
             return item
@@ -156,6 +163,8 @@ class MessageProcessor:
             conversation_type=message.conversation_type,
             session_id=session_id,
         )
+        if message.conversation_type == "group":
+            self.runtime.cooldown.mark(message.conversation_id, message.received_at)
         memory = self._maintain_memory(message.conversation_id, session_id)
         if memory:
             item["memory_after_reply"] = memory
@@ -183,7 +192,12 @@ class MessageProcessor:
     ) -> SpeakDecision:
         if speak.decision != "speak" or conversation_type != "group":
             return speak
-        allowed, reason = self.runtime.cooldown.allow(conversation_id, received_at)
+        check = getattr(self.runtime.cooldown, "check", None)
+        allowed, reason = (
+            check(conversation_id, received_at)
+            if callable(check)
+            else self.runtime.cooldown.allow(conversation_id, received_at)
+        )
         if allowed:
             return speak
         return SpeakDecision(
@@ -581,6 +595,20 @@ def _channel_admission_blocked(route: Any) -> bool:
     return (
         str(getattr(route, "action", "") or "") == "ignore"
         and str(getattr(route, "reason", "") or "").startswith("channel_admission_blocked:")
+    )
+
+
+def _untrusted_channel_source_blocked(route: Any) -> bool:
+    return (
+        str(getattr(route, "action", "") or "") == "ignore"
+        and str(getattr(route, "reason", "") or "").startswith("untrusted_channel_source_blocked:")
+    )
+
+
+def _untrusted_channel_source_context_only(route: Any) -> bool:
+    return (
+        str(getattr(route, "action", "") or "") == "ignore"
+        and str(getattr(route, "reason", "") or "").startswith("untrusted_channel_source_context_only:")
     )
 
 

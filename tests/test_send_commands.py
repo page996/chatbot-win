@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.control.send_commands import (
@@ -265,7 +266,7 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(result["cleared_count"], 1)
             self.assertEqual(list_send_audit(data_dir, limit=10)["items"], [])
 
-    def test_list_send_audit_skips_malformed_jsonl_lines(self) -> None:
+    def test_send_audit_jsonl_projection_does_not_repopulate_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -276,9 +277,12 @@ class SendCommandsTest(unittest.TestCase):
             )
 
             result = list_send_audit(data_dir, limit=10)
+            SendAuditLog(path).append("confirm_reject", queue_id="queue-2", status="rejected")
+            current = list_send_audit(data_dir, limit=10)
 
-            self.assertEqual(result["count"], 1)
-            self.assertEqual(result["items"][0]["action"], "confirm_approve")
+            self.assertEqual(result["count"], 0)
+            self.assertEqual(current["count"], 1)
+            self.assertEqual(current["items"][0]["action"], "confirm_reject")
 
     def test_remove_confirm_item_deletes_only_queue_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -723,9 +727,7 @@ class SendCommandsTest(unittest.TestCase):
             self.assertEqual(task["metadata"]["bridge_id"], new_bridge_id)
             self.assertEqual(bridge_state(data_dir, limit=20)["pending_count"], 1)
 
-    def test_send_approved_confirm_item_bridge_queues_without_manual_binding(self) -> None:
-        # The bridge delivers by wxid/roomid, so it no longer requires a manual
-        # foreground window binding; an unbound channel now queues successfully.
+    def test_send_approved_confirm_item_bridge_queues_by_channel_receiver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -1196,7 +1198,9 @@ def _register_authorized_private_channel(
         "trusted_channel_source": True,
         "is_friend": True,
         "contact_authorization": "explicit_friend",
+        "segment": segment,
     }
+    ChannelRegistryStore(data_dir).upsert(payload)
     (channel_dir / "channel.json").write_text(json.dumps(payload), encoding="utf-8")
     (data_dir / "conversation_channels" / "index.json").write_text(
         json.dumps({"channels": [{"conversation_id": conversation_id, "chat_title": chat_title}]}),

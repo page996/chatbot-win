@@ -7,7 +7,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from app.personal_wechat_bot.config.loader import add_contact, create_default_config, load_config, set_deepseek_provider
+from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config, set_deepseek_provider
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 
 
@@ -20,7 +20,7 @@ class ReplayErrorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            add_contact(data_dir, "wxid_xiaoming")
+            accept_contact(data_dir, "wxid_xiaoming")
             set_deepseek_provider(data_dir, api_key_env="MISSING_DEEPSEEK_KEY_FOR_TEST")
             config = load_config(data_dir)
 

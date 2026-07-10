@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from app.personal_wechat_bot.bootstrap import build_runtime
-from app.personal_wechat_bot.config.loader import add_contact, create_default_config, load_config
+from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config
 from app.personal_wechat_bot.domain.models import RawWeChatMessage, SendResult
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.wechat_driver.fake import FakeWeChatDriver
@@ -20,7 +20,7 @@ class PollingRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            add_contact(data_dir, "wxid_xiaoming")
+            accept_contact(data_dir, "wxid_xiaoming")
             runtime = build_runtime(load_config(data_dir))
             driver = FakeWeChatDriver(FIXTURES / "private_basic.json")
 
@@ -36,7 +36,7 @@ class PollingRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            add_contact(data_dir, "wxid_xiaoming")
+            accept_contact(data_dir, "wxid_xiaoming")
             runtime = build_runtime(load_config(data_dir))
             driver = FakeWeChatDriver(FIXTURES / "private_basic.json")
 
@@ -51,8 +51,8 @@ class PollingRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            add_contact(data_dir, "wxid_a")
-            add_contact(data_dir, "wxid_b")
+            accept_contact(data_dir, "wxid_a")
+            accept_contact(data_dir, "wxid_b")
             runtime = build_runtime(load_config(data_dir))
             driver = _ListDriver(
                 [

@@ -17,9 +17,8 @@ WEFLOW_HISTORY_LIMIT = 50
 class SidebarStateStore:
     """SQLite authority for sidebar/console state projections.
 
-    The first rollout keeps ``weflow_sidebar_state.json`` as a compatibility
-    projection, but moves mutable console state and operation history here so
-    concurrent workers no longer race one JSON file.
+    ``weflow_sidebar_state.json`` is a readable projection. Mutable console
+    state and operation history are read only from SQLite.
     """
 
     def __init__(self, data_dir: str | Path):
@@ -29,12 +28,9 @@ class SidebarStateStore:
     def read_weflow_state(
         self,
         *,
-        legacy_state: dict[str, Any] | None = None,
         history_limit: int = WEFLOW_HISTORY_LIMIT,
     ) -> dict[str, Any]:
         self._ensure_schema()
-        if isinstance(legacy_state, dict):
-            self.import_legacy_weflow_state(legacy_state)
         with self._connection() as db:
             rows = db.execute(
                 """
@@ -166,31 +162,6 @@ class SidebarStateStore:
             payload.setdefault("summary", str(row["summary"] or ""))
             history.append(payload)
         return history
-
-    def import_legacy_weflow_state(self, legacy_state: dict[str, Any]) -> None:
-        if not isinstance(legacy_state, dict) or not legacy_state:
-            return
-        self._ensure_schema()
-        with self._connection() as db:
-            value_count = db.execute(
-                "SELECT COUNT(*) FROM sidebar_state_values WHERE scope = 'weflow'"
-            ).fetchone()[0]
-            history_count = db.execute("SELECT COUNT(*) FROM weflow_operation_history").fetchone()[0]
-        if int(value_count or 0) == 0:
-            values = {key: value for key, value in legacy_state.items() if key != "operation_history"}
-            if values:
-                timestamp = str(values.get("updated_at") or _now_z())
-                with self._connection() as db:
-                    for key, value in values.items():
-                        db.execute(
-                            """
-                            INSERT OR REPLACE INTO sidebar_state_values(scope, key, value_json, updated_at)
-                            VALUES ('weflow', ?, ?, ?)
-                            """,
-                            (str(key), _json_dumps(value), timestamp),
-                        )
-        if int(history_count or 0) == 0 and isinstance(legacy_state.get("operation_history"), list):
-            self.replace_weflow_operation_history(legacy_state["operation_history"])
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

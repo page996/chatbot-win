@@ -74,18 +74,18 @@ def _runtime_schedule(runtime: BotRuntime, workload: str) -> ResourceSchedule:
                 pass
     return ResourceSchedule(
         workload=_normalize_workload(workload),
-        max_parallel_conversations=_legacy_max_parallel_conversations(runtime),
-        llm_total=_legacy_max_parallel_conversations(runtime),
-        llm_interactive=_legacy_max_parallel_conversations(runtime),
+        max_parallel_conversations=_fallback_max_parallel_conversations(runtime),
+        llm_total=_fallback_max_parallel_conversations(runtime),
+        llm_interactive=_fallback_max_parallel_conversations(runtime),
         llm_background=1,
         media_cpu=2,
         file_io=1,
         gpu_media=1,
-        reason="legacy runtime without ResourceScheduler",
+        reason="runtime without ResourceScheduler",
     )
 
 
-def _legacy_max_parallel_conversations(runtime: BotRuntime) -> int:
+def _fallback_max_parallel_conversations(runtime: BotRuntime) -> int:
     key_pool = getattr(runtime, "key_pool", None)
     concurrency_limit = getattr(key_pool, "concurrency_limit", None)
     if callable(concurrency_limit):

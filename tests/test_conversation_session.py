@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment
+from app.personal_wechat_bot.conversation.session_database import ConversationSessionDatabase
 from app.personal_wechat_bot.conversation.session_store import (
     CLEAR_CONTEXT_PHRASES,
     DEFAULT_SESSION_ID,
@@ -31,26 +33,23 @@ class ConversationSessionStoreTest(unittest.TestCase):
             self.assertEqual(state["session_started_at"], state["created_at"])
             self.assertEqual(state["reset_count"], 0)
 
-    def test_current_session_recovers_existing_hash_only_state_after_readable_channel_exists(self) -> None:
+    def test_current_session_keeps_its_sqlite_segment_after_channel_registration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            old_state = root / "conversation_sessions" / "conv1" / "state.json"
-            old_state.parent.mkdir(parents=True, exist_ok=True)
-            old_state.write_text(
-                json.dumps({"conversation_id": "conv1", "current_session_id": "session_old"}),
-                encoding="utf-8",
+            ConversationSessionDatabase(root).upsert_state(
+                "conv1",
+                "conv1",
+                {"conversation_id": "conv1", "current_session_id": "session_old"},
             )
             segment = conversation_segment("conv1", "PAGE")
-            channel = root / "conversation_channels" / segment / "channel.json"
-            channel.parent.mkdir(parents=True, exist_ok=True)
-            channel.write_text(
-                json.dumps({"conversation_id": "conv1", "chat_title": "PAGE"}),
-                encoding="utf-8",
+            ChannelRegistryStore(root).upsert(
+                {"conversation_id": "conv1", "chat_title": "PAGE", "segment": segment}
             )
 
             session_id = ConversationSessionStore(root).current_session_id("conv1")
 
             self.assertEqual(session_id, "session_old")
+            self.assertTrue((root / "conversation_sessions" / "conv1" / "state.json").exists())
 
     def test_current_session_for_message_uses_stable_channel_segment_after_title_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,31 +57,12 @@ class ConversationSessionStoreTest(unittest.TestCase):
             conversation_id = "conv-title"
             old_segment = conversation_segment(conversation_id, "PAGE")
             new_segment = conversation_segment(conversation_id, "PAGE renamed")
-            channel_path = root / "conversation_channels" / old_segment / "channel.json"
-            channel_path.parent.mkdir(parents=True, exist_ok=True)
-            channel_path.write_text(
-                json.dumps(
-                    {
-                        "conversation_id": conversation_id,
-                        "chat_title": "PAGE renamed",
-                        "segment": old_segment,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (root / "conversation_channels" / "index.json").write_text(
-                json.dumps(
-                    {
-                        "channels": [
-                            {
-                                "conversation_id": conversation_id,
-                                "chat_title": "PAGE renamed",
-                                "segment": old_segment,
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
+            ChannelRegistryStore(root).upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "chat_title": "PAGE renamed",
+                    "segment": old_segment,
+                }
             )
             message = NormalizedMessage(
                 message_id="m-title",
@@ -151,28 +131,28 @@ class ConversationSessionStoreTest(unittest.TestCase):
             self.assertTrue((session_dir / "state.json").exists())
             self.assertTrue((session_dir / "events.jsonl").exists())
 
-    def test_legacy_session_files_are_imported_into_sqlite(self) -> None:
+    def test_file_projection_does_not_repopulate_session_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             session_dir = root / "conversation_sessions" / "conv1"
             session_dir.mkdir(parents=True, exist_ok=True)
             (session_dir / "state.json").write_text(
-                json.dumps({"conversation_id": "conv1", "current_session_id": "session_legacy"}),
+                json.dumps({"conversation_id": "conv1", "current_session_id": "session_projection"}),
                 encoding="utf-8",
             )
-            legacy_event = {
+            projection_event = {
                 "type": "session.reset",
                 "conversation_id": "conv1",
-                "session_id": "session_legacy",
+                "session_id": "session_projection",
                 "previous_session_id": DEFAULT_SESSION_ID,
                 "created_at": "2026-06-29T00:00:00+00:00",
             }
-            (session_dir / "events.jsonl").write_text(json.dumps(legacy_event) + "\n", encoding="utf-8")
+            (session_dir / "events.jsonl").write_text(json.dumps(projection_event) + "\n", encoding="utf-8")
 
             store = ConversationSessionStore(root)
 
-            self.assertEqual(store.current_session_id("conv1"), "session_legacy")
-            self.assertEqual(store.database.list_events("conv1"), [legacy_event])
+            self.assertEqual(store.current_session_id("conv1"), DEFAULT_SESSION_ID)
+            self.assertEqual(store.database.list_events("conv1"), [])
             self.assertTrue((root / "conversation_sessions.sqlite").exists())
 
     def test_reset_detector_accepts_chinese_and_english_variants(self) -> None:

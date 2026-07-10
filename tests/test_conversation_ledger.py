@@ -47,11 +47,11 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertTrue((projection_dir / "conversation.md").exists())
             self.assertIn("first", (projection_dir / "conversation.md").read_text(encoding="utf-8"))
 
-    def test_legacy_jsonl_is_imported_into_sqlite(self) -> None:
+    def test_file_projection_does_not_repopulate_missing_sqlite_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = ConversationLedgerStore(root)
-            expected = store.append_message(_message("m1", "legacy"))
+            store.append_message(_message("m1", "projection only"))
             database = root / "conversation_ledger.sqlite"
             database.unlink()
             for suffix in ("-shm", "-wal"):
@@ -62,8 +62,8 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             reopened = ConversationLedgerStore(root)
             entries = reopened.read_entries("conv1")
 
-            self.assertEqual([entry.entry_id for entry in entries], [expected.entry_id])
-            self.assertEqual(entries[0].text_blocks[0]["text"], "legacy")
+            self.assertEqual(entries, [])
+            self.assertEqual(reopened.list_conversation_ids(), [])
             self.assertTrue(database.exists())
 
     def test_append_message_persists_session_id(self) -> None:
@@ -148,6 +148,28 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertTrue(entry.is_self)
             self.assertEqual(entry.role, "self")
 
+    def test_conditional_reply_append_rejects_changed_ledger_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("user1", "first"))
+            stale_reply = ReplyCandidate(
+                message_id="reply-stale",
+                conversation_id="conv1",
+                text="stale",
+                send_mode="dry_run",
+                model="fake",
+            )
+            store.append_message(_message("user2", "newer"))
+
+            rejected = store.append_reply_if_latest(stale_reply, expected_latest_sequence=1)
+            accepted = store.append_reply_if_latest(stale_reply, expected_latest_sequence=2)
+            duplicate = store.append_reply_if_latest(stale_reply, expected_latest_sequence=3)
+
+            self.assertIsNone(rejected)
+            self.assertIsNotNone(accepted)
+            self.assertIsNone(duplicate)
+            self.assertEqual([entry.role for entry in store.read_entries("conv1")], ["user", "user", "assistant"])
+
     def test_pulled_back_self_echo_dedups_against_assistant_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
@@ -159,7 +181,17 @@ class ConversationLedgerStoreTest(unittest.TestCase):
                 send_mode="auto",
                 model="fake",
             )
-            store.append_reply(reply)
+            reply_entry = store.append_reply(reply)
+            store.update_reply_send_result(
+                "conv1",
+                reply_entry.entry_id,
+                SendResult(
+                    message_id="bridge:self-echo",
+                    conversation_id="conv1",
+                    status="queued_to_bridge",
+                    reason="queued_to_non_foreground_bridge:bridge:self-echo",
+                ),
+            )
 
             # WeChat echoes the agent's own reply back through the pull with a
             # fresh message_id and is_self=True.
@@ -178,6 +210,52 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(echo.role, "assistant")
             self.assertEqual(assistant_entries[0].send.get("status"), "sent")
             self.assertEqual(assistant_entries[0].send.get("echo_message_id"), "weflow-echo-xyz")
+
+    def test_dry_run_candidate_does_not_swallow_manual_self_message_with_same_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            reply = ReplyCandidate(
+                message_id="dry-run-candidate",
+                conversation_id="conv1",
+                text="same text",
+                send_mode="dry_run",
+                model="fake",
+            )
+            entry = store.append_reply(reply)
+            store.update_reply_send_result(
+                "conv1",
+                entry.entry_id,
+                SendResult("dry-run-candidate", "conv1", "skipped", "dry_run"),
+            )
+
+            manual = store.append_message_result(_message("manual-self", "same text", is_self=True, sender_name="Me"))
+
+            self.assertEqual(manual.status, "created")
+            self.assertEqual([item.role for item in store.read_entries("conv1")], ["assistant", "self"])
+
+    def test_confirmed_echo_does_not_swallow_later_manual_self_message_with_same_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            reply = ReplyCandidate(
+                message_id="queued-candidate",
+                conversation_id="conv1",
+                text="same text",
+                send_mode="auto",
+                model="fake",
+            )
+            entry = store.append_reply(reply)
+            store.update_reply_send_result(
+                "conv1",
+                entry.entry_id,
+                SendResult("bridge:echo", "conv1", "queued_to_bridge", "bridge:echo"),
+            )
+            first_echo = store.append_message_result(_message("echo-1", "same text", is_self=True, sender_name="Me"))
+
+            later_manual = store.append_message_result(_message("manual-2", "same text", is_self=True, sender_name="Me"))
+
+            self.assertEqual(first_echo.status, "self_echo_confirmed")
+            self.assertEqual(later_manual.status, "created")
+            self.assertEqual([item.role for item in store.read_entries("conv1")], ["assistant", "self"])
 
     def test_pulled_back_self_message_without_match_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -95,6 +95,21 @@ class ConversationLedgerDatabase:
                 (conversation_id, segment, utc_now_iso()),
             )
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        conversation_id = str(conversation_id or "").strip()
+        if not conversation_id:
+            return False
+        with self._connection() as db:
+            entries = db.execute(
+                "DELETE FROM ledger_entries WHERE conversation_id = ?",
+                (conversation_id,),
+            ).rowcount
+            metadata = db.execute(
+                "DELETE FROM ledger_conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).rowcount
+        return bool(entries or metadata)
+
     def _upsert(self, db: sqlite3.Connection, item: dict[str, Any]) -> None:
         entry_id = str(item.get("entry_id") or "").strip()
         if not entry_id:

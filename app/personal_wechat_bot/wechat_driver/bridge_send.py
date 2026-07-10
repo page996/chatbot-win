@@ -10,7 +10,6 @@ from typing import Any
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.conversation.channel_admission import channel_allows_private_receiver
 from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
-from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import SendResult, utc_now_iso
 from app.personal_wechat_bot.runtime.process_lock import process_pid_alive
 from app.personal_wechat_bot.wechat_driver.send_backends import (
@@ -18,11 +17,9 @@ from app.personal_wechat_bot.wechat_driver.send_backends import (
     wechat_native_http_status,
     weflow_http_status,
 )
-from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBinding, WeChatWindowBindingStore
 
 
 BRIDGE_OUTBOX_SEND_DRIVER = "bridge_outbox"
-ALLOWED_MANUAL_BINDING_STATUSES = {"active", "stale"}
 BRIDGE_WORKER_LOCK_STALE_SECONDS = 60.0
 REAL_BRIDGE_SEND_BACKENDS = frozenset({"weflow_http", "wechat_native_http"})
 
@@ -270,7 +267,6 @@ class BridgeSendProbe:
     ack_path: str
     pending_count: int
     ack_count: int
-    manual_bound_count: int
     authorization: str
     blockers: list[str]
     backend: dict[str, Any] = field(default_factory=dict)
@@ -295,7 +291,6 @@ class BridgeOutboxStore:
         text: str,
         *,
         receiver: str = "",
-        manual_binding: WeChatWindowBinding | None = None,
     ) -> dict[str, Any]:
         bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
         record = {
@@ -307,7 +302,6 @@ class BridgeOutboxStore:
             "status": "queued",
             "created_at": utc_now_iso(),
             "transport": "send_bridge",
-            "manual_binding": _manual_binding_payload(manual_binding),
         }
         self._append(self.outbox_path, record)
         return record
@@ -320,7 +314,6 @@ class BridgeOutboxStore:
         name: str = "",
         caption: str = "",
         receiver: str = "",
-        manual_binding: WeChatWindowBinding | None = None,
     ) -> dict[str, Any]:
         bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
         resolved_path = str(Path(path).expanduser().resolve())
@@ -335,7 +328,6 @@ class BridgeOutboxStore:
             "status": "queued",
             "created_at": utc_now_iso(),
             "transport": "send_bridge",
-            "manual_binding": _manual_binding_payload(manual_binding),
         }
         self._append(self.outbox_path, record)
         return record
@@ -429,7 +421,6 @@ class BridgeOutboxStore:
     def state(self, *, limit: int = 30) -> dict[str, Any]:
         outbox = self._read_all(self.outbox_path)
         acks = self._read_all(self.ack_path)
-        manual_bindings = manual_bridge_bindings(self.data_dir)
         ack_states = effective_bridge_ack_states(acks)
         effective_status_counts = {
             BridgeAckStatus.SENT: 0,
@@ -524,11 +515,6 @@ class BridgeOutboxStore:
             "historical_failed_count": effective_status_counts.get(BridgeAckStatus.FAILED, 0),
             "effective_status_counts": effective_status_counts,
             "status_counts_by_backend": status_counts_by_backend,
-            "manual_bound_count": len(manual_bindings),
-            "manual_bound_conversations": [
-                _manual_binding_payload(item)
-                for item in sorted(manual_bindings, key=lambda value: value.last_seen_at, reverse=True)
-            ],
             "items": items,
             "contract": {
                 "producer": "agent writes outbox.jsonl (text + file records)",
@@ -687,14 +673,12 @@ class BridgeOutboxSendDriver:
         self.wechat_native_verify_timeout_seconds = max(0.0, float(wechat_native_verify_timeout_seconds or 0.0))
         self.wechat_native_file_verify_timeout_seconds = max(0.0, float(wechat_native_file_verify_timeout_seconds or 0.0))
         self.store = BridgeOutboxStore(data_dir)
-        self.binding_store = WeChatWindowBindingStore(data_dir)
 
     def health_check(self) -> bool:
         return self.store.root.exists()
 
     def probe(self) -> BridgeSendProbe:
         state = self.store.state(limit=1)
-        manual_bound_count = int(state.get("manual_bound_count", 0) or 0)
         blockers = [] if self.send_enabled else ["send_enabled_false"]
         backend = {
             "send_backend": self.send_backend,
@@ -749,7 +733,6 @@ class BridgeOutboxSendDriver:
             ack_path=str(self.store.ack_path),
             pending_count=int(state.get("pending_count", 0) or 0),
             ack_count=int(state.get("ack_count", 0) or 0),
-            manual_bound_count=manual_bound_count,
             authorization="conversation_whitelist",
             blockers=blockers,
             backend=backend,
@@ -763,10 +746,6 @@ class BridgeOutboxSendDriver:
             return SendResult("bridge-outbox-send", conversation_id, "failed", backend_blocker)
         if not text.strip():
             return SendResult("bridge-outbox-send", conversation_id, "failed", "empty_reply")
-        # The bridge delivers by wxid/roomid, so a manual foreground window
-        # binding is no longer required. Whitelist authorization is enforced
-        # upstream by the router; attach the binding as metadata when present.
-        manual_binding = self._manual_binding_for(conversation_id)
         receiver = self._receiver_for(conversation_id)
         receiver_blocker = _receiver_authorization_blocker(
             self.data_dir,
@@ -776,7 +755,7 @@ class BridgeOutboxSendDriver:
         )
         if receiver_blocker:
             return SendResult("bridge-outbox-send", conversation_id, "failed", receiver_blocker)
-        record = self.store.enqueue(conversation_id, text, receiver=receiver, manual_binding=manual_binding)
+        record = self.store.enqueue(conversation_id, text, receiver=receiver)
         return SendResult(
             message_id=str(record["bridge_id"]),
             conversation_id=conversation_id,
@@ -792,7 +771,6 @@ class BridgeOutboxSendDriver:
             return SendResult("bridge-outbox-send", conversation_id, "failed", backend_blocker)
         if not str(path).strip():
             return SendResult("bridge-outbox-send", conversation_id, "failed", "empty_file_path")
-        manual_binding = self._manual_binding_for(conversation_id)
         receiver = self._receiver_for(conversation_id)
         receiver_blocker = _receiver_authorization_blocker(
             self.data_dir,
@@ -802,21 +780,13 @@ class BridgeOutboxSendDriver:
         )
         if receiver_blocker:
             return SendResult("bridge-outbox-send", conversation_id, "failed", receiver_blocker)
-        record = self.store.enqueue_file(conversation_id, path, caption=caption, receiver=receiver, manual_binding=manual_binding)
+        record = self.store.enqueue_file(conversation_id, path, caption=caption, receiver=receiver)
         return SendResult(
             message_id=str(record["bridge_id"]),
             conversation_id=conversation_id,
             status="queued_to_bridge",
             reason=f"queued_file_to_non_foreground_bridge:{record['bridge_id']}",
         )
-
-    def _manual_binding_for(self, conversation_id: str) -> WeChatWindowBinding | None:
-        binding = self.binding_store.get_binding(conversation_id)
-        if binding is None:
-            return None
-        if binding.status not in ALLOWED_MANUAL_BINDING_STATUSES:
-            return None
-        return binding
 
     def _receiver_for(self, conversation_id: str) -> str:
         receiver = _channel_receiver(self.data_dir, conversation_id)
@@ -1095,30 +1065,9 @@ def _looks_like_private_wechat_receiver(value: str) -> bool:
 
 def _channel_payload(data_dir: str | Path, conversation_id: str) -> dict[str, Any]:
     try:
-        registered = ChannelRegistryStore(data_dir).get(conversation_id)
+        return ChannelRegistryStore(data_dir).get(conversation_id) or {}
     except Exception:
-        registered = None
-    if registered:
-        return registered
-    # Channel dirs are named chat_title_hashPrefix, not the raw conversation_id,
-    # so resolve the segment via the channel index. This is the ONLY reliable
-    # path for the out-of-process send worker, which has no in-memory cache.
-    segment = resolve_segment(data_dir, str(conversation_id or ""))
-    path = Path(data_dir) / "conversation_channels" / segment / "channel.json"
-    if not path.exists():
         return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    payload.setdefault("segment", path.parent.name)
-    try:
-        ChannelRegistryStore(data_dir).insert_if_missing(payload)
-    except Exception:
-        pass
-    return payload
 
 
 def _looks_like_wechat_receiver(value: str) -> bool:
@@ -1178,37 +1127,4 @@ def _latest_by_bridge_id(records: list[dict[str, Any]]) -> dict[str, dict[str, A
         bridge_id: state.ack
         for bridge_id, state in effective_bridge_ack_states(records).items()
         if state.ack
-    }
-
-
-def manual_bridge_bindings(data_dir: str | Path) -> list[WeChatWindowBinding]:
-    store = WeChatWindowBindingStore(data_dir)
-    bindings: list[WeChatWindowBinding] = []
-    for item in store.list_bindings():
-        conversation_id = str(item.get("conversation_id", "")).strip()
-        if not conversation_id:
-            continue
-        status = str(item.get("status", "active") or "active")
-        if status not in ALLOWED_MANUAL_BINDING_STATUSES:
-            continue
-        binding = store.get_binding(conversation_id)
-        if binding is not None:
-            bindings.append(binding)
-    return bindings
-
-
-def _manual_binding_payload(binding: WeChatWindowBinding | None) -> dict[str, Any]:
-    if binding is None:
-        return {}
-    return {
-        "conversation_id": binding.conversation_id,
-        "conversation_type": binding.conversation_type,
-        "chat_title": binding.chat_title,
-        "status": binding.status,
-        "hwnd": binding.hwnd,
-        "title": binding.title,
-        "process_id": binding.process_id,
-        "process_name": binding.process_name,
-        "bound_at": binding.bound_at,
-        "last_seen_at": binding.last_seen_at,
     }

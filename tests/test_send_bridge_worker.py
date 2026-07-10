@@ -50,6 +50,8 @@ class _FlakyBackend:
 def _write_channel(data_dir: Path, conversation_id: str, payload: dict) -> None:
     chat_title = str(payload.get("chat_title", "") or "")
     segment = conversation_segment(conversation_id, chat_title)
+    payload = {**payload, "conversation_id": conversation_id, "segment": segment}
+    ChannelRegistryStore(data_dir).upsert(payload)
     channel_dir = data_dir / "conversation_channels" / segment
     channel_dir.mkdir(parents=True, exist_ok=True)
     (channel_dir / "channel.json").write_text(json.dumps(payload), encoding="utf-8")

@@ -50,7 +50,6 @@ class ConversationSessionStore:
         # conversation_id -> stable directory segment. A message title is only
         # used to choose the first segment before a channel exists.
         self._segment_cache: dict[str, str] = {}
-        self._import_legacy_sessions()
 
     def current_session_id(self, conversation_id: str) -> str:
         with self._conversation_lock(conversation_id):
@@ -152,17 +151,13 @@ class ConversationSessionStore:
         return self.root / resolve_segment(self.data_dir, conversation_id)
 
     def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
-        if not chat_title:
-            cached_segment = self._segment_cache.get(conversation_id, "")
-            if cached_segment:
-                return cached_segment
-            existing_dir = self._find_conversation_dir(conversation_id)
-            if existing_dir.exists():
-                self._segment_cache[conversation_id] = existing_dir.name
-                state = self.database.get_state(conversation_id) or {}
-                if state:
-                    self.database.upsert_state(conversation_id, existing_dir.name, state)
-                return existing_dir.name
+        cached_segment = self._segment_cache.get(conversation_id, "")
+        if cached_segment:
+            return cached_segment
+        database_segment = self.database.segment_for(conversation_id)
+        if database_segment:
+            self._segment_cache[conversation_id] = database_segment
+            return database_segment
         segment = resolve_segment(self.data_dir, conversation_id, chat_title)
         self._segment_cache[conversation_id] = segment
         state = self.database.get_state(conversation_id) or {}
@@ -171,18 +166,7 @@ class ConversationSessionStore:
         return segment
 
     def _find_conversation_dir(self, conversation_id: str) -> Path:
-        candidate = self._conversation_dir(conversation_id)
-        if candidate.exists():
-            return candidate
-        if self.root.exists():
-            for state_json in self.root.glob("*/state.json"):
-                try:
-                    payload = json.loads(state_json.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if isinstance(payload, dict) and payload.get("conversation_id") == conversation_id:
-                    return state_json.parent
-        return candidate
+        return self._conversation_dir(conversation_id)
 
     def _state_path(self, conversation_id: str) -> Path:
         return self._find_conversation_dir(conversation_id) / "state.json"
@@ -195,17 +179,7 @@ class ConversationSessionStore:
         if registered:
             self._restore_readable_projection(conversation_id, registered)
             return registered
-        path = self._find_conversation_dir(conversation_id) / "state.json"
-        if not path.exists():
-            return {}
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        self.database.insert_state_if_missing(conversation_id, path.parent.name, payload)
-        return payload
+        return {}
 
     def _restore_readable_projection(self, conversation_id: str, state: dict[str, Any]) -> None:
         conversation_dir = self._conversation_dir(conversation_id)
@@ -241,33 +215,6 @@ class ConversationSessionStore:
         self.database.append_event(payload)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-    def _import_legacy_sessions(self) -> None:
-        for state_path in sorted(self.root.glob("*/state.json")):
-            try:
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            conversation_id = str(payload.get("conversation_id") or "").strip()
-            if not conversation_id:
-                continue
-            self.database.insert_state_if_missing(conversation_id, state_path.parent.name, payload)
-            events_path = state_path.parent / "events.jsonl"
-            if not events_path.exists():
-                continue
-            events: list[dict[str, Any]] = []
-            try:
-                for line in events_path.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    event = json.loads(line)
-                    if isinstance(event, dict):
-                        events.append(event)
-            except (OSError, json.JSONDecodeError):
-                continue
-            self.database.import_events_if_empty(conversation_id, events)
 
     @contextmanager
     def _conversation_lock(self, conversation_id: str) -> Iterator[None]:

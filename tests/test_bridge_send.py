@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BridgeAckStatus,
@@ -21,14 +22,11 @@ from app.personal_wechat_bot.wechat_driver.bridge_send import (
 
 
 def _write_channel(data_dir: Path, conversation_id: str, payload: dict) -> None:
-    """Write a channel.json + index.json exactly as ConversationChannelStore does.
-
-    Channel dirs are named by the human-readable segment (chat_title_hashPrefix)
-    and the out-of-process send worker recovers that segment from index.json,
-    so a faithful fixture must create both.
-    """
+    """Write SQLite authority plus the readable channel projections."""
     chat_title = str(payload.get("chat_title", "") or "")
     segment = conversation_segment(conversation_id, chat_title)
+    payload = {**payload, "conversation_id": conversation_id, "segment": segment}
+    ChannelRegistryStore(data_dir).upsert(payload)
     channel_dir = data_dir / "conversation_channels" / segment
     channel_dir.mkdir(parents=True, exist_ok=True)
     (channel_dir / "channel.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -424,8 +422,7 @@ class BridgeSendTest(unittest.TestCase):
             self.assertTrue(state["items"][0]["retryable"])
             self.assertNotEqual(retry["bridge_id"], rec["bridge_id"])
 
-    def test_bridge_send_queues_without_manual_binding(self) -> None:
-        # The bridge sends by wxid/roomid, so no manual foreground binding is required.
+    def test_bridge_send_queues_by_conversation_receiver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
@@ -437,7 +434,7 @@ class BridgeSendTest(unittest.TestCase):
             self.assertIn("queued_to_non_foreground_bridge", result.reason)
             self.assertEqual(state["pending_count"], 1)
             self.assertEqual(state["items"][0]["text"], "hello bridge")
-            self.assertEqual(state["items"][0]["manual_binding"], {})
+            self.assertNotIn("manual_binding", state["items"][0])
 
     def test_bridge_send_uses_channel_receiver_for_hashed_conversation_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

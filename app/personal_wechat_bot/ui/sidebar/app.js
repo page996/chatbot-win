@@ -2,8 +2,13 @@
   data: null,
   activeStatus: "pending",
   refreshing: false,
+  refreshPromise: null,
+  pendingRefresh: null,
+  dataEpoch: 0,
   controlsDirty: false,
   controlsSaving: false,
+  controlsRevision: 0,
+  historyResetPending: false,
   statusMessage: "",
   probeExpanded: false,
   activePage: "overview",
@@ -14,6 +19,7 @@
   tasks: [],
   taskHistory: [],
   taskScopeChains: new Map(),
+  taskSyncChains: new Map(),
   backfillTaskByJobId: new Map(),
   taskPopovers: new Map(),
   taskEvents: new Map(),
@@ -30,11 +36,33 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "content-type": "application/json" },
-    ...options,
-  });
-  const payload = await response.json();
+  const { timeoutMs = 120000, headers = {}, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 120000));
+  let response;
+  try {
+    response = await fetch(path, {
+      headers: { "content-type": "application/json", ...headers },
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`请求超时：${path}`);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+  const raw = await response.text();
+  let payload = {};
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch (error) {
+      const invalid = new Error(`服务返回了无效 JSON：HTTP ${response.status}`);
+      invalid.httpStatus = response.status;
+      throw invalid;
+    }
+  }
   if (!response.ok || payload.status === "error") {
     const error = new Error(payload.error || payload.message || `HTTP ${response.status}`);
     error.payload = payload;
@@ -45,15 +73,53 @@ async function api(path, options = {}) {
 }
 
 async function refresh({ forceControls = false, force = false } = {}) {
-  if (state.refreshing || (state.controlsSaving && !force)) return;
+  if (state.historyResetPending && !force) {
+    return { status: "cancelled", message: "历史清理已开始" };
+  }
+  if (state.controlsSaving && !force) {
+    return state.refreshPromise || { status: "skipped", message: "发送控制保存中" };
+  }
+  if (state.refreshPromise) {
+    if (force || forceControls) queueRefresh({ forceControls, force });
+    return state.refreshPromise;
+  }
+  queueRefresh({ forceControls, force });
+  state.refreshPromise = drainRefreshQueue();
+  return state.refreshPromise;
+}
+
+function queueRefresh({ forceControls = false, force = false } = {}) {
+  const pending = state.pendingRefresh || { forceControls: false, force: false };
+  state.pendingRefresh = {
+    forceControls: pending.forceControls || forceControls,
+    force: pending.force || force,
+  };
+}
+
+async function drainRefreshQueue() {
   state.refreshing = true;
+  let result = { status: "ok" };
   try {
-    state.data = await api("/api/state");
-    render({ forceControls });
-  } catch (error) {
-    $("#readinessLine").textContent = `加载失败：${error.message}`;
+    while (state.pendingRefresh) {
+      const request = state.pendingRefresh;
+      state.pendingRefresh = null;
+      const epoch = state.dataEpoch;
+      try {
+        const payload = await api("/api/state");
+        if (epoch === state.dataEpoch && !state.historyResetPending) {
+          state.data = payload;
+          render({ forceControls: request.forceControls });
+        }
+        result = payload;
+      } catch (error) {
+        $("#readinessLine").textContent = `加载失败：${error.message}`;
+        result = { status: "error", message: error.message };
+      }
+    }
+    return result;
   } finally {
     state.refreshing = false;
+    state.refreshPromise = null;
   }
 }
 
@@ -76,6 +142,7 @@ function render({ forceControls = false } = {}) {
   renderAudit();
   renderTaskQueue();
   renderProbeJson();
+  syncTaskButtonLocks();
 }
 
 function renderReadiness(data) {
@@ -322,7 +389,7 @@ function renderChannels(data) {
     const note = document.createElement("div");
     note.className = "channel-note";
     note.innerHTML = `
-      <span>已隐藏 ${channels.hidden_count} 个旧探测/乱码通道：${escapeHtml(reasonSummary(channels.hidden_reasons || {}))}</span>
+      <span>已隐藏 ${channels.hidden_count} 个未信任或异常通道：${escapeHtml(reasonSummary(channels.hidden_reasons || {}))}</span>
       <button class="ghost small" type="button">清理隐藏通道</button>
     `;
     note.querySelector("button").addEventListener("click", (event) =>
@@ -847,7 +914,6 @@ function renderWeFlow(weflow) {
     weflow.security?.primary_source || "weflow_local_fork",
     weflow.security?.requires_token_for_pull ? "正式拉取需要 token" : "",
     weflow.security?.requires_local_fork_marker ? "需要本地 fork marker" : "",
-    weflow.config_migration?.status === "updated" ? "扩展配置已迁移" : "",
     metrics.stalled ? "⚠ 后台疑似停滞（长时间无成功拉取）" : "",
     worker.stop_requested ? "正在停止后台拉取" : "",
     pullJob.running ? `单次拉取后台运行 ${pullJob.seconds_running || 0}s` : "",
@@ -889,7 +955,6 @@ function renderWeFlow(weflow) {
       backend_event_file: weflow.backend_event_file,
       weflow_state_file: weflow.weflow_state_file,
     },
-    config_migration: weflow.config_migration || {},
     native_migration: state.data?.native_migration || {},
   };
   state.weflowLatestStatusText = JSON.stringify(statusPayload, null, 2);
@@ -1254,14 +1319,35 @@ async function clearHistoryData(helpers = {}) {
   if (!confirmed) {
     return { status: "cancelled_by_user", message: "用户取消清空历史数据" };
   }
+  state.historyResetPending = true;
+  state.dataEpoch += 1;
+  syncTaskButtonLocks();
   helpers.update?.(18, "已确认，正在调度关闭清空");
-  const payload = await api("/api/history/clear", {
-    method: "POST",
-    body: JSON.stringify({ source: "sidebar", shutdown_processes: true }),
-  });
+  let payload;
+  try {
+    payload = await api("/api/history/clear", {
+      method: "POST",
+      body: JSON.stringify({ source: "sidebar", shutdown_processes: true }),
+    });
+  } catch (error) {
+    state.historyResetPending = false;
+    syncTaskButtonLocks();
+    throw error;
+  }
   if (payload.status === "shutdown_scheduled") {
     helpers.update?.(96, "已调度：窗口即将关闭；完成后请手动重新打开 sidebar");
     setStatusMessage("已调度关闭清空；完成后请手动重新打开 sidebar");
+    return payload;
+  }
+  if (["blocked", "partial_error"].includes(String(payload.status || ""))) {
+    state.historyResetPending = false;
+    syncTaskButtonLocks();
+    const message = payload.status === "blocked"
+      ? `历史清理被阻断：${payload.message || payload.reason || "仍有历史写入任务运行"}`
+      : `历史清理未完整完成：${payload.error_count || 0} 项删除失败`;
+    helpers.update?.(100, message);
+    setStatusMessage(message);
+    await refresh({ force: true });
     return payload;
   }
   helpers.update?.(78, "历史数据已清空，正在刷新页面状态");
@@ -1273,6 +1359,8 @@ async function clearHistoryData(helpers = {}) {
   );
   state.weflowStatusMode = "live";
   state.weflowLatestStatusText = "";
+  state.historyResetPending = false;
+  syncTaskButtonLocks();
   await refresh({ force: true });
   return payload;
 }
@@ -1347,12 +1435,19 @@ function renderProbeJson() {
 }
 
 function runTask(meta, worker) {
+  const scope = String(meta?.scope || "global");
+  if (state.historyResetPending && scope !== "history:clear") {
+    setStatusMessage("历史清理已开始，新的操作已停止接收");
+    return Promise.resolve({ status: "blocked", message: "history_reset_pending" });
+  }
+  const active = activeTaskForScope(scope);
+  if (active) {
+    setStatusMessage(`${active.scopeLabel || "该作用域"}已有操作进行中：${active.label}`);
+    updateButtonTaskProgress(active);
+    return state.taskScopeChains.get(scope) || Promise.resolve({ status: "blocked", message: "task_scope_busy" });
+  }
   const task = createTask(meta);
-  const scope = task.scope || "global";
-  const previous = state.taskScopeChains.get(scope) || Promise.resolve();
-  const runner = previous
-    .catch(() => null)
-    .then(() => executeTask(task, worker));
+  const runner = Promise.resolve().then(() => executeTask(task, worker));
   const cleanup = runner.finally(() => {
     if (state.taskScopeChains.get(scope) === cleanup) {
       state.taskScopeChains.delete(scope);
@@ -1360,6 +1455,10 @@ function runTask(meta, worker) {
   });
   state.taskScopeChains.set(scope, cleanup);
   return cleanup;
+}
+
+function activeTaskForScope(scope) {
+  return state.tasks.find((task) => task.scope === scope && ["queued", "running"].includes(task.status)) || null;
 }
 
 function createTask(meta = {}) {
@@ -1388,14 +1487,24 @@ function createTask(meta = {}) {
   if (task.button) {
     task.button.disabled = true;
     task.button.dataset.taskLocked = task.id;
+    task.button.dataset.taskScope = task.scope;
     createButtonTaskProgress(task);
   }
   state.tasks.unshift(task);
-  state.tasks = state.tasks.slice(0, 60);
+  pruneLocalTasks();
   recordTaskHistory(task, "created", "任务已加入队列");
   renderTaskQueue();
   syncBackendTask("create", task);
+  syncTaskButtonLocks();
   return task;
+}
+
+function pruneLocalTasks() {
+  const active = state.tasks.filter((task) => ["queued", "running"].includes(task.status));
+  const terminal = state.tasks.filter((task) => !["queued", "running"].includes(task.status)).slice(0, 60);
+  state.tasks = [...active, ...terminal].filter((task, index, items) =>
+    items.findIndex((candidate) => candidate.id === task.id) === index
+  );
 }
 
 async function executeTask(task, worker) {
@@ -1431,6 +1540,10 @@ async function executeTask(task, worker) {
       delete task.button.dataset.taskLocked;
       task.button.disabled = false;
     }
+    setDirtyIndicator(state.controlsSaving ? "saving" : (state.controlsDirty ? "dirty" : "clean"));
+    renderAgentStatus();
+    if (state.data?.weflow) renderWeFlow(state.data.weflow);
+    syncTaskButtonLocks();
   }
 }
 
@@ -1442,6 +1555,8 @@ function finishTask(task, status, phase, progress) {
     finishedAt: new Date().toISOString(),
   });
   recordTaskHistory(task, status === "completed" ? "finished" : status, phase);
+  pruneLocalTasks();
+  syncTaskButtonLocks();
   setTimeout(() => removeButtonTaskProgress(task.id), 1600);
 }
 
@@ -1458,27 +1573,34 @@ function updateTask(taskId, patch) {
   syncBackendTask("update", task);
 }
 
-async function syncBackendTask(action, task) {
+function syncBackendTask(action, task) {
   if (!task || task.backendOnly || task.persist === false) return;
-  try {
-    const payload = {
-      action,
-      task_id: task.id,
-      task: backendTaskPayload(task),
-      patch: backendTaskPayload(task),
-    };
-    const result = await api("/api/tasks", {
-      method: "POST",
-      body: JSON.stringify(payload),
+  const taskId = task.id;
+  const payload = {
+    action,
+    task_id: taskId,
+    task: backendTaskPayload(task),
+    patch: backendTaskPayload(task),
+  };
+  const previous = state.taskSyncChains.get(taskId) || Promise.resolve();
+  const request = previous
+    .catch(() => null)
+    .then(async () => {
+      try {
+        await api("/api/tasks", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        task.backendSynced = true;
+      } catch (error) {
+        task.backendSynced = false;
+      }
     });
-    task.backendSynced = true;
-    if (state.data && result.task_manager) {
-      state.data.task_manager = result.task_manager;
-      renderTaskQueue();
-    }
-  } catch (error) {
-    task.backendSynced = false;
-  }
+  const cleanup = request.finally(() => {
+    if (state.taskSyncChains.get(taskId) === cleanup) state.taskSyncChains.delete(taskId);
+  });
+  state.taskSyncChains.set(taskId, cleanup);
+  return cleanup;
 }
 
 function backendTaskPayload(task) {
@@ -2135,6 +2257,11 @@ async function toggleTaskEvents(taskId) {
     renderTaskQueue();
     return;
   }
+  if (current.loading || state.taskEventsLoading.has(id)) {
+    state.taskEvents.set(id, { ...current, open: true });
+    renderTaskQueue();
+    return;
+  }
   state.taskEvents.set(id, { ...current, open: true, loading: true, error: "" });
   state.taskEventsLoading.add(id);
   renderTaskQueue();
@@ -2143,15 +2270,19 @@ async function toggleTaskEvents(taskId) {
       method: "POST",
       body: JSON.stringify({ action: "events", task_id: id, limit: 40 }),
     });
+    const latest = state.taskEvents.get(id) || {};
     state.taskEvents.set(id, {
-      open: true,
+      ...latest,
+      open: Boolean(latest.open),
       loading: false,
       error: "",
       events: Array.isArray(payload.events) ? payload.events : [],
     });
   } catch (error) {
+    const latest = state.taskEvents.get(id) || {};
     state.taskEvents.set(id, {
-      open: true,
+      ...latest,
+      open: Boolean(latest.open),
       loading: false,
       error: error.message || "unknown_error",
       events: [],
@@ -2746,7 +2877,7 @@ function normalizeBackendTask(task) {
 
 function taskResultFailed(result) {
   if (!result || typeof result !== "object") return false;
-  return ["error", "failed", "partial_error"].includes(String(result.status || ""));
+  return ["error", "failed", "partial_error", "blocked"].includes(String(result.status || ""));
 }
 
 function taskStatusText(status) {
@@ -2879,8 +3010,9 @@ function sleep(ms) {
 }
 
 async function saveControls() {
-  if (state.controlsSaving) return;
+  if (state.controlsSaving) return { status: "blocked", message: "controls_save_in_progress" };
   state.controlsSaving = true;
+  const savedRevision = state.controlsRevision;
   setDirtyIndicator("saving");
   renderSendControlSummary();
   try {
@@ -2905,9 +3037,10 @@ async function saveControls() {
         file_max_bytes: megabytesToBytes($("#fileMaxMb")?.value || 20),
       }),
     });
-    state.controlsDirty = false;
-    setStatusMessage("发送控制已保存");
-    await refresh({ forceControls: true, force: true });
+    const unchanged = state.controlsRevision === savedRevision;
+    state.controlsDirty = !unchanged;
+    setStatusMessage(unchanged ? "发送控制已保存" : "发送控制已保存；还有新的修改待保存");
+    await refresh({ forceControls: unchanged, force: true });
     return { status: "ok" };
   } finally {
     state.controlsSaving = false;
@@ -2936,6 +3069,9 @@ async function queueAction(queueId, action) {
 
 async function removeQueueItem(queueId) {
   if (!queueId) return;
+  if (!window.confirm("确定移除这个审核队列项吗？")) {
+    return { status: "cancelled_by_user", message: "用户取消移除队列项" };
+  }
   const payload = await api(`/api/queue/${encodeURIComponent(queueId)}/remove`, {
     method: "POST",
     body: JSON.stringify({ reviewer: "sidebar", note: "sidebar_remove_queue_item" }),
@@ -2947,6 +3083,10 @@ async function removeQueueItem(queueId) {
 
 async function deleteChannel(conversationId) {
   if (!conversationId) return;
+  const label = conversationLabel(conversationId) || conversationId;
+  if (!window.confirm(`确定清除通道“${label}”吗？`)) {
+    return { status: "cancelled_by_user", message: "用户取消清除通道" };
+  }
   const payload = await api(`/api/channels/delete/${encodeURIComponent(conversationId)}`, {
     method: "POST",
     body: JSON.stringify({}),
@@ -2984,6 +3124,7 @@ async function queueChannelTestReply(conversationId, helpers = {}) {
   const defaultText = `【sidebar测试】这是一条发往 ${label} 的通道文本投递探针。`;
   const text = window.prompt("测试回复内容", defaultText);
   if (text === null) return { status: "cancelled_by_user", message: "已取消测试回复" };
+  if (!String(text).trim()) return { status: "error", message: "测试回复内容不能为空" };
   helpers.update?.(30, "正在生成测试文本投递项");
   const payload = await api(`/api/channels/${encodeURIComponent(id)}/test-reply`, {
     method: "POST",
@@ -3094,6 +3235,9 @@ function readFileAsBase64(file) {
 }
 
 async function cleanupHiddenChannels() {
+  if (!window.confirm("确定清理当前全部隐藏通道吗？")) {
+    return { status: "cancelled_by_user", message: "用户取消清理隐藏通道" };
+  }
   const payload = await api("/api/channels/cleanup-hidden", {
     method: "POST",
     body: JSON.stringify({}),
@@ -3682,25 +3826,8 @@ function weflowHistorySummary(entry) {
   if (imported.appended_count !== undefined) parts.push(`导入后端=${imported.appended_count}`);
   if (pull.processed_count !== undefined) parts.push(`写入对话=${pull.processed_count}`);
   if (result.message || result.error) parts.push(String(result.message || result.error));
-  const legacy = normalizeLegacyWeFlowSummary(entry?.summary);
-  return parts.length ? parts.join(" / ") : (legacy || JSON.stringify(compactPayload(result || entry, 300)));
-}
-
-function normalizeLegacyWeFlowSummary(summary) {
-  const text = String(summary || "").trim();
-  if (!text) return "";
-  return text.split(/\s*\/\s*/).map((part) => {
-    if (part.startsWith("backfilled_talkers=")) {
-      const matches = part.match(/['"][^'"]+['"]/g) || [];
-      if (/\[\s*\]/.test(part)) return "回填对象=0个";
-      return `回填对象=${matches.length || 1}个`;
-    }
-    if (part.startsWith("count=")) return `会话数=${part.slice("count=".length)}`;
-    if (part.startsWith("source=")) return `源=${part.slice("source=".length)}`;
-    if (part.startsWith("appended=")) return `源新增=${part.slice("appended=".length)}`;
-    if (part.startsWith("processed=")) return `写入对话=${part.slice("processed=".length)}`;
-    return part;
-  }).join(" / ");
+  const summary = String(entry?.summary || "").trim();
+  return parts.length ? parts.join(" / ") : (summary || JSON.stringify(compactPayload(result || entry, 300)));
 }
 
 async function weflowBackfill(helpers = {}) {
@@ -3895,6 +4022,7 @@ async function weflowInstallDeps(helpers = {}) {
   const payload = await api("/api/weflow/install-deps", {
     method: "POST",
     body: JSON.stringify({ confirm_install: true }),
+    timeoutMs: 15 * 60 * 1000,
   });
   showWeFlowStatusPayload(compactPayload(payload, 6000));
   setStatusMessage("WeFlow 依赖安装完成");
@@ -3943,8 +4071,11 @@ function splitComma(value) {
 
 function actionButton(label, className, handler, meta = {}) {
   const button = document.createElement("button");
+  button.type = "button";
   button.className = className;
   button.textContent = label;
+  button.title = meta.tooltip || meta.label || label;
+  button.dataset.taskScope = meta.scope || "global";
   button.addEventListener("click", () => {
     runTask(
       {
@@ -3959,6 +4090,7 @@ function actionButton(label, className, handler, meta = {}) {
       (helpers) => handler(helpers),
     );
   });
+  syncTaskButtonLock(button);
   return button;
 }
 
@@ -3977,8 +4109,12 @@ function simpleButton(label, className, handler) {
 function bindTaskButton(selector, meta, handler) {
   const button = $(selector);
   if (!button) return;
+  const initial = typeof meta === "function" ? null : meta;
+  if (initial?.scope) button.dataset.taskScope = initial.scope;
   button.addEventListener("click", (event) => {
+    event.preventDefault();
     const resolved = typeof meta === "function" ? meta(event) : meta;
+    event.currentTarget.dataset.taskScope = resolved?.scope || "global";
     runTask(
       {
         ...(resolved || {}),
@@ -3987,6 +4123,31 @@ function bindTaskButton(selector, meta, handler) {
       (helpers) => handler(helpers, event),
     );
   });
+  syncTaskButtonLock(button);
+}
+
+function syncTaskButtonLocks() {
+  $$('button[data-task-scope]').forEach(syncTaskButtonLock);
+}
+
+function syncTaskButtonLock(button) {
+  if (!button) return;
+  const scope = String(button.dataset.taskScope || "global");
+  const shouldLock = state.historyResetPending || Boolean(activeTaskForScope(scope));
+  if (shouldLock) {
+    if (!button.dataset.taskLocked && !button.dataset.taskScopeLocked) {
+      button.dataset.taskScopeWasDisabled = button.disabled ? "1" : "0";
+      button.dataset.taskScopeLocked = "1";
+    }
+    button.disabled = true;
+    return;
+  }
+  if (button.dataset.taskScopeLocked) {
+    const wasDisabled = button.dataset.taskScopeWasDisabled === "1";
+    delete button.dataset.taskScopeLocked;
+    delete button.dataset.taskScopeWasDisabled;
+    if (!button.dataset.taskLocked) button.disabled = wasDisabled;
+  }
 }
 
 function initBoundedTooltips() {
@@ -4090,6 +4251,7 @@ function currentMode(fallback = "dry_run") {
 }
 
 function markControlsDirty() {
+  state.controlsRevision += 1;
   state.controlsDirty = true;
   setDirtyIndicator("dirty");
   renderSendControlSummary();
@@ -4098,7 +4260,10 @@ function markControlsDirty() {
 function setDirtyIndicator(status) {
   const button = $("#saveControls");
   if (!button) return;
-  button.disabled = status === "saving" || Boolean(button.dataset.taskLocked);
+  button.disabled = status === "saving"
+    || state.historyResetPending
+    || Boolean(button.dataset.taskLocked)
+    || Boolean(button.dataset.taskScopeLocked);
   button.textContent = status === "saving" ? "保存中" : (status === "dirty" ? "保存 *" : "保存");
   button.classList.toggle("dirty", status === "dirty");
 }
@@ -4352,7 +4517,7 @@ function looksLikePlaceholderContactName(value) {
 function reasonSummary(reasons) {
   const labels = {
     probe_fragment: "探测碎片",
-    untrusted_legacy_channel: "旧污染通道",
+    untrusted_channel: "未信任通道",
     mojibake: "乱码标题",
     tool_window: "工具窗口",
     empty_title: "空标题",
@@ -4372,7 +4537,7 @@ const MODEL_QUICK_OPTIONS = [
   { value: "deepseek-v4-pro", label: "deepseek v4 pro" },
 ];
 
-const modelConfigState = { loading: false, loaded: false, probeModels: [] };
+const modelConfigState = { loading: false, loaded: false, probeModels: [], revision: 0, loadPromise: null };
 
 function syncModelQuickSelect(value) {
   $$("#modelQuickSelect [data-model-value]").forEach((button) => {
@@ -4404,6 +4569,7 @@ function chooseModelName(model) {
   if (input) {
     input.value = value;
     input.dataset.touched = "1";
+    modelConfigState.revision += 1;
   }
   setModelSuggestions([value, ...modelConfigState.probeModels]);
   syncModelQuickSelect(value);
@@ -4411,17 +4577,24 @@ function chooseModelName(model) {
 }
 
 async function loadModelConfig({ force = false } = {}) {
-  if (modelConfigState.loading) return;
+  if (modelConfigState.loadPromise) return modelConfigState.loadPromise;
+  const requestedRevision = modelConfigState.revision;
   modelConfigState.loading = true;
-  try {
-    const payload = await api("/api/model-config");
-    applyModelConfig(payload, { force });
-    modelConfigState.loaded = true;
-  } catch (error) {
-    setModelConfigMessage(`加载模型配置失败：${error.message}`, true);
-  } finally {
-    modelConfigState.loading = false;
-  }
+  modelConfigState.loadPromise = (async () => {
+    try {
+      const payload = await api("/api/model-config");
+      applyModelConfig(payload, { force: force && modelConfigState.revision === requestedRevision });
+      modelConfigState.loaded = true;
+      return payload;
+    } catch (error) {
+      setModelConfigMessage(`加载模型配置失败：${error.message}`, true);
+      return { status: "error", message: error.message };
+    } finally {
+      modelConfigState.loading = false;
+      modelConfigState.loadPromise = null;
+    }
+  })();
+  return modelConfigState.loadPromise;
 }
 
 function applyModelConfig(payload, { force = false } = {}) {
@@ -4481,6 +4654,7 @@ function modelConfigPayload() {
 
 async function saveModelConfig(helpers = {}) {
   const payload = modelConfigPayload();
+  const savedRevision = modelConfigState.revision;
   if (!payload.model) {
     setModelConfigMessage("请填写模型名", true);
     return { status: "error" };
@@ -4492,9 +4666,10 @@ async function saveModelConfig(helpers = {}) {
   helpers.update?.(30, "正在保存模型配置");
   try {
     const result = await api("/api/model-config", { method: "POST", body: JSON.stringify(payload) });
-    applyModelConfig(result.model_config || {}, { force: true });
-    setModelConfigMessage("模型配置已保存", false);
-    setStatusMessage("模型配置已保存");
+    const unchanged = modelConfigState.revision === savedRevision;
+    applyModelConfig(result.model_config || {}, { force: unchanged });
+    setModelConfigMessage(unchanged ? "模型配置已保存" : "模型配置已保存；还有新的修改待保存", false);
+    setStatusMessage(unchanged ? "模型配置已保存" : "模型配置已保存；还有新的修改待保存");
     return result;
   } catch (error) {
     setModelConfigMessage(`保存失败：${error.message}`, true);
@@ -4962,6 +5137,7 @@ bindTaskButton("#refreshModelConfig", {
   helpers.update(25, "正在读取模型配置");
   // Explicit refresh: user wants the saved values, so discard any local edits.
   clearModelConfigTouched();
+  modelConfigState.revision += 1;
   await loadModelConfig({ force: true });
   helpers.update(65, "正在读取密钥池");
   await loadKeyPool();
@@ -4973,6 +5149,7 @@ bindTaskButton("#refreshModelConfig", {
     const evt = el.tagName === "SELECT" ? "change" : "input";
     el.addEventListener(evt, () => {
       el.dataset.touched = "1";
+      modelConfigState.revision += 1;
       if (selector === "#modelName") syncModelQuickSelect(el.value);
     });
   }

@@ -79,29 +79,9 @@ class WindowIntrospectionTest(unittest.TestCase):
             )
         )
 
-    def test_active_target_prefers_bound_window(self) -> None:
-        active = window_introspection._active_target(
-            [
-                {"hwnd": 131926, "title": "微信", "process_name": "Weixin.exe"},
-            ],
-            [
-                {
-                    "conversation_id": "private-page",
-                    "chat_title": "PAGE",
-                    "hwnd": 131926,
-                    "status": "active",
-                }
-            ],
-        )
-
-        self.assertEqual(active["status"], "bound_window")
-        self.assertEqual(active["source"], "window_binding")
-        self.assertEqual(active["conversation_id"], "private-page")
-
     def test_active_target_uses_visible_wechat_window(self) -> None:
         active = window_introspection._active_target(
             [{"hwnd": 131926, "title": "微信", "process_name": "Weixin.exe"}],
-            [],
         )
 
         self.assertEqual(active["status"], "wechat_window_available")

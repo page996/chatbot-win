@@ -17,8 +17,8 @@ class PollSnapshotCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             self._run("--data-dir", str(data_dir), "init")
-            self._run("--data-dir", str(data_dir), "add-contact", "wxid_xiaoming")
-            self._run("--data-dir", str(data_dir), "add-group", "学习群")
+            self._run("--data-dir", str(data_dir), "accept-contact", "wxid_xiaoming")
+            self._run("--data-dir", str(data_dir), "accept-group", "学习群")
 
             output = self._run(
                 "--data-dir",

@@ -58,30 +58,6 @@ class ConversationSessionDatabase:
             )
         return item
 
-    def insert_state_if_missing(self, conversation_id: str, segment: str, payload: dict[str, Any]) -> bool:
-        item = dict(payload)
-        conversation_id = str(conversation_id or item.get("conversation_id") or "").strip()
-        if not conversation_id:
-            return False
-        item["conversation_id"] = conversation_id
-        item.setdefault("updated_at", utc_now_iso())
-        with self._connection() as db:
-            cursor = db.execute(
-                """
-                INSERT OR IGNORE INTO conversation_session_states(
-                  conversation_id, segment, current_session_id, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    conversation_id,
-                    str(segment or ""),
-                    str(item.get("current_session_id") or ""),
-                    str(item.get("updated_at") or utc_now_iso()),
-                    json.dumps(item, ensure_ascii=False, sort_keys=True),
-                ),
-            )
-        return bool(cursor.rowcount)
-
     def segment_for(self, conversation_id: str) -> str:
         with self._connection() as db:
             row = db.execute(
@@ -111,36 +87,6 @@ class ConversationSessionDatabase:
                 ),
             )
 
-    def import_events_if_empty(self, conversation_id: str, events: list[dict[str, Any]]) -> int:
-        with self._connection() as db:
-            count = int(
-                db.execute(
-                    "SELECT COUNT(*) FROM conversation_session_events WHERE conversation_id = ?",
-                    (str(conversation_id or ""),),
-                ).fetchone()[0]
-            )
-            if count:
-                return 0
-            imported = 0
-            for payload in events:
-                item = {**dict(payload), "conversation_id": str(conversation_id or "")}
-                db.execute(
-                    """
-                    INSERT INTO conversation_session_events(
-                      conversation_id, session_id, event_type, created_at, payload_json
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(conversation_id or ""),
-                        str(item.get("session_id") or ""),
-                        str(item.get("type") or ""),
-                        str(item.get("created_at") or utc_now_iso()),
-                        json.dumps(item, ensure_ascii=False, sort_keys=True),
-                    ),
-                )
-                imported += 1
-        return imported
-
     def list_events(self, conversation_id: str) -> list[dict[str, Any]]:
         with self._connection() as db:
             rows = db.execute(
@@ -153,6 +99,21 @@ class ConversationSessionDatabase:
                 (str(conversation_id or ""),),
             ).fetchall()
         return [payload for row in rows if (payload := _payload_from_row(row)) is not None]
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        conversation_id = str(conversation_id or "").strip()
+        if not conversation_id:
+            return False
+        with self._connection() as db:
+            events = db.execute(
+                "DELETE FROM conversation_session_events WHERE conversation_id = ?",
+                (conversation_id,),
+            ).rowcount
+            state = db.execute(
+                "DELETE FROM conversation_session_states WHERE conversation_id = ?",
+                (conversation_id,),
+            ).rowcount
+        return bool(events or state)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

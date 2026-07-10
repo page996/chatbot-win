@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.personal_wechat_bot.config.loader import (
@@ -11,11 +13,32 @@ from app.personal_wechat_bot.config.loader import (
     create_default_config,
     load_config,
     set_deepseek_provider,
+    update_config,
 )
 from app.personal_wechat_bot.control.preflight import build_preflight_report
 
 
 class PreflightTest(unittest.TestCase):
+    def test_concurrent_config_updates_do_not_overwrite_unrelated_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            def set_mode(config) -> None:
+                config.mode = "confirm"
+                time.sleep(0.05)
+
+            def set_model(config) -> None:
+                config.providers["chat"].model = "concurrency-test-model"
+                time.sleep(0.05)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(lambda updater: update_config(data_dir, updater), [set_mode, set_model]))
+
+            config = load_config(data_dir)
+            self.assertEqual(config.mode, "confirm")
+            self.assertEqual(config.providers["chat"].model, "concurrency-test-model")
+
     def test_preflight_reports_safe_send_policy_and_channel_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -29,7 +52,6 @@ class PreflightTest(unittest.TestCase):
             self.assertTrue(report["send_policy"]["real_send_implemented"])
             self.assertTrue(report["wechat_access"]["read_only"])
             self.assertEqual(report["accepted_conversations"]["mode"], "channel_admission_guarded")
-            self.assertEqual(report["legacy_whitelist"]["mode"], "compatibility_alias_not_used_for_routing")
             self.assertEqual(
                 report["conversation_channels"]["policy"],
                 "verified_or_identified_wechat_channels",
@@ -37,10 +59,9 @@ class PreflightTest(unittest.TestCase):
             self.assertNotIn("poll-clipboard", report["wechat_access"]["fallback_inputs"])
             self.assertNotIn("poll-clipboard", report["wechat_access"]["available_inputs"])
             self.assertIn("poll-clipboard", report["wechat_access"]["removed_inputs"])
-            self.assertNotIn("poll-ocr-window", report["wechat_access"]["fallback_inputs"])
-            self.assertNotIn("poll-ocr-window", report["wechat_access"]["debug_inputs"])
             self.assertIn("wechat-capture", report["wechat_access"]["debug_inputs"])
-            self.assertIn("poll-ocr-window", report["wechat_access"]["deprecated_inputs"])
+            self.assertEqual(report["wechat_access"]["primary_inputs"], ["poll-backend-events"])
+            self.assertEqual(report["wechat_access"]["context_only_inputs"], ["poll-snapshot"])
             self.assertEqual(report["wechat_access"]["page_ocr_ingestion"], "disabled")
             self.assertEqual(report["tools"]["ocr"]["name"], "vision.ocr")
             self.assertEqual(report["tools"]["ocr"]["scope"], "tool_layer_file_workspace_only")
@@ -50,6 +71,9 @@ class PreflightTest(unittest.TestCase):
             self.assertEqual(report["conversation_channels"]["auto_register_private"], "identified_or_accepted_only")
             self.assertTrue(report["conversation_channels"]["auto_register_groups"])
             self.assertTrue(report["conversation_channels"]["blocks_unknown_private"])
+            storage = report["runtime_guards"]["state_storage_policy"]
+            self.assertEqual(storage["conversation_ledger"], "sqlite_authority_jsonl_markdown_projection")
+            self.assertEqual(storage["send_audit"], "sqlite_authority_jsonl_forensic_projection")
 
     def test_preflight_warns_when_provider_key_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,26 +96,30 @@ class PreflightTest(unittest.TestCase):
 
             hidden = build_preflight_report(config, show_accepted=False)
             shown = build_preflight_report(config, show_accepted=True)
-            legacy_shown = build_preflight_report(config, show_whitelist=True)
 
             self.assertIsNone(hidden["accepted_conversations"]["contacts"])
             self.assertEqual(shown["accepted_conversations"]["contacts"], ["wxid_xiaoming"])
-            self.assertEqual(legacy_shown["accepted_conversations"]["contacts"], ["wxid_xiaoming"])
-            self.assertEqual(shown["legacy_whitelist"]["contacts"], ["wxid_xiaoming"])
             self.assertIn("api_key_env", shown["model"])
             self.assertIn("api_key_present", shown["model"])
 
-    def test_legacy_whitelist_files_are_migrated_to_accepted_channels(self) -> None:
+    def test_config_uses_only_accepted_channel_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            (data_dir / "accepted_contacts.json").unlink()
-            (data_dir / "contacts_whitelist.json").write_text(json.dumps(["wxid_legacy"]), encoding="utf-8")
+            accept_contact(data_dir, "wxid_current")
 
             config = load_config(data_dir)
+            raw = json.loads((data_dir / "config.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(config.accepted_contacts, {"wxid_legacy"})
-            self.assertEqual(config.contacts_whitelist, {"wxid_legacy"})
+            self.assertEqual(config.accepted_contacts, {"wxid_current"})
+            self.assertFalse((data_dir / "contacts_whitelist.json").exists())
+            self.assertFalse((data_dir / "groups_whitelist.json").exists())
+            self.assertNotIn("contacts_whitelist", raw)
+            self.assertNotIn("groups_whitelist", raw)
+            self.assertNotIn("accepted_contacts", raw)
+            self.assertNotIn("accepted_groups", raw)
+            self.assertNotIn("llm", raw)
+            self.assertIn("chat", raw["providers"])
 
     def test_preflight_detects_present_api_key_without_exposing_value(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,7 +191,7 @@ class PreflightTest(unittest.TestCase):
             self.assertFalse(report["wechat_access"]["read_only"])
             self.assertTrue(report["wechat_access"]["write_access_configured"])
 
-    def test_preflight_bridge_outbox_does_not_require_manual_binding(self) -> None:
+    def test_preflight_bridge_outbox_uses_channel_registry_receiver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -174,11 +202,7 @@ class PreflightTest(unittest.TestCase):
 
             report = build_preflight_report(config)
 
-            # The bridge delivers by wxid/roomid, so no manual foreground binding is required.
-            self.assertNotIn(
-                "bridge_outbox requires at least one manually captured WeChat channel binding",
-                report["warnings"],
-            )
+            self.assertNotIn("manual_bound_channels", report["wechat_access"])
 
 
 if __name__ == "__main__":

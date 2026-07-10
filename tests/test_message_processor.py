@@ -392,6 +392,110 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertEqual(result["message"]["metadata"]["session_id"], DEFAULT_SESSION_ID)
             self.assertNotIn("context", result)
 
+    def test_processor_does_not_reset_session_from_context_only_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+
+            result = processor.process(
+                RawWeChatMessage(
+                    raw_id="clear-context-history",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    text=f"@bot {CLEAR_CONTEXT_PHRASES[0]}",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"context_only": True},
+                )
+            )
+
+            self.assertIsNotNone(result)
+            conversation_id = result["message"]["conversation_id"]
+            state = runtime.session_store.state_for_conversation(conversation_id)
+            self.assertEqual(state["current_session_id"], DEFAULT_SESSION_ID)
+            self.assertEqual(state["reset_count"], 0)
+            self.assertNotIn("context", result)
+
+    def test_windows_snapshot_can_only_append_context_to_existing_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+            trusted = processor.process(
+                RawWeChatMessage(
+                    raw_id="trusted-live",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    text="live message",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"source": "backend_events_jsonl"},
+                )
+            )
+
+            snapshot = processor.process(
+                RawWeChatMessage(
+                    raw_id="snapshot-context",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    text="OCR may be incomplete",
+                    observed_at="2026-06-28T01:00:01+00:00",
+                    driver_meta={"source": "windows_snapshot"},
+                )
+            )
+
+            self.assertIsNotNone(trusted)
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot["route"]["action"], "ignore")
+            self.assertTrue(snapshot["context_only"])
+            self.assertFalse(snapshot.get("blocked", False))
+            self.assertNotIn("reply", snapshot)
+            entries = runtime.ledger_store.read_entries(snapshot["message"]["conversation_id"])
+            self.assertEqual([entry.role for entry in entries], ["user", "assistant", "user"])
+            self.assertTrue(entries[-1].text_blocks[0]["metadata"]["context_only"])
+
+    def test_failed_group_reply_generation_does_not_consume_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+            generate_reply = runtime.conversation.generate_reply
+
+            def fail_generation(_message, _speak):
+                raise RuntimeError("generation failed")
+
+            runtime.conversation.generate_reply = fail_generation
+            failed = processor.process(
+                RawWeChatMessage(
+                    raw_id="group-failed-1",
+                    chat_title="Study Group",
+                    sender_name="Alice",
+                    text="first topic",
+                    is_group=True,
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"topic_decision": "speak"},
+                )
+            )
+            runtime.conversation.generate_reply = generate_reply
+
+            retried = processor.process(
+                RawWeChatMessage(
+                    raw_id="group-retry-2",
+                    chat_title="Study Group",
+                    sender_name="Alice",
+                    text="second topic",
+                    is_group=True,
+                    observed_at="2026-06-28T01:00:01+00:00",
+                    driver_meta={"topic_decision": "speak"},
+                )
+            )
+
+            self.assertEqual(failed["error"]["type"], "RuntimeError")
+            self.assertEqual(retried["speak"]["decision"], "speak")
+            self.assertIn("reply", retried)
+
     def test_first_backend_attachment_message_uses_one_segment_for_all_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"

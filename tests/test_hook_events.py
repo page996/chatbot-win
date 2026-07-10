@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from app.personal_wechat_bot.bootstrap import build_runtime
-from app.personal_wechat_bot.config.loader import add_contact, create_default_config, load_config
+from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
@@ -323,7 +323,7 @@ class HookEventsTest(unittest.TestCase):
         self.assertEqual(raw.driver_meta["ordering"]["source_line_no"], 1)
 
     def test_imported_hook_message_enters_ledger_with_attachment(self) -> None:
-        add_contact(self.data_dir, "wxid_page")
+        accept_contact(self.data_dir, "wxid_page")
         self.config = load_config(self.data_dir)
         note = self.data_dir / "inbox" / "note.txt"
         note.write_text("hook file body", encoding="utf-8")
@@ -361,7 +361,7 @@ class HookEventsTest(unittest.TestCase):
         self.assertIn("[file_index]", entries[0].text_blocks[1]["text"])
 
     def test_recall_event_marks_target_message_recalled(self) -> None:
-        add_contact(self.data_dir, "wxid_page")
+        accept_contact(self.data_dir, "wxid_page")
         self.config = load_config(self.data_dir)
         self._append_hook(
             {

@@ -183,7 +183,8 @@ class AuditCleanupTest(unittest.TestCase):
             self.assertGreaterEqual(report["summary"]["database_backed_count"], 1)
             self.assertGreaterEqual(report["summary"]["file_truth_not_migrated_count"], 1)
             self.assertGreaterEqual(report["summary"]["preserved_component_count"], 1)
-            self.assertEqual(report["database_contract_summary"]["existing_count"], 0)
+            self.assertEqual(report["database_contract_summary"]["existing_count"], 2)
+            self.assertEqual(report["database_contract_summary"]["error_count"], 2)
             self.assertFalse((data_dir / "conversation_ledger.sqlite").exists())
 
     def test_storage_status_reports_sqlite_authority_schema_and_rows(self) -> None:
@@ -235,12 +236,14 @@ class AuditCleanupTest(unittest.TestCase):
 
             self.assertEqual(report["database_contract_summary"]["valid_count"], 3)
             self.assertEqual(report["database_contract_summary"]["error_count"], 0)
-            for contract in contracts.values():
+            for component_id in {"conversation_channels", "conversation_ledgers", "conversation_sessions"}:
+                contract = contracts[component_id]
                 self.assertTrue(contract["valid"])
                 self.assertEqual(contract["status"], "ok")
                 self.assertEqual(contract["schema_version"], "1")
                 self.assertEqual(contract["integrity_check"], "ok")
                 self.assertEqual(contract["missing_tables"], [])
+            self.assertGreaterEqual(report["database_contract_summary"]["configured_count"], 8)
             ledger_tables = {item["name"]: item for item in contracts["conversation_ledgers"]["tables"]}
             channel_tables = {item["name"]: item for item in contracts["conversation_channels"]["tables"]}
             session_tables = {item["name"]: item for item in contracts["conversation_sessions"]["tables"]}

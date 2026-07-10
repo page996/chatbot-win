@@ -464,7 +464,7 @@ class SidebarServerTest(unittest.TestCase):
             config = load_config(data_dir)
             channel_store = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                ApiKeyPool(config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -521,7 +521,7 @@ class SidebarServerTest(unittest.TestCase):
             config = load_config(data_dir)
             channel_store = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                ApiKeyPool(config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -628,7 +628,7 @@ class SidebarServerTest(unittest.TestCase):
             config = load_config(data_dir)
             channel_store = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                ApiKeyPool(config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -685,6 +685,11 @@ class SidebarServerTest(unittest.TestCase):
                         str(edge),
                         "--headless=new",
                         "--disable-gpu",
+                        "--disable-gpu-compositing",
+                        "--disable-gpu-shader-disk-cache",
+                        "--disable-gpu-sandbox",
+                        "--disable-features=Dawn,SkiaGraphite,Vulkan,WebGPU",
+                        "--no-sandbox",
                         "--no-first-run",
                         "--no-default-browser-check",
                         "--disable-extensions",

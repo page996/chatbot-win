@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from unittest import mock
 
-from app.personal_wechat_bot.config.loader import add_contact, add_group, create_default_config, load_config
+from app.personal_wechat_bot.config.loader import accept_contact, accept_group, create_default_config, load_config
 from app.personal_wechat_bot.domain.models import ToolCallResult
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 
@@ -28,9 +28,9 @@ class MinimumClosedLoopTest(unittest.TestCase):
             "wxid_minjun",
             "wxid_alice",
         ]:
-            add_contact(self.data_dir, wechat_id)
+            accept_contact(self.data_dir, wechat_id)
         for group_name in ["学习群", "群+！@#￥%……&*", "研究会さくら", "스터디", "Study Group"]:
-            add_group(self.data_dir, group_name)
+            accept_group(self.data_dir, group_name)
         self.config = load_config(self.data_dir)
 
     def tearDown(self) -> None:

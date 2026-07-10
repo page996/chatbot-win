@@ -30,10 +30,8 @@ _ALLOWED_TRANSITIONS = {
 class ConfirmQueue:
     """SQLite-backed authority for the human confirmation queue.
 
-    ``confirm_queue.jsonl`` remains a compatibility projection for older
-    diagnostics and operator inspection, but the state machine now reads and
-    writes ``confirm_queue.sqlite``. On first use, any legacy JSONL records are
-    imported into SQLite before normal operations continue.
+    ``confirm_queue.jsonl`` is a readable projection for diagnostics and
+    operator inspection. It never repopulates the SQLite authority.
     """
 
     def __init__(self, path: str | Path):
@@ -258,22 +256,6 @@ class ConfirmQueue:
                 records.append(item)
         return records
 
-    def _read_legacy_jsonl_unlocked(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        records: list[dict[str, Any]] = []
-        with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item, dict):
-                    records.append(item)
-        return records
-
     def _write_all(self, records: list[dict[str, Any]]) -> None:
         with self._queue_lock():
             self._write_all_unlocked(records)
@@ -360,46 +342,9 @@ class ConfirmQueue:
                 "INSERT OR REPLACE INTO confirm_queue_meta(key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
-            count = db.execute("SELECT COUNT(*) FROM confirm_queue_items").fetchone()[0]
-            imported = db.execute(
-                "SELECT value FROM confirm_queue_meta WHERE key = 'legacy_jsonl_imported'"
-            ).fetchone()
             db.commit()
         finally:
             db.close()
-        if int(count or 0) == 0 and (imported is None or str(imported["value"]) != "1"):
-            legacy_records = self._read_legacy_jsonl_unlocked()
-            if legacy_records:
-                with self._connection() as writable:
-                    for item in legacy_records:
-                        if not isinstance(item, dict):
-                            continue
-                        queue_id = str(item.get("queue_id") or "").strip()
-                        if not queue_id:
-                            continue
-                        writable.execute(
-                            """
-                            INSERT OR IGNORE INTO confirm_queue_items(
-                              queue_id, status, created_at, updated_at, record_json
-                            )
-                            VALUES (?, ?, ?, ?, ?)
-                            """,
-                            (
-                                queue_id,
-                                str(item.get("status") or ""),
-                                str(item.get("created_at") or utc_now_iso()),
-                                utc_now_iso(),
-                                _json_dumps(item),
-                            ),
-                        )
-                    writable.execute(
-                        "INSERT OR REPLACE INTO confirm_queue_meta(key, value) VALUES ('legacy_jsonl_imported', '1')"
-                    )
-            else:
-                with self._connection() as writable:
-                    writable.execute(
-                        "INSERT OR REPLACE INTO confirm_queue_meta(key, value) VALUES ('legacy_jsonl_imported', '1')"
-                    )
 
 
 def _json_dumps(value: Any) -> str:

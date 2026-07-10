@@ -18,7 +18,6 @@ from app.personal_wechat_bot.wechat_driver.send_driver_factory import (
     is_real_send_driver_implemented,
     registered_send_drivers,
 )
-from app.personal_wechat_bot.wechat_driver.bridge_send import manual_bridge_bindings
 
 
 def build_preflight_report(
@@ -26,19 +25,15 @@ def build_preflight_report(
     show_accepted: bool = False,
     *,
     include_tool_health: bool = True,
-    show_whitelist: bool | None = None,
 ) -> dict[str, Any]:
-    if show_whitelist is not None:
-        show_accepted = show_accepted or show_whitelist
-    chat_provider = config.providers.get("chat", config.llm)
+    chat_provider = config.providers["chat"]
     key_pool = ApiKeyPool(chat_provider, config.data_dir)
     key_refs = key_pool.refs()
     key_descriptions = key_pool.describe()
     api_key_present = any(item.available for item in key_refs)
     file_roots = resolve_allowed_roots(config.data_dir, config.file_read_roots)
     voice_roots = resolve_allowed_roots(config.data_dir, config.wechat_voice_roots)
-    manual_bound_channels = manual_bridge_bindings(config.data_dir)
-    warnings = _warnings(config, api_key_present, manual_bound_count=len(manual_bound_channels))
+    warnings = _warnings(config, api_key_present)
     if include_tool_health:
         ocr_health = build_default_ocr_engine(mode=config.ocr_mode).health()
         asr_health = LocalAsrSubprocessEngine(mode=config.asr_mode).health()
@@ -65,10 +60,10 @@ def build_preflight_report(
         "wechat_access": {
             "read_only": not write_access_configured,
             "write_access_configured": write_access_configured,
-            "primary_inputs": ["poll-backend-events", "poll-snapshot", "poll-fake"],
-            "fallback_inputs": ["wechat-snapshot"],
-            "debug_inputs": ["wechat-capture"],
-            "deprecated_inputs": ["ocr-snapshot", "poll-ocr-window", "ocr-window-diagnose"],
+            "primary_inputs": ["poll-backend-events"],
+            "context_only_inputs": ["poll-snapshot"],
+            "fallback_inputs": [],
+            "debug_inputs": ["wechat-snapshot", "wechat-capture", "poll-fake"],
             "removed_inputs": ["poll-clipboard"],
             "available_inputs": [
                 "poll-backend-events",
@@ -81,20 +76,6 @@ def build_preflight_report(
             "send_driver": config.send_driver,
             "implemented_send_drivers": implemented_send_drivers(),
             "registered_send_drivers": registered_send_drivers(),
-            "manual_bound_channels": {
-                "count": len(manual_bound_channels),
-                "policy": "bridge_outbox_receiver_from_channel_registry",
-                "items": [
-                    {
-                        "conversation_id": item.conversation_id,
-                        "conversation_type": item.conversation_type,
-                        "chat_title": item.chat_title,
-                        "status": item.status,
-                        "last_seen_at": item.last_seen_at,
-                    }
-                    for item in manual_bound_channels
-                ],
-            },
         },
         "model": {
             "provider_id": chat_provider.provider_id,
@@ -123,14 +104,6 @@ def build_preflight_report(
         },
         "accepted_conversations": {
             "mode": "channel_admission_guarded",
-            "contacts_count": len(config.accepted_contacts),
-            "groups_count": len(config.accepted_groups),
-            "contacts": sorted(config.accepted_contacts) if show_accepted else None,
-            "groups": sorted(config.accepted_groups) if show_accepted else None,
-            "legacy_files_synced": ["contacts_whitelist.json", "groups_whitelist.json"],
-        },
-        "legacy_whitelist": {
-            "mode": "compatibility_alias_not_used_for_routing",
             "contacts_count": len(config.accepted_contacts),
             "groups_count": len(config.accepted_groups),
             "contacts": sorted(config.accepted_contacts) if show_accepted else None,
@@ -175,9 +148,9 @@ def build_preflight_report(
             "send_audit": str(Path(config.data_dir).resolve() / "send_audit.jsonl"),
             "send_audit_authority": str(Path(config.data_dir).resolve() / "send_audit.sqlite"),
             "state_storage_policy": {
-                "conversation_ledger": "markdown_truth_source",
+                "conversation_ledger": "sqlite_authority_jsonl_markdown_projection",
                 "confirm_queue": "sqlite_authority_jsonl_projection",
-                "send_audit": "jsonl_evidence_sqlite_index",
+                "send_audit": "sqlite_authority_jsonl_forensic_projection",
                 "sidebar_state": "sqlite_authority_json_projection",
                 "send_bridge": "jsonl_evidence_preserved_on_history_clear",
             },
@@ -268,7 +241,7 @@ def _skipped_tool_health(config: BotConfig) -> tuple[Any, Any, Any]:
     return ocr, asr, office
 
 
-def _warnings(config: BotConfig, api_key_present: bool, *, manual_bound_count: int = 0) -> list[str]:
+def _warnings(config: BotConfig, api_key_present: bool) -> list[str]:
     warnings: list[str] = []
     if config.mode == "auto":
         warnings.append("auto mode requested; use confirm mode first before real sending")
@@ -278,7 +251,7 @@ def _warnings(config: BotConfig, api_key_present: bool, *, manual_bound_count: i
         warnings.append("send is enabled but mode is not confirm while send_confirm_required is true")
     if not config.accepted_contacts and not config.accepted_groups:
         warnings.append("no accepted contacts or groups recorded yet; unknown private WeChat conversations will be blocked")
-    chat_provider = config.providers.get("chat", config.llm)
+    chat_provider = config.providers["chat"]
     if chat_provider.base_url and not api_key_present:
         warnings.append(f"chat provider base_url is configured but {chat_provider.api_key_env} is missing")
     if config.file_max_bytes <= 0:

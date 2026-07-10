@@ -21,24 +21,25 @@ class _JsonLLM:
         self.model = model
         self.calls = 0
 
-    def generate_reply(self, prompt: str) -> str:
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str:
         self.calls += 1
         self.last_prompt = prompt
+        self.last_workload = workload
         return json.dumps(self.payload, ensure_ascii=False)
 
 
 class _ProseLLM:
-    def generate_reply(self, prompt: str) -> str:
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str:
         return "这是一段没有 JSON 包裹的分析散文。"
 
 
 class _BoomLLM:
-    def generate_reply(self, prompt: str) -> str:
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str:
         raise RuntimeError("llm exploded")
 
 
 class _FakeChatLLM:
-    def generate_reply(self, prompt: str) -> str:
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str:
         return "ok\nPLAN: reply\nMONITOR: fake_llm.completed\nSUMMARY: ok"
 
 
@@ -54,6 +55,7 @@ class FileAnalyzerTest(unittest.TestCase):
         self.assertEqual(result.key_points, ["需要护照", "需要照片"])
         self.assertEqual(result.topics, ["签证", "留学"])
         self.assertEqual(result.model, "m1")
+        self.assertEqual(llm.last_workload, "background")
 
     def test_analyze_skips_empty_text(self) -> None:
         llm = _JsonLLM({"summary": "x"})

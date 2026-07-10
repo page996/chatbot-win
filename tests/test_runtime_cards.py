@@ -11,6 +11,21 @@ from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
 
 
 class RuntimeCardStoreTest(unittest.TestCase):
+    def test_data_directory_projection_is_not_imported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            old_root = data_dir / "runtime_cards"
+            old_root.mkdir(parents=True)
+            (old_root / "state.json").write_text(
+                '{"enabled_skill_ids": [], "equipped_persona_id": ""}',
+                encoding="utf-8",
+            )
+
+            state = RuntimeCardStore(data_dir).state()
+
+            self.assertIn("skill.file_workspace_agent", state["state"]["enabled_skill_ids"])
+            self.assertEqual(state["state"]["equipped_persona_id"], "persona.default_wechat_friend")
+
     def test_defaults_enable_file_workspace_and_dialogue_skills(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = RuntimeCardStore(Path(tmp) / "data")

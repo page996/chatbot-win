@@ -405,7 +405,7 @@ class SidebarApiTest(unittest.TestCase):
             history_config = load_config(data_dir)
             history_channels = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(history_config.providers.get("chat", history_config.llm), data_dir),
+                ApiKeyPool(history_config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -487,7 +487,7 @@ class SidebarApiTest(unittest.TestCase):
             reopened_config = load_config(data_dir)
             reopened_channels = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(reopened_config.providers.get("chat", reopened_config.llm), data_dir),
+                ApiKeyPool(reopened_config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -505,7 +505,7 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["config"]["mode"], "confirm")
             self.assertIn("survive history clear", "\n".join(RuntimeCardStore(data_dir).prompt_lines()))
 
-    def test_history_clear_preserves_migrated_config_runtime_cards_and_bridge_evidence_only(self) -> None:
+    def test_history_clear_preserves_config_runtime_cards_and_bridge_evidence_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -517,7 +517,6 @@ class SidebarApiTest(unittest.TestCase):
             config.wechat_native_send_text_path = "/custom-text"
             config.wechat_native_status_path = "/custom-status"
             config.providers["chat"].api_key_file = "api_keys.local.md"
-            config.llm = config.providers["chat"]
             save_config(config)
             (data_dir / "api_keys.local.md").write_text("sk-history-clear-secret", encoding="utf-8")
             sidecar = persistent_config_dir(data_dir)
@@ -613,6 +612,27 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["counts"]["total"], 0)
             self.assertEqual(state["tasks"], [])
 
+    def test_history_clear_removes_read_only_content_addressed_workspace(self) -> None:
+        from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            source = Path(tmp) / "attachment.txt"
+            source.write_text("immutable attachment", encoding="utf-8")
+            staged = FileWorkspace(data_dir / "file_workspace").stage_file(
+                source,
+                conversation_id="conv-read-only",
+                session_id="session-read-only",
+            )
+
+            result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse((data_dir / "file_workspace").exists())
+            self.assertFalse(Path(staged.staged_path).exists())
+            self.assertFalse(Path(staged.blob_path).exists())
+
     def test_history_clear_removes_channel_state_authority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -628,12 +648,12 @@ class SidebarApiTest(unittest.TestCase):
             self.assertFalse((data_dir / "channel_state.sqlite-shm").exists())
             self.assertFalse((data_dir / "channel_state.sqlite-wal").exists())
 
-    def test_weflow_sidebar_state_migrates_legacy_json_projection_to_sqlite(self) -> None:
+    def test_weflow_json_projection_does_not_repopulate_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            legacy_path = data_dir / "weflow_sidebar_state.json"
-            legacy_path.write_text(
+            projection_path = data_dir / "weflow_sidebar_state.json"
+            projection_path.write_text(
                 json.dumps(
                     {
                         "base_url": "http://127.0.0.1:5039",
@@ -641,9 +661,9 @@ class SidebarApiTest(unittest.TestCase):
                         "operation_history": [
                             {
                                 "time": "2026-07-10T00:00:00Z",
-                                "action": "legacy",
+                                "action": "projection",
                                 "status": "ok",
-                                "summary": "legacy imported",
+                                "summary": "projection only",
                                 "result": {"status": "ok"},
                             }
                         ],
@@ -653,13 +673,17 @@ class SidebarApiTest(unittest.TestCase):
             )
 
             state = sidebar_api.build_sidebar_weflow_state(data_dir)
-            legacy_path.unlink()
+            sidebar_api._write_weflow_sidebar_state(
+                data_dir,
+                {"base_url": "http://127.0.0.1:5040", "talkers": ["wxid_current"]},
+            )
+            projection_path.unlink()
             sqlite_state = sidebar_api.build_sidebar_weflow_state(data_dir)
 
-            self.assertEqual(state["base_url"], "http://127.0.0.1:5039")
-            self.assertEqual(sqlite_state["base_url"], "http://127.0.0.1:5039")
-            self.assertEqual(sqlite_state["requested_talkers"], ["wxid_alice"])
-            self.assertEqual(sqlite_state["operation_history"][0]["action"], "legacy")
+            self.assertNotEqual(state["base_url"], "http://127.0.0.1:5039")
+            self.assertEqual(state["operation_history"], [])
+            self.assertEqual(sqlite_state["base_url"], "http://127.0.0.1:5040")
+            self.assertEqual(sqlite_state["requested_talkers"], ["wxid_current"])
             self.assertTrue((data_dir / "sidebar_state.sqlite").exists())
 
     def test_weflow_operation_history_uses_sqlite_under_concurrent_writes(self) -> None:
@@ -759,6 +783,52 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(blocked["active_workers"][0]["worker"], "dialog_agent")
             self.assertEqual(forced["status"], "ok")
             self.assertFalse(event_file.exists())
+
+    def test_history_clear_blocks_while_cross_process_agent_tick_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            event_file = data_dir / "backend_events.jsonl"
+            event_file.write_text("{}\n", encoding="utf-8")
+            lock = sidebar_api.ProcessLock(
+                data_dir / "runtime_locks" / "sidebar_agent_tick.lock",
+                label="test_agent_tick",
+                stale_after_seconds=3600,
+            )
+            lock.acquire()
+            try:
+                result = clear_sidebar_history_data(data_dir)
+            finally:
+                lock.release()
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["reason"], "history_clear_runtime_active")
+            self.assertEqual(result["active_workers"][0]["worker"], "dialog_agent_tick")
+            self.assertTrue(event_file.exists())
+
+    def test_history_clear_blocks_while_external_send_bridge_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            event_file = data_dir / "backend_events.jsonl"
+            event_file.write_text("{}\n", encoding="utf-8")
+            lock = sidebar_api.ProcessLock(
+                sidebar_api.bridge_worker_lock_path(data_dir),
+                label="send_bridge_worker",
+                stale_after_seconds=sidebar_api.BRIDGE_WORKER_LOCK_STALE_SECONDS,
+                metadata={"backend_name": "dry_run", "data_dir": str(data_dir.resolve())},
+            )
+            lock.acquire()
+            try:
+                result = clear_sidebar_history_data(data_dir)
+            finally:
+                lock.release()
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["reason"], "history_clear_runtime_active")
+            self.assertEqual(result["active_workers"][0]["worker"], "send_bridge")
+            self.assertEqual(result["active_workers"][0]["source"], "external_process")
+            self.assertTrue(event_file.exists())
 
     def test_resource_audit_is_cached_and_injected_into_task_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -971,7 +1041,7 @@ class SidebarApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            key_pool = ApiKeyPool(config.providers["chat"], data_dir)
             store = ConversationChannelStore(
                 data_dir,
                 key_pool,
@@ -996,7 +1066,7 @@ class SidebarApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            key_pool = ApiKeyPool(config.providers["chat"], data_dir)
             store = ConversationChannelStore(
                 data_dir,
                 key_pool,
@@ -1033,7 +1103,7 @@ class SidebarApiTest(unittest.TestCase):
             config = load_config(data_dir)
             config.accepted_contacts.add("wxid_emoji_friend")
             save_config(config)
-            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            key_pool = ApiKeyPool(config.providers["chat"], data_dir)
             store = ConversationChannelStore(
                 data_dir,
                 key_pool,
@@ -1063,12 +1133,12 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["channels"]["hidden_count"], 0)
             self.assertEqual(state["channels"]["items"][0]["chat_title"], "🎧")
 
-    def test_sidebar_channel_state_hides_legacy_weflow_symbol_title_without_friend_proof(self) -> None:
+    def test_sidebar_channel_state_hides_weflow_symbol_title_without_friend_proof(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            key_pool = ApiKeyPool(config.providers["chat"], data_dir)
             store = ConversationChannelStore(
                 data_dir,
                 key_pool,
@@ -1091,6 +1161,7 @@ class SidebarApiTest(unittest.TestCase):
             payload = json.loads(channel_path.read_text(encoding="utf-8"))
             payload["trusted_channel_source"] = False
             payload["source_names"] = ["weflow_discovery"]
+            store.registry.upsert(payload)
             channel_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
             state = build_sidebar_state(data_dir)
@@ -1105,7 +1176,7 @@ class SidebarApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            key_pool = ApiKeyPool(config.providers["chat"], data_dir)
             store = ConversationChannelStore(
                 data_dir,
                 key_pool,
@@ -1120,15 +1191,16 @@ class SidebarApiTest(unittest.TestCase):
 
             decision = router.decide(message)
 
-            self.assertEqual(decision.action, "process")
+            self.assertEqual(decision.action, "ignore")
+            self.assertEqual(decision.reason, "untrusted_channel_source_blocked:windows_snapshot")
             self.assertEqual(store.list_channels(), [])
 
-    def test_sidebar_hides_untrusted_legacy_channels_but_keeps_trusted_chat(self) -> None:
+    def test_sidebar_hides_untrusted_channels_but_keeps_trusted_chat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            key_pool = ApiKeyPool(config.providers["chat"], data_dir)
             store = ConversationChannelStore(
                 data_dir,
                 key_pool,
@@ -1143,50 +1215,48 @@ class SidebarApiTest(unittest.TestCase):
             )
             assert trusted is not None and stale is not None
             store.ensure_channel(trusted)
-            # Simulate a pre-provenance channel left by old snapshot/OCR ingestion.
-            stale_path = data_dir / "conversation_channels" / stale.conversation_id / "channel.json"
-            stale_path.parent.mkdir(parents=True, exist_ok=True)
-            stale_path.write_text(
-                """
-{
-  "conversation_id": "2ce59ad9ab7cc4bdfe59a871",
-  "conversation_type": "private",
-  "chat_title": "PTURE",
-  "status": "active",
-  "key_slots": 1,
-  "api_key_refs": [],
-  "session_scope": "per_conversation_current_session",
-  "backend_dir": "",
-  "context_dir": "",
-  "file_workspace_dir": "",
-  "sender_names": ["PTURE"],
-  "sender_wechat_ids": [],
-  "created_at": "2026-06-30T00:00:00+00:00",
-  "updated_at": "2026-06-30T00:00:00+00:00"
-}
-""".strip(),
-                encoding="utf-8",
+            store.registry.upsert(
+                {
+                    "conversation_id": stale.conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "PTURE",
+                    "segment": stale.conversation_id,
+                    "status": "active",
+                    "key_slots": 1,
+                    "api_key_refs": [],
+                    "session_scope": "per_conversation_current_session",
+                    "sender_names": ["PTURE"],
+                    "sender_wechat_ids": [],
+                    "source_names": [],
+                    "trusted_channel_source": False,
+                    "created_at": "2026-06-30T00:00:00+00:00",
+                    "updated_at": "2026-06-30T00:00:00+00:00",
+                }
             )
 
             state = build_sidebar_state(data_dir)
 
             self.assertEqual([item["chat_title"] for item in state["channels"]["items"]], ["PAGE"])
-            self.assertEqual(state["channels"]["hidden_reasons"]["untrusted_legacy_channel"], 1)
+            self.assertEqual(state["channels"]["hidden_reasons"]["untrusted_channel"], 1)
 
-    def test_sidebar_hides_legacy_trusted_unidentified_private_weflow_channel(self) -> None:
+    def test_sidebar_hides_trusted_unidentified_private_weflow_channel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             conversation_id = conversation_id_for("private", "wxid_ghost")
-            channel_path = data_dir / "conversation_channels" / "wxid_ghost_legacy" / "channel.json"
-            channel_path.parent.mkdir(parents=True, exist_ok=True)
-            channel_path.write_text(
-                json.dumps(
-                    {
+            config = load_config(data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(config.providers["chat"], data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            store.registry.upsert(
+                {
                         "conversation_id": conversation_id,
                         "conversation_type": "private",
                         "chat_title": "馃帶",
-                        "segment": "wxid_ghost_legacy",
+                        "segment": "wxid_ghost_current",
                         "status": "active",
                         "key_slots": 1,
                         "api_key_refs": [],
@@ -1202,10 +1272,7 @@ class SidebarApiTest(unittest.TestCase):
                         "created_at": "2026-07-08T00:00:00+00:00",
                         "updated_at": "2026-07-08T00:00:00+00:00",
                         "next_key_index": 0,
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+                    }
             )
 
             state = build_sidebar_state(data_dir)
@@ -1220,7 +1287,7 @@ class SidebarApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            key_pool = ApiKeyPool(config.providers["chat"], data_dir)
             store = ConversationChannelStore(
                 data_dir,
                 key_pool,
@@ -1235,8 +1302,8 @@ class SidebarApiTest(unittest.TestCase):
             )
             assert trusted is not None and hidden is not None
             store.ensure_channel(trusted)
-            store.ensure_channel(hidden)
-            ledger_file = data_dir / "conversation_ledgers" / hidden.conversation_id / "conversation.md"
+            hidden_channel = store.ensure_channel(hidden)
+            ledger_file = data_dir / "conversation_ledgers" / hidden_channel.segment / "conversation.md"
             ledger_file.parent.mkdir(parents=True, exist_ok=True)
             ledger_file.write_text("keep", encoding="utf-8")
 
@@ -1249,39 +1316,45 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["channels"]["hidden_count"], 0)
             self.assertIsNotNone(store.get_channel(trusted.conversation_id))
             self.assertIsNone(store.get_channel(hidden.conversation_id))
-            self.assertTrue(ledger_file.exists())
+            self.assertFalse(ledger_file.exists())
 
     def test_sidebar_delete_untrusted_channel_fully_purges_associated_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            conversation_id = "legacy-noise"
-            channel_file = data_dir / "conversation_channels" / "NOISE_legacy-n" / "channel.json"
-            ledger_dir = data_dir / "conversation_ledgers" / "NOISE_legacy-n"
-            workspace_dir = data_dir / "file_workspace" / "NOISE_legacy-n"
-            session_dir = data_dir / "conversation_sessions" / "NOISE_legacy-n"
+            conversation_id = "untrusted-noise"
+            segment = "NOISE_untruste"
+            channel_file = data_dir / "conversation_channels" / segment / "channel.json"
+            ledger_dir = data_dir / "conversation_ledgers" / segment
+            workspace_dir = data_dir / "file_workspace" / segment
+            session_dir = data_dir / "conversation_sessions" / segment
             channel_file.parent.mkdir(parents=True, exist_ok=True)
             ledger_dir.mkdir(parents=True, exist_ok=True)
             workspace_dir.mkdir(parents=True, exist_ok=True)
             session_dir.mkdir(parents=True, exist_ok=True)
-            channel_file.write_text(
-                """
-{
-  "conversation_id": "legacy-noise",
-  "conversation_type": "private",
-  "chat_title": "NOISE",
-  "status": "active",
-  "key_slots": 1,
-  "api_key_refs": [],
-  "session_scope": "per_conversation_current_session",
-  "sender_names": ["NOISE"],
-  "sender_wechat_ids": [],
-  "source_names": [],
-  "trusted_channel_source": false
-}
-""".strip(),
-                encoding="utf-8",
+            config = load_config(data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(config.providers["chat"], data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
             )
+            payload = {
+                "conversation_id": conversation_id,
+                "conversation_type": "private",
+                "chat_title": "NOISE",
+                "segment": segment,
+                "status": "active",
+                "key_slots": 1,
+                "api_key_refs": [],
+                "session_scope": "per_conversation_current_session",
+                "sender_names": ["NOISE"],
+                "sender_wechat_ids": [],
+                "source_names": [],
+                "trusted_channel_source": False,
+            }
+            store.registry.upsert(payload)
+            channel_file.write_text(json.dumps(payload), encoding="utf-8")
             (ledger_dir / "conversation.md").write_text("ledger", encoding="utf-8")
             (workspace_dir / "file.txt").write_text("file", encoding="utf-8")
             (session_dir / "state.json").write_text("session", encoding="utf-8")
@@ -1302,7 +1375,7 @@ class SidebarApiTest(unittest.TestCase):
             config = load_config(data_dir)
             store = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                ApiKeyPool(config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -1324,7 +1397,7 @@ class SidebarApiTest(unittest.TestCase):
             config = load_config(data_dir)
             store = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                ApiKeyPool(config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -1459,7 +1532,7 @@ class SidebarApiTest(unittest.TestCase):
             config = load_config(data_dir)
             channel_store = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                ApiKeyPool(config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -1563,7 +1636,7 @@ class SidebarApiTest(unittest.TestCase):
             config = load_config(data_dir)
             channel_store = ConversationChannelStore(
                 data_dir,
-                ApiKeyPool(config.providers.get("chat", config.llm), data_dir),
+                ApiKeyPool(config.providers["chat"], data_dir),
                 file_workspace_root=data_dir / "file_workspace",
                 context_root=data_dir / "conversation_ledgers",
             )
@@ -2180,6 +2253,38 @@ class SidebarApiTest(unittest.TestCase):
             second = sidebar_api.sidebar_agent_tick(data_dir, {})
             self.assertEqual(second["agent"]["proactive_reply_count"], 0)
             self.assertEqual(len(ledger.read_entries(conversation_id)), len(entries))
+
+    def test_sidebar_agent_tick_never_replies_to_history_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_history_friend")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="history-only-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="History Friend",
+                    sender_name="History Friend",
+                    sender_wechat_id="wxid_history_friend",
+                    text="old unanswered message",
+                    is_self=False,
+                    received_at="2025-07-08T09:00:00+08:00",
+                    metadata={
+                        "source": "backend_events_jsonl",
+                        "context_only": True,
+                        "capture_phase": "history_backfill",
+                    },
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["proactive_reply_count"], 0)
+            self.assertEqual(result["session_snapshot"]["after"]["pending_user_count"], 0)
+            self.assertEqual([entry.role for entry in ledger.read_entries(conversation_id)], ["user"])
 
     def test_sidebar_agent_tick_ignores_old_session_pending_after_context_reset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3940,9 +4045,8 @@ class SidebarKeyPoolApiTest(unittest.TestCase):
     def _configure_key_file(self, data_dir: Path, relative: str = "keys.md") -> None:
         create_default_config(data_dir)
         config = load_config(data_dir)
-        provider = config.providers.get("chat", config.llm)
+        provider = config.providers["chat"]
         provider.api_key_file = relative
-        config.llm.api_key_file = relative
         config.providers["chat"] = provider
         save_config(config)
 
@@ -4070,9 +4174,8 @@ class SidebarModelConfigApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            provider = config.providers.get("chat", config.llm)
+            provider = config.providers["chat"]
             provider.api_key_file = "keys.md"
-            config.llm.api_key_file = "keys.md"
             config.providers["chat"] = provider
             save_config(config)
 
@@ -4125,9 +4228,8 @@ class SidebarModelConfigApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config = load_config(data_dir)
-            provider = config.providers.get("chat", config.llm)
+            provider = config.providers["chat"]
             provider.api_key_file = "keys.md"
-            config.llm.api_key_file = "keys.md"
             config.providers["chat"] = provider
             save_config(config)
             (data_dir / "keys.md").write_text("KEY_01 = sk-available-1234\n", encoding="utf-8")

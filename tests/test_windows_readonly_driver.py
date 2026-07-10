@@ -28,6 +28,7 @@ class SnapshotMessageParserTest(unittest.TestCase):
         self.assertFalse(messages[0].is_group)
         self.assertEqual(messages[0].chat_title, "小明")
         self.assertEqual(messages[0].sender_wechat_id, "wxid_xiaoming")
+        self.assertTrue(messages[0].driver_meta["context_only"])
         self.assertTrue(messages[1].is_group)
         self.assertEqual(messages[1].chat_title, "学习群")
 

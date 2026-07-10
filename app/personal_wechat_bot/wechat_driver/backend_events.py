@@ -262,6 +262,7 @@ class BackendEventJsonlDriver:
                 "source_batch_count": batch_count,
                 "import_sequence": import_sequence,
                 "history_index": history_index,
+                "capture_phase": str(meta_source.get("capture_phase") or meta_source.get("capturePhase") or ""),
                 "conversation_id_hint": conversation_id,
                 "session_id": session_id,
                 "original_text": event.text,

@@ -21,19 +21,18 @@ class ModelRouterTest(unittest.TestCase):
             self.assertEqual(config.providers["chat"].model, "deepseek-v4-flash")
             self.assertEqual(config.providers["chat"].provider, "deepseek")
 
-    def test_legacy_llm_config_backfills_chat_provider(self) -> None:
+    def test_missing_provider_map_uses_current_chat_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             config_path = data_dir / "config.json"
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             raw.pop("providers", None)
-            raw["llm"]["model"] = "legacy-chat-model"
             config_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
             config = load_config(data_dir)
 
-            self.assertEqual(config.providers["chat"].model, "legacy-chat-model")
+            self.assertEqual(config.providers["chat"].model, "deepseek-v4-flash")
 
     def test_model_router_selects_chat_provider_by_capability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

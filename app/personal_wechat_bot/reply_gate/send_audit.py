@@ -15,11 +15,10 @@ SCHEMA_VERSION = 1
 
 
 class SendAuditLog:
-    """Append-only send audit with a SQLite read/index authority.
+    """Append-only send audit with SQLite as the operational authority.
 
-    The JSONL file remains the forensic evidence stream. SQLite mirrors it for
-    fast, WAL-protected reads and compact sidebar projections, and imports old
-    JSONL records on first use.
+    JSONL remains an append-only forensic projection. Reads use SQLite, and the
+    database never repopulates itself from that projection.
     """
 
     def __init__(self, path: str | Path):
@@ -125,22 +124,6 @@ class SendAuditLog:
                 records.append(item)
         return records
 
-    def _read_legacy_jsonl_unlocked(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        records: list[dict[str, Any]] = []
-        with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item, dict):
-                    records.append(item)
-        return records
-
     def _audit_lock(self):
         return jsonl_operation_lock(self.path, timeout_seconds=15.0)
 
@@ -183,7 +166,6 @@ class SendAuditLog:
         self._ensure_schema_unlocked()
         with self._connection() as db:
             db.execute("DELETE FROM send_audit_events")
-            db.execute("INSERT OR REPLACE INTO send_audit_meta(key, value) VALUES ('legacy_jsonl_imported', '1')")
 
     def _ensure_schema_unlocked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,38 +202,9 @@ class SendAuditLog:
                 "INSERT OR REPLACE INTO send_audit_meta(key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
-            count = db.execute("SELECT COUNT(*) FROM send_audit_events").fetchone()[0]
-            imported = db.execute("SELECT value FROM send_audit_meta WHERE key = 'legacy_jsonl_imported'").fetchone()
             db.commit()
         finally:
             db.close()
-        if int(count or 0) == 0 and (imported is None or str(imported["value"]) != "1"):
-            legacy_records = self._read_legacy_jsonl_unlocked()
-            with self._connection() as writable:
-                for item in legacy_records:
-                    if not isinstance(item, dict):
-                        continue
-                    writable.execute(
-                        """
-                        INSERT INTO send_audit_events(
-                          timestamp, action, queue_id, status, reason, reviewer, note, record_json
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            str(item.get("timestamp") or utc_now_iso()),
-                            str(item.get("action") or ""),
-                            str(item.get("queue_id") or ""),
-                            str(item.get("status") or ""),
-                            str(item.get("reason") or ""),
-                            str(item.get("reviewer") or ""),
-                            str(item.get("note") or ""),
-                            _json_dumps(item),
-                        ),
-                    )
-                writable.execute(
-                    "INSERT OR REPLACE INTO send_audit_meta(key, value) VALUES ('legacy_jsonl_imported', '1')"
-                )
 
     def _annotate_resolved_failures(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         annotated = [dict(item) for item in records]

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
+from app.personal_wechat_bot.conversation.session_store import CLEAR_CONTEXT_PHRASES, DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import RawWeChatMessage
 from app.personal_wechat_bot.processor.message_processor import MessageProcessor
 from app.personal_wechat_bot.runtime.conversation_scheduler import ConversationScheduler
@@ -142,6 +143,41 @@ class ConversationSchedulerTest(unittest.TestCase):
             self.assertEqual(entries[1].text_blocks[0]["text"], "second")
             self.assertTrue(entries[0].text_blocks[0]["metadata"]["context_only"])
             self.assertTrue(entries[0].text_blocks[0]["metadata"]["deferred_reply"])
+
+    def test_scheduler_applies_reset_before_later_message_in_same_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+            messages = [
+                RawWeChatMessage(
+                    raw_id="reset-first",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    text=f"@bot {CLEAR_CONTEXT_PHRASES[0]}",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                ),
+                RawWeChatMessage(
+                    raw_id="after-reset",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    text="continue in a clean session",
+                    observed_at="2026-06-28T01:00:01+00:00",
+                ),
+            ]
+
+            result = ConversationScheduler(processor.process, max_parallel_conversations=1).process_batch(messages)
+
+            self.assertEqual(len(result.processed), 2)
+            self.assertTrue(result.processed[0]["context"]["reset"])
+            self.assertIn("reply", result.processed[1])
+            conversation_id = result.processed[1]["message"]["conversation_id"]
+            state = runtime.session_store.state_for_conversation(conversation_id)
+            self.assertNotEqual(state["current_session_id"], DEFAULT_SESSION_ID)
+            entries = runtime.ledger_store.read_entries(conversation_id)
+            self.assertEqual([entry.role for entry in entries], ["user", "user", "assistant"])
+            self.assertTrue(all(entry.session_id == state["current_session_id"] for entry in entries))
 
 
 if __name__ == "__main__":

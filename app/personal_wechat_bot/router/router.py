@@ -40,9 +40,25 @@ class Router:
             return RouteDecision(message.message_id, message.conversation_id, "duplicate", "message already processed")
 
         trusted_channel = _trusted_channel_source(message)
+        untrusted_channel = _untrusted_channel_source(message)
         channel = None
+        existing = self.channel_store.get_channel(message.conversation_id) if self.channel_store is not None else None
+        if untrusted_channel:
+            source = str(message.metadata.get("source") or "unknown").strip()
+            if existing is None:
+                return RouteDecision(
+                    message.message_id,
+                    message.conversation_id,
+                    "ignore",
+                    f"untrusted_channel_source_blocked:{source}",
+                )
+            return RouteDecision(
+                message.message_id,
+                message.conversation_id,
+                "ignore",
+                f"untrusted_channel_source_context_only:{source}",
+            )
         if self.channel_store is not None and trusted_channel:
-            existing = self.channel_store.get_channel(message.conversation_id)
             admission = channel_admission_for_message(
                 message,
                 self.config,
@@ -84,6 +100,11 @@ def _trusted_channel_source(message: NormalizedMessage) -> bool:
     if source in UNTRUSTED_CHANNEL_SOURCES:
         return False
     return False
+
+
+def _untrusted_channel_source(message: NormalizedMessage) -> bool:
+    source = str(message.metadata.get("source", "")).strip()
+    return source in UNTRUSTED_CHANNEL_SOURCES
 
 
 def _message_dedupe_ids(message: NormalizedMessage) -> list[str]:

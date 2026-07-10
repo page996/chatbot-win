@@ -25,11 +25,6 @@ class ProviderConfig:
     cooldown_seconds: int = 0
 
 
-@dataclass
-class LLMConfig(ProviderConfig):
-    pass
-
-
 def default_providers() -> dict[str, ProviderConfig]:
     return {"chat": ProviderConfig()}
 
@@ -63,7 +58,6 @@ class BotConfig:
     context_window_messages: int = 20
     topics: list[str] = field(default_factory=lambda: ["日常闲聊", "学习", "AI"])
     avoid_topics: list[str] = field(default_factory=list)
-    llm: LLMConfig = field(default_factory=LLMConfig)
     providers: dict[str, ProviderConfig] = field(default_factory=default_providers)
     key_assignment_policy: str = "conversation_sticky"
     save_full_chat: bool = True
@@ -145,19 +139,3 @@ class BotConfig:
             "xxx",
         ]
     )
-
-    @property
-    def contacts_whitelist(self) -> set[str]:
-        return self.accepted_contacts
-
-    @contacts_whitelist.setter
-    def contacts_whitelist(self, value: set[str]) -> None:
-        self.accepted_contacts = set(value)
-
-    @property
-    def groups_whitelist(self) -> set[str]:
-        return self.accepted_groups
-
-    @groups_whitelist.setter
-    def groups_whitelist(self, value: set[str]) -> None:
-        self.accepted_groups = set(value)

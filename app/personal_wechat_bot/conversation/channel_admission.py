@@ -219,9 +219,9 @@ def conversation_identity_for_message(message: NormalizedMessage) -> str:
 def channel_allows_private_receiver(channel: Any, config: BotConfig | None = None) -> bool:
     """True when an existing private channel carries enough identity to send.
 
-    This is the send-bridge backstop for legacy channel files. A trusted source
-    alone is not enough: old WeFlow/native discovery could persist a bare wxid
-    before the channel-admission policy became stricter.
+    This is the send-bridge backstop for persisted channel records. A trusted
+    source alone is not enough: discovery may expose a bare wxid without proof
+    that the receiver is an accepted contact.
     """
 
     if not channel or isinstance(channel, bool):

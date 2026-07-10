@@ -7,7 +7,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
+from app.personal_wechat_bot.conversation.ledger_database import ConversationLedgerDatabase
 from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
+from app.personal_wechat_bot.conversation.session_database import ConversationSessionDatabase
 from app.personal_wechat_bot.config.schema import ProviderConfig
 from app.personal_wechat_bot.domain.models import NormalizedMessage
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
@@ -67,10 +70,12 @@ class ConversationChannelStoreTest(unittest.TestCase):
     def test_sqlite_registry_remains_authoritative_without_file_projection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            key_file = root / "keys.md"
+            key_file.write_text("KEY_A=secret-a\n", encoding="utf-8")
+            provider = ProviderConfig(api_key_env="", api_key_file="keys.md")
             store = ConversationChannelStore(
                 root,
-                ApiKeyPool(provider),
+                ApiKeyPool(provider, root),
                 file_workspace_root=root / "file_workspace",
                 context_root=root / "conversation_ledgers",
             )
@@ -84,26 +89,28 @@ class ConversationChannelStoreTest(unittest.TestCase):
 
             reopened_store = ConversationChannelStore(
                 root,
-                ApiKeyPool(provider),
+                ApiKeyPool(provider, root),
                 file_workspace_root=root / "file_workspace",
                 context_root=root / "conversation_ledgers",
             )
             reopened = reopened_store.get_channel(conversation_id)
             listed = reopened_store.list_channels()
+            selected_key = reopened_store.api_key_for_request(conversation_id)
 
             self.assertTrue((root / "conversation_channels.sqlite").exists())
             self.assertIsNotNone(reopened)
             self.assertEqual(reopened.chat_title, "Alice")
             self.assertEqual([item.conversation_id for item in listed], [conversation_id])
+            self.assertEqual(selected_key, "secret-a")
             self.assertEqual(resolve_segment(root, conversation_id), channel.segment)
             self.assertTrue((projection_dir / "channel.json").exists())
             self.assertTrue((root / "conversation_channels" / "index.json").exists())
 
-    def test_legacy_file_registry_is_imported_into_sqlite(self) -> None:
+    def test_file_projection_does_not_register_a_channel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            conversation_id = "private-legacy-import"
-            segment = conversation_segment(conversation_id, "Legacy Friend")
+            conversation_id = "private-projection-only"
+            segment = conversation_segment(conversation_id, "Projection Only")
             channel_path = root / "conversation_channels" / segment / "channel.json"
             channel_path.parent.mkdir(parents=True, exist_ok=True)
             channel_path.write_text(
@@ -111,13 +118,13 @@ class ConversationChannelStoreTest(unittest.TestCase):
                     {
                         "conversation_id": conversation_id,
                         "conversation_type": "private",
-                        "chat_title": "Legacy Friend",
+                        "chat_title": "Projection Only",
                         "segment": segment,
                         "status": "active",
                         "key_slots": 1,
                         "api_key_refs": [],
-                        "sender_names": ["Legacy Friend"],
-                        "sender_wechat_ids": ["wxid_legacy_friend"],
+                        "sender_names": ["Projection Only"],
+                        "sender_wechat_ids": ["wxid_projection_only"],
                         "source_names": ["weflow_discovery"],
                         "trusted_channel_source": True,
                         "is_friend": True,
@@ -134,7 +141,8 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 context_root=root / "conversation_ledgers",
             )
 
-            self.assertIsNotNone(store.get_channel(conversation_id))
+            self.assertIsNone(store.get_channel(conversation_id))
+            self.assertEqual(store.list_channels(), [])
             self.assertTrue((root / "conversation_channels.sqlite").exists())
 
     def test_group_channel_gets_two_key_slots_when_pool_allows(self) -> None:
@@ -157,22 +165,18 @@ class ConversationChannelStoreTest(unittest.TestCase):
             # Human-readable naming: directory name is now chat_title_hashPrefix.
             self.assertTrue((root / "conversation_channels" / "Study Group_group-1" / "channel.json").exists())
 
-    def test_segment_resolution_scans_channel_json_when_index_is_missing(self) -> None:
+    def test_segment_resolution_uses_sqlite_registry_without_projection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             conversation_id = "private-readable"
             segment = conversation_segment(conversation_id, "Alice")
-            channel_path = root / "conversation_channels" / segment / "channel.json"
-            channel_path.parent.mkdir(parents=True, exist_ok=True)
-            channel_path.write_text(
-                """
-{
-  "conversation_id": "private-readable",
-  "conversation_type": "private",
-  "chat_title": "Alice"
-}
-""".strip(),
-                encoding="utf-8",
+            ChannelRegistryStore(root).upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "Alice",
+                    "segment": segment,
+                }
             )
 
             self.assertEqual(resolve_segment(root, conversation_id), segment)
@@ -343,9 +347,8 @@ class ConversationChannelStoreTest(unittest.TestCase):
                 file_workspace_root=root / "file_workspace",
                 context_root=root / "conversation_ledgers",
             )
-            conversation_id = "legacy-noise"
-            # After human-readable naming, the actual directory segment is chat_title_hashPrefix.
-            segment = "PTURE_legacy-n"
+            conversation_id = "untrusted-noise"
+            segment = conversation_segment(conversation_id, "NOISE")
             channel_path = root / "conversation_channels" / segment / "channel.json"
             ledger_file = root / "conversation_ledgers" / segment / "conversation.md"
             workspace_file = root / "file_workspace" / segment / "session_default" / "file.txt"
@@ -354,27 +357,33 @@ class ConversationChannelStoreTest(unittest.TestCase):
             ledger_file.parent.mkdir(parents=True, exist_ok=True)
             workspace_file.parent.mkdir(parents=True, exist_ok=True)
             session_file.parent.mkdir(parents=True, exist_ok=True)
-            channel_path.write_text(
-                """
-{
-  "conversation_id": "legacy-noise",
-  "conversation_type": "private",
-  "chat_title": "PTURE",
-  "status": "active",
-  "key_slots": 1,
-  "api_key_refs": [],
-  "session_scope": "per_conversation_current_session",
-  "sender_names": ["PTURE"],
-  "sender_wechat_ids": [],
-  "source_names": [],
-  "trusted_channel_source": false
-}
-""".strip(),
-                encoding="utf-8",
-            )
+            channel_payload = {
+                "conversation_id": conversation_id,
+                "conversation_type": "private",
+                "chat_title": "NOISE",
+                "segment": segment,
+                "status": "active",
+                "key_slots": 1,
+                "api_key_refs": [],
+                "session_scope": "per_conversation_current_session",
+                "sender_names": ["NOISE"],
+                "sender_wechat_ids": [],
+                "source_names": [],
+                "trusted_channel_source": False,
+            }
+            store.registry.upsert(channel_payload)
+            channel_path.write_text(json.dumps(channel_payload), encoding="utf-8")
             ledger_file.write_text("purge ledger", encoding="utf-8")
             workspace_file.write_text("purge file", encoding="utf-8")
             session_file.write_text("purge session", encoding="utf-8")
+            ledger_database = ConversationLedgerDatabase(root)
+            ledger_database.set_segment(conversation_id, segment)
+            session_database = ConversationSessionDatabase(root)
+            session_database.upsert_state(
+                conversation_id,
+                segment,
+                {"conversation_id": conversation_id, "current_session_id": "session_default"},
+            )
 
             cleanup = store.delete_channel_with_cleanup(conversation_id)
 
@@ -384,6 +393,8 @@ class ConversationChannelStoreTest(unittest.TestCase):
             self.assertFalse(ledger_file.parent.exists())
             self.assertFalse((root / "file_workspace" / segment).exists())
             self.assertFalse(session_file.parent.exists())
+            self.assertNotIn(conversation_id, ledger_database.list_conversation_ids())
+            self.assertIsNone(session_database.get_state(conversation_id))
 
 
 def _message(

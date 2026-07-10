@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
 import time
 from dataclasses import asdict, is_dataclass
@@ -20,8 +19,6 @@ from app.personal_wechat_bot.control.commands import (
     init_config,
     set_deepseek_api,
     set_chat_api,
-    whitelist_contact,
-    whitelist_group,
 )
 from app.personal_wechat_bot.control.audit import (
     build_artifact_cleanup_report,
@@ -52,11 +49,6 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
-from app.personal_wechat_bot.runtime.conversation_migration import (
-    ConversationMigration,
-    load_migration_map,
-    migrate_conversations,
-)
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
@@ -107,7 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     preflight = sub.add_parser("preflight")
     preflight.add_argument("--show-accepted", action="store_true")
-    preflight.add_argument("--show-whitelist", action="store_true")
 
     sub.add_parser("send-readiness")
 
@@ -118,13 +109,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--hook-event-file", default=None)
     run_agent.add_argument("--hook-state-file", default=None)
     run_agent.add_argument("--no-backend-events", action="store_true")
-    run_agent.add_argument(
-        "--no-wechat-ocr",
-        action="store_true",
-        help="deprecated compatibility flag; WeChat page OCR ingestion is always disabled",
-    )
-    run_agent.add_argument("--ocr-output", default=None, help=argparse.SUPPRESS)
-    run_agent.add_argument("--ocr-capture-mode", choices=["window", "screen", "auto"], default="auto", help=argparse.SUPPRESS)
     run_agent.add_argument("--verbose", action="store_true")
 
     sidebar = sub.add_parser("send-sidebar")
@@ -228,12 +212,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     accept_group = sub.add_parser("accept-group")
     accept_group.add_argument("group_name")
-
-    add_contact = sub.add_parser("add-contact")
-    add_contact.add_argument("wechat_id")
-
-    add_group = sub.add_parser("add-group")
-    add_group.add_argument("group_name")
 
     rename = sub.add_parser("rename-group")
     rename.add_argument("old_name")
@@ -370,12 +348,6 @@ def build_parser() -> argparse.ArgumentParser:
     listen_weflow.add_argument("--forever", action="store_true")
     listen_weflow.add_argument("--allow-non-local", action="store_true")
 
-    migrate_conv = sub.add_parser("migrate-conversations")
-    migrate_conv.add_argument("--map", required=True, help="path to migration map JSON")
-    migrate_conv.add_argument("--apply", action="store_true", help="apply changes (default is dry-run preview)")
-    migrate_conv.add_argument("--backup", action="store_true", help="copy data-dir to a timestamped backup before applying")
-    migrate_conv.add_argument("--verbose", action="store_true")
-
     poll_backend = sub.add_parser("poll-backend-events")
     poll_backend.add_argument("--event-file", default=None)
     poll_backend.add_argument("--mode", default=None)
@@ -398,9 +370,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("wechat-health")
 
-    poll_snapshot = sub.add_parser("poll-snapshot")
+    poll_snapshot = sub.add_parser("poll-snapshot", help="parse a diagnostic snapshot as context-only input")
     poll_snapshot.add_argument("snapshot")
-    poll_snapshot.add_argument("--mode", default=None)
     poll_snapshot.add_argument("--loops", type=int, default=1)
     poll_snapshot.add_argument("--interval", type=float, default=1.0)
     poll_snapshot.add_argument("--verbose", action="store_true")
@@ -440,27 +411,6 @@ def build_parser() -> argparse.ArgumentParser:
     local_asr.add_argument("--model", default="base")
     local_asr.add_argument("--language", default="auto")
 
-    ocr_snapshot = sub.add_parser("ocr-snapshot")
-    ocr_snapshot.add_argument("image")
-    ocr_snapshot.add_argument("--chat-title", default="")
-
-    poll_ocr = sub.add_parser("poll-ocr-window")
-    poll_ocr.add_argument("--chat-title", default="")
-    poll_ocr.add_argument("--output", default="data/wechat_window.bmp")
-    poll_ocr.add_argument("--mode", default=None)
-    poll_ocr.add_argument("--verbose", action="store_true")
-    poll_ocr.add_argument("--loops", type=int, default=1)
-    poll_ocr.add_argument("--interval", type=float, default=1.0)
-    poll_ocr.add_argument("--capture-mode", choices=["window", "screen", "auto"], default="auto")
-    poll_ocr.add_argument("--delay-seconds", type=float, default=0.0)
-
-    diagnose_ocr = sub.add_parser("ocr-window-diagnose")
-    diagnose_ocr.add_argument("--chat-title", default="")
-    diagnose_ocr.add_argument("--output", default="data/wechat_window_diagnose.bmp")
-    diagnose_ocr.add_argument("--capture-mode", choices=["window", "screen", "auto"], default="auto")
-    diagnose_ocr.add_argument("--delay-seconds", type=float, default=0.0)
-    diagnose_ocr.add_argument("--show-ocr-text", action="store_true")
-
     sub.add_parser("capabilities")
     return parser
 
@@ -476,7 +426,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "preflight":
         config = load_config(args.data_dir)
-        result = build_preflight_report(config, show_accepted=args.show_accepted or args.show_whitelist)
+        result = build_preflight_report(config, show_accepted=args.show_accepted)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "send-readiness":
@@ -677,14 +627,6 @@ def main(argv: list[str] | None = None) -> None:
         accept_group_channel(args.data_dir, args.group_name)
         print(f"accepted group channel {args.group_name}")
         return
-    if args.command == "add-contact":
-        whitelist_contact(args.data_dir, args.wechat_id)
-        print(f"accepted contact channel {args.wechat_id} (legacy add-contact alias)")
-        return
-    if args.command == "add-group":
-        whitelist_group(args.data_dir, args.group_name)
-        print(f"accepted group channel {args.group_name} (legacy add-group alias)")
-        return
     if args.command == "rename-group":
         change_group_name(args.data_dir, args.old_name, args.new_name)
         print(f"renamed group {args.old_name} -> {args.new_name}")
@@ -706,8 +648,6 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "poll-fake":
         config = load_config(args.data_dir)
-        if args.mode:
-            config.mode = args.mode
         runtime = build_runtime(config)
         driver = FakeWeChatDriver(args.fixture)
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
@@ -847,10 +787,6 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(json.dumps({**result.__dict__, "weflow_ready": weflow_ready, "send_enabled": False}, ensure_ascii=False, indent=2))
         return
-    if args.command == "migrate-conversations":
-        result = _run_migrate_conversations(args)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
     if args.command == "pull-hook-messages":
         config = load_config(args.data_dir)
         if args.mode:
@@ -928,8 +864,6 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "poll-snapshot":
         config = load_config(args.data_dir)
-        if args.mode:
-            config.mode = args.mode
         runtime = build_runtime(config)
         driver = WindowsWeChatReadOnlyDriver(snapshot_provider=FileSnapshotProvider(args.snapshot))
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
@@ -1042,18 +976,6 @@ def main(argv: list[str] | None = None) -> None:
             "send_enabled": False,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-    if args.command == "ocr-snapshot":
-        _ = (args.image, args.chat_title)
-        print(json.dumps(_deprecated_page_ocr_payload("ocr-snapshot"), ensure_ascii=False, indent=2))
-        return
-    if args.command == "poll-ocr-window":
-        _ = (args.chat_title, args.output, args.mode, args.verbose, args.loops, args.interval, args.capture_mode, args.delay_seconds)
-        print(json.dumps(_deprecated_page_ocr_payload("poll-ocr-window"), ensure_ascii=False, indent=2))
-        return
-    if args.command == "ocr-window-diagnose":
-        _ = (args.chat_title, args.output, args.capture_mode, args.delay_seconds, args.show_ocr_text)
-        print(json.dumps(_deprecated_page_ocr_payload("ocr-window-diagnose"), ensure_ascii=False, indent=2))
         return
 
 
@@ -1231,70 +1153,6 @@ def _jsonable_dataclass(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _run_migrate_conversations(args) -> dict[str, Any]:
-    from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
-
-    data_dir = Path(args.data_dir)
-    migrations = _resolve_migrations(args.map, conversation_id_for)
-    backup_path = ""
-    if args.apply and args.backup:
-        backup_path = _backup_data_dir(data_dir)
-    report = migrate_conversations(data_dir, migrations, dry_run=not args.apply)
-    payload = report.to_dict()
-    payload["applied"] = bool(args.apply)
-    payload["backup_path"] = backup_path
-    if not args.apply:
-        payload["hint"] = "dry-run only; re-run with --apply (and --backup) to execute"
-    if not args.verbose:
-        for item in payload.get("items", []):
-            item.pop("moved_dirs", None)
-    return payload
-
-
-def _resolve_migrations(map_path: str, conversation_id_for) -> list[ConversationMigration]:
-    """Load a migration map, deriving new_id from talker_id when omitted.
-
-    Map entries may provide new_id directly, or provide talker_id (+ optional
-    conversation_type, default 'private'/'group' inferred from '@chatroom') so
-    the new conversation_id is computed the same way the pipeline would.
-    """
-
-    raw = json.loads(Path(map_path).read_text(encoding="utf-8"))
-    items = raw.get("migrations") if isinstance(raw, dict) else raw
-    if not isinstance(items, list):
-        raise SystemExit("migration map must contain a 'migrations' list")
-    resolved: list[ConversationMigration] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        old_id = str(item.get("old_id") or "").strip()
-        if not old_id:
-            continue
-        new_id = str(item.get("new_id") or "").strip()
-        talker_id = str(item.get("talker_id") or "").strip()
-        chat_title = str(item.get("chat_title") or "").strip()
-        if not new_id and talker_id:
-            ctype = str(item.get("conversation_type") or "").strip()
-            if not ctype:
-                ctype = "group" if talker_id.endswith("@chatroom") else "private"
-            new_id = conversation_id_for(ctype, talker_id)
-        if not new_id:
-            raise SystemExit(f"migration entry for old_id={old_id} needs new_id or talker_id")
-        resolved.append(
-            ConversationMigration(old_id=old_id, new_id=new_id, chat_title=chat_title, talker_id=talker_id)
-        )
-    if not resolved:
-        raise SystemExit("no usable migration entries found")
-    return resolved
-
-
-def _backup_data_dir(data_dir: Path) -> str:
-    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    backup = data_dir.parent / f"{data_dir.name}_backup_{stamp}"
-    shutil.copytree(data_dir, backup)
-    return str(backup)
-
-
 def _load_config_or_default(data_dir: str) -> BotConfig:
     try:
         return load_config(data_dir)
@@ -1335,29 +1193,6 @@ def _backend_event_driver(
         session_store=runtime.session_store,
         voice_cache_resolver=_voice_cache_resolver(config, extra_roots=extra_roots),
     )
-
-
-def _ocr_parse_payload(parse_result) -> dict[str, object] | None:
-    if parse_result is None:
-        return None
-    return {
-        "status": parse_result.status,
-        "reason": parse_result.reason,
-        "message": parse_result.message,
-        "attachments": list(parse_result.attachments),
-        "evidence": list(parse_result.evidence),
-    }
-
-
-def _deprecated_page_ocr_payload(command: str) -> dict[str, object]:
-    return {
-        "status": "deprecated",
-        "command": command,
-        "reason": "WeChat page OCR ingestion is disabled. Use backend events or pure wechat-capture for page/window acquisition; OCR is reserved for file-layer tools such as ocr-image and vision.ocr.",
-        "will_write_ledger": False,
-        "processed_count": 0,
-        "send_enabled": False,
-    }
 
 
 if __name__ == "__main__":

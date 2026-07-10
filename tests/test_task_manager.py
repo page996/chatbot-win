@@ -125,7 +125,7 @@ class TaskStatusStoreTest(unittest.TestCase):
             self.assertEqual(Path(projection["sqlite"]), sqlite_path)
             self.assertEqual(projection["tasks"][0]["task_id"], "sqlite-task")
 
-    def test_legacy_json_projection_migrates_into_sqlite(self) -> None:
+    def test_json_projection_does_not_repopulate_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             task_dir = data_dir / "task_manager"
@@ -135,8 +135,8 @@ class TaskStatusStoreTest(unittest.TestCase):
                     {
                         "tasks": [
                             {
-                                "task_id": "legacy-task",
-                                "title": "Legacy task",
+                                "task_id": "projection-task",
+                                "title": "Projection task",
                                 "status": "queued",
                                 "updated_at": "2026-07-08T00:00:00Z",
                             }
@@ -148,11 +148,12 @@ class TaskStatusStoreTest(unittest.TestCase):
             )
 
             state = TaskStatusStore(data_dir).state()
+            TaskStatusStore(data_dir).create({"task_id": "current-task", "title": "Current task"})
             reloaded = TaskStatusStore(data_dir).state()
 
             self.assertTrue((data_dir / "scheduler.sqlite").exists())
-            self.assertEqual(state["tasks"][0]["task_id"], "legacy-task")
-            self.assertEqual(reloaded["tasks"][0]["task_id"], "legacy-task")
+            self.assertEqual(state["tasks"], [])
+            self.assertEqual([item["task_id"] for item in reloaded["tasks"]], ["current-task"])
 
     def test_ephemeral_ui_diagnostics_are_hidden_from_persistent_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -286,39 +287,32 @@ class TaskStatusStoreTest(unittest.TestCase):
     def test_stale_weflow_child_task_is_repaired_when_parent_finished(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
-            task_dir = data_dir / "task_manager"
-            task_dir.mkdir(parents=True)
-            (task_dir / "tasks.json").write_text(
-                json.dumps(
-                    {
-                        "tasks": [
-                            {
-                                "task_id": "weflow-parent",
-                                "title": "WeFlow 拉取任务",
-                                "status": "completed",
-                                "progress": 100,
-                                "external_id": "pull-1",
-                                "concurrency_key": "weflow:pull:pull-1",
-                                "updated_at": "2026-07-07T01:00:01Z",
-                                "finished_at": "2026-07-07T01:00:01Z",
-                            },
-                            {
-                                "task_id": "weflow-child",
-                                "title": "WeFlow 拉取：wxid_user",
-                                "status": "running",
-                                "progress": 58,
-                                "external_id": "pull-1",
-                                "concurrency_key": "weflow:pull:wxid_user",
-                                "updated_at": "2026-07-07T01:00:00Z",
-                            },
-                        ]
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "weflow-parent",
+                    "title": "WeFlow 拉取任务",
+                    "status": "completed",
+                    "progress": 100,
+                    "external_id": "pull-1",
+                    "concurrency_key": "weflow:pull:pull-1",
+                    "updated_at": "2026-07-07T01:00:01Z",
+                    "finished_at": "2026-07-07T01:00:01Z",
+                }
+            )
+            store.create(
+                {
+                    "task_id": "weflow-child",
+                    "title": "WeFlow 拉取：wxid_user",
+                    "status": "running",
+                    "progress": 58,
+                    "external_id": "pull-1",
+                    "concurrency_key": "weflow:pull:wxid_user",
+                    "updated_at": "2026-07-07T01:00:00Z",
+                }
             )
 
-            state = TaskStatusStore(data_dir).state()
+            state = store.state()
             child = next(item for item in state["tasks"] if item["task_id"] == "weflow-child")
 
             self.assertEqual(child["status"], "completed")

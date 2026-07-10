@@ -75,7 +75,7 @@ class GuardedSendExecutor:
 
         Integrity-first: a file is sent even if its text parse was blocked, as
         long as the driver supports file sending and the path exists. Drivers
-        without a ``send_file`` method (e.g. legacy/read-only) simply skip files.
+        without a ``send_file`` method (for example read-only probes) skip files.
         """
         results: list[FileSendResult] = []
         driver = self.driver

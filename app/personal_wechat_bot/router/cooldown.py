@@ -18,8 +18,13 @@ class ConversationCooldown:
             self._init_db()
 
     def allow(self, conversation_id: str, now_iso_text: str | None = None) -> tuple[bool, str]:
-        if self.seconds <= 0:
+        allowed, reason = self.check(conversation_id, now_iso_text)
+        if allowed:
             self.mark(conversation_id, now_iso_text)
+        return allowed, reason
+
+    def check(self, conversation_id: str, now_iso_text: str | None = None) -> tuple[bool, str]:
+        if self.seconds <= 0:
             return True, "cooldown_disabled"
 
         now = _parse_iso(now_iso_text) if now_iso_text else datetime.now(timezone.utc)
@@ -30,7 +35,6 @@ class ConversationCooldown:
                 remaining = int(self.seconds - elapsed)
                 return False, f"group_cooldown:{remaining}s_remaining"
 
-        self.mark(conversation_id, now.isoformat())
         return True, "cooldown_allowed"
 
     def mark(self, conversation_id: str, now_iso_text: str | None = None) -> None:

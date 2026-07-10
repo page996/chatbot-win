@@ -9,6 +9,7 @@ import time
 import zipfile
 from pathlib import Path
 
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
@@ -114,25 +115,13 @@ class FileWorkspaceTest(unittest.TestCase):
             conversation_id = "conversation-title-change"
             old_segment = conversation_segment(conversation_id, "Alice")
             new_segment = conversation_segment(conversation_id, "Alice Renamed")
-            channel_path = data_dir / "conversation_channels" / old_segment / "channel.json"
-            channel_path.parent.mkdir(parents=True, exist_ok=True)
-            channel_path.write_text(
-                json.dumps({"conversation_id": conversation_id, "chat_title": "Alice Renamed", "segment": old_segment}),
-                encoding="utf-8",
-            )
-            (data_dir / "conversation_channels" / "index.json").write_text(
-                json.dumps(
-                    {
-                        "channels": [
-                            {
-                                "conversation_id": conversation_id,
-                                "chat_title": "Alice Renamed",
-                                "segment": old_segment,
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
+            ChannelRegistryStore(data_dir).upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "Alice Renamed",
+                    "segment": old_segment,
+                }
             )
             source = root / "wechat" / "note.txt"
             source.parent.mkdir()

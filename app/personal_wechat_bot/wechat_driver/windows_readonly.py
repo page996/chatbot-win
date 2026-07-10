@@ -186,10 +186,9 @@ class SnapshotMessageParser:
         chat_title, sender_name, sender_wechat_id, text = parts
         if not chat_title or not sender_name or not text:
             return None
-        context_only = False
+        context_only = True
         voice_meta: dict[str, object] = {}
         if text.startswith("[OCR_CONTEXT]"):
-            context_only = True
             text = text.removeprefix("[OCR_CONTEXT]").strip()
             if not text:
                 return None
