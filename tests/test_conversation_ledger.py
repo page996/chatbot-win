@@ -214,7 +214,10 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertFalse(attachment_block["metadata"]["visible_in_context"])
             self.assertNotIn("file parsed content", markdown)
             self.assertIn("[block:attachment:pdf file_id=file123 name=report.pdf hidden=true read=file.read]", markdown)
-            self.assertIn("[file:file123 name=report.pdf kind=file status=indexed read=file.read]", markdown)
+            self.assertIn(
+                "[file:file123 name=report.pdf kind=file status=indexed read=file.read origin=user direction=incoming]",
+                markdown,
+            )
             self.assertNotIn("manifest=workspace/file123/manifest.json", markdown)
 
     def test_attachment_ai_analysis_brief_is_visible_but_raw_file_body_is_hidden(self) -> None:
@@ -405,6 +408,35 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertIn("[block:annotation:web", markdown)
             self.assertTrue((store.annotations_dir("conv1") / f"{entry.entry_id}_{url_id}.md").exists())
 
+    def test_annotate_entry_adds_visible_tool_annotation_without_new_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            entry = store.append_message(_message("m1", "what changed in this library today?"))
+
+            changed = store.annotate_entry(
+                "conv1",
+                entry.entry_id,
+                kind="annotation:websearch",
+                annotation_id="search-m1",
+                summary="Search found the current release note.",
+                text="Search evidence:\n- Official docs say version 2 is current.",
+                source_path="tool_outputs/web_search/search-m1.md",
+                metadata={"level": "standard", "result_count": 1},
+            )
+            entries = store.read_entries("conv1")
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+            rendered = LedgerContextAssembler(store, max_recent_entries=5).build_snapshot(
+                _message("m2", "so what should I do?")
+            ).render_for_prompt()
+
+            self.assertTrue(changed)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].text_blocks[-1]["kind"], "annotation:websearch")
+            self.assertTrue(entries[0].text_blocks[-1]["metadata"]["visible_in_context"])
+            self.assertIn("[block:annotation:websearch", markdown)
+            self.assertIn("Search found the current release note.", rendered)
+            self.assertTrue((store.annotations_dir("conv1") / f"{entry.entry_id}_search-m1.md").exists())
+
     def test_append_reply_uses_conversation_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
@@ -506,6 +538,86 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertNotIn("agent generated file body", markdown)
             self.assertIn("[block:attachment:text file_id=file123 name=result.md hidden=true read=file.read]", markdown)
 
+    def test_outgoing_file_send_details_track_per_attachment_bridge_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            path = str(Path(tmp) / "report.txt")
+            reply = ReplyCandidate(
+                message_id="m1",
+                conversation_id="conv1",
+                text="reply with file",
+                send_mode="confirm",
+                model="fake",
+                attachments=[{"path": path, "name": "report.txt", "kind": "document"}],
+            )
+            entry = store.append_reply(reply)
+            details = {
+                "kind": "multi_part_send",
+                "text": {
+                    "status": "queued_to_bridge",
+                    "reason": "queued_to_non_foreground_bridge:bridge:conv1:text",
+                    "message_id": "bridge:conv1:text",
+                },
+                "files": [
+                    {
+                        "path": path,
+                        "name": "report.txt",
+                        "status": "queued_to_bridge",
+                        "reason": "queued_file_to_non_foreground_bridge:bridge:conv1:file",
+                        "message_id": "bridge:conv1:file",
+                    }
+                ],
+                "bridge_ids": ["bridge:conv1:text", "bridge:conv1:file"],
+                "part_count": 2,
+            }
+
+            store.update_reply_send_result(
+                "conv1",
+                entry.entry_id,
+                SendResult(
+                    message_id="bridge:conv1:text",
+                    conversation_id="conv1",
+                    status="queued_to_bridge",
+                    reason="queued_to_non_foreground_bridge:bridge:conv1:text",
+                    details=details,
+                ),
+            )
+            with_details = store.read_entries("conv1")[0]
+
+            self.assertEqual(with_details.send["details"]["bridge_ids"], ["bridge:conv1:text", "bridge:conv1:file"])
+            self.assertEqual(with_details.attachments[0]["send"]["bridge_id"], "bridge:conv1:file")
+            self.assertEqual(with_details.attachments[0]["send"]["status"], "queued_to_bridge")
+
+            store.update_bridge_send_result(
+                "conv1",
+                "bridge:conv1:file",
+                status="sent",
+                reason="wechat_native_http_send_file_verified",
+                external_message_id="ext-file",
+            )
+            file_sent = store.read_entries("conv1")[0]
+
+            self.assertEqual(file_sent.attachments[0]["send"]["status"], "sent")
+            self.assertEqual(file_sent.attachments[0]["send"]["external_message_id"], "ext-file")
+            self.assertEqual(file_sent.send["status"], "queued_to_bridge")
+
+            store.update_bridge_send_result(
+                "conv1",
+                "bridge:conv1:text",
+                status="sent",
+                reason="wechat_native_http_send_text_verified",
+                external_message_id="ext-text",
+            )
+            all_sent = store.read_entries("conv1")[0]
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+
+            self.assertEqual(all_sent.send["status"], "sent")
+            self.assertEqual(all_sent.send["details"]["text"]["external_message_id"], "ext-text")
+            self.assertIn("send_status=sent", markdown)
+            self.assertIn("bridge_id=bridge:conv1:file", markdown)
+            self.assertIn("origin=agent", markdown)
+            self.assertIn("direction=outgoing", markdown)
+
 
 class LedgerContextAssemblerTest(unittest.TestCase):
     def test_build_snapshot_uses_active_entries_quote_window_and_files(self) -> None:
@@ -529,6 +641,19 @@ class LedgerContextAssemblerTest(unittest.TestCase):
             self.assertEqual(snapshot.file_refs[0]["file_id"], "f1")
             self.assertIn("Quoted-message window", rendered)
             self.assertIn("file message", rendered)
+
+    def test_rendered_context_labels_owner_self_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("owner", "我手动接一句", is_self=True, sender_name="Me"))
+            current = _message("friend", "好的", sender_name="Friend")
+            store.append_message(current)
+
+            rendered = LedgerContextAssembler(store, max_recent_entries=5).build_snapshot(current).render_for_prompt()
+
+            self.assertIn("Role map: user=the other contact/group participant", rendered)
+            self.assertIn("role=self(owner_manual)", rendered)
+            self.assertIn("role=user(other_party)", rendered)
 
     def test_budget_keeps_quote_window_and_trims_recent_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

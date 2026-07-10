@@ -37,10 +37,10 @@ class WeChatWindowBinding:
 class WeChatWindowBindingStore:
     """Read-only store of legacy manual window bindings.
 
-    Foreground binding creation has been removed (wcf delivers by wxid/roomid, so
-    a bound foreground window is no longer needed). This store now only reads
-    existing ``window_bindings.json`` entries and reconciles their liveness, which
-    the bridge uses as optional metadata.
+    Foreground binding creation has been removed because the bridge delivers by
+    wxid/roomid, so a bound foreground window is no longer needed. This store
+    now only reads existing ``window_bindings.json`` entries and reconciles
+    their liveness, which the bridge uses as optional metadata.
     """
 
     def __init__(

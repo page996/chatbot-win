@@ -10,7 +10,7 @@ from app.personal_wechat_bot.wechat_driver.windows_readonly import WindowInfo, W
 
 
 class WeChatWindowBindingStoreTest(unittest.TestCase):
-    """Foreground binding creation was removed (wcf delivers by wxid/roomid).
+    """Foreground binding creation was removed; the bridge delivers by wxid/roomid.
 
     The store is now read-only: it reads legacy ``window_bindings.json`` entries
     and reconciles their liveness. These tests seed bindings directly on disk.

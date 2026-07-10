@@ -47,6 +47,8 @@ class LedgerContextSnapshot:
             f"Context budget: estimated_tokens={self.estimated_tokens} budget={self.token_budget}",
             "Only active ledger entries are visible. Recalled or removed entries are excluded from reasoning.",
             "Recent context is scoped to the current session. Explicitly quoted messages may restore a narrow cross-session window.",
+            "Role map: user=the other contact/group participant; self=the current WeChat account owner speaking manually; assistant=this Agent's own prior reply.",
+            "Do not treat self messages as requests from the other party. Use self messages only as owner context, correction, or handoff instructions.",
         ]
         for section in self.sections:
             if not section.lines:
@@ -96,7 +98,12 @@ class LedgerContextAssembler:
         conversation_dir = self.ledger_store.conversation_markdown_path(message.conversation_id).parent
         memory = _read_memory(memory_dir_for_conversation(conversation_dir, session_id))
         analysis = _analyze(session_entries, message)
-        runtime_card_lines = self.runtime_cards.prompt_lines() if self.runtime_cards is not None else []
+        runtime_card_lines = []
+        if self.runtime_cards is not None:
+            try:
+                runtime_card_lines = self.runtime_cards.prompt_lines(conversation_id=message.conversation_id)
+            except TypeError:
+                runtime_card_lines = self.runtime_cards.prompt_lines()
         sections = _budget_sections(
             _build_sections(
                 runtime_card_lines=runtime_card_lines,
@@ -148,6 +155,7 @@ def as_payload(entry: Any) -> dict[str, Any]:
         "links": [dict(item) for item in entry.links],
         "source": entry.source,
         "role": entry.role,
+        "send": dict(getattr(entry, "send", {}) or {}),
         "created_at": entry.created_at,
         "updated_at": entry.updated_at,
     }
@@ -306,13 +314,21 @@ def _file_lines(file_refs: list[dict[str, Any]]) -> list[str]:
     for item in file_refs[-30:]:
         parse = item.get("parse") if isinstance(item.get("parse"), dict) else {}
         artifacts = item.get("artifacts") if isinstance(item.get("artifacts"), dict) else {}
+        send = item.get("send") if isinstance(item.get("send"), dict) else {}
         parts = [
             f"name={item.get('name', '')}",
             f"file_id={item.get('file_id', '')}",
             f"kind={item.get('kind', '')}",
             f"status={item.get('status', '')}",
             f"parse_status={parse.get('status', '')}",
+            f"origin={item.get('origin', '')}",
+            f"direction={item.get('direction', '')}",
+            f"source={item.get('source', '')}",
+            f"send_status={send.get('status', '')}",
+            f"bridge_id={send.get('bridge_id') or send.get('message_id') or ''}",
         ]
+        if send.get("external_message_id"):
+            parts.append(f"external_message_id={send.get('external_message_id')}")
         if item.get("file_id"):
             parts.append("read_tool=file.read")
             parts.append(f"read_args=file_id={item.get('file_id', '')}")
@@ -380,7 +396,7 @@ def _link_lines(link_refs: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_entry_line(item: dict[str, Any], max_text_chars: int) -> str:
-    role = "self" if item.get("is_self") else item.get("role", "user")
+    role = _entry_role_label(item)
     text = "\n".join(
         str(block.get("text", ""))
         for block in item.get("text_blocks", [])
@@ -392,6 +408,15 @@ def _render_entry_line(item: dict[str, Any], max_text_chars: int) -> str:
         f"- #{int(item.get('sequence', 0) or 0):06d} {item.get('received_at', '')} "
         f"{item.get('sender_name', '')} role={role}{quote_note}: {_compact(text, max_text_chars)}"
     )
+
+
+def _entry_role_label(item: dict[str, Any]) -> str:
+    raw_role = str(item.get("role") or "user")
+    if raw_role == "assistant":
+        return "assistant(agent)"
+    if item.get("is_self") or raw_role == "self":
+        return "self(owner_manual)"
+    return "user(other_party)"
 
 
 def _visible_text_block(block: Any) -> bool:
@@ -425,7 +450,7 @@ def _collect_file_refs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             if key:
                 seen.add(key)
-            refs.append(dict(attachment))
+            refs.append(_file_ref_with_entry_context(attachment, item))
     return refs
 
 
@@ -440,6 +465,28 @@ def _dedupe_file_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(key)
         kept.append(dict(item))
     return kept
+
+
+def _file_ref_with_entry_context(attachment: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    origin = _entry_origin(entry)
+    direction = "outgoing" if origin in {"agent", "owner_manual"} else "incoming"
+    return {
+        **dict(attachment),
+        "origin": origin,
+        "direction": direction,
+        "entry_role": str(entry.get("role") or ""),
+        "entry_sequence": int(entry.get("sequence", 0) or 0),
+        "entry_message_id": str(entry.get("message_id") or ""),
+    }
+
+
+def _entry_origin(entry: dict[str, Any]) -> str:
+    role = str(entry.get("role") or "")
+    if role == "assistant":
+        return "agent"
+    if entry.get("is_self") or role == "self":
+        return "owner_manual"
+    return "user"
 
 
 def _collect_link_refs(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:

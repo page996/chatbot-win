@@ -29,6 +29,17 @@ class MessageProcessor:
         self.runtime.event_logger.log("message.normalized", message, message_id=message.message_id)
         original_message_id = message.message_id
 
+        route = self.runtime.router.decide(message)
+        self.runtime.event_logger.log("route.decision", route, message_id=message.message_id)
+        if _channel_admission_blocked(route):
+            self._mark_message_done(message, original_message_id)
+            return {
+                "message": asdict(message),
+                "route": asdict(route),
+                "context_only": True,
+                "blocked": True,
+            }
+
         reset_session_id = self.runtime.session_store.maybe_reset_for_message(message)
         if reset_session_id:
             pending_context_item = {"session_id": reset_session_id, "reset": True}
@@ -36,6 +47,15 @@ class MessageProcessor:
             pending_context_item = None
         session_id = reset_session_id or self.runtime.session_store.current_session_id_for_message(message)
         message = self._with_session_id(message, session_id)
+        if reset_session_id:
+            message = self._with_metadata(
+                message,
+                {
+                    "context_only": True,
+                    "control_event": "session_reset",
+                    "reset_session_id": reset_session_id,
+                },
+            )
 
         recall_item = self._handle_recall_event(message)
         if recall_item is not None:
@@ -50,8 +70,6 @@ class MessageProcessor:
                 message = enriched
                 self.runtime.event_logger.log("message.enriched", message, message_id=message.message_id)
 
-        route = self.runtime.router.decide(message)
-        self.runtime.event_logger.log("route.decision", route, message_id=message.message_id)
         item: dict[str, Any] = {"message": asdict(message), "route": asdict(route)}
         if pending_context_item is not None:
             item["context"] = pending_context_item
@@ -394,6 +412,11 @@ class MessageProcessor:
         metadata["session_id"] = session_id
         return replace(message, metadata=metadata)
 
+    def _with_metadata(self, message: NormalizedMessage, patch: dict[str, Any]) -> NormalizedMessage:
+        metadata = dict(message.metadata)
+        metadata.update(patch)
+        return replace(message, metadata=metadata)
+
     def _enrich_reply_attachments(self, reply: ReplyCandidate, session_id: str) -> ReplyCandidate:
         candidates = self._reply_attachment_candidates(reply)
         if not candidates:
@@ -552,6 +575,13 @@ def _attachment_candidate(value: Any, *, source: str) -> dict[str, Any]:
         "kind": kind,
         "source": str(value.get("source") or source).strip(),
     }
+
+
+def _channel_admission_blocked(route: Any) -> bool:
+    return (
+        str(getattr(route, "action", "") or "") == "ignore"
+        and str(getattr(route, "reason", "") or "").startswith("channel_admission_blocked:")
+    )
 
 
 def _message_has_attachments(message: NormalizedMessage) -> bool:

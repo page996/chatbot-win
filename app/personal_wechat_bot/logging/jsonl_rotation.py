@@ -28,16 +28,34 @@ def append_line_with_rotation(
     keep: int = DEFAULT_KEEP,
 ) -> None:
     """Append ``line`` (a single record, no trailing newline) then rotate if big."""
+    with jsonl_operation_lock(path):
+        append_line_with_rotation_unlocked(path, line, max_bytes=max_bytes, keep=keep)
+
+
+def append_line_with_rotation_unlocked(
+    path: Path,
+    line: str,
+    *,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    keep: int = DEFAULT_KEEP,
+) -> None:
+    """Append a line while the caller already holds ``jsonl_operation_lock``."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _file_lock(path.with_suffix(path.suffix + ".lock")):
-        with path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        try:
-            if path.exists() and path.stat().st_size >= max_bytes:
-                _rotate(path, keep=keep)
-        except OSError:
-            # Rotation is best-effort; never lose the just-written record over it.
-            pass
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    try:
+        if path.exists() and path.stat().st_size >= max_bytes:
+            _rotate(path, keep=keep)
+    except OSError:
+        # Rotation is best-effort; never lose the just-written record over it.
+        pass
+
+
+@contextmanager
+def jsonl_operation_lock(path: Path, *, timeout_seconds: float = 10.0) -> Iterator[None]:
+    """Serialize read/append/truncate operations for one JSONL file."""
+    with _file_lock(path.with_suffix(path.suffix + ".lock"), timeout_seconds=timeout_seconds):
+        yield
 
 
 def _rotate(path: Path, *, keep: int) -> None:

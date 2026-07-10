@@ -1,4 +1,4 @@
-const state = {
+﻿const state = {
   data: null,
   activeStatus: "pending",
   refreshing: false,
@@ -19,7 +19,12 @@ const state = {
   taskEvents: new Map(),
   taskEventsLoading: new Set(),
   channelLaneOpenState: new Map(),
+  renderingChannelLanes: false,
 };
+
+const BACKFILL_POLL_INTERVAL_MS = 1000;
+const BACKFILL_STALE_TIMEOUT_MS = 15 * 60 * 1000;
+const BACKFILL_MAX_WAIT_MS = 60 * 60 * 1000;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -110,6 +115,8 @@ function syncControls(data) {
     }
     driverSelect.value = selectedSendDriver(config.send_driver, drivers);
   }
+  const backendSelect = $("#sendBackendSelect");
+  if (backendSelect) backendSelect.value = selectedSendBackend(config.send_backend);
   const ocrModeSelect = $("#ocrModeSelect");
   if (ocrModeSelect) ocrModeSelect.value = runtimeMode(config.ocr_mode);
   const asrModeSelect = $("#asrModeSelect");
@@ -144,7 +151,13 @@ function configBoolean(value, fallback = false) {
 function selectedSendDriver(configured, drivers) {
   const driver = String(configured || "").trim();
   if (driver) return driver;
-  return drivers[0] || "not_implemented";
+  if (drivers.includes("bridge_outbox")) return "bridge_outbox";
+  return drivers[0] || "bridge_outbox";
+}
+
+function selectedSendBackend(configured) {
+  const backend = String(configured || "wechat_native_http").trim().toLowerCase();
+  return ["dry_run", "weflow_http", "wechat_native_http"].includes(backend) ? backend : "wechat_native_http";
 }
 
 function driverNames(data) {
@@ -152,7 +165,7 @@ function driverNames(data) {
   const names = registered.map((item) => item.name).filter(Boolean);
   const configured = data.config?.send_driver;
   if (configured && !names.includes(configured)) names.unshift(configured);
-  return names.length ? names : ["not_implemented", "bridge_outbox"];
+  return names.length ? names : ["bridge_outbox", "not_implemented"];
 }
 
 function renderSendControlSummary(data = state.data) {
@@ -162,7 +175,9 @@ function renderSendControlSummary(data = state.data) {
   const sendEnabledInput = $("#sendEnabled");
   const sendEnabled = sendEnabledInput ? sendEnabledInput.checked : configBoolean(config.send_enabled, false);
   const driverSelect = $("#driverSelect");
-  const driver = String((driverSelect && driverSelect.value) || config.send_driver || "not_implemented").trim();
+  const driver = String((driverSelect && driverSelect.value) || config.send_driver || "bridge_outbox").trim();
+  const backendSelect = $("#sendBackendSelect");
+  const backend = selectedSendBackend((backendSelect && backendSelect.value) || config.send_backend);
   const isDirty = Boolean(state.controlsDirty || state.controlsSaving);
   setSendStatusPill("#sendModeSummary", `模式：${sendModeText(mode)}`, sendModeTone(mode));
   setSendStatusPill(
@@ -170,7 +185,7 @@ function renderSendControlSummary(data = state.data) {
     `真实发送：${sendEnabled ? "开启" : "关闭"}`,
     sendEnabled ? (mode === "auto" ? "danger" : "warn") : "muted",
   );
-  setSendStatusPill("#sendDriverSummary", `驱动：${sendDriverText(driver)}`, sendDriverTone(driver, data));
+  setSendStatusPill("#sendDriverSummary", `驱动：${sendDriverText(driver)} / 后端：${sendBackendText(backend)}`, sendDriverTone(driver, data, backend));
   if (isDirty) {
     setSendStatusPill("#sendBridgeSummary", "非前台桥：保存后审查", "warn");
     return;
@@ -211,20 +226,38 @@ function sendDriverText(driver) {
   return driver;
 }
 
-function sendDriverTone(driver, data = state.data) {
+function sendDriverTone(driver, data = state.data, backend = "") {
   if (!driver || driver === "not_implemented") return "danger";
+  const selectedBackend = selectedSendBackend(backend || data?.config?.send_backend);
+  if (driver === "bridge_outbox" && !["weflow_http", "wechat_native_http"].includes(selectedBackend)) return "warn";
   const registered = new Set((data?.driver_probe?.registered_send_drivers || []).map((item) => String(item.name || "")));
   if (!registered.size) return driver === "bridge_outbox" ? "ok" : "warn";
   return registered.has(driver) ? "ok" : "danger";
+}
+
+function sendBackendText(backend) {
+  return {
+    dry_run: "dry-run演练",
+    weflow_http: "WeFlow HTTP真实",
+    wechat_native_http: "本地微信 Native HTTP",
+  }[selectedSendBackend(backend)] || "dry-run演练";
 }
 
 function bridgeStatusTone(status) {
   return {
     bridge_outbox_available: "muted",
     bridge_outbox_configured_disabled: "muted",
+    bridge_outbox_dry_run_backend: "warn",
+    bridge_outbox_weflow_http_unavailable: "danger",
+    bridge_outbox_weflow_token_missing: "danger",
+    bridge_outbox_weflow_send_not_supported: "danger",
+    bridge_outbox_wechat_native_http_unavailable: "danger",
+    bridge_outbox_wechat_native_accepted_unverified: "warn",
     bridge_outbox_ready: "ok",
     bridge_outbox_worker_down: "warn",
     bridge_outbox_worker_down_backlog: "danger",
+    bridge_outbox_worker_config_unknown: "warn",
+    bridge_outbox_worker_stale_config: "danger",
   }[status] || "muted";
 }
 
@@ -270,6 +303,9 @@ function renderWechatProbe(probe) {
       node.append(candidateList);
     }
     list.append(node);
+    requestAnimationFrame(() => {
+      if (node.isConnected) node.dataset.userToggleArmed = "1";
+    });
   }
 }
 
@@ -304,6 +340,7 @@ function renderChannels(data) {
     list.append(note);
   }
   if (!items.length) {
+    state.renderingChannelLanes = false;
     list.append(emptyNode("还没有可信后端服务通道"));
     return;
   }
@@ -325,6 +362,22 @@ function renderChannels(data) {
       <div class="channel-actions"></div>
     `;
     const actions = node.querySelector(".channel-actions");
+    actions.append(actionButton("测文本", "ghost small", (helpers) => queueChannelTestReply(channel.conversation_id, helpers), {
+      label: `生成测试回复：${displayName}`,
+      category: "发送测试",
+      scope: `conversation:${channel.conversation_id}`,
+      scopeLabel: "通道发送探针",
+      target: channel.conversation_id,
+      persist: false,
+    }));
+    actions.append(actionButton("测文件", "ghost small", (helpers) => queueChannelTestFile(channel.conversation_id, helpers), {
+      label: `投递测试文件：${displayName}`,
+      category: "发送测试",
+      scope: `conversation:${channel.conversation_id}`,
+      scopeLabel: "通道文件探针",
+      target: channel.conversation_id,
+      persist: false,
+    }));
     actions.append(actionButton("清除通道", "ghost small", () => deleteChannel(channel.conversation_id), {
       label: `清除通道：${displayName}`,
       category: "通道",
@@ -340,6 +393,7 @@ function renderCounts(data) {
   $("#pendingCount").textContent = data.queues?.pending?.count || 0;
   $("#approvedCount").textContent = data.queues?.approved?.count || 0;
   $("#bridgeQueuedCount").textContent = data.queues?.queued_to_bridge?.count || 0;
+  $("#acceptedCount").textContent = data.queues?.accepted?.count || 0;
   $("#rejectedCount").textContent = data.queues?.rejected?.count || 0;
   $("#sentCount").textContent = data.queues?.sent?.count || 0;
   $("#failedCount").textContent = data.queues?.failed?.count || 0;
@@ -353,70 +407,150 @@ function renderQueue() {
     list.append(emptyNode(`${queueStatusText(state.activeStatus)}队列为空`));
     return;
   }
+  const channelGroups = Array.isArray(queue.channels)
+    ? queue.channels.filter((item) => Array.isArray(item.items) && item.items.length)
+    : [];
+  if (channelGroups.length) {
+    for (const channel of channelGroups) {
+      list.append(renderQueueChannelGroup(channel));
+    }
+    return;
+  }
   for (const item of queue.items) {
-    const reply = item.reply || {};
-    const node = document.createElement("article");
-    node.className = `queue-item status-${item.status || state.activeStatus}`;
-    node.innerHTML = `
-      <div class="queue-head">
-        <span>${escapeHtml(queueStatusText(item.status || state.activeStatus))}</span>
-        <time>${escapeHtml(shortTime(item.updated_at || reply.created_at || ""))}</time>
-      </div>
-      <div class="conversation">${escapeHtml(conversationLabel(reply.conversation_id || ""))}</div>
-      <div class="reply-text">${escapeHtml(reply.text || "")}</div>
-      <div class="actions"></div>
-    `;
-    const actions = node.querySelector(".actions");
-    const conversationId = reply.conversation_id || item.conversation_id || "";
-    const queueScope = `queue:${item.queue_id}`;
-    if (item.status === "pending") {
-      actions.append(actionButton("通过", "primary", () => queueAction(item.queue_id, "approve"), {
-        label: `通过回复：${conversationId || item.queue_id}`,
-        category: "发送审核",
-        scope: queueScope,
-        scopeLabel: "审核队列事件",
-        target: item.queue_id,
-      }));
-      actions.append(actionButton("拒绝", "danger", () => queueAction(item.queue_id, "reject"), {
-        label: `拒绝回复：${conversationId || item.queue_id}`,
-        category: "发送审核",
-        scope: queueScope,
-        scopeLabel: "审核队列事件",
-        target: item.queue_id,
-      }));
-    }
-    if (item.status === "approved") {
-      actions.append(actionButton("3秒后发送", "primary", () => delayedQueueAction(item.queue_id, "send-approved"), {
-        label: `发送回复：${conversationId || item.queue_id}`,
-        category: "发送审核",
-        scope: queueScope,
-        scopeLabel: "审核队列事件",
-        target: item.queue_id,
-      }));
-      actions.append(actionButton("拒绝", "danger", () => queueAction(item.queue_id, "reject"), {
-        label: `拒绝回复：${conversationId || item.queue_id}`,
-        category: "发送审核",
-        scope: queueScope,
-        scopeLabel: "审核队列事件",
-        target: item.queue_id,
-      }));
-    }
-    if (["failed", "rejected", "sent"].includes(item.status || state.activeStatus)) {
-      actions.append(actionButton("×", "danger mini", () => removeQueueItem(item.queue_id), {
-        label: `移除队列项：${conversationId || item.queue_id}`,
-        category: "发送审核",
-        scope: queueScope,
-        scopeLabel: "审核队列事件",
-        target: item.queue_id,
-      }));
-    }
-    list.append(node);
+    list.append(renderQueueItem(item));
   }
 }
 
+function renderQueueChannelGroup(channel) {
+  const details = document.createElement("details");
+  details.className = "queue-channel";
+  details.open = true;
+  const conversationId = String(channel.conversation_id || "");
+  const summary = document.createElement("summary");
+  summary.innerHTML = `
+    <div class="queue-channel-head">
+      <div>
+        <strong>${escapeHtml(channel.display_name || conversationLabel(conversationId) || "未知通道")}</strong>
+        <span>${escapeHtml([
+          conversationTypeText(channel.conversation_type || ""),
+          channel.receiver ? `receiver ${channel.receiver}` : "",
+          conversationId && channel.display_name !== conversationId ? conversationId : "",
+        ].filter(Boolean).join(" / "))}</span>
+      </div>
+      <em>${escapeHtml(`${channel.count || channel.items.length} 条`)}</em>
+    </div>
+    <div class="queue-channel-status">${escapeHtml(queueChannelStatusSummary(channel.status_counts || {}))}</div>
+  `;
+  details.append(summary);
+  const body = document.createElement("div");
+  body.className = "queue-channel-items";
+  for (const item of channel.items || []) {
+    body.append(renderQueueItem(item));
+  }
+  details.append(body);
+  return details;
+}
+
+function renderQueueItem(item) {
+  const reply = item.reply || {};
+  const note = String(item.note || item.reason || "");
+  const node = document.createElement("article");
+  node.className = `queue-item status-${item.status || state.activeStatus}`;
+  node.innerHTML = `
+    <div class="queue-head">
+      <span>${escapeHtml(queueStatusText(item.status || state.activeStatus, note))}</span>
+      <time>${escapeHtml(shortTime(item.updated_at || item.reviewed_at || reply.created_at || ""))}</time>
+    </div>
+    <div class="conversation">${escapeHtml(conversationLabel(reply.conversation_id || item.conversation_id || ""))}</div>
+    <div class="reply-text">${escapeHtml(reply.text || "")}</div>
+    ${note ? `<p>${escapeHtml(note)}</p>` : ""}
+    <div class="actions"></div>
+  `;
+  const actions = node.querySelector(".actions");
+  const conversationId = reply.conversation_id || item.conversation_id || "";
+  const queueScope = `queue:${item.queue_id}`;
+  if (item.status === "pending") {
+    actions.append(actionButton("通过", "primary", () => queueAction(item.queue_id, "approve"), {
+      label: `通过回复：${conversationId || item.queue_id}`,
+      category: "发送审核",
+      scope: queueScope,
+      scopeLabel: "审核队列事件",
+      target: item.queue_id,
+    }));
+    actions.append(actionButton("拒绝", "danger", () => queueAction(item.queue_id, "reject"), {
+      label: `拒绝回复：${conversationId || item.queue_id}`,
+      category: "发送审核",
+      scope: queueScope,
+      scopeLabel: "审核队列事件",
+      target: item.queue_id,
+    }));
+  }
+  if (item.status === "approved") {
+    actions.append(actionButton("发送", "primary", () => queueAction(item.queue_id, "send-approved"), {
+      label: `发送回复：${conversationId || item.queue_id}`,
+      category: "发送审核",
+      scope: queueScope,
+      scopeLabel: "审核队列事件",
+      target: item.queue_id,
+    }));
+    actions.append(actionButton("拒绝", "danger", () => queueAction(item.queue_id, "reject"), {
+      label: `拒绝回复：${conversationId || item.queue_id}`,
+      category: "发送审核",
+      scope: queueScope,
+      scopeLabel: "审核队列事件",
+      target: item.queue_id,
+    }));
+  }
+  if (["failed", "rejected", "sent", "accepted"].includes(item.status || state.activeStatus)) {
+    actions.append(actionButton("×", "danger mini", () => removeQueueItem(item.queue_id), {
+      label: `移除队列项：${conversationId || item.queue_id}`,
+      category: "发送审核",
+      scope: queueScope,
+      scopeLabel: "审核队列事件",
+      target: item.queue_id,
+    }));
+  }
+  return node;
+}
+
+function queueChannelStatusSummary(counts) {
+  const parts = ["pending", "approved", "queued_to_bridge", "accepted", "rejected", "sent", "failed"]
+    .map((status) => [queueStatusText(status), Number(counts[status] || 0)])
+    .filter(([, count]) => count > 0)
+    .map(([label, count]) => `${label} ${count}`);
+  return parts.join(" / ") || "无待处理项";
+}
+
 function renderBridge(bridge) {
-  $("#bridgePendingCount").textContent = `${bridge.pending_count || 0} 待消费 / ${bridge.ack_count || 0} 已确认 / ${bridge.channel_count || 0} 通道`;
-  $("#bridgePath").textContent = bridge.outbox_path || "未创建 outbox";
+  const openProblems = Number(
+    bridge.active_problem_count !== undefined ? bridge.active_problem_count : bridge.open_problem_count || 0,
+  );
+  const activeUnverified = Number(
+    bridge.active_unverified_count !== undefined
+      ? bridge.active_unverified_count
+      : bridge.accepted_count || bridge.unverified_count || 0,
+  );
+  const legacyUnverified = Number(bridge.legacy_hook_unverified_count || 0);
+  const historicalFailures = Number(
+    bridge.historical_failed_count !== undefined ? bridge.historical_failed_count : bridge.failed_count || 0,
+  );
+  const summaryParts = [
+    `${openProblems} 当前需复核`,
+    `${bridge.pending_count || 0} 待消费`,
+    `${bridge.sent_count || 0} 已送达`,
+    `${activeUnverified} 当前未验证`,
+    `${historicalFailures} 历史失败`,
+    `${bridge.blocked_count || 0} 阻断`,
+    `${bridge.channel_count || 0} 通道`,
+  ];
+  if (legacyUnverified) {
+    summaryParts.splice(4, 0, `${legacyUnverified} 旧端口未验证`);
+  }
+  $("#bridgePendingCount").textContent = summaryParts.join(" / ");
+  $("#bridgePath").textContent = [
+    bridge.outbox_path || "outbox not created",
+    bridgeWorkerSummary(bridge.worker || {}),
+  ].filter(Boolean).join(" | ");
   const list = $("#bridgeList");
   list.innerHTML = "";
   const channels = Array.isArray(bridge.channels) ? bridge.channels : [];
@@ -451,38 +585,102 @@ function renderBridge(bridge) {
     list.append(emptyNode("非前台桥 outbox 为空"));
     return;
   }
-  for (const item of items.slice(-10).reverse()) {
-    const node = document.createElement("article");
-    node.className = `bridge-item status-${item.status || "queued"}`;
-    node.innerHTML = `
-      <div class="queue-head">
-        <span>${escapeHtml(bridgeStatusText(item.status || "queued"))}</span>
-        <time>${escapeHtml(shortTime(item.created_at || ""))}</time>
-      </div>
-      <div class="conversation">${escapeHtml(conversationLabel(item.conversation_id || ""))}</div>
-      <div class="reply-text">${escapeHtml(item.text || "")}</div>
-      <p>${escapeHtml([item.bridge_id || "", item.receiver ? `receiver=${item.receiver}` : ""].filter(Boolean).join(" / "))}</p>
-      <div class="actions"></div>
-    `;
-    const actions = node.querySelector(".actions");
-    if ((item.status || "queued") === "queued") {
-      actions.append(actionButton("标记已发", "primary", () => ackBridge(item.bridge_id, "sent"), {
-        label: `桥接标记已发：${item.conversation_id || item.bridge_id}`,
-        category: "非前台桥",
-        scope: `send-review:bridge:${item.bridge_id || item.conversation_id}`,
-        scopeLabel: "非前台桥事件",
-        target: item.conversation_id || "",
-      }));
-      actions.append(actionButton("标记失败", "danger", () => ackBridge(item.bridge_id, "failed"), {
-        label: `桥接标记失败：${item.conversation_id || item.bridge_id}`,
-        category: "非前台桥",
-        scope: `send-review:bridge:${item.bridge_id || item.conversation_id}`,
-        scopeLabel: "非前台桥事件",
-        target: item.conversation_id || "",
-      }));
+  const itemChannels = Array.isArray(bridge.item_channels)
+    ? bridge.item_channels.filter((item) => Array.isArray(item.items) && item.items.length)
+    : [];
+  if (itemChannels.length) {
+    for (const channel of itemChannels) {
+      list.append(renderBridgeChannelGroup(channel));
     }
-    list.append(node);
+    return;
   }
+  for (const item of items.slice(-10).reverse()) {
+    list.append(renderBridgeItem(item));
+  }
+}
+
+function renderBridgeChannelGroup(channel) {
+  const details = document.createElement("details");
+  details.className = "bridge-item-channel";
+  details.open = true;
+  const conversationId = String(channel.conversation_id || "");
+  const summary = document.createElement("summary");
+  summary.innerHTML = `
+    <div class="queue-channel-head">
+      <div>
+        <strong>${escapeHtml(channel.display_name || conversationLabel(conversationId) || "未知通道")}</strong>
+        <span>${escapeHtml([
+          conversationTypeText(channel.conversation_type || ""),
+          channel.receiver ? `receiver ${channel.receiver}` : "",
+          conversationId && channel.display_name !== conversationId ? conversationId : "",
+        ].filter(Boolean).join(" / "))}</span>
+      </div>
+      <em>${escapeHtml(`${channel.count || channel.items.length} 条`)}</em>
+    </div>
+    <div class="queue-channel-status">${escapeHtml(bridgeChannelStatusSummary(channel.status_counts || {}))}</div>
+  `;
+  details.append(summary);
+  const body = document.createElement("div");
+  body.className = "queue-channel-items";
+  for (const item of channel.items || []) {
+    body.append(renderBridgeItem(item));
+  }
+  details.append(body);
+  return details;
+}
+
+function renderBridgeItem(item) {
+  const node = document.createElement("article");
+  node.className = `bridge-item status-${item.status || "queued"}`;
+  const ack = item.ack && typeof item.ack === "object" ? item.ack : {};
+  const ackReason = String(ack.reason || "");
+  const ackBackend = String(item.ack_backend || "");
+  const retryBlocker = String(item.retry_blocker || "");
+  node.innerHTML = `
+    <div class="queue-head">
+      <span>${escapeHtml(bridgeStatusText(item.status || "queued", ackReason))}</span>
+      <time>${escapeHtml(shortTime(item.created_at || ""))}</time>
+    </div>
+    <div class="conversation">${escapeHtml(conversationLabel(item.conversation_id || ""))}</div>
+    <div class="reply-text">${escapeHtml(item.text || "")}</div>
+    <p>${escapeHtml([item.bridge_id || "", item.receiver ? `receiver=${item.receiver}` : "", ackBackend ? `backend=${ackBackend}` : "", ackReason, retryBlocker].filter(Boolean).join(" / "))}</p>
+    <div class="actions"></div>
+  `;
+  const actions = node.querySelector(".actions");
+  if (item.retryable) {
+    actions.append(actionButton("重投", "primary", () => retryBridge(item.bridge_id), {
+      label: `重投桥接项：${item.conversation_id || item.bridge_id}`,
+      category: "非前台桥",
+      scope: `send-review:bridge-retry:${item.bridge_id || item.conversation_id}`,
+      scopeLabel: "非前台桥重投",
+      target: item.conversation_id || "",
+    }));
+  }
+  if ((item.status || "queued") === "queued") {
+    actions.append(actionButton("标记已发", "primary", () => ackBridge(item.bridge_id, "sent"), {
+      label: `桥接标记已发：${item.conversation_id || item.bridge_id}`,
+      category: "非前台桥",
+      scope: `send-review:bridge:${item.bridge_id || item.conversation_id}`,
+      scopeLabel: "非前台桥事件",
+      target: item.conversation_id || "",
+    }));
+    actions.append(actionButton("标记失败", "danger", () => ackBridge(item.bridge_id, "failed"), {
+      label: `桥接标记失败：${item.conversation_id || item.bridge_id}`,
+      category: "非前台桥",
+      scope: `send-review:bridge:${item.bridge_id || item.conversation_id}`,
+      scopeLabel: "非前台桥事件",
+      target: item.conversation_id || "",
+    }));
+  }
+  return node;
+}
+
+function bridgeChannelStatusSummary(counts) {
+  const parts = ["queued", "inflight", "accepted", "sent", "failed", "blocked", "retry"]
+    .map((status) => [bridgeStatusText(status), Number(counts[status] || 0)])
+    .filter(([, count]) => count > 0)
+    .map(([label, count]) => `${label} ${count}`);
+  return parts.join(" / ") || "无桥接项";
 }
 
 function renderRuntimeCards(runtimeCards) {
@@ -496,6 +694,7 @@ function renderRuntimeCards(runtimeCards) {
   $("#skillCount").textContent = `${activeSkillIds.size} 启用`;
   $("#personaName").textContent = persona.name || "未装备";
   $("#taskCount").textContent = `${activeTaskIds.size} 装备`;
+  renderChannelRuntimeOverrides(runtimeCards, catalog);
   renderCardList({
     root: $("#skillList"),
     cards: catalog.filter((item) => item.card_type === "skill"),
@@ -543,6 +742,90 @@ function renderRuntimeCards(runtimeCards) {
   });
 }
 
+function renderChannelRuntimeOverrides(runtimeCards, catalog) {
+  const overrides = runtimeCards.state?.channel_overrides || {};
+  $("#channelOverrideCount").textContent = `${Object.keys(overrides).length} 覆盖`;
+  renderChannelOverrideOptions();
+  const personaSelect = $("#channelOverridePersonaSelect");
+  if (personaSelect) {
+    const current = personaSelect.value;
+    const personas = catalog.filter((item) => item.card_type === "persona");
+    personaSelect.innerHTML = [
+      `<option value="">继承全局人物卡</option>`,
+      ...personas.map((card) => `<option value="${escapeHtml(card.card_id)}">${escapeHtml(card.name || card.card_id)}</option>`),
+    ].join("");
+    if ([...personaSelect.options].some((option) => option.value === current)) {
+      personaSelect.value = current;
+    }
+  }
+  const skillInput = $("#channelOverrideSkillIds");
+  if (skillInput && !skillInput.dataset.placeholderBound) {
+    const skills = catalog.filter((item) => item.card_type === "skill").map((item) => item.card_id).join(", ");
+    if (skills) skillInput.placeholder = `技能 card_id，逗号分隔；可用：${skills}`;
+    skillInput.dataset.placeholderBound = "1";
+  }
+  renderChannelOverrideList(overrides, catalog);
+}
+
+function renderChannelOverrideOptions() {
+  const options = $("#channelOverrideConversationOptions");
+  if (!options) return;
+  const channels = Array.isArray(state.data?.channels?.items) ? state.data.channels.items : [];
+  options.innerHTML = channels
+    .filter((channel) => String(channel?.conversation_id || "").trim())
+    .map((channel) => {
+      const id = String(channel.conversation_id || "").trim();
+      const label = [channelDisplayName(channel), conversationTypeText(channel.conversation_type || "")]
+        .filter(Boolean)
+        .join(" / ");
+      return `<option value="${escapeHtml(id)}" label="${escapeHtml(label || id)}"></option>`;
+    })
+    .join("");
+}
+
+function renderChannelOverrideList(overrides, catalog) {
+  const list = $("#channelOverrideList");
+  if (!list) return;
+  list.innerHTML = "";
+  const entries = Object.entries(overrides || {}).filter(([conversationId]) => String(conversationId || "").trim());
+  if (!entries.length) {
+    list.append(emptyNode("暂无通道人设覆盖"));
+    return;
+  }
+  const byId = new Map(catalog.map((card) => [card.card_id, card]));
+  for (const [conversationId, override] of entries) {
+    const payload = override && typeof override === "object" ? override : {};
+    const personaId = String(payload.persona_id || "").trim();
+    const skillIds = Array.isArray(payload.skill_ids) ? payload.skill_ids.map((item) => String(item || "").trim()).filter(Boolean) : [];
+    const persona = personaId ? byId.get(personaId) : null;
+    const skillNames = skillIds.map((id) => byId.get(id)?.name || id);
+    const node = document.createElement("article");
+    node.className = "runtime-card channel-override-card";
+    node.innerHTML = `
+      <div class="runtime-card-head">
+        <div>
+          <strong>${escapeHtml(conversationLabel(conversationId) || conversationId)}</strong>
+          <span>${escapeHtml(conversationId)}</span>
+        </div>
+        <span class="card-state">通道覆盖</span>
+      </div>
+      <p>${escapeHtml([
+        persona ? `人物卡：${persona.name || persona.card_id}` : "人物卡：继承全局",
+        skillNames.length ? `技能：${skillNames.join(", ")}` : "技能：无通道覆盖",
+      ].join(" / "))}</p>
+      <div class="actions"></div>
+    `;
+    node.querySelector(".actions").append(simpleButton("编辑", "ghost small", () => {
+      $("#channelOverrideConversationId").value = conversationId;
+      const personaSelect = $("#channelOverridePersonaSelect");
+      if (personaSelect) personaSelect.value = personaId;
+      const skillInput = $("#channelOverrideSkillIds");
+      if (skillInput) skillInput.value = skillIds.join(", ");
+    }));
+    list.append(node);
+  }
+}
+
 function renderWeFlow(weflow) {
   const worker = weflow.worker || {};
   const pullJob = weflow.pull_job || {};
@@ -550,10 +833,14 @@ function renderWeFlow(weflow) {
   const metrics = worker.metrics || {};
   const bridgeState = weflow.bridge_state || {};
   const readiness = weflow.readiness || {};
+  const requestedTalkers = Array.isArray(weflow.requested_talkers) ? weflow.requested_talkers : [];
+  const selectedTalkers = talkerIds();
   $("#weflowStatus").textContent = worker.running
     ? `后台运行中 / ${worker.loops || 0} 轮`
     : (readiness.status || weflow.last_pull?.status || weflow.last_health?.status || "未检查");
   $("#weflowDetail").textContent = [
+    selectedTalkers.length ? `前端选中 ${selectedTalkers.length} talker` : "",
+    requestedTalkers.length ? `后端最近请求 ${requestedTalkers.length} talker` : "",
     readiness.token_present ? `token ${readiness.token_source === "environment" ? "存在（环境变量）" : "存在"}` : "token 缺失",
     readiness.service_reachable ? "WeFlow 可达" : "",
     readiness.fork_ok ? "fork marker 正常" : "",
@@ -590,6 +877,8 @@ function renderWeFlow(weflow) {
       recent_ticks: metrics.recent_ticks || [],
     },
     bridge_state: bridgeState,
+    selected_talkers: selectedTalkers,
+    requested_talkers: requestedTalkers,
     last_health: weflow.last_health || {},
     last_discover: compactPayload(weflow.last_discover || {}, 1800),
     last_pull: compactPayload(weflow.last_pull || {}, 1800),
@@ -601,6 +890,7 @@ function renderWeFlow(weflow) {
       weflow_state_file: weflow.weflow_state_file,
     },
     config_migration: weflow.config_migration || {},
+    native_migration: state.data?.native_migration || {},
   };
   state.weflowLatestStatusText = JSON.stringify(statusPayload, null, 2);
   if (state.weflowStatusMode === "live" || !$("#weflowStatusBox").textContent.trim()) {
@@ -666,17 +956,23 @@ function renderWeFlowStoredSessions(sessions) {
   for (const session of filtered.slice(0, 20)) {
     const sessionId = String(session.id || "").trim();
     if (!sessionId) continue;
+    const blocked = isBlockedWeFlowSession(session);
     const node = document.createElement("article");
-    node.className = "stored-session-item";
+    node.className = `stored-session-item${blocked ? " blocked" : ""}`;
     node.innerHTML = `
       <div>
         <strong>${escapeHtml(session.name || sessionId)}</strong>
-        <span>${escapeHtml(conversationTypeText(session.type || ""))} / ${escapeHtml(session.cached ? "本地库" : "实时发现")}</span>
+        <span>${escapeHtml(conversationTypeText(session.type || ""))} / ${escapeHtml(session.cached ? "本地库" : "实时发现")}${blocked ? ` / ${escapeHtml(weflowBlockedSessionText(session))}` : ""}</span>
       </div>
       <div class="stored-session-actions"></div>
     `;
     const actions = node.querySelector(".stored-session-actions");
-    actions.append(simpleButton(selected.has(sessionId) ? "已加入" : "加入", "ghost mini", () => addTalker(sessionId)));
+    const addButton = simpleButton(selected.has(sessionId) ? "已加入" : (blocked ? "已阻断" : "加入"), "ghost mini", () => addTalker(sessionId));
+    if (blocked) {
+      addButton.disabled = true;
+      addButton.title = weflowBlockedSessionText(session);
+    }
+    actions.append(addButton);
     if (session.conversation_id) {
       actions.append(actionButton("×", "danger mini", () => deleteChannel(session.conversation_id), {
         label: `删除本地通道：${session.name || sessionId}`,
@@ -773,23 +1069,170 @@ function renderCardList({ root, cards, activeIds, emptyText, actionFor }) {
 
 function renderAudit() {
   const list = $("#auditList");
-  const items = state.data?.audit?.items || [];
+  const audit = state.data?.audit || {};
+  const items = audit.items || [];
   $("#auditCount").textContent = items.length;
   list.innerHTML = "";
   if (!items.length) {
     list.append(emptyNode("暂无发送审计记录"));
     return;
   }
+  const channelGroups = Array.isArray(audit.channels)
+    ? audit.channels.filter((item) => Number(item.total_count || 0) > 0)
+    : [];
+  if (channelGroups.length) {
+    for (const channel of channelGroups) {
+      list.append(renderAuditChannelGroup(channel));
+    }
+    return;
+  }
   for (const item of items.slice(-8).reverse()) {
+    list.append(renderAuditItem(item));
+  }
+}
+
+function renderAuditChannelGroup(channel) {
+  const details = document.createElement("details");
+  details.className = "audit-channel queue-channel";
+  details.open = true;
+  const conversationId = String(channel.conversation_id || "");
+  const summary = document.createElement("summary");
+  summary.innerHTML = `
+    <div class="queue-channel-head">
+      <div>
+        <strong>${escapeHtml(channel.display_name || conversationLabel(conversationId) || "未知通道")}</strong>
+        <span>${escapeHtml([
+          conversationTypeText(channel.conversation_type || ""),
+          channel.receiver ? `receiver ${channel.receiver}` : "",
+          conversationId && channel.display_name !== conversationId ? conversationId : "",
+        ].filter(Boolean).join(" / "))}</span>
+      </div>
+      <em>${escapeHtml(`${channel.total_count || 0} 条`)}</em>
+    </div>
+    <div class="queue-channel-status">${escapeHtml(auditChannelPhaseSummary(channel.phase_counts || {}))}</div>
+  `;
+  details.append(summary);
+  const body = document.createElement("div");
+  body.className = "queue-channel-items";
+  for (const phase of auditPhaseOrder()) {
+    const bucket = channel.phases?.[phase] || {};
+    const phaseItems = Array.isArray(bucket.items) ? bucket.items : [];
+    if (!phaseItems.length) continue;
+    body.append(renderAuditPhaseGroup(phase, phaseItems));
+  }
+  details.append(body);
+  return details;
+}
+
+function renderAuditPhaseGroup(phase, items) {
+  const group = document.createElement("section");
+  group.className = "audit-phase-group";
+  const recent = [...items]
+    .sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")))
+    .slice(-8)
+    .reverse();
+  const head = document.createElement("div");
+  head.className = "audit-phase-head";
+  head.innerHTML = `
+    <strong>${escapeHtml(auditPhaseText(phase))}</strong>
+    <span>${escapeHtml(`${items.length} 条`)}</span>
+  `;
+  group.append(head);
+  const body = document.createElement("div");
+  body.className = "audit-phase-items";
+  for (const item of recent) {
+    body.append(renderAuditItem(item));
+  }
+  group.append(body);
+  return group;
+}
+
+function renderAuditItem(item) {
     const node = document.createElement("article");
-    node.className = "audit-item";
+    const resolved = Boolean(item.resolved);
+    const severity = auditSeverity(item);
+    const failed = Boolean(item.problem) || (severity === "error" && !resolved);
+    node.className = `audit-item audit-item-${severity}${resolved ? " audit-item-resolved" : ""}${failed ? " audit-item-error" : ""}`;
+    const status = auditDisplayStatusText(item, resolved);
+    const detail = auditDetailText(item, resolved);
     node.innerHTML = `
       <span>${escapeHtml(actionText(item.action || ""))}</span>
-      <strong>${escapeHtml(queueStatusText(item.status || ""))}</strong>
-      <p>${escapeHtml(item.reason || item.note || item.queue_id || "")}</p>
+      <strong>${escapeHtml(status)}</strong>
+      <p>${escapeHtml(detail)}</p>
     `;
-    list.append(node);
+  return node;
+}
+
+function auditChannelPhaseSummary(counts) {
+  const parts = auditPhaseOrder()
+    .map((phase) => [auditPhaseText(phase), Number(counts[phase] || 0)])
+    .filter(([, count]) => count > 0)
+    .map(([label, count]) => `${label} ${count}`);
+  return parts.join(" / ") || "无审计项";
+}
+
+function auditPhaseOrder() {
+  return ["pending", "approved", "queued_to_bridge", "accepted", "rejected", "sent", "failed", "blocked", "resolved", "other"];
+}
+
+function auditPhaseText(phase) {
+  return {
+    blocked: "已阻断",
+    resolved: "已恢复",
+    other: "其他",
+  }[phase] || queueStatusText(phase);
+}
+
+function auditSeverity(item) {
+  const raw = String(item?.severity || "").toLowerCase();
+  if (["error", "warning", "resolved", "info"].includes(raw)) return raw;
+  if (item?.action === "ledger_sync_failed" && !item?.resolved) return "error";
+  if (item?.action === "confirm_send_attempt" && item?.status === "failed") return "error";
+  if (item?.action === "confirm_send_blocked") return "warning";
+  return item?.resolved ? "resolved" : "info";
+}
+
+function auditDisplayStatusText(item, resolved = false) {
+  if (resolved) return "已恢复";
+  const action = String(item?.action || "");
+  const status = String(item?.status || "");
+  if (action === "confirm_approve") return "已通过";
+  if (action === "confirm_reject") return "已拒绝";
+  if (action === "confirm_remove") return "已移除";
+  if (action === "bridge_retry") return "已重投";
+  if (action === "ledger_sync_recovered") return "已恢复";
+  if (action === "ledger_sync_failed") return "账本异常";
+  if (action === "confirm_send_blocked") return "已阻断";
+  return queueStatusText(status, item?.reason || "");
+}
+
+function auditDetailText(item, resolved = false) {
+  const payload = item?.payload && typeof item.payload === "object" ? item.payload : {};
+  const sendResult = payload.send_result && typeof payload.send_result === "object" ? payload.send_result : {};
+  const parts = [];
+  const base = item?.reason || item?.note || "";
+  if (base) parts.push(String(base));
+  const conversationId = item?.conversation_id || payload.conversation_id || sendResult.conversation_id || "";
+  const channelName = item?.channel_display_name || "";
+  if (conversationId) {
+    const label = channelName && channelName !== conversationId
+      ? `${channelName} (${conversationId})`
+      : conversationLabel(conversationId);
+    parts.push(`通道：${label}`);
   }
+  if (item?.queue_id) parts.push(`审核项：${item.queue_id}`);
+  const bridgeIds = [];
+  if (Array.isArray(payload.bridge_ids)) bridgeIds.push(...payload.bridge_ids);
+  if (payload.bridge_id) bridgeIds.push(payload.bridge_id);
+  if (payload.ack_status || bridgeIds.length) {
+    const ackText = payload.ack_status ? `桥回执：${queueStatusText(payload.ack_status)}` : "桥回执";
+    parts.push([ackText, bridgeIds.length ? bridgeIds.join(", ") : ""].filter(Boolean).join(" / "));
+  }
+  if (resolved && item?.resolved_by) {
+    parts.push(`已由 ${actionText(item.resolved_by)} 覆盖`);
+  }
+  if (!parts.length && item?.queue_id) parts.push(`审核项：${item.queue_id}`);
+  return parts.join("\n");
 }
 
 async function clearSendAudit(helpers = {}) {
@@ -806,7 +1249,7 @@ async function clearSendAudit(helpers = {}) {
 
 async function clearHistoryData(helpers = {}) {
   const confirmed = window.confirm(
-    "确定删除历史数据吗？\n\n将关闭 sidebar 和 WeFlow，清空对话、队列、文件中间层和 WeFlow 运行历史；侧边栏配置、模型配置、密钥池和技能/人设会保留。\n\n清理完成后不会自动重启，请手动重新打开 sidebar。",
+    "确定删除历史数据吗？\n\n将关闭 sidebar 和 WeFlow，清空对话、审核队列、文件中间层和 WeFlow 运行历史；侧边栏配置、模型配置、密钥池、技能/人设，以及已跑通的 send_bridge outbox/acks/worker 证据会保留。\n\n清理完成后不会自动重启，请手动重新打开 sidebar。",
   );
   if (!confirmed) {
     return { status: "cancelled_by_user", message: "用户取消清空历史数据" };
@@ -832,6 +1275,45 @@ async function clearHistoryData(helpers = {}) {
   state.weflowLatestStatusText = "";
   await refresh({ force: true });
   return payload;
+}
+
+async function inspectStorageStatus(helpers = {}) {
+  helpers.update?.(18, "正在扫描存储边界");
+  const box = $("#storageStatusBox");
+  try {
+    const payload = await api("/api/storage/status", {
+      method: "POST",
+      body: JSON.stringify({ include_sizes: true, max_entries_per_component: 5000 }),
+    });
+    state.data = { ...(state.data || {}), storage_migration: payload };
+    const summary = storageStatusSummary(payload);
+    if (box) {
+      box.hidden = false;
+      box.textContent = JSON.stringify(compactPayload(payload, 9000), null, 2);
+    }
+    helpers.update?.(100, summary);
+    setStatusMessage(summary);
+    return payload;
+  } catch (error) {
+    const message = `存储边界扫描失败：${error.message}`;
+    if (box) {
+      box.hidden = false;
+      box.textContent = JSON.stringify({ status: "error", message, response: error.payload || null }, null, 2);
+    }
+    setStatusMessage(message);
+    return { status: "error", message, response: error.payload || null };
+  }
+}
+
+function storageStatusSummary(payload) {
+  const summary = payload?.summary || {};
+  const db = Number(summary.database_backed_count || 0);
+  const fileTruth = Number(summary.file_truth_not_migrated_count || 0);
+  const preserved = Number(summary.preserved_component_count || 0);
+  const reset = Number(summary.reset_component_count || 0);
+  const truncated = Number(summary.truncated_component_count || 0);
+  const suffix = truncated ? ` / ${truncated} 项尺寸已截断` : "";
+  return `存储边界：DB ${db} 项 / 文件真源 ${fileTruth} 项 / 清历史保留 ${preserved} 项 / 重置 ${reset} 项${suffix}`;
 }
 
 function renderProbeJson() {
@@ -880,6 +1362,7 @@ function createTask(meta = {}) {
     queuedAt: now,
     startedAt: "",
     finishedAt: "",
+    updatedAt: now,
     detail: meta.detail || "",
     button: meta.button || null,
     conversationId: meta.conversationId || conversationIdFromTaskMeta(meta) || "",
@@ -952,6 +1435,7 @@ function updateTask(taskId, patch) {
   if (patch.progress !== undefined) {
     patch.progress = clampPercent(patch.progress);
   }
+  patch.updatedAt = patch.updatedAt || new Date().toISOString();
   Object.assign(task, patch);
   renderTaskQueue();
   updateButtonTaskProgress(task);
@@ -995,6 +1479,7 @@ function backendTaskPayload(task) {
     concurrency_key: task.scope || "global",
     started_at: task.startedAt || "",
     finished_at: task.finishedAt || "",
+    updated_at: task.updatedAt || "",
     metadata: {
       scope_label: task.scopeLabel || taskScopeText(task.scope || "global"),
       target: task.target || "",
@@ -1103,6 +1588,7 @@ function recordTaskHistory(task, event, detail = "") {
 function renderTaskQueue() {
   renderOperationHistory();
   renderResourceCommandCenter();
+  renderAgentStatus();
   renderResourceAudit();
   renderResourceScheduler();
   renderChannelTaskLanes();
@@ -1144,6 +1630,70 @@ function renderResourceCommandCenter() {
     appendTaskEventControls(node, task);
     centralList.append(node);
   }
+}
+
+function renderAgentStatus() {
+  const root = $("#agentStatusSummary");
+  if (!root) return;
+  const agent = state.data?.agent || {};
+  const lastTick = agent.last_tick && typeof agent.last_tick === "object" ? agent.last_tick : {};
+  const worker = agent.worker && typeof agent.worker === "object" ? agent.worker : {};
+  const workerRunning = Boolean(worker.running);
+  const startButton = $("#agentStartButton");
+  const stopButton = $("#agentStopButton");
+  if (startButton && !startButton.dataset.taskLocked) startButton.disabled = workerRunning || Boolean(worker.stop_requested);
+  if (stopButton && !stopButton.dataset.taskLocked) stopButton.disabled = !workerRunning && !worker.stop_requested;
+  root.innerHTML = "";
+  root.append(agentStatusPill(`连续：${agentWorkerStatusText(worker)}`));
+  if (workerRunning || worker.last_status) {
+    root.append(agentStatusPill(`worker tick：${Number(worker.loops || 0)}`));
+    root.append(agentStatusPill(`最近处理：${Number(worker.last_processed_count || 0)} 条`));
+  }
+  if (!lastTick.job_id) {
+    root.append(agentStatusPill("状态：未运行"));
+    root.append(agentStatusPill(`事件文件：${Number(agent.event_file_count || 0)}`));
+    return;
+  }
+  const session = lastTick.session_summary && typeof lastTick.session_summary === "object" ? lastTick.session_summary : {};
+  const cursor = lastTick.cursor && typeof lastTick.cursor === "object" ? lastTick.cursor : {};
+  root.append(agentStatusPill(`状态：${taskStatusText(lastTick.status || agent.status || "idle")}`));
+  root.append(agentStatusPill(`处理：${Number(lastTick.processed_count || 0)} 条`));
+  root.append(agentStatusPill(`主动：${Number(lastTick.proactive_reply_count || 0)} 条`));
+  root.append(agentStatusPill(`逐通道聚合：${Number(session.conversation_count || 0)} 通道`));
+  const requestedTalkers = Array.isArray(lastTick.requested_talkers) ? lastTick.requested_talkers : [];
+  const requestedConversations = Array.isArray(lastTick.requested_conversation_ids) ? lastTick.requested_conversation_ids : [];
+  if (requestedTalkers.length || requestedConversations.length) {
+    root.append(agentStatusPill(`作用域：${requestedTalkers.length || requestedConversations.length} 个选定通道`));
+  }
+  root.append(agentStatusPill(`待接：${Number(session.pending_user_count || 0)} 条`));
+  const blockedPending = Number(session.blocked_pending_user_count || 0);
+  const openingGreeting = Number(session.opening_greeting_count || 0);
+  if (blockedPending > 0) root.append(agentStatusPill(`阻断：${blockedPending} 条等新消息`));
+  if (openingGreeting > 0) root.append(agentStatusPill(`开场：${openingGreeting} 通道`));
+  root.append(agentStatusPill(`游标：${Number(cursor.read_offset || 0)}`));
+  if (worker.last_error) root.append(agentStatusPill(`worker 错误：${worker.last_error}`));
+}
+
+function agentStatusPill(text) {
+  const node = document.createElement("span");
+  node.textContent = text;
+  node.title = text;
+  return node;
+}
+
+function agentWorkerStatusText(worker) {
+  if (!worker || typeof worker !== "object") return "未启动";
+  if (worker.stop_requested) return "停止中";
+  if (worker.running) {
+    const status = String(worker.last_status || "").trim();
+    if (status === "idle") return "运行中/空闲";
+    if (status === "error") return "运行中/有错误";
+    if (status === "starting") return "启动中";
+    return "运行中";
+  }
+  if (worker.last_status === "stopped") return "已停止";
+  if (worker.last_status === "error") return "已停止/有错误";
+  return "未启动";
 }
 
 function renderResourcePools(root, pools) {
@@ -1356,13 +1906,19 @@ function renderDispatchPreviewItem(item, blocked) {
 function renderChannelTaskLanes() {
   const list = $("#channelTaskList");
   const count = $("#channelLaneCount");
-  if (!list || !count) return;
+  if (!list || !count) {
+    state.renderingChannelLanes = false;
+    return;
+  }
+  rememberRenderedChannelLaneOpenState(list);
   const lanes = channelLaneViewModels();
   const items = Array.isArray(lanes) ? lanes : [];
   count.textContent = items.length;
+  state.renderingChannelLanes = true;
   list.innerHTML = "";
   if (!items.length) {
     list.append(emptyNode("暂无通道状态；完成一次拉取后会按会话生成独立 lane。"));
+    state.renderingChannelLanes = false;
     return;
   }
   const visibleLaneIds = new Set();
@@ -1372,11 +1928,12 @@ function renderChannelTaskLanes() {
     const laneId = String(lane.conversation_id || lane.display_name || lane.current_topic?.topic_id || fallbackLaneId);
     visibleLaneIds.add(laneId);
     const tasks = orderedTasks(lane.tasks || []);
-    const activeTasks = tasks.filter((task) => taskIsActive(task));
-    const historyTasks = tasks.filter((task) => !taskIsActive(task)).slice(0, 5);
-    const current = activeTasks[0] || tasks[0] || {};
+    const visibleTasks = laneVisibleTasks(tasks);
+    const activeTasks = visibleTasks.filter((task) => taskIsActive(task));
+    const historyTasks = visibleTasks.filter((task) => !taskIsActive(task)).slice(0, 3);
+    const current = activeTasks[0] || visibleTasks[0] || {};
     const topic = lane.current_topic || {};
-    const counts = lane.counts || taskCounts(tasks);
+    const counts = taskCounts(visibleTasks);
     const audit = lane.resource_audit || {};
     const fileStates = Array.isArray(lane.file_states) ? lane.file_states : [];
     const replyState = lane.reply_state && typeof lane.reply_state === "object" ? lane.reply_state : {};
@@ -1392,6 +1949,7 @@ function renderChannelTaskLanes() {
       channelIdlePhase(lane);
     const node = document.createElement("details");
     node.className = `channel-lane status-${laneStatus}`;
+    node.dataset.laneId = laneId;
     node.open = rememberedOpen === null ? activeTasks.length > 0 : Boolean(rememberedOpen);
     node.innerHTML = `
       <summary>
@@ -1416,6 +1974,7 @@ function renderChannelTaskLanes() {
       <div class="lane-topic-list"></div>
     `;
     node.addEventListener("toggle", () => {
+      if (state.renderingChannelLanes || !node.isConnected || node.dataset.userToggleArmed !== "1") return;
       state.channelLaneOpenState.set(laneId, node.open);
     });
     const controlSlot = node.querySelector(".lane-control-slot");
@@ -1440,17 +1999,27 @@ function renderChannelTaskLanes() {
     const topicList = node.querySelector(".lane-topic-list");
     for (const item of laneTopicItems(lane).slice(0, 6)) {
       const topicNode = document.createElement("span");
-      topicNode.textContent = `${item.title || item.topic_id || "主题"} · ${item.active_count || 0}/${item.task_count || 0}`;
+      const active = Number(item.active_count || 0);
+      const taskCount = Number(item.task_count || 0);
+      const terminal = Number(item.terminal_count || 0);
+      if (taskCount > 0 && active === 0 && terminal >= taskCount) {
+        topicNode.classList.add("is-terminal");
+      }
+      topicNode.textContent = `${item.title || item.topic_id || "主题"} · ${topicProgressText(item)}`;
       topicList.append(topicNode);
     }
     if (!topicList.children.length) {
       topicList.remove();
     }
     list.append(node);
+    requestAnimationFrame(() => {
+      if (node.isConnected) node.dataset.userToggleArmed = "1";
+    });
   }
   for (const laneId of state.channelLaneOpenState.keys()) {
     if (!visibleLaneIds.has(laneId)) state.channelLaneOpenState.delete(laneId);
   }
+  state.renderingChannelLanes = false;
 }
 
 function renderLaneTask(task) {
@@ -1472,6 +2041,14 @@ function renderLaneTask(task) {
   `;
   appendTaskEventControls(node, task);
   return node;
+}
+
+function rememberRenderedChannelLaneOpenState(list) {
+  for (const node of list.querySelectorAll(".channel-lane[data-lane-id]")) {
+    const laneId = String(node.dataset.laneId || "").trim();
+    if (!laneId) continue;
+    state.channelLaneOpenState.set(laneId, Boolean(node.open));
+  }
 }
 
 function appendTaskEventControls(root, task) {
@@ -1612,6 +2189,20 @@ function renderLaneControl(lane, control) {
   const actionClass = "ghost mini";
   const currentMode = control.mode;
   const canResume = currentMode !== "active";
+  actions.append(actionButton("测文本", actionClass, (helpers) => queueChannelTestReply(conversationId, helpers), {
+    category: "发送测试",
+    scope: `conversation:${conversationId}`,
+    scopeLabel: "通道发送探针",
+    target: conversationId,
+    label: `生成测试回复：${lane.display_name || conversationId}`,
+  }));
+  actions.append(actionButton("测文件", actionClass, (helpers) => queueChannelTestFile(conversationId, helpers), {
+    category: "发送测试",
+    scope: `conversation:${conversationId}`,
+    scopeLabel: "通道文件探针",
+    target: conversationId,
+    label: `投递测试文件：${lane.display_name || conversationId}`,
+  }));
   actions.append(actionButton(canResume ? "恢复" : "暂停", actionClass, () => {
     const waitReason = String(node.querySelector(".lane-wait-input")?.value || "人工暂停").trim() || "人工暂停";
     return updateChannelControl(conversationId, {
@@ -1694,7 +2285,7 @@ function channelLaneViewModels() {
     laneById.set(id, lane);
   }
   return Array.from(laneById.values())
-    .map((lane) => ({ ...lane, counts: taskCounts(lane.tasks || []) }))
+    .map((lane) => ({ ...lane, counts: taskCounts(laneVisibleTasks(lane.tasks || [])) }))
     .sort((left, right) => laneSortScore(right) - laneSortScore(left));
 }
 
@@ -1824,16 +2415,44 @@ function laneTopicItems(lane) {
   for (const item of [...(lane.topic_queue || []), ...(lane.topic_history || [])]) {
     const id = String(item?.topic_id || item?.title || "").trim();
     if (!id || seen.has(id)) continue;
+    if (!shouldShowLaneTopicItem(item)) continue;
     seen.add(id);
     items.push(item);
   }
   return items;
 }
 
+function shouldShowLaneTopicItem(item) {
+  const active = Number(item?.active_count || 0);
+  if (active > 0) return true;
+  const total = Number(item?.task_count || 0);
+  const terminal = Number(item?.terminal_count || 0);
+  if (!(total > 0 && terminal >= total)) return true;
+  const stamp = Date.parse(String(item?.updated_at || ""));
+  if (!Number.isFinite(stamp)) return false;
+  const ageMs = Date.now() - stamp;
+  return Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 30 * 60 * 1000;
+}
+
+function topicProgressText(item) {
+  const active = Number(item?.active_count || 0);
+  const total = Number(item?.task_count || 0);
+  const terminal = Number(item?.terminal_count || 0);
+  const topicId = String(item?.topic_id || "");
+  if (total > 0 && active === 0 && terminal >= total) {
+    return topicId.startsWith("file:") ? `文件已完成 ${terminal}/${total}` : `已完成 ${terminal}/${total}`;
+  }
+  if (active > 0) return `进行中 ${active}/${total || active}`;
+  if (total > 0) return `等待 ${active}/${total}`;
+  return "已记录";
+}
+
 function channelIdlePhase(lane) {
   const reply = lane.reply_state && typeof lane.reply_state === "object" ? lane.reply_state : {};
-  if (reply.status && reply.status !== "idle") {
-    return `最近回复：${replyStatusText(reply.status)} ${shortTime(reply.last_reply_at || "")}`;
+  if (reply.status && reply.status !== "idle" && !configBoolean(reply.historical, false)) {
+    const reason = String(reply.last_send_reason || "");
+    const statusText = replyDisplayStatusText(reply, reply.status, reason);
+    return `最近回复：${statusText} ${shortTime(reply.last_reply_at || "")}`;
   }
   if (lane.last_message_at) {
     return `最近消息 ${shortTime(lane.last_message_at)} · ${Number(lane.message_count || 0)} 条已入账`;
@@ -1848,17 +2467,25 @@ function renderLaneReplyState(reply) {
   if (!reply || typeof reply !== "object") return null;
   const status = String(reply.status || reply.last_send_status || "idle");
   if (status === "idle" && !reply.last_reply_at && !reply.last_reply_entry_id) return null;
+  const reason = String(reply.last_send_reason || "");
+  const statusText = replyDisplayStatusText(reply, status, reason);
   const node = document.createElement("article");
   node.className = "lane-reply-state";
   node.innerHTML = `
     <div class="lane-state-head">
       <strong>回复状态</strong>
-      <span>${escapeHtml(replyStatusText(status))}</span>
+      <span>${escapeHtml(statusText)}</span>
     </div>
-    <small>${escapeHtml(shortTime(reply.last_reply_at || "")) || "尚无回复"} · ${escapeHtml(reply.last_send_status || status)}</small>
+    <small>${escapeHtml(shortTime(reply.last_reply_at || "")) || "尚无回复"} · ${escapeHtml(reason || reply.last_send_status || status)}</small>
     <small>${escapeHtml(compactText(reply.last_reply_message_id || reply.last_reply_entry_id || "", 80))}</small>
   `;
   return node;
+}
+
+function replyDisplayStatusText(reply, status, reason = "") {
+  if (configBoolean(reply?.historical, false) && status === "failed") return "历史发送失败";
+  if (status === "sent" && String(reason || "").includes("dry_run_not_delivered")) return "演练完成（未投递）";
+  return replyStatusText(status);
 }
 
 function renderLaneFileList(files) {
@@ -1935,6 +2562,19 @@ function taskIsActive(task) {
   return ["queued", "running", "waiting", "paused", "blocked"].includes(String(task?.status || ""));
 }
 
+function laneVisibleTasks(tasks = []) {
+  return (tasks || []).filter((task) => taskIsActive(task) || shouldShowLaneHistoryTask(task));
+}
+
+function shouldShowLaneHistoryTask(task) {
+  const status = String(task?.status || "");
+  if (!["completed", "failed", "cancelled"].includes(status)) return true;
+  const stamp = taskRecencyStamp(task);
+  if (!stamp) return false;
+  const ageMs = Date.now() - stamp;
+  return Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 30 * 60 * 1000;
+}
+
 function isCentralTask(task) {
   const scope = String(task?.scope || "");
   return !task?.conversationId || isNonLaneScope(scope);
@@ -1967,7 +2607,7 @@ function taskCounts(tasks = []) {
 }
 
 function laneSortScore(lane) {
-  const tasks = lane.tasks || [];
+  const tasks = laneVisibleTasks(lane.tasks || []);
   const active = tasks.filter((task) => taskIsActive(task));
   const current = orderedTasks(active.length ? active : tasks)[0] || {};
   const control = normalizeChannelControl(lane.control || {});
@@ -1986,8 +2626,16 @@ function orderedTasks(tasks = state.tasks) {
     if (byStatus) return byStatus;
     const byPriority = Number(right.priority || 0) - Number(left.priority || 0);
     if (byPriority) return byPriority;
-    return String(right.queuedAt).localeCompare(String(left.queuedAt));
+    return taskRecencyStamp(right) - taskRecencyStamp(left);
   });
+}
+
+function taskRecencyStamp(task) {
+  for (const value of [task?.updatedAt, task?.finishedAt, task?.startedAt, task?.queuedAt]) {
+    const stamp = Date.parse(String(value || ""));
+    if (Number.isFinite(stamp)) return stamp;
+  }
+  return 0;
 }
 
 function resourcePoolText(name) {
@@ -2073,6 +2721,7 @@ function normalizeBackendTask(task) {
     queuedAt: String(task.created_at || task.queuedAt || ""),
     startedAt: String(task.started_at || task.startedAt || ""),
     finishedAt: String(task.finished_at || task.finishedAt || ""),
+    updatedAt: String(task.updated_at || task.updatedAt || task.finished_at || task.started_at || task.created_at || ""),
     conversationId: String(task.conversation_id || task.conversationId || ""),
     assignedWorker: String(task.assigned_worker || task.assignedWorker || ""),
     backendOnly: true,
@@ -2107,6 +2756,7 @@ function replyStatusText(status) {
     dry_run: "演练",
     queued_for_confirm: "待审核",
     queued_to_bridge: "已入非前台桥",
+    accepted: "端口已接收（未验证）",
     sent: "已发送",
     failed: "发送失败",
     skipped: "已跳过",
@@ -2232,6 +2882,7 @@ async function saveControls() {
         mode,
         send_enabled: Boolean($("#sendEnabled")?.checked),
         send_driver: driver,
+        send_backend: selectedSendBackend($("#sendBackendSelect")?.value),
         send_confirm_required: mode !== "auto",
         ocr_mode: runtimeMode($("#ocrModeSelect")?.value),
         asr_mode: runtimeMode($("#asrModeSelect")?.value),
@@ -2265,11 +2916,6 @@ async function queueAction(queueId, action) {
   }
   await refresh({ force: true });
   return payload;
-}
-
-async function delayedQueueAction(queueId, action) {
-  await countdown("请切到目标微信聊天窗口", 3);
-  return queueAction(queueId, action);
 }
 
 async function removeQueueItem(queueId) {
@@ -2310,6 +2956,127 @@ async function updateChannelControl(conversationId, payload = {}) {
   return response;
 }
 
+async function queueChannelTestReply(conversationId, helpers = {}) {
+  const id = String(conversationId || "").trim();
+  if (!id) return { status: "error", message: "conversation_id_empty" };
+  const scope = requireSelectedTalkerScope(id);
+  if (!scope.ok) {
+    helpers.update?.(100, scope.message);
+    return scope;
+  }
+  const label = conversationLabel(id) || id;
+  const defaultText = `【sidebar测试】这是一条发往 ${label} 的通道文本投递探针。`;
+  const text = window.prompt("测试回复内容", defaultText);
+  if (text === null) return { status: "cancelled_by_user", message: "已取消测试回复" };
+  helpers.update?.(30, "正在生成测试文本投递项");
+  const payload = await api(`/api/channels/${encodeURIComponent(id)}/test-reply`, {
+    method: "POST",
+    body: JSON.stringify({
+      text,
+      talkers: scope.talkers,
+      conversation_ids: scope.conversation_ids,
+      require_scope: true,
+    }),
+  });
+  if (payload.dispatch_mode === "confirm") state.activeStatus = "pending";
+  const message = sidebarTestDispatchMessage("测试回复", payload);
+  helpers.update?.(80, message);
+  setStatusMessage(message);
+  await refresh({ force: true });
+  return payload;
+}
+
+async function queueChannelTestFile(conversationId, helpers = {}) {
+  const id = String(conversationId || "").trim();
+  if (!id) return { status: "error", message: "conversation_id_empty" };
+  const scope = requireSelectedTalkerScope(id);
+  if (!scope.ok) {
+    helpers.update?.(100, scope.message);
+    return scope;
+  }
+  helpers.update?.(18, "等待选择本地文件");
+  const file = await chooseLocalFile();
+  if (!file) return { status: "cancelled_by_user", message: "未选择文件" };
+  const maxBytes = Number(state.data?.config?.file_max_bytes || 20 * 1024 * 1024);
+  if (Number.isFinite(maxBytes) && maxBytes > 0 && file.size > maxBytes) {
+    return { status: "error", message: `文件超过上限：${file.size} > ${maxBytes}` };
+  }
+  const caption = window.prompt("文件 caption（可留空，只投递文件）", "") ?? "";
+  helpers.update?.(42, "正在读取文件内容");
+  const contentBase64 = await readFileAsBase64(file);
+  helpers.update?.(68, "正在生成文件发送审核项");
+  const payload = await api(`/api/channels/${encodeURIComponent(id)}/test-file`, {
+    method: "POST",
+    body: JSON.stringify({
+      caption,
+      file: {
+        name: file.name || "upload.bin",
+        size: file.size,
+        mime_type: file.type || "",
+        content_base64: contentBase64,
+      },
+      talkers: scope.talkers,
+      conversation_ids: scope.conversation_ids,
+      require_scope: true,
+    }),
+  });
+  if (payload.dispatch_mode === "confirm") state.activeStatus = "pending";
+  const message = sidebarTestDispatchMessage("测试文件", payload);
+  helpers.update?.(86, message);
+  setStatusMessage(message);
+  await refresh({ force: true });
+  return payload;
+}
+
+function sidebarTestDispatchMessage(label, payload = {}) {
+  if (payload.status === "blocked") {
+    return `${label}被阻断：${payload.reason || payload.message || "发送范围未确认"}`;
+  }
+  if (payload.dispatch_mode === "auto") {
+    const result = payload.send_result || {};
+    const status = result.status || payload.status || "submitted";
+    const reason = result.reason ? ` / ${result.reason}` : "";
+    return `${label}已自动投递：${status}${reason}`;
+  }
+  return `${label}已进入发送审核：${payload.queue_id || ""}`;
+}
+
+function chooseLocalFile() {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.style.position = "fixed";
+    input.style.left = "-9999px";
+    let settled = false;
+    const finish = (file) => {
+      if (settled) return;
+      settled = true;
+      input.remove();
+      resolve(file || null);
+    };
+    input.addEventListener("change", () => finish(input.files?.[0] || null), { once: true });
+    window.addEventListener("focus", () => {
+      setTimeout(() => {
+        if (!settled && !input.files?.length) finish(null);
+      }, 350);
+    }, { once: true });
+    document.body.append(input);
+    input.click();
+  });
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error("file_read_failed"));
+    reader.onload = () => {
+      const value = String(reader.result || "");
+      resolve(value.includes(",") ? value.split(",", 2)[1] : value);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 async function cleanupHiddenChannels() {
   const payload = await api("/api/channels/cleanup-hidden", {
     method: "POST",
@@ -2335,6 +3102,22 @@ async function ackBridge(bridgeId, status) {
   return payload;
 }
 
+async function retryBridge(bridgeId) {
+  if (!bridgeId) return;
+  const payload = await api("/api/bridge/retry", {
+    method: "POST",
+    body: JSON.stringify({
+      bridge_id: bridgeId,
+      reviewer: "sidebar",
+      note: "manual_sidebar_bridge_retry",
+    }),
+  });
+  const nextId = payload.new_bridge_id ? `：${payload.new_bridge_id}` : "";
+  setStatusMessage(`桥接项已重投${nextId}`);
+  await refresh({ force: true });
+  return payload;
+}
+
 async function runtimeCardAction(action, payload) {
   const result = await api(`/api/runtime-cards/${action}`, {
     method: "POST",
@@ -2348,14 +3131,32 @@ async function runtimeCardAction(action, payload) {
 async function savePersonaCard(event) {
   event.preventDefault();
   const name = $("#personaCardName").value.trim();
-  const content = $("#personaCardContent").value.trim();
-  if (!content) {
+  const payload = {
+    name,
+    description: $("#personaCardDescription").value.trim(),
+    personality: $("#personaCardPersonality").value.trim(),
+    scenario: $("#personaCardScenario").value.trim(),
+    mes_example: $("#personaCardMesExample").value.trim(),
+    content: $("#personaCardContent").value.trim(),
+  };
+  const hasPersonaBody = ["description", "personality", "scenario", "mes_example", "content"]
+    .some((key) => Boolean(payload[key]));
+  if (!hasPersonaBody) {
     setStatusMessage("人物卡内容不能为空");
     return { status: "error", message: "人物卡内容不能为空" };
   }
-  const result = await runtimeCardAction("save-persona", { name, content });
-  $("#personaCardName").value = "";
-  $("#personaCardContent").value = "";
+  const result = await runtimeCardAction("save-persona", payload);
+  [
+    "#personaCardName",
+    "#personaCardDescription",
+    "#personaCardPersonality",
+    "#personaCardScenario",
+    "#personaCardMesExample",
+    "#personaCardContent",
+  ].forEach((selector) => {
+    const node = $(selector);
+    if (node) node.value = "";
+  });
   return result;
 }
 
@@ -2370,6 +3171,50 @@ async function saveTaskCard(event) {
   const result = await runtimeCardAction("save-task", { name, content });
   $("#taskCardName").value = "";
   $("#taskCardContent").value = "";
+  return result;
+}
+
+async function saveChannelRuntimeOverride(event) {
+  event.preventDefault();
+  const conversationId = $("#channelOverrideConversationId").value.trim();
+  if (!conversationId) {
+    setStatusMessage("请先填写 conversation_id");
+    return { status: "error", message: "conversation_id required" };
+  }
+  const personaId = $("#channelOverridePersonaSelect").value.trim();
+  const skillIds = $("#channelOverrideSkillIds").value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (personaId) {
+    await runtimeCardAction("set-channel-persona", { conversation_id: conversationId, card_id: personaId });
+  } else {
+    await runtimeCardAction("clear-channel-persona", { conversation_id: conversationId });
+  }
+  await runtimeCardAction("set-channel-skills", { conversation_id: conversationId, card_ids: skillIds });
+  setStatusMessage(`通道卡片覆盖已保存：${conversationId}`);
+  return { status: "ok" };
+}
+
+async function clearChannelPersonaOverride() {
+  const conversationId = $("#channelOverrideConversationId").value.trim();
+  if (!conversationId) {
+    setStatusMessage("请先填写 conversation_id");
+    return { status: "error", message: "conversation_id required" };
+  }
+  const result = await runtimeCardAction("clear-channel-persona", { conversation_id: conversationId });
+  setStatusMessage(`通道人物卡已恢复全局：${conversationId}`);
+  return result;
+}
+
+async function clearChannelSkillsOverride() {
+  const conversationId = $("#channelOverrideConversationId").value.trim();
+  if (!conversationId) {
+    setStatusMessage("请先填写 conversation_id");
+    return { status: "error", message: "conversation_id required" };
+  }
+  const result = await runtimeCardAction("clear-channel-skills", { conversation_id: conversationId });
+  setStatusMessage(`通道技能已恢复全局：${conversationId}`);
   return result;
 }
 
@@ -2396,6 +3241,35 @@ async function auditLocalResources(helpers = {}) {
   helpers.update?.(92, "并发建议已写入总台视图");
   setStatusMessage("本机资源审计已完成");
   return payload;
+}
+
+async function exportDiagnosticsBundle(helpers = {}) {
+  helpers.update?.(18, "正在收集诊断快照");
+  try {
+    const payload = await api("/api/diagnostics/export", {
+      method: "POST",
+      body: JSON.stringify({ limit: 80, persist: true }),
+    });
+    const createdAt = String(payload.created_at || new Date().toISOString()).replace(/[:.]/g, "-");
+    const filename = `wechat-agent-diagnostics-${createdAt}.json`;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.style.display = "none";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    const savedPath = payload.path ? `，已写入 ${payload.path}` : "";
+    helpers.update?.(100, `诊断包已导出${savedPath}`);
+    setStatusMessage(`诊断包已导出${savedPath}`);
+    return payload;
+  } catch (error) {
+    setStatusMessage(`诊断导出失败：${error.message}`);
+    return { status: "error", message: error.message, response: error.payload || null };
+  }
 }
 
 async function probeRuntimeGpu(helpers = {}) {
@@ -2506,6 +3380,57 @@ function weflowPayload(extra = {}) {
   };
 }
 
+function agentConversationScopePayload() {
+  const talkers = talkerIds();
+  if (!talkers.length) return {};
+  return {
+    talkers,
+    conversation_ids: conversationIdsForTalkers(talkers),
+  };
+}
+
+function conversationIdsForTalkers(talkers) {
+  const wanted = new Set((Array.isArray(talkers) ? talkers : []).map((item) => String(item || "").trim()).filter(Boolean));
+  if (!wanted.size) return [];
+  const channels = Array.isArray(state.data?.channels?.items) ? state.data.channels.items : [];
+  const ids = [];
+  for (const channel of channels) {
+    const aliases = [
+      channel.conversation_id,
+      channel.conversation_key,
+      channel.chat_title,
+      ...(Array.isArray(channel.sender_wechat_ids) ? channel.sender_wechat_ids : []),
+      ...(Array.isArray(channel.sender_names) ? channel.sender_names : []),
+    ].map((item) => String(item || "").trim()).filter(Boolean);
+    if (aliases.some((item) => wanted.has(item))) ids.push(String(channel.conversation_id || "").trim());
+  }
+  return [...new Set(ids.filter(Boolean))];
+}
+
+function requireSelectedTalkerScope(conversationId = "") {
+  const id = String(conversationId || "").trim();
+  const talkers = talkerIds();
+  if (!talkers.length) {
+    const message = "请先在 WeFlow talkers 中选择至少一个本地通道";
+    setStatusMessage(message);
+    return { ok: false, status: "blocked", reason: "send_scope_required", message, talkers: [], conversation_ids: [] };
+  }
+  const conversationIds = conversationIdsForTalkers(talkers);
+  if (id && !conversationIds.includes(id)) {
+    const message = "当前通道不在已选 talkers 范围内，已阻止发送";
+    setStatusMessage(message);
+    return {
+      ok: false,
+      status: "blocked",
+      reason: "send_scope_mismatch",
+      message,
+      talkers,
+      conversation_ids: conversationIds,
+    };
+  }
+  return { ok: true, talkers, conversation_ids: conversationIds };
+}
+
 async function weflowAction(action, extra = {}, helpers = {}) {
   helpers.update?.(24, `WeFlow ${action} 请求已发送`);
   try {
@@ -2528,19 +3453,31 @@ async function weflowAction(action, extra = {}, helpers = {}) {
 }
 
 async function runAgentTick(helpers = {}) {
+  const scope = requireSelectedTalkerScope();
+  if (!scope.ok) {
+    helpers.update?.(100, scope.message);
+    return scope;
+  }
   helpers.update?.(18, "正在读取当前会话文件");
   try {
     const payload = await api("/api/agent/tick", {
       method: "POST",
-      body: JSON.stringify({ loops: 1 }),
+      body: JSON.stringify({ loops: 1, ...agentConversationScopePayload() }),
     });
     const agent = payload.agent || {};
     const snapshot = payload.session_snapshot?.after || {};
     const processed = Number(agent.processed_count ?? payload.processed_count ?? 0);
     const conversationCount = Number(snapshot.conversation_count || 0);
-    helpers.update?.(88, `已处理 ${processed} 条消息，聚合 ${conversationCount} 个通道`);
-    setStatusMessage(`对话 Agent 完成：处理 ${processed} 条消息`);
+    const pendingCount = Number(snapshot.pending_user_count || 0);
+    const blockedCount = Number(snapshot.blocked_pending_user_count || 0);
+    const openingCount = Number(snapshot.opening_greeting_count || 0);
+    const tickMessage = processed > 0
+      ? `已处理 ${processed} 条消息，逐通道聚合 ${conversationCount} 个通道`
+      : `没有新事件；逐通道聚合 ${conversationCount} 个通道，待接 ${pendingCount} 条，阻断 ${blockedCount} 条，开场 ${openingCount} 通道`;
+    helpers.update?.(88, tickMessage);
+    setStatusMessage(`对话 Agent 完成：${processed > 0 ? `处理 ${processed} 条消息` : "没有新事件"}`);
     if (state.data) {
+      if (payload.agent_state) state.data.agent = payload.agent_state;
       if (payload.task_manager) state.data.task_manager = payload.task_manager;
       if (payload.channels) state.data.channels = payload.channels;
     }
@@ -2548,6 +3485,51 @@ async function runAgentTick(helpers = {}) {
     return payload;
   } catch (error) {
     setStatusMessage(`对话 Agent 失败：${error.message}`);
+    await refresh({ force: true });
+    return { status: "error", message: error.message, response: error.payload || null };
+  }
+}
+
+async function runAgentWorkerAction(action, helpers = {}) {
+  const starting = action === "start";
+  const scope = starting ? requireSelectedTalkerScope() : { ok: true };
+  if (!scope.ok) {
+    helpers.update?.(100, scope.message);
+    return scope;
+  }
+  helpers.update?.(18, starting ? "正在启动连续接话" : "正在停止连续接话");
+  try {
+    const payload = await api(`/api/agent/${action}`, {
+      method: "POST",
+      body: JSON.stringify(starting ? { interval_seconds: 2, loops: 1, ...agentConversationScopePayload() } : {}),
+    });
+    const worker = payload.worker || payload.agent_state?.worker || {};
+    if (payload.status === "blocked") {
+      const message = payload.message || payload.reason || "连续接话已被阻断";
+      helpers.update?.(100, message);
+      setStatusMessage(`连续接话启动被阻断：${message}`);
+      if (state.data) {
+        if (payload.agent_state) state.data.agent = payload.agent_state;
+        if (payload.task_manager) state.data.task_manager = payload.task_manager;
+      }
+      await refresh({ force: true });
+      return payload;
+    }
+    helpers.update?.(82, starting ? "连续接话状态已启动" : "连续接话停止信号已发送");
+    setStatusMessage(
+      starting
+        ? `连续接话：${worker.running ? "运行中" : "已请求启动"}`
+        : `连续接话：${worker.running ? "停止中" : "已停止"}`,
+    );
+    if (state.data) {
+      if (payload.agent_state) state.data.agent = payload.agent_state;
+      else state.data.agent = { ...(state.data.agent || {}), worker };
+      if (payload.task_manager) state.data.task_manager = payload.task_manager;
+    }
+    await refresh({ force: true });
+    return payload;
+  } catch (error) {
+    setStatusMessage(`连续接话${starting ? "启动" : "停止"}失败：${error.message}`);
     await refresh({ force: true });
     return { status: "error", message: error.message, response: error.payload || null };
   }
@@ -2592,10 +3574,10 @@ function renderSessionList(sessions) {
   list.innerHTML = sessions
     .map(
       (s) => `
-    <div class="session-item" data-session-id="${escapeHtml(s.id || "")}">
+    <div class="session-item${isBlockedWeFlowSession(s) ? " blocked" : ""}" data-session-id="${escapeHtml(s.id || "")}" data-blocked="${isBlockedWeFlowSession(s) ? "true" : "false"}">
       <div>
         <div class="session-item-name">${escapeHtml(s.name || s.id || "（无名称）")}</div>
-        <div class="session-item-id">${escapeHtml(s.id || "")}</div>
+        <div class="session-item-id">${escapeHtml(s.id || "")}${isBlockedWeFlowSession(s) ? ` / ${escapeHtml(weflowBlockedSessionText(s))}` : ""}</div>
       </div>
     </div>
   `
@@ -2603,6 +3585,7 @@ function renderSessionList(sessions) {
     .join("");
   list.querySelectorAll(".session-item").forEach((item) => {
     item.addEventListener("click", () => {
+      if (item.dataset.blocked === "true") return;
       const sessionId = item.dataset.sessionId;
       if (sessionId) {
         addTalker(sessionId);
@@ -2610,6 +3593,22 @@ function renderSessionList(sessions) {
       }
     });
   });
+}
+
+function isBlockedWeFlowSession(session) {
+  return (
+    String(session?.channel_registration_status || "").trim() === "blocked" ||
+    Boolean(String(session?.channel_blocked_reason || "").trim())
+  );
+}
+
+function weflowBlockedSessionText(session) {
+  const reason = String(session?.channel_blocked_reason || "").trim();
+  const labels = {
+    private_contact_explicitly_not_friend: "非好友已阻断",
+    private_contact_unknown_or_unidentified: "未知私聊已阻断",
+  };
+  return labels[reason] || "通道已阻断";
 }
 
 function showWeFlowStatusText(text, mode = "action") {
@@ -2662,7 +3661,7 @@ function weflowHistorySummary(entry) {
   const pull = result.pull && typeof result.pull === "object" ? result.pull : {};
   const imported = pull.import && typeof pull.import === "object" ? pull.import : {};
   if (source.status) parts.push(`源=${source.status}`);
-  if (source.scanned_count !== undefined) parts.push(`源扫描=${source.scanned_count}`);
+  if (source.scanned_count !== undefined) parts.push(`扫描页=${source.scanned_count}`);
   if (source.appended_count !== undefined) parts.push(`源新增=${source.appended_count}`);
   if (imported.appended_count !== undefined) parts.push(`导入后端=${imported.appended_count}`);
   if (pull.processed_count !== undefined) parts.push(`写入对话=${pull.processed_count}`);
@@ -2733,20 +3732,63 @@ async function waitForBackfillCompletion(jobId, helpers = {}) {
     helpers.update?.(70, "回填任务已创建，等待下一次状态刷新");
     return { status: "started", message: "backfill job started" };
   }
+  const startedAt = Date.now();
+  let lastProgressAt = Date.now();
+  let lastSignature = "";
+  let missingJobPolls = 0;
   while (true) {
-    await sleep(1000);
+    await sleep(BACKFILL_POLL_INTERVAL_MS);
     const weflow = await api("/api/weflow/status");
     state.data = { ...(state.data || {}), weflow };
     renderWeFlow(weflow);
     const job = weflow.backfill_job || {};
+    const status = String(job.status || "");
+    const sameJob = String(job.job_id || "") === String(jobId);
+    if (!sameJob || !status || status === "idle") {
+      missingJobPolls += 1;
+      if (missingJobPolls >= 3) {
+        return {
+          status: "interrupted",
+          message: "历史回填任务状态已丢失，前端已解除按钮锁；如后端仍在运行，可使用取消回填。",
+          backfill_job: job,
+        };
+      }
+    } else {
+      missingJobPolls = 0;
+    }
     const progress = backfillProgress(job);
     helpers.update?.(progress.percent, progress.text);
-    if (["completed", "cancelled", "error", "interrupted"].includes(String(job.status || ""))) {
+    const signature = JSON.stringify([
+      status,
+      job.updated_at || "",
+      job.running || false,
+      job.cancel_requested || false,
+      job.progress || {},
+    ]);
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      lastProgressAt = Date.now();
+    }
+    if (["completed", "cancelled", "error", "interrupted"].includes(status)) {
       const result = weflow.last_backfill || job.result || job;
       showWeFlowStatusPayload(result);
       return {
         ...(typeof result === "object" && result ? result : {}),
         status: job.status === "completed" ? (result.status || "ok") : job.status,
+        backfill_job: job,
+      };
+    }
+    if (Date.now() - lastProgressAt > BACKFILL_STALE_TIMEOUT_MS) {
+      return {
+        status: "interrupted",
+        message: "历史回填长时间没有状态进展，前端已解除按钮锁；后端若仍运行可使用取消回填。",
+        backfill_job: job,
+      };
+    }
+    if (Date.now() - startedAt > BACKFILL_MAX_WAIT_MS) {
+      return {
+        status: "interrupted",
+        message: "历史回填超过前端等待上限，前端已解除按钮锁；后端若仍运行可在状态面板继续观察或取消。",
         backfill_job: job,
       };
     }
@@ -2842,6 +3884,38 @@ async function weflowInstallDeps(helpers = {}) {
   setStatusMessage("WeFlow 依赖安装完成");
   await refresh({ force: true });
   return payload;
+}
+
+async function nativeMigrationProbe(helpers = {}) {
+  helpers.update?.(18, "正在检查微信版本和 Native HTTP");
+  try {
+    const payload = await api("/api/native/migration-probe", {
+      method: "POST",
+      body: JSON.stringify({ persist: true, include_cleanup_sizes: true }),
+    });
+    helpers.update?.(78, nativeMigrationSummary(payload));
+    showWeFlowStatusPayload(compactPayload(payload, 7000));
+    state.data = { ...(state.data || {}), native_migration: payload };
+    setStatusMessage(nativeMigrationSummary(payload));
+    await refresh({ force: true });
+    return payload;
+  } catch (error) {
+    const payload = { status: "error", action: "native-migration-probe", message: error.message, response: error.payload || null };
+    showWeFlowStatusPayload(payload);
+    setStatusMessage(`Native 探测失败：${error.message}`);
+    return payload;
+  }
+}
+
+function nativeMigrationSummary(payload) {
+  const gate = payload?.version_gate?.gate || "unknown";
+  const version = payload?.version_gate?.best_version || "未知版本";
+  const http = payload?.http_status?.status || "unknown";
+  const candidates = payload?.message_scan?.candidate_count ?? 0;
+  const blockers = Array.isArray(payload?.blockers) ? payload.blockers.length : 0;
+  const deploy = payload?.deploy_manifest?.status || "unknown";
+  const saved = payload?.report_path ? " / 已保存报告" : "";
+  return `Native：${payload?.status || "unknown"} / 部署 ${deploy} / 版本 ${version}(${gate}) / HTTP ${http} / 路径候选 ${candidates} / 阻断 ${blockers}${saved}`;
 }
 
 function splitComma(value) {
@@ -3021,22 +4095,6 @@ function setStatusMessage(message) {
   }, 2500);
 }
 
-function countdown(prefix, seconds) {
-  return new Promise((resolve) => {
-    let remaining = seconds;
-    $("#readinessLine").textContent = `${prefix}：${remaining}s`;
-    const timer = setInterval(() => {
-      remaining -= 1;
-      if (remaining <= 0) {
-        clearInterval(timer);
-        resolve();
-        return;
-      }
-      $("#readinessLine").textContent = `${prefix}：${remaining}s`;
-    }, 1000);
-  });
-}
-
 function emptyNode(text) {
   const node = document.createElement("div");
   node.className = "empty";
@@ -3073,11 +4131,15 @@ function statusText(status) {
   }[status] || status;
 }
 
-function queueStatusText(status) {
+function queueStatusText(status, reason = "") {
+  if (status === "sent" && String(reason || "").includes("dry_run_not_delivered")) {
+    return "演练完成（未投递）";
+  }
   return {
     pending: "待审核",
     approved: "已通过",
     rejected: "已拒绝",
+    accepted: "端口已接收（未验证）",
     sent: "已发送",
     failed: "失败",
     queued: "已入桥",
@@ -3088,13 +4150,35 @@ function queueStatusText(status) {
   }[status] || status || "";
 }
 
-function bridgeStatusText(status) {
+function bridgeStatusText(status, reason = "") {
+  if (status === "sent" && String(reason || "").includes("dry_run_not_delivered")) {
+    return "演练完成（未投递）";
+  }
   return {
     queued: "待桥接",
+    accepted: "端口已接收（未验证）",
     sent: "已确认发送",
     failed: "发送失败",
     blocked: "已阻断",
   }[status] || status || "";
+}
+
+function bridgeWorkerSummary(worker) {
+  if (!worker || typeof worker !== "object") return "";
+  const source = String(worker.source || "");
+  const running = worker.running ? "running" : "stopped";
+  const pid = worker.pid ? `pid=${worker.pid}` : "";
+  const backend = worker.backend_name ? `backend=${worker.backend_name}` : "";
+  const config = bridgeWorkerConfigText(worker.config_status || "", worker.config_match);
+  return ["worker", running, source, pid, backend, config].filter(Boolean).join(" ");
+}
+
+function bridgeWorkerConfigText(status, match) {
+  if (status === "matched" || match === true) return "config=matched";
+  if (status === "stale" || match === false) return "config=stale";
+  if (status === "unknown_legacy_lock") return "config=legacy-unknown";
+  if (status === "not_running") return "";
+  return status ? `config=${status}` : "";
 }
 
 function conversationTypeText(value) {
@@ -3118,9 +4202,17 @@ function backgroundSendText(value) {
   return {
     bridge_outbox_available: "bridge_outbox 可入队",
     bridge_outbox_configured_disabled: "bridge_outbox 已配置，发送未启用",
+    bridge_outbox_dry_run_backend: "bridge_outbox 使用 dry-run 后端，不会投递到微信",
+    bridge_outbox_weflow_http_unavailable: "bridge_outbox 使用 WeFlow HTTP，但本地发送端口未就绪",
+    bridge_outbox_weflow_token_missing: "bridge_outbox 使用 WeFlow HTTP，但缺少 WEFLOW_API_TOKEN",
+    bridge_outbox_weflow_send_not_supported: "bridge_outbox 使用 WeFlow HTTP，但当前 WeFlow 未实现非前台发送",
+    bridge_outbox_wechat_native_http_unavailable: "bridge_outbox 使用本地微信 Native HTTP，但本地服务未就绪或未登录",
+    bridge_outbox_wechat_native_accepted_unverified: "bridge_outbox 使用本地微信 Native HTTP，端口可接收；sent 由回读确认",
     bridge_outbox_ready: "bridge_outbox 已启用（投递中）",
     bridge_outbox_worker_down: "bridge_outbox 已启用，但投递进程未运行",
     bridge_outbox_worker_down_backlog: "bridge_outbox 投递进程未运行，有待发消息积压",
+    bridge_outbox_worker_config_unknown: "bridge_outbox 投递进程运行中，但配置签名未知",
+    bridge_outbox_worker_stale_config: "bridge_outbox 投递进程运行中，但启动配置已过期",
   }[value] || value;
 }
 
@@ -3166,6 +4258,15 @@ function probeStatusText(value) {
 
 function actionText(action) {
   return {
+    confirm_approve: "发送审核通过",
+    confirm_reject: "发送审核拒绝",
+    confirm_remove: "发送审核移除",
+    confirm_send_attempt: "发送提交",
+    confirm_send_blocked: "发送阻断",
+    bridge_ack_sync: "桥接回执同步",
+    bridge_retry: "桥接重投",
+    ledger_sync_failed: "账本同步失败",
+    ledger_sync_recovered: "账本同步已恢复",
     approve: "通过",
     reject: "拒绝",
     "send-approved": "发送",
@@ -3608,6 +4709,7 @@ document.addEventListener("click", (event) => {
 
 $("#sendEnabled")?.addEventListener("change", markControlsDirty);
 $("#driverSelect")?.addEventListener("change", markControlsDirty);
+$("#sendBackendSelect")?.addEventListener("change", markControlsDirty);
 $("#ocrModeSelect")?.addEventListener("change", markControlsDirty);
 $("#asrModeSelect")?.addEventListener("change", markControlsDirty);
 $("#fileMaxMb")?.addEventListener("input", markControlsDirty);
@@ -3645,11 +4747,26 @@ bindTaskButton("#resourceAuditButton", {
   category: "资源",
   scope: "diagnostic:resource-audit",
 }, (helpers) => auditLocalResources(helpers));
+bindTaskButton("#diagnosticsExportButton", {
+  label: "导出诊断包",
+  category: "诊断",
+  scope: "diagnostic:export",
+}, (helpers) => exportDiagnosticsBundle(helpers));
 bindTaskButton("#agentTickButton", {
   label: "运行对话 Agent",
   category: "Agent",
   scope: "agent:tick",
 }, (helpers) => runAgentTick(helpers));
+bindTaskButton("#agentStartButton", {
+  label: "启动连续对话 Agent",
+  category: "Agent",
+  scope: "agent:worker",
+}, (helpers) => runAgentWorkerAction("start", helpers));
+bindTaskButton("#agentStopButton", {
+  label: "停止连续对话 Agent",
+  category: "Agent",
+  scope: "agent:worker",
+}, (helpers) => runAgentWorkerAction("stop", helpers));
 bindTaskButton("#bridgeRefreshButton", {
   label: "刷新非前台桥",
   category: "非前台桥",
@@ -3665,6 +4782,11 @@ bindTaskButton("#clearAuditButton", {
   category: "发送审计",
   scope: "audit:clear",
 }, (helpers) => clearSendAudit(helpers));
+bindTaskButton("#storageStatusButton", {
+  label: "审查存储迁移边界",
+  category: "历史数据",
+  scope: "history:storage-status",
+}, (helpers) => inspectStorageStatus(helpers));
 bindTaskButton("#clearHistoryDataButton", {
   label: "清空历史数据",
   category: "历史数据",
@@ -3737,6 +4859,11 @@ bindTaskButton("#weflowInstallButton", {
   category: "WeFlow",
   scope: "weflow:exclusive",
 }, (helpers) => weflowInstallDeps(helpers));
+bindTaskButton("#nativeMigrationProbeButton", {
+  label: "微信 Native 迁移探测",
+  category: "WeFlow",
+  scope: "diagnostic:native-migration",
+}, (helpers) => nativeMigrationProbe(helpers));
 $("#weflowHelpButton")?.addEventListener("click", () => {
   setWeFlowHelpVisible($("#weflowHelpPopover")?.hidden !== false);
 });
@@ -3762,6 +4889,28 @@ $("#personaForm").addEventListener("submit", (event) => {
     () => savePersonaCard(event),
   );
 });
+$("#channelRuntimeForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  runTask(
+    {
+      label: "保存通道人设覆盖",
+      category: "技能/人设",
+      scope: "settings:runtime-cards",
+      button: event.submitter || null,
+    },
+    () => saveChannelRuntimeOverride(event),
+  );
+});
+bindTaskButton("#clearChannelPersonaButton", {
+  label: "清除通道人物卡覆盖",
+  category: "技能/人设",
+  scope: "settings:runtime-cards",
+}, clearChannelPersonaOverride);
+bindTaskButton("#clearChannelSkillsButton", {
+  label: "清除通道技能覆盖",
+  category: "技能/人设",
+  scope: "settings:runtime-cards",
+}, clearChannelSkillsOverride);
 $("#taskForm").addEventListener("submit", (event) => {
   event.preventDefault();
   runTask(

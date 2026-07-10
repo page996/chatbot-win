@@ -3,10 +3,15 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import time
 from pathlib import Path
+from unittest import mock
 
-from app.personal_wechat_bot.control.sidebar_api import sidebar_task_action
+from app.personal_wechat_bot.config.loader import create_default_config, save_config
+from app.personal_wechat_bot.control.sidebar_api import build_sidebar_task_manager, sidebar_task_action
 from app.personal_wechat_bot.conversation.channel_state_store import ChannelStateStore
+from app.personal_wechat_bot.domain.models import ReplyCandidate
+from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 
 
@@ -42,6 +47,48 @@ class TaskStatusStoreTest(unittest.TestCase):
             self.assertIn("gpu", state["scheduler"]["resource_pools"])
             self.assertEqual(state["channels"][0]["conversation_id"], "conv-a")
             self.assertEqual(state["channels"][0]["resource_audit"]["estimated_cost"], 5)
+
+    def test_dry_run_send_task_phase_is_repaired_on_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStatusStore(Path(tmp) / "data")
+            store.create(
+                {
+                    "task_id": "send-1",
+                    "title": "发送回复",
+                    "kind": "send",
+                    "status": "completed",
+                    "conversation_id": "conv-a",
+                    "phase": "非前台桥发送完成",
+                    "detail": "dry_run_not_delivered:text",
+                }
+            )
+
+            task = TaskStatusStore(Path(tmp) / "data").state()["tasks"][0]
+
+            self.assertEqual(task["phase"], "非前台桥演练完成，未投递微信")
+
+    def test_terminal_lane_task_is_not_current_topic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStatusStore(Path(tmp) / "data")
+            store.create(
+                {
+                    "task_id": "send-old",
+                    "title": "Send old reply",
+                    "kind": "send",
+                    "status": "cancelled",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "topic_id": "reply-old",
+                    "topic_title": "Old reply",
+                    "priority": 90,
+                }
+            )
+
+            lane = store.state()["channels"][0]
+
+            self.assertEqual(lane["current_topic"]["status"], "idle")
+            self.assertEqual(lane["current_topic"]["topic_id"], "")
+            self.assertEqual(lane["history"][0]["task_id"], "send-old")
 
     def test_sidebar_task_action_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,6 +182,70 @@ class TaskStatusStoreTest(unittest.TestCase):
             self.assertEqual(state["counts"]["total"], 1)
             self.assertEqual(state["tasks"][0]["task_id"], "real-1")
 
+    def test_ephemeral_ui_tasks_are_purged_from_sqlite_on_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = TaskStatusStore(data_dir)
+            store.scheduler_store.replace_tasks(
+                [
+                    {
+                        "task_id": "probe-leftover",
+                        "title": "Old UI probe",
+                        "kind": "environment",
+                        "status": "running",
+                        "scope": "diagnostic:runtime-gpu",
+                        "metadata": {"local_ui": True},
+                    },
+                    {
+                        "task_id": "real-task",
+                        "title": "Real queued work",
+                        "kind": "file",
+                        "status": "queued",
+                        "scope": "conversation:conv-a",
+                    },
+                ]
+            )
+
+            state = store.state()
+            persisted = TaskStatusStore(data_dir).scheduler_store.list_tasks()
+            projection = json.loads((data_dir / "task_manager" / "tasks.json").read_text(encoding="utf-8"))
+
+            self.assertEqual([item["task_id"] for item in state["tasks"]], ["real-task"])
+            self.assertEqual([item["task_id"] for item in persisted], ["real-task"])
+            self.assertEqual([item["task_id"] for item in projection["tasks"]], ["real-task"])
+
+    def test_local_ui_conversation_probe_tasks_are_hidden_from_persistent_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStatusStore(Path(tmp) / "data")
+
+            store.create(
+                {
+                    "task_id": "channel-probe",
+                    "title": "Channel file probe",
+                    "kind": "发送测试",
+                    "status": "running",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "metadata": {"local_ui": True, "scope_label": "通道文件探针"},
+                }
+            )
+            store.create(
+                {
+                    "task_id": "send-real",
+                    "title": "Send reply",
+                    "kind": "send",
+                    "status": "queued",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                }
+            )
+
+            state = store.state()
+
+            self.assertEqual([item["task_id"] for item in state["tasks"]], ["send-real"])
+            self.assertEqual(state["counts"]["active"], 1)
+            self.assertEqual(state["channels"][0]["active"][0]["task_id"], "send-real")
+
     def test_weflow_tasks_do_not_pollute_channel_lanes_and_finish_by_external_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStatusStore(Path(tmp) / "data")
@@ -212,6 +323,361 @@ class TaskStatusStoreTest(unittest.TestCase):
             self.assertEqual(child["status"], "completed")
             self.assertEqual(child["progress"], 100)
 
+    def test_bridge_send_task_is_repaired_from_terminal_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = TaskStatusStore(data_dir)
+            bridge_id = "bridge:conv-a:abc123"
+            store.create(
+                {
+                    "task_id": "send-bridge",
+                    "title": "Send bridge",
+                    "kind": "send",
+                    "status": "queued",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "metadata": {"send_reason": f"queued_to_non_foreground_bridge:{bridge_id}"},
+                }
+            )
+            ack_path = data_dir / "send_bridge" / "acks.jsonl"
+            ack_path.parent.mkdir(parents=True, exist_ok=True)
+            ack_path.write_text(
+                json.dumps(
+                    {
+                        "bridge_id": bridge_id,
+                        "status": "failed",
+                        "reason": "wechat_native_http_send_text_error:missing",
+                        "created_at": "2026-07-08T01:00:00Z",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["external_id"], bridge_id)
+            self.assertEqual(task["progress"], 100)
+            self.assertIn("wechat_native_http_send_text_error", task["last_error"])
+
+    def test_bridge_send_task_accepted_ack_is_completed_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            bridge_id = "bridge:conv-a:accepted123"
+            TaskStatusStore(data_dir).create(
+                {
+                    "task_id": "send-bridge-accepted",
+                    "title": "Send bridge",
+                    "kind": "send",
+                    "status": "queued",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "metadata": {"send_reason": f"queued_to_non_foreground_bridge:{bridge_id}"},
+                }
+            )
+            ack_path = data_dir / "send_bridge" / "acks.jsonl"
+            ack_path.parent.mkdir(parents=True, exist_ok=True)
+            ack_path.write_text(
+                json.dumps(
+                    {
+                        "bridge_id": bridge_id,
+                        "status": "accepted",
+                        "reason": "wechat_native_http_send_file_accepted_unverified",
+                        "created_at": "2026-07-08T01:00:00Z",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["external_id"], bridge_id)
+            self.assertEqual(task["progress"], 100)
+            self.assertEqual(task["last_error"], "")
+            self.assertIn("accepted", task["phase"])
+            self.assertEqual(task["metadata"]["aggregate_bridge_status"], "accepted")
+
+    def test_multipart_bridge_send_task_waits_for_all_terminal_acks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            text_bridge_id = "bridge:conv-a:text123"
+            file_bridge_id = "bridge:conv-a:file123"
+            TaskStatusStore(data_dir).create(
+                {
+                    "task_id": "send-bridge-multipart",
+                    "title": "Send bridge multipart",
+                    "kind": "send",
+                    "status": "queued",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "external_id": text_bridge_id,
+                    "metadata": {
+                        "bridge_id": text_bridge_id,
+                        "bridge_ids": [text_bridge_id, file_bridge_id],
+                        "send_reason": f"queued_to_non_foreground_bridge:{text_bridge_id};{file_bridge_id}",
+                    },
+                }
+            )
+            ack_path = data_dir / "send_bridge" / "acks.jsonl"
+            ack_path.parent.mkdir(parents=True, exist_ok=True)
+            ack_path.write_text(
+                json.dumps(
+                    {
+                        "bridge_id": text_bridge_id,
+                        "status": "sent",
+                        "reason": "wechat_native_http_send_text_verified",
+                        "created_at": "2026-07-08T01:00:00Z",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            waiting = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(waiting["status"], "queued")
+            self.assertEqual(waiting["external_id"], text_bridge_id)
+
+            with ack_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "bridge_id": file_bridge_id,
+                            "status": "accepted",
+                            "reason": "wechat_native_http_send_file_accepted_unverified",
+                            "created_at": "2026-07-08T01:00:02Z",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            completed = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["progress"], 100)
+            self.assertIn("accepted", completed["phase"])
+            self.assertEqual(completed["metadata"]["aggregate_bridge_status"], "accepted")
+            self.assertEqual(set(completed["metadata"]["bridge_acks"].keys()), {text_bridge_id, file_bridge_id})
+
+    def test_obsolete_weflow_send_blocker_is_repaired_after_backend_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            config = create_default_config(data_dir)
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+            config.send_backend = "wechat_native_http"
+            save_config(config)
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "send-old-weflow",
+                    "title": "Send reply",
+                    "kind": "send",
+                    "status": "blocked",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "detail": "weflow_backend_unavailable:weflow_text_send_not_supported:native-not-implemented",
+                    "last_error": "weflow_backend_unavailable:weflow_text_send_not_supported:native-not-implemented",
+                }
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["progress"], 100)
+            self.assertIn("obsolete_send_backend_blocker", task["last_error"])
+
+    def test_obsolete_stale_worker_send_blocker_is_repaired_when_worker_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            config = create_default_config(data_dir)
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+            config.send_backend = "wechat_native_http"
+            save_config(config)
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "send-old-stale-worker",
+                    "title": "Send reply",
+                    "kind": "send",
+                    "status": "blocked",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "detail": "bridge_worker_stale_config:worker_backend=wechat_native_http:expected_backend=wechat_native_http",
+                    "last_error": "bridge_worker_stale_config:worker_backend=wechat_native_http:expected_backend=wechat_native_http",
+                }
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.tasks.manager._bridge_worker_config_is_matched",
+                return_value=True,
+            ):
+                task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["progress"], 100)
+            self.assertIn("obsolete_bridge_worker_stale_config", task["last_error"])
+
+    def test_obsolete_stale_worker_task_with_approved_queue_is_reopened(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            config = create_default_config(data_dir)
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+            config.send_backend = "wechat_native_http"
+            save_config(config)
+            reply = ReplyCandidate(
+                message_id="message-approved-after-stale",
+                conversation_id="conv-a",
+                text="hello after stale worker",
+                send_mode="confirm",
+                model="test",
+            )
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(reply)
+            queue.approve(queue_id, reviewer="tester")
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "send-message-approved-after-stale",
+                    "title": "Send reply",
+                    "kind": "send",
+                    "status": "failed",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "detail": "obsolete_bridge_worker_stale_config:current_backend=wechat_native_http",
+                    "last_error": "obsolete_bridge_worker_stale_config:current_backend=wechat_native_http",
+                    "metadata": {"message_id": reply.message_id},
+                }
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.tasks.manager._bridge_worker_config_is_matched",
+                return_value=True,
+            ):
+                task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "queued")
+            self.assertEqual(task["progress"], 55)
+            self.assertEqual(task["last_error"], "")
+            self.assertEqual(task["finished_at"], "")
+            self.assertIn("obsolete_bridge_worker_stale_config", task["detail"])
+
+    def test_auto_mode_retires_old_sidebar_confirm_test_send_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            config = create_default_config(data_dir)
+            config.mode = "auto"
+            config.send_confirm_required = False
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+            config.send_backend = "wechat_native_http"
+            save_config(config)
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "send-sidebar_channel_test_replyold",
+                    "title": "Send reply",
+                    "kind": "send",
+                    "status": "queued",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "detail": "confirm_approved",
+                    "metadata": {"message_id": "sidebar_channel_test_reply:old"},
+                }
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "cancelled")
+            self.assertEqual(task["progress"], 100)
+            self.assertIn("obsolete_sidebar_confirm_test_task", task["last_error"])
+
+    def test_auto_mode_retires_sidebar_test_reopened_after_stale_worker_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            config = create_default_config(data_dir)
+            config.mode = "auto"
+            config.send_confirm_required = False
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+            config.send_backend = "wechat_native_http"
+            save_config(config)
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "send-sidebar_channel_test_replyold",
+                    "title": "Send reply",
+                    "kind": "send",
+                    "status": "queued",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "resource_class": "send_bridge",
+                    "detail": "obsolete_bridge_worker_stale_config:current_backend=wechat_native_http",
+                    "phase": "发送阻断已解除，等待重新投递",
+                    "metadata": {"message_id": "sidebar_channel_test_reply:old"},
+                }
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "cancelled")
+            self.assertEqual(task["progress"], 100)
+            self.assertIn("obsolete_sidebar_confirm_test_task", task["last_error"])
+
+    def test_reply_task_is_repaired_when_assistant_ledger_entry_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "reply-msg-1",
+                    "title": "Reply",
+                    "kind": "reply",
+                    "status": "running",
+                    "conversation_id": "conv-a",
+                    "scope": "conversation:conv-a",
+                    "external_id": "msg-1",
+                }
+            )
+            ledger = data_dir / "conversation_ledgers" / "conv-a" / "messages.jsonl"
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "message_id": "msg-1",
+                        "role": "assistant",
+                        "updated_at": "2026-07-08T01:00:00Z",
+                        "text_blocks": [{"kind": "reply", "text": "hello"}],
+                        "send": {"status": "failed", "reason": "backend_missing"},
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["progress"], 100)
+            self.assertEqual(task["actual_cost"], 1)
+
     def test_global_backend_tasks_do_not_create_channel_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStatusStore(Path(tmp) / "data")
@@ -229,6 +695,123 @@ class TaskStatusStoreTest(unittest.TestCase):
 
             self.assertEqual(state["counts"]["active"], 1)
             self.assertEqual(state["channels"], [])
+
+    def test_sidebar_task_manager_finishes_stale_agent_worker_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "agent-worker",
+                    "title": "连续对话 Agent",
+                    "kind": "Agent",
+                    "status": "running",
+                    "external_id": "agent-worker",
+                    "metadata": {"worker": True},
+                }
+            )
+
+            state = build_sidebar_task_manager(data_dir)
+            task = next(item for item in state["tasks"] if item["task_id"] == "agent-worker")
+
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(state["counts"]["active"], 0)
+
+    def test_running_worker_task_with_stale_heartbeat_is_terminalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            stale_at = time.time() - 600
+            TaskStatusStore(data_dir).create(
+                {
+                    "task_id": "weflow-worker",
+                    "title": "WeFlow worker",
+                    "kind": "WeFlow",
+                    "status": "running",
+                    "external_id": "worker",
+                    "scope": "weflow:pull:worker",
+                    "metadata": {
+                        "worker": True,
+                        "worker_kind": "weflow",
+                        "worker_heartbeat_at": stale_at,
+                        "worker_stale_after_seconds": 30,
+                    },
+                }
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["progress"], 100)
+            self.assertIn("worker_heartbeat_stale", task["last_error"])
+            self.assertTrue(task["metadata"]["worker_reconciled"])
+
+    def test_fresh_worker_task_is_not_terminalized_on_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            TaskStatusStore(data_dir).create(
+                {
+                    "task_id": "fresh-worker",
+                    "title": "Fresh worker",
+                    "kind": "Agent",
+                    "status": "running",
+                    "external_id": "agent-worker",
+                    "scope": "agent:worker",
+                    "metadata": {
+                        "worker": True,
+                        "worker_kind": "agent",
+                        "worker_heartbeat_at": time.time(),
+                        "worker_stale_after_seconds": 300,
+                    },
+                }
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "running")
+            self.assertEqual(task["progress"], 0)
+
+    def test_sidebar_task_manager_finishes_stale_weflow_worker_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            TaskStatusStore(data_dir).create(
+                {
+                    "task_id": "weflow-worker",
+                    "title": "WeFlow 拉取任务",
+                    "kind": "WeFlow",
+                    "status": "running",
+                    "external_id": "worker",
+                    "scope": "weflow:pull:worker",
+                    "metadata": {"worker": True, "worker_kind": "weflow"},
+                }
+            )
+
+            state = build_sidebar_task_manager(data_dir)
+            task = next(item for item in state["tasks"] if item["task_id"] == "weflow-worker")
+
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["detail"], "worker_not_running")
+
+    def test_sidebar_task_manager_finishes_stale_send_bridge_worker_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            TaskStatusStore(data_dir).create(
+                {
+                    "task_id": "send-bridge-worker",
+                    "title": "发送桥 worker",
+                    "kind": "send_bridge_worker",
+                    "status": "running",
+                    "external_id": "send-bridge-worker",
+                    "scope": "send_bridge:worker",
+                    "resource_class": "send_bridge",
+                    "metadata": {"worker": True, "worker_kind": "send_bridge"},
+                }
+            )
+
+            state = build_sidebar_task_manager(data_dir)
+            task = next(item for item in state["tasks"] if item["task_id"] == "send-bridge-worker")
+
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["detail"], "worker_not_running")
 
     def test_claim_next_respects_resource_channel_dependencies_and_scope_mutex(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

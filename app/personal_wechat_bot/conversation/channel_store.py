@@ -8,13 +8,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from app.personal_wechat_bot.conversation.channel_admission import (
+    private_contact_is_explicit_friend,
+    private_contact_is_explicit_non_friend,
+)
 from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
 
 
-CHANNEL_POLICY = "auto_accept_wechat_contacts_and_groups"
+CHANNEL_POLICY = "verified_or_identified_wechat_channels"
 TRUSTED_CHANNEL_SOURCES = frozenset(
     {"backend_events_jsonl", "backend_file_watcher", "manual_backend_event", "weflow_discovery"}
 )
@@ -36,6 +40,8 @@ class ConversationChannel:
     sender_wechat_ids: list[str]
     source_names: list[str]
     trusted_channel_source: bool
+    is_friend: bool
+    contact_authorization: str
     created_at: str
     updated_at: str
     next_key_index: int = 0
@@ -111,6 +117,11 @@ class ConversationChannelStore:
             trusted_channel_source = bool(existing.get("trusted_channel_source", False)) if existing else False
             if source_name in TRUSTED_CHANNEL_SOURCES or message.metadata.get("trusted_channel_source") is True:
                 trusted_channel_source = True
+            is_friend = bool(existing.get("is_friend", False)) if existing else False
+            if private_contact_is_explicit_non_friend(message.metadata):
+                is_friend = False
+            elif private_contact_is_explicit_friend(message.metadata):
+                is_friend = True
             channel_dir = self.root / segment
             backend_dir = channel_dir / "backend"
             backend_dir.mkdir(parents=True, exist_ok=True)
@@ -131,6 +142,8 @@ class ConversationChannelStore:
                 "conversation_key": conversation_key,
                 "source_names": source_names,
                 "trusted_channel_source": trusted_channel_source,
+                "is_friend": is_friend,
+                "contact_authorization": "explicit_friend" if is_friend else str(existing.get("contact_authorization", "") or ""),
                 "created_at": existing.get("created_at", now) if existing else now,
                 "updated_at": now,
                 "next_key_index": int(existing.get("next_key_index", 0)) if existing else 0,
@@ -309,6 +322,8 @@ class ConversationChannelStore:
                 "api_key_refs": payload.get("api_key_refs", []),
                 "source_names": payload.get("source_names", []),
                 "trusted_channel_source": payload.get("trusted_channel_source", False),
+                "is_friend": payload.get("is_friend", False),
+                "contact_authorization": payload.get("contact_authorization", ""),
                 "updated_at": payload.get("updated_at", ""),
             }
         )
@@ -356,6 +371,8 @@ def _channel_from_payload(payload: dict[str, Any]) -> ConversationChannel:
         sender_wechat_ids=[str(item) for item in payload.get("sender_wechat_ids", [])],
         source_names=[str(item) for item in payload.get("source_names", [])],
         trusted_channel_source=bool(payload.get("trusted_channel_source", False)),
+        is_friend=bool(payload.get("is_friend", False)),
+        contact_authorization=str(payload.get("contact_authorization", "") or ""),
         created_at=str(payload.get("created_at", "")),
         updated_at=str(payload.get("updated_at", "")),
         next_key_index=int(payload.get("next_key_index", 0)),

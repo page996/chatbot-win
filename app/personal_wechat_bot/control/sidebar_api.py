@@ -1,27 +1,38 @@
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.schema import DEFAULT_LLM_MAX_CONCURRENCY
-from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
+from app.personal_wechat_bot.conversation.channel_admission import (
+    channel_admission_for_session,
+    channel_allows_private_receiver,
+)
+from app.personal_wechat_bot.conversation.channel_store import CHANNEL_POLICY, ConversationChannelStore
 from app.personal_wechat_bot.conversation.channel_state_store import (
     ChannelStateStore,
     build_channel_state_projection,
@@ -29,17 +40,31 @@ from app.personal_wechat_bot.conversation.channel_state_store import (
 )
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.config.loader import ensure_config, load_config, migrate_file_allowed_extensions, save_config, set_model_provider
-from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
+from app.personal_wechat_bot.control.audit import build_storage_migration_status
+from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SpeakDecision, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
+from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+from app.personal_wechat_bot.reply_gate.send_audit import SendAuditLog
 from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
-from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError, blocking_process_lock
+from app.personal_wechat_bot.runtime.process_lock import (
+    ProcessLock,
+    ProcessLockError,
+    blocking_process_lock,
+    process_pid_alive,
+)
 from app.personal_wechat_bot.runtime.resource_governor import audit_local_resources
 from app.personal_wechat_bot.runtime.resource_gate import gpu_gate_snapshot, llm_gate_snapshot
 from app.personal_wechat_bot.runtime.resource_scheduler import ResourceScheduler
+from app.personal_wechat_bot.runtime.send_bridge_worker import (
+    BRIDGE_WORKER_LOCK_STALE_SECONDS,
+    bridge_worker_config_signature,
+    bridge_worker_lock_alive,
+    bridge_worker_lock_path,
+)
 from app.personal_wechat_bot.runtime.weflow_state_summary import summarize_weflow_bridge_state
 from app.personal_wechat_bot.runtime.weflow_worker_metrics import WeflowWorkerMetrics
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
@@ -54,17 +79,23 @@ from app.personal_wechat_bot.control.send_commands import (
     probe_send_controls,
     reject_confirm_item,
     remove_confirm_item,
+    retry_bridge_item,
     send_approved_confirm_item,
     set_send_controls,
     sync_bridge_ack_to_send_state,
 )
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
+from app.personal_wechat_bot.control.sidebar_state_store import SidebarStateStore
 from app.personal_wechat_bot.wechat_driver.window_introspection import build_wechat_window_probe
 from app.personal_wechat_bot.wechat_driver.window_binding import WeChatWindowBindingStore
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state, is_terminal_bridge_ack_status
+from app.personal_wechat_bot.wechat_driver.send_backends import (
+    wechat_native_http_status,
+    weflow_http_status,
+)
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
 from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
@@ -77,14 +108,15 @@ from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
 from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 
 
-QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "rejected", "sent", "failed")
+QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "accepted", "rejected", "sent", "failed")
+AUDIT_PHASES = QUEUE_STATUSES + ("blocked", "resolved", "other")
+BRIDGE_ITEM_STATUSES = ("queued", "inflight", "accepted", "sent", "failed", "blocked", "retry")
 _HISTORY_RESET_DIRS = (
     "agent_workspace",
     "conversation_channels",
     "conversation_ledgers",
     "conversation_sessions",
     "file_workspace",
-    "send_bridge",
     "tool_outputs",
     "task_manager",
 )
@@ -93,19 +125,28 @@ _HISTORY_RESET_FILES = (
     "backend_events.jsonl.raw_ids.json",
     "backend_file_watcher.sqlite",
     "confirm_queue.jsonl",
+    "confirm_queue.sqlite",
+    "confirm_queue.sqlite-shm",
+    "confirm_queue.sqlite-wal",
     "conversation_cooldowns.sqlite",
     "channel_state.sqlite",
     "channel_state.sqlite-shm",
     "channel_state.sqlite-wal",
     "file_index.sqlite",
     "hook_events.jsonl",
+    "hook_events.jsonl.raw_ids.json",
     "hook_events_state.json",
+    "hook_events_state.json.consumer.lock",
     "logs.jsonl",
     "processed_messages.sqlite",
+    "runtime/agent_state.json",
     "scheduler.sqlite",
     "scheduler.sqlite-shm",
     "scheduler.sqlite-wal",
     "send_audit.jsonl",
+    "send_audit.sqlite",
+    "send_audit.sqlite-shm",
+    "send_audit.sqlite-wal",
     "weflow_bridge_state.json",
     "weflow_sessions.json",
     "weflow_process.err.log",
@@ -115,6 +156,13 @@ _HISTORY_RESET_LOCK_TOLERANT_FILES = {
     "weflow_process.err.log",
     "weflow_process.out.log",
 }
+_HISTORY_PRESERVED_RUNTIME_PATHS = (
+    "send_bridge/outbox.jsonl",
+    "send_bridge/acks.jsonl",
+    "send_bridge/synced_acks.json",
+    "send_bridge/accepted_reverify.json",
+    "send_bridge/.bridge_worker.lock",
+)
 logger = logging.getLogger(__name__)
 _SIDEBAR_API_SCHEMA_VERSION = "20260707-runtime-probe-v2"
 _SIDEBAR_API_LOADED_AT = utc_now_iso()
@@ -123,6 +171,9 @@ _WEFLOW_BACKFILL_JOBS: dict[str, dict[str, Any]] = {}
 _WEFLOW_PULL_JOBS: dict[str, dict[str, Any]] = {}
 _WEFLOW_LOCK = threading.RLock()
 _WEFLOW_STATE_FILE_LOCK = threading.RLock()
+_AGENT_WORKERS: dict[str, dict[str, Any]] = {}
+_AGENT_LOCK = threading.RLock()
+_AGENT_TICK_LOCK = threading.Lock()
 # Max times the supervisor auto-restarts a died worker loop before giving up.
 _WEFLOW_MAX_RESTARTS = 10
 # In-process send-bridge workers, keyed by data-dir. Started alongside the
@@ -142,13 +193,26 @@ _WEFLOW_OPERATION_LOCK = threading.Lock()
 # the file lock, so the two never deadlock. See _WEFLOW consume-lock wiring in
 # _build_weflow_pull_context.
 _WEFLOW_CONSUMER_LOCK = threading.Lock()
+_NATIVE_MIGRATION_LOCK = threading.Lock()
+_SUPPORTED_WECHAT_NATIVE_VERSIONS = ("4.1.10.53",)
+_NATIVE_MESSAGE_ROOT_ENV_NAMES = (
+    "WECHAT_NATIVE_MESSAGE_ROOT",
+    "WECHAT_MESSAGE_ROOT",
+    "WECHAT_FILES_DIR",
+    "WEFLOW_DATA_ROOT",
+)
+
+
+def _normalize_send_backend(value: str) -> str:
+    return str(value or "dry_run").strip().lower()
 
 
 def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
     config = ensure_config(data_dir)
-    queues = {status: list_confirm_queue(data_dir, status=status) for status in QUEUE_STATUSES}
     channels = _channel_state(data_dir)
+    queues = _sidebar_queue_state(data_dir, channels_state=channels)
     send_bridge = _sidebar_bridge_state(data_dir, channels_state=channels, limit=12)
+    audit = _sidebar_audit_state(data_dir, channels_state=channels, queues_state=queues)
     return {
         "status": "ok",
         "server": {
@@ -170,7 +234,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "sidebar_role": "audit_and_send_controls_only",
             "window_probe_role": "diagnostic_only",
             "supports_multi_conversation": True,
-            "send_driver_boundary": "bridge_outbox queues replies for the WeChatFerry send bridge (non-foreground, delivered by wxid/roomid); backend events can receive multiple conversations without page OCR",
+            "send_driver_boundary": "bridge_outbox queues replies for the configured non-foreground send backend (delivered by wxid/roomid); backend events can receive multiple conversations without page OCR",
             "input_pipeline": "POST /api/backend-events or append-backend-event -> backend_events.jsonl -> run-agent/poll-backend-events -> conversation_ledgers",
             "background_send_status": _background_send_status(config, send_bridge, data_dir),
         },
@@ -178,6 +242,26 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "mode": config.mode,
             "send_enabled": config.send_enabled,
             "send_driver": config.send_driver,
+            "send_backend": _normalize_send_backend(str(getattr(config, "send_backend", "dry_run") or "dry_run")),
+            "weflow_base_url": str(getattr(config, "weflow_base_url", "http://127.0.0.1:5031") or "http://127.0.0.1:5031"),
+            "weflow_token_env": str(getattr(config, "weflow_token_env", "WEFLOW_API_TOKEN") or "WEFLOW_API_TOKEN"),
+            "weflow_send_text_path": str(getattr(config, "weflow_send_text_path", "/send/text") or "/send/text"),
+            "weflow_send_file_path": str(getattr(config, "weflow_send_file_path", "/send/file") or "/send/file"),
+            "weflow_send_timeout_seconds": float(getattr(config, "weflow_send_timeout_seconds", 35.0) or 35.0),
+            "wechat_native_base_url": str(
+                getattr(config, "wechat_native_base_url", "http://127.0.0.1:30001") or "http://127.0.0.1:30001"
+            ),
+            "wechat_native_send_text_path": str(getattr(config, "wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
+            "wechat_native_send_image_path": str(getattr(config, "wechat_native_send_image_path", "/SendImgMsg") or "/SendImgMsg"),
+            "wechat_native_send_file_path": str(
+                getattr(config, "wechat_native_send_file_path", "/send_file_msg") or "/send_file_msg"
+            ),
+            "wechat_native_status_path": str(getattr(config, "wechat_native_status_path", "/QueryDB/status") or "/QueryDB/status"),
+            "wechat_native_timeout_seconds": float(getattr(config, "wechat_native_timeout_seconds", 15.0) or 15.0),
+            "wechat_native_verify_timeout_seconds": float(getattr(config, "wechat_native_verify_timeout_seconds", 10.0) or 0.0),
+            "wechat_native_file_verify_timeout_seconds": float(
+                getattr(config, "wechat_native_file_verify_timeout_seconds", 45.0) or 0.0
+            ),
             "send_confirm_required": config.send_confirm_required,
             "send_max_chars": config.send_max_chars,
             "send_min_interval_seconds": config.send_min_interval_seconds,
@@ -189,6 +273,7 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "channel_states": channels.get("states", []),
         "runtime_cards": build_sidebar_runtime_cards(data_dir),
         "task_manager": build_sidebar_task_manager(data_dir),
+        "agent": build_sidebar_agent_state(data_dir),
         "resource_audit": _last_resource_audit(data_dir),
         "resource_scheduler": _resource_scheduler_snapshot(data_dir),
         "queues": queues,
@@ -196,15 +281,404 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "driver_probe": probe_send_controls(data_dir)["probe"],
         "send_bridge": send_bridge,
         "weflow": build_sidebar_weflow_state(data_dir),
+        "native_migration": build_sidebar_native_migration_state(data_dir),
         "wechat_window_probe": _safe_wechat_window_probe(data_dir, max_children=0, max_controls=0),
-        "audit": list_send_audit(data_dir, limit=30),
+        "audit": audit,
     }
 
 
+def _sidebar_queue_state(
+    data_dir: str | Path,
+    *,
+    channels_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    queues: dict[str, Any] = {status: list_confirm_queue(data_dir, status=status) for status in QUEUE_STATUSES}
+    channel_map = _queue_channel_lookup(channels_state or _channel_state(data_dir))
+    grouped: dict[str, dict[str, Any]] = {}
+    per_status_groups: dict[str, dict[str, dict[str, Any]]] = {status: {} for status in QUEUE_STATUSES}
+
+    for status in QUEUE_STATUSES:
+        payload = queues.get(status) if isinstance(queues.get(status), dict) else {}
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            conversation_id = _queue_item_conversation_id(item) or "unknown"
+            group = grouped.get(conversation_id)
+            if group is None:
+                group = _new_queue_channel_group(conversation_id, channel_map.get(conversation_id, {}))
+                grouped[conversation_id] = group
+            status_bucket = group["statuses"][status]
+            status_bucket["items"].append(item)
+            status_bucket["count"] += 1
+            group["status_counts"][status] += 1
+            group["total_count"] += 1
+            latest_at = _queue_item_time(item)
+            if latest_at > group["latest_at"]:
+                group["latest_at"] = latest_at
+            per_status_groups[status][conversation_id] = group
+
+    for status in QUEUE_STATUSES:
+        payload = queues.get(status) if isinstance(queues.get(status), dict) else {}
+        payload["channels"] = [
+            _queue_status_channel_view(group, status)
+            for group in sorted(
+                per_status_groups[status].values(),
+                key=lambda item: (str(item.get("latest_at") or ""), str(item.get("display_name") or "")),
+                reverse=True,
+            )
+        ]
+        queues[status] = payload
+    queues["by_channel"] = {
+        "status": "ok",
+        "statuses": list(QUEUE_STATUSES),
+        "count": len(grouped),
+        "channels": [
+            _queue_channel_view(group)
+            for group in sorted(
+                grouped.values(),
+                key=lambda item: (str(item.get("latest_at") or ""), str(item.get("display_name") or "")),
+                reverse=True,
+            )
+        ],
+    }
+    return queues
+
+
+def _queue_channel_lookup(channels_state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    items = channels_state.get("items") if isinstance(channels_state, dict) else []
+    if not isinstance(items, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        conversation_id = str(item.get("conversation_id") or "").strip()
+        if not conversation_id:
+            continue
+        result[conversation_id] = item
+    return result
+
+
+def _new_queue_channel_group(conversation_id: str, channel: dict[str, Any]) -> dict[str, Any]:
+    display_name = str(channel.get("chat_title") or channel.get("display_name") or "").strip() or conversation_id
+    return {
+        "conversation_id": conversation_id,
+        "display_name": display_name,
+        "conversation_type": str(channel.get("conversation_type") or ""),
+        "receiver": _receiver_from_channel(channel),
+        "total_count": 0,
+        "latest_at": "",
+        "status_counts": {status: 0 for status in QUEUE_STATUSES},
+        "statuses": {status: {"count": 0, "items": []} for status in QUEUE_STATUSES},
+    }
+
+
+def _queue_channel_view(group: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "conversation_id": group["conversation_id"],
+        "display_name": group["display_name"],
+        "conversation_type": group["conversation_type"],
+        "receiver": group["receiver"],
+        "total_count": group["total_count"],
+        "latest_at": group["latest_at"],
+        "status_counts": dict(group["status_counts"]),
+        "statuses": {
+            status: {"count": group["statuses"][status]["count"], "items": list(group["statuses"][status]["items"])}
+            for status in QUEUE_STATUSES
+            if group["statuses"][status]["count"]
+        },
+    }
+
+
+def _queue_status_channel_view(group: dict[str, Any], status: str) -> dict[str, Any]:
+    bucket = group["statuses"][status]
+    return {
+        "conversation_id": group["conversation_id"],
+        "display_name": group["display_name"],
+        "conversation_type": group["conversation_type"],
+        "receiver": group["receiver"],
+        "count": bucket["count"],
+        "latest_at": group["latest_at"],
+        "status_counts": dict(group["status_counts"]),
+        "items": list(bucket["items"]),
+    }
+
+
+def _queue_item_conversation_id(item: dict[str, Any]) -> str:
+    reply = item.get("reply") if isinstance(item.get("reply"), dict) else {}
+    return str(reply.get("conversation_id") or item.get("conversation_id") or "").strip()
+
+
+def _queue_item_time(item: dict[str, Any]) -> str:
+    reply = item.get("reply") if isinstance(item.get("reply"), dict) else {}
+    return str(item.get("updated_at") or item.get("reviewed_at") or item.get("created_at") or reply.get("created_at") or "")
+
+
+def _sidebar_audit_state(
+    data_dir: str | Path,
+    *,
+    channels_state: dict[str, Any] | None = None,
+    queues_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    audit = list_send_audit(data_dir, limit=30, compact_transitions=True)
+    items = audit.get("items") if isinstance(audit.get("items"), list) else []
+    channel_map = _queue_channel_lookup(channels_state or _channel_state(data_dir))
+    queue_lookup = _audit_queue_lookup(queues_state or _sidebar_queue_state(data_dir, channels_state=channels_state))
+    grouped: dict[str, dict[str, Any]] = {}
+    per_phase_groups: dict[str, dict[str, dict[str, Any]]] = {phase: {} for phase in AUDIT_PHASES}
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        phase = _audit_item_phase(item)
+        conversation_id = _audit_item_conversation_id(item, queue_lookup) or "unknown"
+        channel = channel_map.get(conversation_id, {})
+        group = grouped.get(conversation_id)
+        if group is None:
+            group = _new_audit_channel_group(conversation_id, channel)
+            grouped[conversation_id] = group
+        item_view = _audit_item_view(item, phase, conversation_id, channel)
+        bucket = group["phases"][phase]
+        bucket["items"].append(item_view)
+        bucket["count"] += 1
+        group["phase_counts"][phase] += 1
+        group["total_count"] += 1
+        latest_at = _audit_item_time(item)
+        if latest_at > group["latest_at"]:
+            group["latest_at"] = latest_at
+        per_phase_groups[phase][conversation_id] = group
+
+    audit["channels"] = [
+        _audit_channel_view(group)
+        for group in sorted(
+            grouped.values(),
+            key=lambda item: (str(item.get("latest_at") or ""), str(item.get("display_name") or "")),
+            reverse=True,
+        )
+    ]
+    audit["phases"] = {
+        phase: {
+            "count": sum(group["phases"][phase]["count"] for group in per_phase_groups[phase].values()),
+            "channels": [
+                _audit_phase_channel_view(group, phase)
+                for group in sorted(
+                    per_phase_groups[phase].values(),
+                    key=lambda item: (str(item.get("latest_at") or ""), str(item.get("display_name") or "")),
+                    reverse=True,
+                )
+            ],
+        }
+        for phase in AUDIT_PHASES
+    }
+    return audit
+
+
+def _new_audit_channel_group(conversation_id: str, channel: dict[str, Any]) -> dict[str, Any]:
+    display_name = str(channel.get("chat_title") or channel.get("display_name") or "").strip() or conversation_id
+    return {
+        "conversation_id": conversation_id,
+        "display_name": display_name,
+        "conversation_type": str(channel.get("conversation_type") or ""),
+        "receiver": _receiver_from_channel(channel),
+        "total_count": 0,
+        "latest_at": "",
+        "phase_counts": {phase: 0 for phase in AUDIT_PHASES},
+        "phases": {phase: {"count": 0, "items": []} for phase in AUDIT_PHASES},
+    }
+
+
+def _audit_channel_view(group: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "conversation_id": group["conversation_id"],
+        "display_name": group["display_name"],
+        "conversation_type": group["conversation_type"],
+        "receiver": group["receiver"],
+        "total_count": group["total_count"],
+        "latest_at": group["latest_at"],
+        "phase_counts": dict(group["phase_counts"]),
+        "phases": {
+            phase: {"count": group["phases"][phase]["count"], "items": list(group["phases"][phase]["items"])}
+            for phase in AUDIT_PHASES
+            if group["phases"][phase]["count"]
+        },
+    }
+
+
+def _audit_phase_channel_view(group: dict[str, Any], phase: str) -> dict[str, Any]:
+    bucket = group["phases"][phase]
+    return {
+        "conversation_id": group["conversation_id"],
+        "display_name": group["display_name"],
+        "conversation_type": group["conversation_type"],
+        "receiver": group["receiver"],
+        "count": bucket["count"],
+        "latest_at": group["latest_at"],
+        "phase_counts": dict(group["phase_counts"]),
+        "items": list(bucket["items"]),
+    }
+
+
+def _audit_item_view(
+    item: dict[str, Any],
+    phase: str,
+    conversation_id: str,
+    channel: dict[str, Any],
+) -> dict[str, Any]:
+    display_name = str(channel.get("chat_title") or channel.get("display_name") or "").strip() or conversation_id
+    view = dict(item)
+    view["phase"] = phase
+    view["conversation_id"] = conversation_id
+    view["channel_display_name"] = display_name
+    view["receiver"] = _receiver_from_channel(channel)
+    return view
+
+
+def _audit_queue_lookup(queues_state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for status in QUEUE_STATUSES:
+        payload = queues_state.get(status) if isinstance(queues_state, dict) else {}
+        items = payload.get("items") if isinstance(payload, dict) and isinstance(payload.get("items"), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            queue_id = str(item.get("queue_id") or "").strip()
+            if queue_id:
+                lookup[queue_id] = item
+    return lookup
+
+
+def _audit_item_conversation_id(item: dict[str, Any], queue_lookup: dict[str, dict[str, Any]]) -> str:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    send_result = payload.get("send_result") if isinstance(payload.get("send_result"), dict) else {}
+    conversation_id = str(payload.get("conversation_id") or send_result.get("conversation_id") or "").strip()
+    if conversation_id:
+        return conversation_id
+    queue_id = str(item.get("queue_id") or "").strip()
+    if queue_id:
+        return _queue_item_conversation_id(queue_lookup.get(queue_id, {}))
+    return ""
+
+
+def _audit_item_phase(item: dict[str, Any]) -> str:
+    if bool(item.get("resolved")):
+        return "resolved"
+    status = str(item.get("status") or "").strip()
+    if status in AUDIT_PHASES:
+        return status
+    action = str(item.get("action") or "").strip()
+    if action == "confirm_approve":
+        return "approved"
+    if action == "confirm_reject":
+        return "rejected"
+    if action == "confirm_send_blocked":
+        return "blocked"
+    if action == "ledger_sync_recovered":
+        return "resolved"
+    if action == "ledger_sync_failed":
+        return "failed"
+    if action == "bridge_ack_sync":
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        ack_status = str(payload.get("ack_status") or "").strip()
+        if ack_status == "accepted":
+            return "accepted"
+        if ack_status == "sent":
+            return "sent"
+        if ack_status in {"failed", "blocked"}:
+            return "failed"
+    return "other"
+
+
+def _audit_item_time(item: dict[str, Any]) -> str:
+    return str(item.get("timestamp") or item.get("created_at") or item.get("updated_at") or "")
+
+
+def _receiver_from_channel(channel: dict[str, Any]) -> str:
+    if str(channel.get("conversation_type") or "").strip() == "private" and not channel_allows_private_receiver(channel):
+        return ""
+    key = str(channel.get("conversation_key") or "").strip()
+    if _looks_like_wechat_receiver(key):
+        return key
+    sender_ids = channel.get("sender_wechat_ids") if isinstance(channel.get("sender_wechat_ids"), list) else []
+    for value in sender_ids:
+        text = str(value or "").strip()
+        if _looks_like_wechat_receiver(text):
+            return text
+    return ""
+
+
 def build_sidebar_task_manager(data_dir: str | Path = "data") -> dict[str, Any]:
-    state = TaskStatusStore(data_dir).state()
+    root = Path(data_dir).resolve()
+    _reconcile_sidebar_runtime_tasks(root)
+    state = TaskStatusStore(root).state()
     _inject_runtime_resource_limits(state, data_dir)
     return state
+
+
+def _reconcile_sidebar_runtime_tasks(root: Path) -> None:
+    store = TaskStatusStore(root)
+    agent_worker = _agent_worker_state(root)
+    if not bool(agent_worker.get("running")):
+        store.finish_external(
+            "agent-worker",
+            {
+                "status": "completed",
+                "progress": 100,
+                "phase": "连续接话已停止",
+                "detail": "worker_not_running",
+                "actual_cost": 1,
+            },
+        )
+    weflow_worker = _weflow_worker_state(root)
+    if not bool(weflow_worker.get("running")):
+        store.finish_external(
+            "worker",
+            {
+                "status": "completed",
+                "progress": 100,
+                "phase": "后台拉取已停止",
+                "detail": "worker_not_running",
+                "actual_cost": 1,
+            },
+        )
+    bridge_worker = _bridge_worker_public_state(root)
+    if not bool(bridge_worker.get("running")):
+        store.finish_external(
+            "send-bridge-worker",
+            {
+                "status": "completed",
+                "progress": 100,
+                "phase": "发送桥 worker 已停止",
+                "detail": "worker_not_running",
+                "actual_cost": 1,
+            },
+        )
+
+
+def _worker_task_metadata(
+    *,
+    scope_label: str,
+    worker_kind: str,
+    last_status: str = "",
+    last_error: str = "",
+    stale_after_seconds: float = 120.0,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "scope_label": scope_label,
+        "worker": True,
+        "worker_kind": worker_kind,
+        "worker_pid": os.getpid(),
+        "worker_heartbeat_at": time.time(),
+        "worker_stale_after_seconds": max(1.0, float(stale_after_seconds)),
+        "last_status": last_status,
+        "last_error": last_error,
+        **(extra or {}),
+    }
+
+
+def build_sidebar_agent_state(data_dir: str | Path = "data") -> dict[str, Any]:
+    return _agent_public_state(Path(data_dir).resolve())
 
 
 def sidebar_resource_audit(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -221,6 +695,105 @@ def sidebar_resource_audit(data_dir: str | Path = "data", payload: dict[str, Any
     except OSError as exc:
         result["storage_error"] = f"{type(exc).__name__}: {exc}"
     return result
+
+
+def sidebar_diagnostics_export(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build a support bundle snapshot without exporting secret values."""
+
+    payload = payload if isinstance(payload, dict) else {}
+    root = Path(data_dir).resolve()
+    limit = _bounded_int(payload.get("limit"), 50, 1, 500)
+    config = ensure_config(root)
+    queues = _sidebar_queue_state(root)
+    bundle = {
+        "schema": "sidebar_diagnostics_export_v1",
+        "status": "ok",
+        "created_at": utc_now_iso(),
+        "data_dir": str(root),
+        "config": _diagnostic_config_summary(config),
+        "task_manager": build_sidebar_task_manager(root),
+        "queue_counts": {status: int(queues.get(status, {}).get("count", 0)) for status in QUEUE_STATUSES},
+        "queues": _sanitize_for_diagnostics(queues),
+        "send_audit_tail": _sanitize_for_diagnostics(list_send_audit(root, limit=limit, compact_transitions=True)),
+        "send_bridge": _sanitize_for_diagnostics(build_sidebar_bridge_state(root)),
+        "readiness": _sanitize_for_diagnostics(build_send_readiness_report(root)),
+        "driver_probe": _sanitize_for_diagnostics(probe_send_controls(root)),
+        "weflow": _sanitize_for_diagnostics(build_sidebar_weflow_state(root)),
+        "native_migration": _sanitize_for_diagnostics(build_sidebar_native_migration_state(root)),
+        "storage_migration": _sanitize_for_diagnostics(
+            build_storage_migration_status(root, include_sizes=False, max_entries_per_component=1000)
+        ),
+        "agent": _sanitize_for_diagnostics(build_sidebar_agent_state(root)),
+        "resource_audit": _sanitize_for_diagnostics(_last_resource_audit(root)),
+        "recent_backend_events": _sanitize_for_diagnostics(_tail_jsonl(root / "backend_events.jsonl", limit=limit)),
+        "recent_send_audit_raw": _sanitize_for_diagnostics(_tail_jsonl(root / "send_audit.jsonl", limit=limit)),
+        "preserved_send_bridge_files": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
+    }
+    if bool(payload.get("persist", True)):
+        out_dir = root / "diagnostics"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        out_path = out_dir / f"diagnostics-{stamp}.json"
+        _write_json(out_path, bundle)
+        bundle["export_path"] = str(out_path)
+    return bundle
+
+
+def sidebar_storage_migration_status(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    return build_storage_migration_status(
+        data_dir,
+        include_sizes=bool(payload.get("include_sizes", payload.get("includeSizes", True))),
+        max_entries_per_component=_bounded_int(payload.get("max_entries_per_component"), 5000, 100, 50000),
+    )
+
+
+def _diagnostic_config_summary(config: Any) -> dict[str, Any]:
+    keys = (
+        "mode",
+        "send_enabled",
+        "send_driver",
+        "send_backend",
+        "send_confirm_required",
+        "wechat_native_base_url",
+        "wechat_native_send_text_path",
+        "wechat_native_send_image_path",
+        "wechat_native_send_file_path",
+        "wechat_native_status_path",
+        "wechat_native_timeout_seconds",
+        "wechat_native_verify_timeout_seconds",
+        "wechat_native_file_verify_timeout_seconds",
+        "weflow_base_url",
+        "weflow_token_env",
+        "weflow_send_text_path",
+        "weflow_send_file_path",
+        "weflow_send_timeout_seconds",
+        "ocr_mode",
+        "asr_mode",
+    )
+    return _sanitize_for_diagnostics({key: getattr(config, key, None) for key in keys})
+
+
+def _sanitize_for_diagnostics(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if _diagnostic_secret_key(key_text):
+                sanitized[key_text] = "<redacted>"
+            else:
+                sanitized[key_text] = _sanitize_for_diagnostics(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_for_diagnostics(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_diagnostics(item) for item in value]
+    return value
+
+
+def _diagnostic_secret_key(key: str) -> bool:
+    lowered = str(key or "").lower()
+    return any(marker in lowered for marker in ("api_key", "apikey", "token", "secret", "password", "authorization"))
 
 
 def _last_resource_audit(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -435,6 +1008,1221 @@ def build_sidebar_wechat_probe(data_dir: str | Path = "data") -> dict[str, Any]:
     return _safe_wechat_window_probe(data_dir, max_children=200, max_controls=300)
 
 
+def build_sidebar_native_migration_state(data_dir: str | Path = "data") -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    latest_path = root / "native_diagnostics" / "native-migration-latest.json"
+    latest = _read_json(latest_path, {})
+    if not isinstance(latest, dict) or not latest:
+        return {
+            "status": "empty",
+            "schema": "native_migration_state_v1",
+            "latest_path": str(latest_path),
+            "message": "no native migration probe has been run",
+        }
+    summary_keys = (
+        "status",
+        "created_at",
+        "base_url",
+        "status_path",
+        "version_gate",
+        "http_status",
+        "message_scan",
+        "deploy_manifest",
+        "report_path",
+    )
+    return {
+        "status": "ok",
+        "schema": "native_migration_state_v1",
+        "latest_path": str(latest_path),
+        "latest": {key: latest.get(key) for key in summary_keys if key in latest},
+    }
+
+
+def sidebar_native_migration_probe(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Probe the portable PC WeChat native bridge deployment without sending.
+
+    This is intentionally a dry-run style migration report: it checks the local
+    native HTTP status endpoint, discovers the running Weixin executable/version,
+    scans bounded local message-root candidates only after the version gate, and
+    reports cleanup candidates without deleting anything.
+    """
+
+    payload = payload if isinstance(payload, dict) else {}
+    root = Path(data_dir).resolve()
+    config = ensure_config(root)
+    timeout = _bounded_float(
+        payload.get("timeout_seconds"),
+        min(float(getattr(config, "wechat_native_timeout_seconds", 15.0) or 15.0), 3.0),
+        0.2,
+        10.0,
+    )
+    include_cleanup_sizes = bool(payload.get("include_cleanup_sizes", True))
+    max_depth = _bounded_int(payload.get("max_depth"), 5, 0, 8)
+    max_entries = _bounded_int(payload.get("max_entries"), 2500, 50, 20000)
+    limit = _bounded_int(payload.get("limit"), 20, 1, 100)
+
+    with _NATIVE_MIGRATION_LOCK:
+        native_base_url = str(getattr(config, "wechat_native_base_url", "http://127.0.0.1:30001") or "http://127.0.0.1:30001")
+        http_status = wechat_native_http_status(
+            native_base_url,
+            text_path=str(getattr(config, "wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
+            image_path=str(getattr(config, "wechat_native_send_image_path", "/SendImgMsg") or "/SendImgMsg"),
+            file_path=str(getattr(config, "wechat_native_send_file_path", "/send_file_msg") or "/send_file_msg"),
+            status_path=str(getattr(config, "wechat_native_status_path", "/QueryDB/status") or "/QueryDB/status"),
+            timeout_seconds=timeout,
+        )
+        extra_http_probes = _wechat_native_extra_http_probes(native_base_url, timeout_seconds=min(timeout, 0.8))
+        discovery_status = _wechat_native_discovery_status(http_status, extra_http_probes)
+        processes = _dedupe_native_processes(
+            [*_wechat_native_processes(), *_wechat_native_http_owner_processes(native_base_url)]
+        )
+        install_candidates = _wechat_native_install_candidates(processes)
+        version_gate = _wechat_native_version_gate(discovery_status, processes, install_candidates)
+        force_scan = bool(payload.get("force_scan", False))
+        deep_scan = force_scan or version_gate.get("gate") == "supported"
+        message_roots = _wechat_message_root_seeds(discovery_status, processes, install_candidates)
+        message_candidates = _wechat_message_path_candidates(
+            message_roots,
+            deep_scan=deep_scan,
+            max_depth=max_depth,
+            max_entries=max_entries,
+            limit=limit,
+        )
+        artifact_inventory = _native_hook_artifact_inventory(include_sizes=include_cleanup_sizes)
+        cleanup_manifest = _native_hook_cleanup_manifest(include_sizes=include_cleanup_sizes)
+        blockers = _native_migration_blockers(http_status, version_gate, message_candidates, deep_scan=deep_scan)
+        report_path = ""
+        status = _native_migration_status(http_status, version_gate, blockers)
+        deploy_manifest = _native_deploy_manifest(
+            status=status,
+            version_gate=version_gate,
+            http_status=http_status,
+            message_candidates=message_candidates,
+            artifact_inventory=artifact_inventory,
+            cleanup_manifest=cleanup_manifest,
+        )
+        report = {
+            "schema": "native_migration_probe_v1",
+            "status": status,
+            "created_at": utc_now_iso(),
+            "data_dir": str(root),
+            "base_url": native_base_url,
+            "status_path": str(getattr(config, "wechat_native_status_path", "/QueryDB/status") or "/QueryDB/status"),
+            "send_paths": {
+                "text": str(getattr(config, "wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
+                "image": str(getattr(config, "wechat_native_send_image_path", "/SendImgMsg") or "/SendImgMsg"),
+                "file": str(getattr(config, "wechat_native_send_file_path", "/send_file_msg") or "/send_file_msg"),
+            },
+            "supported_versions": list(_SUPPORTED_WECHAT_NATIVE_VERSIONS),
+            "http_status": http_status,
+            "extra_http_probes": extra_http_probes,
+            "processes": processes,
+            "install_candidates": install_candidates,
+            "version_gate": version_gate,
+            "message_scan": {
+                "deep_scan": deep_scan,
+                "force_scan": force_scan,
+                "max_depth": max_depth,
+                "max_entries": max_entries,
+                "seed_count": len(message_roots),
+                "candidate_count": len(message_candidates),
+                "skipped_reason": "" if deep_scan else "version_not_supported_yet",
+            },
+            "message_path_candidates": message_candidates,
+            "artifact_inventory": artifact_inventory,
+            "cleanup_manifest": cleanup_manifest,
+            "deploy_manifest": deploy_manifest,
+            "blockers": blockers,
+            "migration_plan": _native_migration_plan(status, version_gate, http_status, message_candidates),
+        }
+        if bool(payload.get("persist", True)):
+            out_dir = root / "native_diagnostics"
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            out_path = out_dir / f"native-migration-{stamp}.json"
+            latest_path = out_dir / "native-migration-latest.json"
+            report_path = str(out_path)
+            report["report_path"] = report_path
+            _write_json(out_path, report)
+            _write_json(latest_path, report)
+        else:
+            report["report_path"] = report_path
+    return report
+
+
+def _wechat_native_processes() -> list[dict[str, Any]]:
+    if os.name != "nt":
+        return []
+    powershell = _powershell_executable()
+    if not powershell:
+        return []
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$names = @('Weixin', 'WeChat')
+Get-Process -Name $names -ErrorAction SilentlyContinue |
+  Where-Object { -not [string]::IsNullOrWhiteSpace($_.Path) } |
+  ForEach-Object {
+    $info = $null
+    try { $info = (Get-Item -LiteralPath $_.Path).VersionInfo } catch {}
+    [pscustomobject]@{
+      pid = $_.Id
+      name = $_.ProcessName
+      path = $_.Path
+      product_version = if ($info) { $info.ProductVersion } else { '' }
+      file_version = if ($info) { $info.FileVersion } else { '' }
+      product_name = if ($info) { $info.ProductName } else { '' }
+      company_name = if ($info) { $info.CompanyName } else { '' }
+    }
+  } | ConvertTo-Json -Compress -Depth 4
+"""
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return []
+    try:
+        parsed = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+    items = parsed if isinstance(parsed, list) else [parsed]
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or item.get("Path") or "").strip()
+        if not path:
+            continue
+        result.append(
+            {
+                "pid": item.get("pid") or item.get("Id") or item.get("PID") or 0,
+                "name": str(item.get("name") or item.get("ProcessName") or "").strip(),
+                "path": path,
+                "root": str(Path(path).parent),
+                "product_version": str(item.get("product_version") or "").strip(),
+                "file_version": str(item.get("file_version") or "").strip(),
+                "product_name": str(item.get("product_name") or "").strip(),
+                "company_name": str(item.get("company_name") or "").strip(),
+            }
+        )
+    return result
+
+
+def _wechat_native_http_owner_processes(base_url: str) -> list[dict[str, Any]]:
+    if os.name != "nt":
+        return []
+    parsed = urlparse(str(base_url or "").strip() or "http://127.0.0.1:30001")
+    if parsed.scheme != "http" or (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+        return []
+    port = parsed.port or 80
+    powershell = _powershell_executable()
+    if not powershell:
+        return []
+    env = os.environ.copy()
+    env["CODEX_NATIVE_HTTP_PORT"] = str(port)
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$port = [int]$env:CODEX_NATIVE_HTTP_PORT
+Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+  Select-Object -First 8 |
+  ForEach-Object {
+    $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+    if ($null -ne $proc -and -not [string]::IsNullOrWhiteSpace($proc.Path)) {
+      $info = $null
+      try { $info = (Get-Item -LiteralPath $proc.Path).VersionInfo } catch {}
+      [pscustomobject]@{
+        pid = $proc.Id
+        name = $proc.ProcessName
+        path = $proc.Path
+        root = Split-Path -Parent $proc.Path
+        source = 'native_http_port_owner'
+        product_version = if ($info) { $info.ProductVersion } else { '' }
+        file_version = if ($info) { $info.FileVersion } else { '' }
+        product_name = if ($info) { $info.ProductName } else { '' }
+        company_name = if ($info) { $info.CompanyName } else { '' }
+      }
+    }
+  } | ConvertTo-Json -Compress -Depth 4
+"""
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return []
+    try:
+        parsed_json = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+    items = parsed_json if isinstance(parsed_json, list) else [parsed_json]
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        result.append(
+            {
+                "pid": item.get("pid") or 0,
+                "name": str(item.get("name") or "").strip(),
+                "path": path,
+                "root": str(item.get("root") or Path(path).parent),
+                "source": "native_http_port_owner",
+                "product_version": str(item.get("product_version") or "").strip(),
+                "file_version": str(item.get("file_version") or "").strip(),
+                "product_name": str(item.get("product_name") or "").strip(),
+                "company_name": str(item.get("company_name") or "").strip(),
+            }
+        )
+    return result
+
+
+def _dedupe_native_processes(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for process in processes:
+        if not isinstance(process, dict):
+            continue
+        identity = (str(process.get("pid") or ""), str(process.get("path") or "").lower())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(process)
+    return result
+
+
+def _wechat_native_discovery_status(http_status: dict[str, Any], extra_http_probes: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        **http_status,
+        "health": {
+            "status": http_status.get("health", {}),
+            "extra_http_probes": extra_http_probes,
+        },
+    }
+
+
+def _wechat_native_extra_http_probes(base_url: str, *, timeout_seconds: float) -> list[dict[str, Any]]:
+    endpoints = (
+        "/version",
+        "/api/version",
+        "/debug/version",
+        "/debug/status",
+        "/health",
+        "/status",
+        "/QueryDB/version",
+    )
+    results: list[dict[str, Any]] = []
+    for endpoint in endpoints:
+        url = _native_local_endpoint_url(base_url, endpoint)
+        if not url:
+            results.append({"endpoint": endpoint, "status": "skipped", "reason": "non_local_or_invalid_base_url"})
+            continue
+        try:
+            payload = _native_http_json_get(url, timeout_seconds=timeout_seconds)
+            results.append({"endpoint": endpoint, "url": url, "status": "ok", "payload": payload})
+        except Exception as exc:
+            results.append({"endpoint": endpoint, "url": url, "status": "error", "error": f"{type(exc).__name__}:{exc}"})
+    return results
+
+
+def _native_local_endpoint_url(base_url: str, endpoint: str) -> str:
+    base = str(base_url or "").strip().rstrip("/") or "http://127.0.0.1:30001"
+    parsed = urlparse(base)
+    if parsed.scheme != "http" or (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+        return ""
+    path = str(endpoint or "").strip() or "/"
+    if path.startswith("http://") or path.startswith("https://"):
+        parsed_path = urlparse(path)
+        if parsed_path.scheme != "http" or (parsed_path.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+            return ""
+        return path
+    return base.rstrip("/") + "/" + path.lstrip("/")
+
+
+def _native_http_json_get(url: str, *, timeout_seconds: float) -> dict[str, Any]:
+    request = Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urlopen(request, timeout=max(0.2, float(timeout_seconds))) as response:
+            raw = response.read(1_000_000).decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        try:
+            detail = exc.read(500).decode("utf-8", errors="replace")
+        finally:
+            exc.close()
+        raise ValueError(f"http_{exc.code}:{detail}") from exc
+    except URLError as exc:
+        raise ValueError(f"url_error:{exc.reason}") from exc
+    if not raw.strip():
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("response_not_json_object")
+    return parsed
+
+
+def _powershell_executable() -> str:
+    return shutil.which("powershell") or shutil.which("pwsh") or ""
+
+
+def _wechat_native_install_candidates(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[tuple[str, Path]] = []
+    for process in processes:
+        root = Path(str(process.get("root") or "")).expanduser()
+        if str(root):
+            candidates.append(("running_process", root))
+    env_root = _env_value("WECHAT_NATIVE_WEIXIN_ROOT")
+    if env_root:
+        candidates.append(("WECHAT_NATIVE_WEIXIN_ROOT", Path(env_root).expanduser()))
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        base = _env_value(env_name)
+        if not base:
+            continue
+        base_path = Path(base).expanduser()
+        for rel in (
+            Path("Tencent") / "Weixin",
+            Path("Tencent") / "WeChat",
+            Path("Weixin"),
+            Path("WeChat"),
+        ):
+            candidates.append((env_name, base_path / rel))
+
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    process_by_root = {str(Path(str(item.get("root") or "")).resolve()).lower(): item for item in processes if item.get("root")}
+    for source, root in candidates:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved = root
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        exe = _first_existing_path((resolved / "Weixin.exe", resolved / "WeChat.exe"))
+        process = process_by_root.get(key, {})
+        version_info = (
+            {
+                "product_version": str(process.get("product_version") or ""),
+                "file_version": str(process.get("file_version") or ""),
+                "source": "running_process",
+            }
+            if process
+            else _windows_file_version_info(exe)
+        )
+        hook = resolved / "version.dll"
+        result.append(
+            {
+                "source": source,
+                "root": str(resolved),
+                "exists": resolved.exists(),
+                "exe": str(exe) if exe else "",
+                "exe_exists": bool(exe and exe.exists()),
+                "version": _best_version_from_mapping(version_info),
+                "version_info": version_info,
+                "deployed_hook": str(hook),
+                "deployed_hook_exists": hook.exists(),
+                "deployed_hook_size": hook.stat().st_size if hook.exists() else 0,
+            }
+        )
+    return result
+
+
+def _first_existing_path(paths: tuple[Path, ...]) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
+def _windows_file_version_info(path: Path) -> dict[str, Any]:
+    if os.name != "nt" or not path or not path.exists():
+        return {}
+    powershell = _powershell_executable()
+    if not powershell:
+        return {}
+    env = os.environ.copy()
+    env["CODEX_FILE_VERSION_PATH"] = str(path)
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$path = $env:CODEX_FILE_VERSION_PATH
+$info = (Get-Item -LiteralPath $path).VersionInfo
+[pscustomobject]@{
+  product_version = $info.ProductVersion
+  file_version = $info.FileVersion
+  product_name = $info.ProductName
+  company_name = $info.CompanyName
+} | ConvertTo-Json -Compress -Depth 3
+"""
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return {}
+    try:
+        parsed = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _wechat_native_version_gate(
+    http_status: dict[str, Any],
+    processes: list[dict[str, Any]],
+    install_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    detections: list[dict[str, Any]] = []
+    for item in _version_candidates_from_value(http_status.get("health", {})):
+        detections.append({"source": "native_http_health", **item})
+    for process in processes:
+        for key in ("product_version", "file_version"):
+            value = str(process.get(key) or "").strip()
+            normalized = _normalize_wechat_version(value)
+            if normalized:
+                detections.append({"source": f"process.{key}", "raw": value, "version": normalized, "path": process.get("path", "")})
+    for candidate in install_candidates:
+        value = str(candidate.get("version") or "").strip()
+        normalized = _normalize_wechat_version(value)
+        if normalized:
+            detections.append(
+                {"source": "install_candidate", "raw": value, "version": normalized, "path": candidate.get("exe", "")}
+            )
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in detections:
+        identity = (str(item.get("source") or ""), str(item.get("version") or ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    supported = any(str(item.get("version") or "") in _SUPPORTED_WECHAT_NATIVE_VERSIONS for item in unique)
+    has_version = any(item.get("version") for item in unique)
+    gate = "supported" if supported else ("unsupported" if has_version else "unknown")
+    return {
+        "gate": gate,
+        "supported": supported,
+        "supported_versions": list(_SUPPORTED_WECHAT_NATIVE_VERSIONS),
+        "detected_versions": unique,
+        "best_version": str(unique[0].get("version") or "") if unique else "",
+        "policy": "deep message path scan runs only for supported version unless force_scan=true",
+    }
+
+
+def _version_candidates_from_value(value: Any, *, path: str = "") -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_path = f"{path}.{key}" if path else str(key)
+            if _looks_like_version_key(str(key)):
+                normalized = _normalize_wechat_version(str(item))
+                if normalized:
+                    result.append({"raw": str(item), "version": normalized, "field": key_path})
+            result.extend(_version_candidates_from_value(item, path=key_path))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            result.extend(_version_candidates_from_value(item, path=f"{path}[{index}]"))
+    elif isinstance(value, (str, int, float)):
+        normalized = _normalize_wechat_version(str(value))
+        if normalized and _looks_like_version_key(path):
+            result.append({"raw": str(value), "version": normalized, "field": path})
+    return result
+
+
+def _looks_like_version_key(value: str) -> bool:
+    lowered = str(value or "").lower()
+    return any(token in lowered for token in ("version", "ver", "build", "wechat", "weixin"))
+
+
+def _normalize_wechat_version(value: str) -> str:
+    text = str(value or "").strip()
+    match = re.search(r"\b(\d+\.\d+\.\d+\.\d+)\b", text)
+    if match:
+        return match.group(1)
+    compact = re.sub(r"[^0-9]", "", text)
+    if compact == "411053":
+        return "4.1.10.53"
+    return ""
+
+
+def _best_version_from_mapping(value: dict[str, Any]) -> str:
+    for key in ("product_version", "file_version", "ProductVersion", "FileVersion"):
+        normalized = _normalize_wechat_version(str(value.get(key) or ""))
+        if normalized:
+            return normalized
+    return ""
+
+
+def _wechat_message_root_seeds(
+    http_status: dict[str, Any],
+    processes: list[dict[str, Any]],
+    install_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seeds: list[dict[str, Any]] = []
+
+    def add(path: str | Path, source: str) -> None:
+        text = str(path or "").strip()
+        if not text:
+            return
+        candidate = Path(text).expanduser()
+        seeds.append({"path": str(candidate), "source": source})
+
+    for env_name in _NATIVE_MESSAGE_ROOT_ENV_NAMES:
+        add(_env_value(env_name), env_name)
+    for item in _wechat_configured_data_roots():
+        add(item["path"], item["source"])
+    for item in _path_candidates_from_value(http_status.get("health", {})):
+        add(item["path"], f"native_http_health.{item['field']}")
+    for process in processes:
+        root = str(process.get("root") or "")
+        if root:
+            add(Path(root).parent, "process_parent")
+    for candidate in install_candidates:
+        root = str(candidate.get("root") or "")
+        if root and candidate.get("exists"):
+            add(Path(root).parent, "install_parent")
+
+    home = Path.home()
+    documents = home / "Documents"
+    one_drive = _env_value("OneDrive")
+    document_roots = [documents]
+    if one_drive:
+        document_roots.append(Path(one_drive) / "Documents")
+    for docs in document_roots:
+        for rel in ("xwechat_files", "WeChat Files", "Weixin Files"):
+            add(docs / rel, "default_documents")
+    appdata = _env_value("APPDATA")
+    local_appdata = _env_value("LOCALAPPDATA")
+    if appdata:
+        for rel in (Path("Tencent") / "WeChat", Path("Tencent") / "Weixin"):
+            add(Path(appdata) / rel, "default_appdata")
+        add(Path(appdata) / "Tencent" / "xwechat", "default_appdata_xwechat")
+    if local_appdata:
+        for rel in (Path("Tencent") / "WeChat", Path("Tencent") / "Weixin", Path("Tencent") / "xwechat", "xwechat_files"):
+            add(Path(local_appdata) / rel, "default_localappdata")
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for seed in seeds:
+        try:
+            key = str(Path(seed["path"]).resolve()).lower()
+        except OSError:
+            key = str(seed["path"]).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(seed)
+    return unique
+
+
+def _wechat_configured_data_roots() -> list[dict[str, str]]:
+    roots: list[dict[str, str]] = []
+    for env_name in ("APPDATA", "LOCALAPPDATA"):
+        base = _env_value(env_name)
+        if not base:
+            continue
+        config_dir = Path(base) / "Tencent" / "xwechat" / "config"
+        if not config_dir.exists():
+            continue
+        try:
+            files = [path for path in config_dir.iterdir() if path.is_file() and path.suffix.lower() in {".ini", ".cfg", ".txt"}]
+        except OSError:
+            continue
+        for path in files[:20]:
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in lines[:40]:
+                text = line.strip().strip('"')
+                if not _looks_like_local_wechat_path(text) and not re.match(r"^[a-z]:\\", text, flags=re.IGNORECASE):
+                    continue
+                candidate = Path(text)
+                roots.append({"path": str(candidate), "source": f"xwechat_config:{path.name}"})
+                roots.append({"path": str(candidate / "xwechat_files"), "source": f"xwechat_config:{path.name}:xwechat_files"})
+    return roots
+
+
+def _path_candidates_from_value(value: Any, *, field: str = "") -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child_field = f"{field}.{key}" if field else str(key)
+            result.extend(_path_candidates_from_value(item, field=child_field))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            result.extend(_path_candidates_from_value(item, field=f"{field}[{index}]"))
+    elif isinstance(value, str):
+        text = value.strip()
+        if _looks_like_local_wechat_path(text):
+            result.append({"path": text, "field": field})
+    return result
+
+
+def _looks_like_local_wechat_path(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or len(text) > 500:
+        return False
+    lower = text.lower()
+    if not (re.match(r"^[a-z]:\\", text, flags=re.IGNORECASE) or text.startswith("\\\\")):
+        return False
+    return any(token in lower for token in ("wechat", "weixin", "xwechat", "msg", "micro"))
+
+
+def _wechat_message_path_candidates(
+    seeds: list[dict[str, Any]],
+    *,
+    deep_scan: bool,
+    max_depth: int,
+    max_entries: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for seed in seeds:
+        path = Path(str(seed.get("path") or "")).expanduser()
+        exists = path.exists()
+        signals = _scan_wechat_message_signals(path, max_depth=max_depth, max_entries=max_entries) if exists and deep_scan else {}
+        score = _score_wechat_message_path(path, exists=exists, signals=signals)
+        candidates.append(
+            {
+                "path": str(path),
+                "source": str(seed.get("source") or ""),
+                "exists": exists,
+                "kind": "message_root_candidate",
+                "score": score,
+                "scan_status": "scanned" if exists and deep_scan else ("missing" if not exists else "skipped_version_gate"),
+                "signals": signals,
+            }
+        )
+    candidates.sort(key=lambda item: (int(item.get("score", 0) or 0), str(item.get("exists"))), reverse=True)
+    return candidates[:limit]
+
+
+def _scan_wechat_message_signals(root: Path, *, max_depth: int, max_entries: int) -> dict[str, Any]:
+    queue: list[tuple[Path, int]] = [(root, 0)]
+    db_files: list[str] = []
+    signal_dirs: list[str] = []
+    entries = 0
+    truncated = False
+    while queue:
+        current, depth = queue.pop(0)
+        try:
+            children = list(current.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            entries += 1
+            if entries > max_entries:
+                truncated = True
+                queue.clear()
+                break
+            name = child.name.lower()
+            try:
+                is_dir = child.is_dir()
+            except OSError:
+                continue
+            if is_dir:
+                if _wechat_signal_dir_name(name) and len(signal_dirs) < 40:
+                    signal_dirs.append(str(child))
+                if depth < max_depth:
+                    queue.append((child, depth + 1))
+            elif _wechat_signal_db_file(name):
+                if len(db_files) < 40:
+                    db_files.append(str(child))
+    return {
+        "scanned_entries": entries,
+        "truncated": truncated,
+        "db_file_count": len(db_files),
+        "db_files": db_files,
+        "signal_dir_count": len(signal_dirs),
+        "signal_dirs": signal_dirs,
+    }
+
+
+def _wechat_signal_dir_name(name: str) -> bool:
+    lowered = str(name or "").lower()
+    return lowered in {"msg", "db", "filestorage", "files", "image", "video", "voice"} or any(
+        token in lowered for token in ("xwechat", "wechat files", "weixin files", "micro", "message")
+    )
+
+
+def _wechat_signal_db_file(name: str) -> bool:
+    lowered = str(name or "").lower()
+    if lowered.endswith((".db", ".sqlite", ".sqlite3")):
+        return any(token in lowered for token in ("msg", "micro", "media", "contact", "chat", "session", "db"))
+    return lowered in {"micro_msg.db", "msg.db"}
+
+
+def _score_wechat_message_path(path: Path, *, exists: bool, signals: dict[str, Any]) -> int:
+    lower = str(path).lower()
+    score = 0
+    if exists:
+        score += 20
+    if "xwechat_files" in lower:
+        score += 45
+    elif "xwechat" in lower:
+        score += 30
+    if "wechat-doc" in lower:
+        score += 32
+    if "wechat files" in lower or "weixin files" in lower:
+        score += 35
+    if "\\tencent\\" in lower:
+        score += 12
+    score += min(40, int(signals.get("db_file_count", 0) or 0) * 6)
+    score += min(25, int(signals.get("signal_dir_count", 0) or 0) * 4)
+    return score
+
+
+def _native_migration_blockers(
+    http_status: dict[str, Any],
+    version_gate: dict[str, Any],
+    message_candidates: list[dict[str, Any]],
+    *,
+    deep_scan: bool,
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if not bool(http_status.get("available")):
+        blockers.append({"code": "native_http_unavailable", "reason": str(http_status.get("reason") or "")})
+    if version_gate.get("gate") == "unsupported":
+        blockers.append(
+            {
+                "code": "unsupported_wechat_version",
+                "detected_versions": version_gate.get("detected_versions", []),
+                "supported_versions": list(_SUPPORTED_WECHAT_NATIVE_VERSIONS),
+            }
+        )
+    elif version_gate.get("gate") == "unknown":
+        blockers.append({"code": "wechat_version_unknown", "supported_versions": list(_SUPPORTED_WECHAT_NATIVE_VERSIONS)})
+    if deep_scan and not any(item.get("exists") and int(item.get("score", 0) or 0) >= 40 for item in message_candidates):
+        blockers.append({"code": "message_path_not_confirmed", "candidate_count": len(message_candidates)})
+    return blockers
+
+
+def _native_migration_status(
+    http_status: dict[str, Any],
+    version_gate: dict[str, Any],
+    blockers: list[dict[str, Any]],
+) -> str:
+    if version_gate.get("gate") == "unsupported":
+        return "version_unsupported"
+    if not bool(http_status.get("available")):
+        return "native_http_unavailable"
+    if version_gate.get("gate") == "unknown":
+        return "version_unknown"
+    if blockers:
+        return "needs_attention"
+    return "ready"
+
+
+def _native_migration_plan(
+    status: str,
+    version_gate: dict[str, Any],
+    http_status: dict[str, Any],
+    message_candidates: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    steps = [
+        {
+            "step": "confirm_version",
+            "status": "done" if version_gate.get("gate") == "supported" else "blocked",
+            "detail": f"supported={','.join(_SUPPORTED_WECHAT_NATIVE_VERSIONS)} detected={version_gate.get('best_version') or 'unknown'}",
+        },
+        {
+            "step": "confirm_native_http",
+            "status": "done" if http_status.get("available") else "blocked",
+            "detail": str(http_status.get("status") or http_status.get("reason") or ""),
+        },
+        {
+            "step": "confirm_message_path",
+            "status": "done" if any(item.get("exists") and int(item.get("score", 0) or 0) >= 40 for item in message_candidates) else "pending",
+            "detail": "use the highest scoring existing xwechat_files / WeChat Files candidate",
+        },
+        {
+            "step": "cleanup_historical_hook_residue",
+            "status": "dry_run_only",
+            "detail": "review cleanup_manifest before deleting reference/cache directories",
+        },
+    ]
+    if status == "ready":
+        steps.append({"step": "start_bridge_worker", "status": "next", "detail": "use bridge_outbox + wechat_native_http"})
+    return steps
+
+
+def _native_deploy_manifest(
+    *,
+    status: str,
+    version_gate: dict[str, Any],
+    http_status: dict[str, Any],
+    message_candidates: list[dict[str, Any]],
+    artifact_inventory: dict[str, Any],
+    cleanup_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    required_paths = [
+        _deploy_path_item("app/personal_wechat_bot", role="runtime_package", required=True),
+        _deploy_path_item("scripts/start_sidebar_frontend.py", role="sidebar_launcher", required=True),
+        _deploy_path_item("scripts/send_bridge_worker.py", role="send_bridge_worker", required=True),
+        _deploy_path_item("scripts/deploy_wechat_native_hook.ps1", role="native_hook_deploy_script", required=True),
+        _deploy_path_item("scripts/build_wechat_native_hook.ps1", role="native_hook_build_script", required=True),
+        _deploy_path_item("vendor/artifacts/wechat-native-411053/version.dll", role="current_native_hook_dll", required=True),
+    ]
+    optional_paths = [
+        _deploy_path_item("requirements-document.txt", role="document_tools_requirements", required=False),
+        _deploy_path_item("requirements-ocr-light.txt", role="light_ocr_requirements", required=False),
+        _deploy_path_item("requirements-asr-light.txt", role="light_asr_requirements", required=False),
+        _deploy_path_item("requirements-windows-ui.txt", role="windows_ui_requirements", required=False),
+        _deploy_path_item("vendor/reference/WeFlow-gitcode/package.json", role="weflow_reference_package", required=False),
+        _deploy_path_item("vendor/reference/WeFlow-gitcode/package-lock.json", role="weflow_reference_lockfile", required=False),
+    ]
+    missing_required = [item for item in required_paths if not item.get("exists")]
+    cleanup_items = cleanup_manifest.get("items") if isinstance(cleanup_manifest.get("items"), list) else []
+    cleanup_candidates = [
+        {
+            "relative_path": str(item.get("relative_path") or ""),
+            "classification": str(item.get("classification") or ""),
+            "safe_to_delete_after_review": bool(item.get("safe_to_delete_after_review", False)),
+            "exists": bool(item.get("exists", False)),
+        }
+        for item in cleanup_items
+        if isinstance(item, dict) and bool(item.get("exists", False))
+    ]
+    current_artifacts = artifact_inventory.get("current_artifacts")
+    if not isinstance(current_artifacts, list):
+        current_artifacts = []
+    version_supported = version_gate.get("gate") == "supported"
+    http_available = bool(http_status.get("available"))
+    message_path_confirmed = any(
+        item.get("exists") and int(item.get("score", 0) or 0) >= 40
+        for item in message_candidates
+        if isinstance(item, dict)
+    )
+    blockers: list[dict[str, Any]] = []
+    if missing_required:
+        blockers.append(
+            {
+                "code": "missing_required_deploy_paths",
+                "paths": [str(item.get("relative_path") or "") for item in missing_required],
+            }
+        )
+    if not version_supported:
+        blockers.append(
+            {
+                "code": "wechat_version_not_supported",
+                "detected": version_gate.get("best_version") or "unknown",
+                "required": list(_SUPPORTED_WECHAT_NATIVE_VERSIONS),
+            }
+        )
+    if not http_available:
+        blockers.append({"code": "native_http_not_ready", "reason": str(http_status.get("reason") or "")})
+    if not message_path_confirmed:
+        blockers.append({"code": "message_path_not_confirmed"})
+    return {
+        "schema": "native_deploy_manifest_v1",
+        "status": "ready" if not blockers and status == "ready" else "needs_attention",
+        "github_checkout_policy": "required paths must be committed or documented; generated caches/node_modules/build outputs stay reinstallable and should not be treated as runtime truth",
+        "required_paths": required_paths,
+        "optional_dependency_paths": optional_paths,
+        "current_artifacts": [
+            {
+                "relative_path": str(item.get("relative_path") or ""),
+                "role": str(item.get("role") or ""),
+                "exists": bool(item.get("exists", False)),
+                "keep": bool(item.get("keep", False)),
+            }
+            for item in current_artifacts
+            if isinstance(item, dict)
+        ],
+        "operator_steps": [
+            {
+                "step": "install_python_dependencies",
+                "status": "manual",
+                "command": "python -m pip install -r requirements-document.txt -r requirements-ocr-light.txt -r requirements-asr-light.txt -r requirements-windows-ui.txt",
+            },
+            {
+                "step": "probe_pc_wechat",
+                "status": "manual",
+                "command": "python -m app.personal_wechat_bot.main --data-dir data native-migration-probe",
+            },
+            {
+                "step": "deploy_native_hook",
+                "status": "manual",
+                "command": "powershell -ExecutionPolicy Bypass -File scripts/deploy_wechat_native_hook.ps1",
+            },
+            {
+                "step": "start_sidebar_and_bridge",
+                "status": "manual",
+                "command": "python scripts/start_sidebar_frontend.py --data-dir data",
+            },
+        ],
+        "cleanup_candidates": cleanup_candidates,
+        "blockers": blockers,
+    }
+
+
+def _deploy_path_item(relative_path: str, *, role: str, required: bool) -> dict[str, Any]:
+    path = _repo_root() / relative_path
+    return {
+        "relative_path": relative_path,
+        "path": str(path),
+        "role": role,
+        "required": required,
+        "exists": path.exists(),
+    }
+
+
+def _native_hook_artifact_inventory(*, include_sizes: bool) -> dict[str, Any]:
+    items = [
+        _native_path_inventory_item(
+            "vendor/artifacts/wechat-native-411053",
+            role="current_native_hook_artifact",
+            keep=True,
+            reason="preferred deploy artifact for the project-owned PC WeChat 4.1.10.53 native bridge",
+            include_sizes=include_sizes,
+        ),
+        _native_path_inventory_item(
+            "vendor/artifacts/wechat-hook-411053-text",
+            role="verified_text_hook_artifact",
+            keep=True,
+            reason="known text-capable 4.1.10.53 artifact used as compatibility evidence",
+            include_sizes=include_sizes,
+        ),
+        _native_path_inventory_item(
+            "vendor/artifacts/wechat-hook-411053-image-experimental",
+            role="experimental_media_hook",
+            keep=False,
+            reason="experimental image-path artifact; not part of the current real-send baseline",
+            include_sizes=include_sizes,
+        ),
+        _native_path_inventory_item(
+            "vendor/reference/WeChat-Hook-aixed",
+            role="native_hook_source_reference",
+            keep=False,
+            reason="source/reference tree for rebuilding; can be archived outside SSD after artifact is frozen",
+            include_sizes=include_sizes,
+        ),
+        _native_path_inventory_item(
+            "vendor/reference/WeFlow-gitcode",
+            role="weflow_reference_fork",
+            keep=False,
+            reason="large reference fork; node_modules/dist output are cache/build products",
+            include_sizes=include_sizes,
+        ),
+        _native_path_inventory_item(
+            "vendor/reference/WeChatFerry-gitee",
+            role="deprecated_wcf_reference",
+            keep=False,
+            reason="deprecated WCF reference; do not resurrect as foreground/native send path",
+            include_sizes=include_sizes,
+        ),
+        _native_path_inventory_item(
+            "vendor/reference/wxbot",
+            role="deprecated_bot_reference",
+            keep=False,
+            reason="legacy reference bot, not part of current bridge pipeline",
+            include_sizes=include_sizes,
+        ),
+        _native_path_inventory_item(
+            "vendor/reference/wechat-binaries",
+            role="wechat_binary_reference_archive",
+            keep=False,
+            reason="large binary archive for reverse-engineering reference; not needed at runtime",
+            include_sizes=include_sizes,
+        ),
+    ]
+    return {
+        "schema": "native_hook_artifact_inventory_v1",
+        "items": items,
+        "current_artifacts": [item for item in items if item.get("keep")],
+        "historical_count": sum(1 for item in items if not item.get("keep")),
+    }
+
+
+def _native_hook_cleanup_manifest(*, include_sizes: bool) -> dict[str, Any]:
+    items = [
+        _native_cleanup_item(
+            "vendor/reference/WeFlow-gitcode/node_modules",
+            classification="reinstallable_cache",
+            reason="npm dependencies are restorable from package-lock; not needed in a GitHub checkout",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/WeFlow-gitcode/dist-electron",
+            classification="build_output",
+            reason="WeFlow build output can be regenerated from source",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/WeFlow-gitcode/.git",
+            classification="nested_vcs_cache",
+            reason="vendored reference history is not needed at runtime; keep package files and reinstall dependencies as needed",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/WeChat-Hook-aixed/.git",
+            classification="nested_vcs_cache",
+            reason="nested git history is not needed to build the current hook source tree",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/WeChat-Hook-aixed/x64",
+            classification="build_output",
+            reason="MSBuild output is regenerated by scripts/build_wechat_native_hook.ps1",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/WeChat-Hook-aixed/x64_Version",
+            classification="build_output",
+            reason="legacy native build output; current deploy artifact lives under vendor/artifacts/wechat-native-411053",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/artifacts/wechat-hook-411053-image-experimental",
+            classification="experimental_artifact",
+            reason="not part of current wechat_native_http baseline",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/WeChatFerry-gitee",
+            classification="deprecated_reference",
+            reason="WCF/Wcferry path is intentionally removed from the current architecture",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/wxbot",
+            classification="deprecated_reference",
+            reason="legacy bot reference, no active import/runtime dependency",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/downloads/LibreOffice_26.2.4_Win_x86-64.msi",
+            classification="installer_cache",
+            reason="large installer cache; runtime lives under vendor/libreoffice",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/downloads/libreoffice_admin_extract.log",
+            classification="install_log",
+            reason="large extraction log, not needed at runtime",
+            include_sizes=include_sizes,
+        ),
+        _native_cleanup_item(
+            "vendor/reference/wechat-binaries",
+            classification="reference_binary_archive",
+            reason="reverse-engineering archive; move off SSD if no longer needed locally",
+            include_sizes=include_sizes,
+            conservative=True,
+        ),
+    ]
+    total = sum(int(item.get("size_bytes", 0) or 0) for item in items if item.get("exists"))
+    return {
+        "schema": "native_hook_cleanup_manifest_v1",
+        "dry_run": True,
+        "delete_performed": False,
+        "requires_explicit_cleanup_action": True,
+        "total_candidate_bytes": total,
+        "items": items,
+    }
+
+
+def _native_path_inventory_item(
+    relative_path: str,
+    *,
+    role: str,
+    keep: bool,
+    reason: str,
+    include_sizes: bool,
+) -> dict[str, Any]:
+    path = _repo_root() / relative_path
+    size = _path_size_summary(path) if include_sizes else {"size_bytes": 0, "file_count": 0, "truncated": False}
+    return {
+        "path": str(path),
+        "relative_path": relative_path,
+        "exists": path.exists(),
+        "role": role,
+        "keep": keep,
+        "reason": reason,
+        **size,
+    }
+
+
+def _native_cleanup_item(
+    relative_path: str,
+    *,
+    classification: str,
+    reason: str,
+    include_sizes: bool,
+    conservative: bool = False,
+) -> dict[str, Any]:
+    path = _repo_root() / relative_path
+    size = _path_size_summary(path) if include_sizes else {"size_bytes": 0, "file_count": 0, "truncated": False}
+    return {
+        "path": str(path),
+        "relative_path": relative_path,
+        "exists": path.exists(),
+        "classification": classification,
+        "reason": reason,
+        "safe_to_delete_after_review": not conservative,
+        "conservative_review_required": conservative,
+        **size,
+    }
+
+
+def _path_size_summary(path: Path, *, max_files: int = 250_000) -> dict[str, Any]:
+    if not path.exists():
+        return {"size_bytes": 0, "file_count": 0, "truncated": False}
+    if path.is_file():
+        try:
+            return {"size_bytes": path.stat().st_size, "file_count": 1, "truncated": False}
+        except OSError:
+            return {"size_bytes": 0, "file_count": 0, "truncated": True}
+    total = 0
+    count = 0
+    truncated = False
+    try:
+        iterator = path.rglob("*")
+        for child in iterator:
+            if not child.is_file():
+                continue
+            count += 1
+            if count > max_files:
+                truncated = True
+                break
+            try:
+                total += child.stat().st_size
+            except OSError:
+                truncated = True
+    except OSError:
+        truncated = True
+    return {"size_bytes": total, "file_count": count, "truncated": truncated}
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
 def _safe_wechat_window_probe(
     data_dir: str | Path,
     *,
@@ -534,9 +2322,28 @@ def cleanup_sidebar_channels(data_dir: str | Path, *, hidden_only: bool = True) 
 
 
 def update_sidebar_controls(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
     mode = payload.get("mode")
     enabled = _payload_bool(payload, "send_enabled")
     driver = payload.get("send_driver")
+    backend = payload.get("send_backend") or payload.get("sendBackend")
+    weflow_base_url = payload.get("weflow_base_url") or payload.get("weflowBaseUrl")
+    weflow_token_env = payload.get("weflow_token_env") or payload.get("weflowTokenEnv")
+    weflow_text_path = payload.get("weflow_send_text_path") or payload.get("weflowSendTextPath")
+    weflow_file_path = payload.get("weflow_send_file_path") or payload.get("weflowSendFilePath")
+    weflow_timeout = payload.get("weflow_send_timeout_seconds") or payload.get("weflowSendTimeoutSeconds")
+    wechat_native_base_url = payload.get("wechat_native_base_url") or payload.get("wechatHookBaseUrl")
+    wechat_native_text_path = payload.get("wechat_native_send_text_path") or payload.get("wechatHookSendTextPath")
+    wechat_native_image_path = payload.get("wechat_native_send_image_path") or payload.get("wechatHookSendImagePath")
+    wechat_native_file_path = payload.get("wechat_native_send_file_path") or payload.get("wechatHookSendFilePath")
+    wechat_native_status_path = payload.get("wechat_native_status_path") or payload.get("wechatHookStatusPath")
+    wechat_native_timeout = payload.get("wechat_native_timeout_seconds") or payload.get("wechatHookTimeoutSeconds")
+    wechat_native_verify_timeout = (
+        payload.get("wechat_native_verify_timeout_seconds") or payload.get("wechatHookVerifyTimeoutSeconds")
+    )
+    wechat_native_file_verify_timeout = (
+        payload.get("wechat_native_file_verify_timeout_seconds") or payload.get("wechatHookFileVerifyTimeoutSeconds")
+    )
     confirm_required = _payload_bool(payload, "send_confirm_required")
     max_chars = payload.get("send_max_chars")
     min_interval_seconds = payload.get("send_min_interval_seconds")
@@ -545,12 +2352,37 @@ def update_sidebar_controls(data_dir: str | Path, payload: dict[str, Any]) -> di
         mode=str(mode) if mode is not None else None,
         enabled=enabled,
         driver=str(driver) if driver is not None else None,
+        backend=str(backend) if backend is not None else None,
+        weflow_base_url=str(weflow_base_url) if weflow_base_url is not None else None,
+        weflow_token_env=str(weflow_token_env) if weflow_token_env is not None else None,
+        weflow_send_text_path=str(weflow_text_path) if weflow_text_path is not None else None,
+        weflow_send_file_path=str(weflow_file_path) if weflow_file_path is not None else None,
+        weflow_send_timeout_seconds=float(weflow_timeout) if weflow_timeout is not None else None,
+        wechat_native_base_url=str(wechat_native_base_url) if wechat_native_base_url is not None else None,
+        wechat_native_send_text_path=str(wechat_native_text_path) if wechat_native_text_path is not None else None,
+        wechat_native_send_image_path=str(wechat_native_image_path) if wechat_native_image_path is not None else None,
+        wechat_native_send_file_path=str(wechat_native_file_path) if wechat_native_file_path is not None else None,
+        wechat_native_status_path=str(wechat_native_status_path) if wechat_native_status_path is not None else None,
+        wechat_native_timeout_seconds=float(wechat_native_timeout) if wechat_native_timeout is not None else None,
+        wechat_native_verify_timeout_seconds=(
+            float(wechat_native_verify_timeout) if wechat_native_verify_timeout is not None else None
+        ),
+        wechat_native_file_verify_timeout_seconds=(
+            float(wechat_native_file_verify_timeout) if wechat_native_file_verify_timeout is not None else None
+        ),
         confirm_required=confirm_required,
         max_chars=int(max_chars) if max_chars is not None else None,
         min_interval_seconds=int(min_interval_seconds) if min_interval_seconds is not None else None,
     )
     runtime_config = _update_runtime_modes_from_payload(data_dir, payload)
-    return {"status": "ok", "send_controls": controls, "runtime_modes": runtime_config, "runtime_config": runtime_config}
+    bridge_worker = _reconcile_bridge_worker_after_config_change(root, dict(payload))
+    return {
+        "status": "ok",
+        "send_controls": controls,
+        "runtime_modes": runtime_config,
+        "runtime_config": runtime_config,
+        "bridge_worker": bridge_worker,
+    }
 
 
 def _payload_bool(payload: dict[str, Any], key: str) -> bool | None:
@@ -772,7 +2604,201 @@ def append_sidebar_backend_event(data_dir: str | Path, payload: dict[str, Any]) 
     }
 
 
+def sidebar_channel_test_reply(
+    data_dir: str | Path,
+    conversation_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    root = Path(data_dir).resolve()
+    config = ensure_config(root)
+    review_required = bool(getattr(config, "send_confirm_required", True))
+    channel = _require_sidebar_channel(root, conversation_id)
+    scope_error = _sidebar_channel_send_scope_error(channel, payload, default_require=True)
+    if scope_error:
+        return {
+            "status": "blocked",
+            "action": "channel_test_reply",
+            "conversation_id": channel.conversation_id,
+            "reason": scope_error,
+            "message": scope_error,
+        }
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        text = f"【sidebar测试】这是一条发往 {channel.chat_title or channel.conversation_id} 的通道文本投递探针。"
+    reply = _sidebar_test_reply_candidate(
+        channel,
+        text=text,
+        origin="sidebar_channel_test_reply",
+        attachments=[],
+        review_required=review_required,
+    )
+    entry = ConversationLedgerStore(root).append_reply(
+        reply,
+        chat_title=channel.chat_title,
+        conversation_type=channel.conversation_type or "private",
+    )
+    dispatch = _dispatch_sidebar_test_reply(root, reply, entry.entry_id)
+    return {
+        "status": "ok",
+        "action": "channel_test_reply",
+        "conversation_id": channel.conversation_id,
+        **dispatch,
+        "reply": asdict(reply),
+        "ledger_entry_id": entry.entry_id,
+        "message": dispatch.get("message", ""),
+    }
+
+
+def sidebar_channel_test_file(
+    data_dir: str | Path,
+    conversation_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    root = Path(data_dir).resolve()
+    channel = _require_sidebar_channel(root, conversation_id)
+    scope_error = _sidebar_channel_send_scope_error(channel, payload, default_require=True)
+    if scope_error:
+        return {
+            "status": "blocked",
+            "action": "channel_test_file",
+            "conversation_id": channel.conversation_id,
+            "reason": scope_error,
+            "message": scope_error,
+        }
+    config = ensure_config(root)
+    review_required = bool(getattr(config, "send_confirm_required", True))
+    upload = payload.get("file") if isinstance(payload.get("file"), dict) else payload
+    raw_name = str(upload.get("name") or payload.get("name") or "upload.bin").strip()
+    safe_name = _safe_upload_filename(raw_name)
+    content_base64 = str(
+        upload.get("content_base64")
+        or upload.get("contentBase64")
+        or upload.get("base64")
+        or payload.get("content_base64")
+        or ""
+    ).strip()
+    if not content_base64:
+        raise ValueError("file.content_base64 is required")
+    content = _decode_upload_base64(content_base64)
+    max_bytes = int(getattr(config, "file_max_bytes", 20 * 1024 * 1024) or 20 * 1024 * 1024)
+    if len(content) > max_bytes:
+        raise ValueError(f"uploaded file exceeds file_max_bytes: {len(content)} > {max_bytes}")
+    segment = str(getattr(channel, "segment", "") or channel.conversation_id or "unknown")
+    target_dir = root / "outgoing_uploads" / _safe_upload_filename(segment)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = (target_dir / f"{uuid4().hex[:12]}_{safe_name}").resolve()
+    if root not in target.parents:
+        raise ValueError("upload target escapes data_dir")
+    target.write_bytes(content)
+    caption = str(payload.get("caption") or payload.get("text") or "").strip()
+    attachment = {
+        "path": str(target),
+        "name": safe_name,
+        "kind": _upload_kind_for_name(safe_name),
+        "mime_type": str(upload.get("mime_type") or upload.get("type") or payload.get("mime_type") or "").strip(),
+        "size": len(content),
+        "status": "outgoing",
+        "source": "sidebar_channel_test_file",
+    }
+    reply = _sidebar_test_reply_candidate(
+        channel,
+        text=caption,
+        origin="sidebar_channel_test_file",
+        attachments=[attachment],
+        review_required=review_required,
+    )
+    entry = ConversationLedgerStore(root).append_reply(
+        reply,
+        chat_title=channel.chat_title,
+        conversation_type=channel.conversation_type or "private",
+    )
+    dispatch = _dispatch_sidebar_test_reply(root, reply, entry.entry_id)
+    return {
+        "status": "ok",
+        "action": "channel_test_file",
+        "conversation_id": channel.conversation_id,
+        **dispatch,
+        "reply": asdict(reply),
+        "ledger_entry_id": entry.entry_id,
+        "stored_path": str(target),
+        "attachment": attachment,
+        "message": dispatch.get("message", ""),
+    }
+
+
+def _dispatch_sidebar_test_reply(root: Path, reply: ReplyCandidate, ledger_entry_id: str) -> dict[str, Any]:
+    config = ensure_config(root)
+    if bool(getattr(config, "send_confirm_required", True)):
+        queue = ConfirmQueue(root / "confirm_queue.jsonl")
+        queue_id = queue.enqueue(reply)
+        return {
+            "dispatch_mode": "confirm",
+            "queue_id": queue_id,
+            "item": queue.get(queue_id),
+            "send_result": {},
+            "message": "测试发送已进入发送审核",
+        }
+    _start_bridge_worker(root, {"source": "sidebar_channel_test_auto"})
+    send_result = GuardedSendExecutor(config, build_send_driver(config)).execute_auto(reply)
+    ledger_updated = ConversationLedgerStore(root).update_reply_send_result(
+        reply.conversation_id,
+        ledger_entry_id,
+        send_result,
+    )
+    SendAuditLog(root / "send_audit.jsonl").append(
+        "confirm_send_attempt",
+        queue_id=reply.message_id,
+        status=send_result.status,
+        reason=send_result.reason,
+        payload={
+            "conversation_id": reply.conversation_id,
+            "message_id": reply.message_id,
+            "send_result": asdict(send_result),
+            "dispatch_mode": "auto",
+            "ledger_updated": ledger_updated,
+        },
+    )
+    return {
+        "dispatch_mode": "auto",
+        "queue_id": "",
+        "item": {},
+        "send_result": asdict(send_result),
+        "message": f"测试发送已自动投递：{send_result.status}",
+    }
+
+
+def _sidebar_channel_send_scope_error(channel: Any, payload: dict[str, Any], *, default_require: bool = False) -> str:
+    raw_require = payload.get("require_scope", payload.get("requireScope", default_require))
+    if not bool(raw_require):
+        return ""
+    talkers = set(_string_list(payload.get("talkers") or payload.get("talker") or []))
+    if not talkers:
+        return "send_scope_required: select at least one talker before sending"
+    channel_ids = {
+        str(getattr(channel, "conversation_id", "") or "").strip(),
+        str(getattr(channel, "conversation_key", "") or "").strip(),
+        str(getattr(channel, "chat_title", "") or "").strip(),
+    }
+    sender_ids = getattr(channel, "sender_wechat_ids", [])
+    if isinstance(sender_ids, list):
+        channel_ids.update(str(item or "").strip() for item in sender_ids)
+    sender_names = getattr(channel, "sender_names", [])
+    if isinstance(sender_names, list):
+        channel_ids.update(str(item or "").strip() for item in sender_names)
+    channel_ids.discard("")
+    if not talkers.intersection(channel_ids):
+        return "send_scope_mismatch: selected talkers do not include this channel"
+    return ""
+
+
 def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    with _AGENT_TICK_LOCK:
+        return _sidebar_agent_tick_unlocked(data_dir, payload)
+
+
+def _sidebar_agent_tick_unlocked(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run one bounded dialog-agent tick over the backend event bus."""
 
     payload = payload if isinstance(payload, dict) else {}
@@ -783,50 +2809,74 @@ def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | 
     event_file.parent.mkdir(parents=True, exist_ok=True)
     event_file.touch(exist_ok=True)
     loops = _bounded_int(payload.get("loops"), 1, 1, 20)
-    requested_conversations = _string_list(payload.get("conversation_ids") or payload.get("conversationIds") or [])
+    requested_talkers = _agent_requested_talkers(payload)
+    requested_conversations = _agent_requested_conversation_ids(root, payload)
+    requested_scope = _agent_has_requested_scope(payload)
+    cursor_scope_ids = _agent_cursor_scope_ids(
+        requested_scope=requested_scope,
+        requested_talkers=requested_talkers,
+        requested_conversation_ids=requested_conversations,
+    )
+    requested_snapshot_scope = requested_conversations if requested_scope else None
+    agent_state_before = _read_agent_state(root)
+    restore_cursor = not bool(payload.get("replay") or payload.get("ignore_cursor") or payload.get("ignoreCursor"))
     job_id = f"agent-tick-{uuid4().hex[:12]}"
     task_id = job_id
     store = TaskStatusStore(root)
-    store.create(
-        {
-            "task_id": task_id,
-            "title": "运行对话 Agent",
-            "kind": "Agent",
-            "status": "queued",
-            "priority": 90,
-            "progress": 5,
-            "phase": "等待读取会话文件",
-            "detail": str(event_file),
-            "concurrency_key": "agent:tick",
-            "resource_class": "llm_interactive",
-            "estimated_cost": 2,
-            "external_id": job_id,
-            "metadata": {
-                "event_file": str(event_file),
-                "scope_label": "对话 Agent",
-                "loops": loops,
-            },
-        }
+    task_payload = {
+        "task_id": task_id,
+        "title": "运行对话 Agent",
+        "kind": "Agent",
+        "status": "queued",
+        "priority": 90,
+        "progress": 5,
+        "phase": "等待读取会话文件",
+        "detail": str(event_file),
+        "concurrency_key": "agent:tick",
+        "resource_class": "llm_interactive",
+        "estimated_cost": 2,
+        "external_id": job_id,
+        "metadata": {
+            "event_file": str(event_file),
+            "scope_label": "对话 Agent",
+            "loops": loops,
+        },
+    }
+    _safe_agent_tick_task_create(store, task_payload)
+    _safe_agent_tick_task_transition(
+        store,
+        task_id,
+        "start",
+        {"progress": 15, "phase": "正在读取当前 session 对话文件"},
+        base_payload=task_payload,
     )
-    store.transition(task_id, "start", {"progress": 15, "phase": "正在读取当前 session 对话文件"})
-    snapshot_before = _agent_session_snapshot(root, runtime=runtime, conversation_ids=requested_conversations)
+    snapshot_before = _agent_session_snapshot(root, runtime=runtime, conversation_ids=requested_snapshot_scope)
     result: dict[str, Any]
     processed_conversations: list[str] = []
+    cursor_restored = False
+    cursor_after: dict[str, Any] = {}
     try:
         driver = _build_agent_backend_driver(
             config,
             runtime,
             event_file,
+            allowed_conversation_ids=requested_conversations if requested_scope else None,
             extra_roots=_string_list(payload.get("extra_roots") or payload.get("extraRoots") or []),
         )
+        if restore_cursor:
+            cursor_restored = driver.restore_cursor(
+                _agent_event_cursor(agent_state_before, event_file, scope_ids=cursor_scope_ids)
+            )
         runtime.active_driver = driver
-        store.update(
+        _safe_agent_tick_task_update(
+            store,
             task_id,
             {
                 "progress": 35,
                 "phase": "正在运行消息聚合与接话管线",
-                "detail": f"会话快照 {snapshot_before.get('conversation_count', 0)} 个",
+                "detail": f"会话快照 {snapshot_before.get('conversation_count', 0)} 个；游标{'已恢复' if cursor_restored else '从头读取'}",
             },
+            base_payload=task_payload,
         )
         result = PollingRunner(
             runtime,
@@ -834,29 +2884,65 @@ def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | 
             poll_interval_seconds=0,
             workload="interactive",
         ).run_forever(max_loops=loops)
+        cursor_after = driver.cursor()
         processed_conversations = _agent_processed_conversation_ids(result)
+        after_scope = _dedupe_strings([*requested_conversations, *processed_conversations])
         snapshot_after = _agent_session_snapshot(
             root,
             runtime=runtime,
-            conversation_ids=_dedupe_strings([*requested_conversations, *processed_conversations]),
+            conversation_ids=after_scope if requested_scope else None,
         )
+        proactive_replies = _agent_generate_proactive_replies(
+            root,
+            runtime=runtime,
+            snapshot=snapshot_after,
+            limit=_bounded_int(payload.get("proactive_limit") or payload.get("proactiveLimit"), 10, 0, 10),
+            enabled=bool(payload.get("proactive_pending", payload.get("proactivePending", True))),
+        )
+        if proactive_replies:
+            processed_conversations = _dedupe_strings(
+                [
+                    *processed_conversations,
+                    *[str(item.get("conversation_id") or "") for item in proactive_replies],
+                ]
+            )
+            after_scope = _dedupe_strings([*requested_conversations, *processed_conversations])
+            snapshot_after = _agent_session_snapshot(
+                root,
+                runtime=runtime,
+                conversation_ids=after_scope if requested_scope else None,
+            )
         processed_count = int(result.get("processed_count") or 0)
-        store.transition(
+        result["proactive_replies"] = proactive_replies
+        result["proactive_attempt_count"] = len(proactive_replies)
+        result["proactive_reply_count"] = sum(
+            1
+            for item in proactive_replies
+            if isinstance(item, dict) and str(item.get("status") or "") == "ok"
+        )
+        result["requested_talkers"] = requested_talkers
+        result["requested_conversation_ids"] = requested_conversations
+        _safe_agent_tick_task_transition(
+            store,
             task_id,
             "complete",
             {
                 "progress": 100,
                 "phase": "一次接话管线已完成",
                 "detail": f"处理 {processed_count} 条消息；聚合 {snapshot_after.get('conversation_count', 0)} 个通道",
-                "actual_cost": max(1, processed_count),
+                "actual_cost": max(1, processed_count + len(proactive_replies)),
             },
+            base_payload=task_payload,
         )
         status = "ok"
         error = ""
     except Exception as exc:
         result = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "processed_count": 0, "processed": []}
-        snapshot_after = _agent_session_snapshot(root, runtime=runtime, conversation_ids=requested_conversations)
-        store.transition(
+        result["requested_talkers"] = requested_talkers
+        result["requested_conversation_ids"] = requested_conversations
+        snapshot_after = _agent_session_snapshot(root, runtime=runtime, conversation_ids=requested_snapshot_scope)
+        _safe_agent_tick_task_transition(
+            store,
             task_id,
             "fail",
             {
@@ -865,12 +2951,25 @@ def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | 
                 "detail": str(exc),
                 "last_error": str(exc),
             },
+            base_payload=task_payload,
         )
         status = "error"
         error = str(exc)
+    agent_state = _record_agent_tick_state(
+        root,
+        event_file=event_file,
+        job_id=job_id,
+        status=status,
+        result=result,
+        snapshot=snapshot_after,
+        cursor=cursor_after,
+        cursor_scope_ids=cursor_scope_ids,
+        cursor_restored=cursor_restored,
+        error=error,
+    )
     channels = _channel_state(root)
     task_manager = build_sidebar_task_manager(root)
-    queues = {queue_status: list_confirm_queue(root, status=queue_status) for queue_status in QUEUE_STATUSES}
+    queues = _sidebar_queue_state(root, channels_state=channels)
     response = {
         "status": status,
         "agent": {
@@ -880,11 +2979,20 @@ def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | 
             "event_file": str(event_file),
             "loops": loops,
             "processed_count": int(result.get("processed_count") or 0),
+            "proactive_reply_count": int(result.get("proactive_reply_count") or 0),
+            "proactive_attempt_count": int(result.get("proactive_attempt_count") or 0),
+            "proactive_replies": result.get("proactive_replies", []),
             "processed": result.get("processed", []),
             "runner_status": result.get("status", ""),
             "processed_conversation_ids": processed_conversations,
+            "requested_talkers": requested_talkers,
+            "requested_conversation_ids": requested_conversations,
+            "aggregation_mode": "per_channel",
+            "cursor_restored": cursor_restored,
+            "cursor": cursor_after,
             "policy": "read_session_snapshot_then_poll_backend_events_then_reply_gate",
         },
+        "agent_state": agent_state,
         "session_snapshot": {
             "before": snapshot_before,
             "after": snapshot_after,
@@ -896,6 +3004,522 @@ def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | 
     if error:
         response["error"] = error
     return response
+
+
+def _safe_agent_tick_task_create(store: TaskStatusStore, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return store.create(payload)
+    except Exception as exc:
+        logger.warning("agent tick task create failed: %s", exc)
+        return {}
+
+
+def _safe_agent_tick_task_update(
+    store: TaskStatusStore,
+    task_id: str,
+    patch: dict[str, Any],
+    *,
+    base_payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return store.update(task_id, patch)
+    except KeyError:
+        return _safe_agent_tick_task_create(store, {**base_payload, **patch})
+    except Exception as exc:
+        logger.warning("agent tick task update failed for %s: %s", task_id, exc)
+        return {}
+
+
+def _safe_agent_tick_task_transition(
+    store: TaskStatusStore,
+    task_id: str,
+    action: str,
+    patch: dict[str, Any] | None = None,
+    *,
+    base_payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return store.transition(task_id, action, patch)
+    except KeyError:
+        status = {
+            "start": "running",
+            "pause": "paused",
+            "resume": "queued",
+            "wait": "waiting",
+            "block": "blocked",
+            "complete": "completed",
+            "fail": "failed",
+            "cancel": "cancelled",
+        }.get(str(action or "").strip().lower(), str(base_payload.get("status") or "queued"))
+        return _safe_agent_tick_task_create(store, {**base_payload, **(patch or {}), "status": status})
+    except Exception as exc:
+        logger.warning("agent tick task transition failed for %s: %s", task_id, exc)
+        return {}
+
+
+def sidebar_agent_start(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Start a conservative continuous dialog-agent worker."""
+
+    payload = payload if isinstance(payload, dict) else {}
+    root = Path(data_dir).resolve()
+    event_file = _backend_event_file_path(root, payload)
+    key = str(root)
+    with _AGENT_LOCK:
+        requested_talkers = _agent_requested_talkers(payload)
+        requested_conversations = _agent_requested_conversation_ids(root, payload)
+        existing = _AGENT_WORKERS.get(key)
+        thread = existing.get("thread") if isinstance(existing, dict) else None
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            scope_check = _agent_running_worker_scope_check(
+                existing,
+                event_file=event_file,
+                requested_talkers=requested_talkers,
+                requested_conversation_ids=requested_conversations,
+            )
+            if not scope_check["match"]:
+                _upsert_agent_worker_task(
+                    root,
+                    progress=25,
+                    phase="连续接话已在其他作用域运行",
+                    detail=str(scope_check["reason"]),
+                )
+                return {
+                    "status": "blocked",
+                    "reason": "agent_worker_scope_mismatch",
+                    "message": "Dialog Agent worker is already running with a different scope; stop it before starting another scope.",
+                    "worker": _agent_worker_state(root),
+                    "running_scope": scope_check["running_scope"],
+                    "requested_scope": scope_check["requested_scope"],
+                    "agent_state": _agent_public_state(root),
+                    "task_manager": build_sidebar_task_manager(root),
+                }
+            _upsert_agent_worker_task(
+                root,
+                progress=25,
+                phase="连续接话已在运行",
+                detail=str(event_file),
+            )
+            return {
+                "status": "ok",
+                "worker": _agent_worker_state(root),
+                "agent_state": _agent_public_state(root),
+                "task_manager": build_sidebar_task_manager(root),
+                "message": "Dialog Agent worker is already running",
+            }
+        stop_event = threading.Event()
+        worker_payload = dict(payload)
+        worker_payload["loops"] = _bounded_int(worker_payload.get("loops"), 1, 1, 5)
+        interval = _bounded_float(worker_payload.get("interval_seconds") or worker_payload.get("intervalSeconds"), 2.0, 0.05, 60.0)
+        thread = threading.Thread(
+            target=_agent_background_loop,
+            args=(root, worker_payload, stop_event),
+            name="sidebar-agent-worker",
+            daemon=True,
+        )
+        _AGENT_WORKERS[key] = {
+            "thread": thread,
+            "stop": stop_event,
+            "started_at": time.time(),
+            "loops": 0,
+            "interval_seconds": interval,
+            "event_file": str(event_file),
+            "requested_talkers": requested_talkers,
+            "requested_conversation_ids": requested_conversations,
+            "last_status": "starting",
+            "last_error": "",
+            "last_tick_at": 0,
+            "last_heartbeat_at": 0,
+            "last_idle_at": 0,
+            "stop_requested": False,
+        }
+        _upsert_agent_worker_task(
+            root,
+            progress=15,
+            phase="连续接话后台 worker 已启动",
+            detail=str(event_file),
+        )
+        thread.start()
+    return {
+        "status": "ok",
+        "worker": _agent_worker_state(root),
+        "agent_state": _agent_public_state(root),
+        "task_manager": build_sidebar_task_manager(root),
+        "message": "Dialog Agent worker started",
+    }
+
+
+def _agent_running_worker_scope_check(
+    worker: dict[str, Any],
+    *,
+    event_file: Path,
+    requested_talkers: list[str],
+    requested_conversation_ids: list[str],
+) -> dict[str, Any]:
+    running_talkers = _dedupe_strings(
+        [str(item or "") for item in worker.get("requested_talkers", [])]
+        if isinstance(worker.get("requested_talkers"), list)
+        else []
+    )
+    running_conversations = _dedupe_strings(
+        [str(item or "") for item in worker.get("requested_conversation_ids", [])]
+        if isinstance(worker.get("requested_conversation_ids"), list)
+        else []
+    )
+    requested_talkers = _dedupe_strings(requested_talkers)
+    requested_conversation_ids = _dedupe_strings(requested_conversation_ids)
+    running_event_file = _normalize_path_for_compare(str(worker.get("event_file") or ""))
+    requested_event_file = _normalize_path_for_compare(str(event_file))
+    same_event_file = bool(running_event_file and requested_event_file and running_event_file == requested_event_file)
+    if running_conversations and requested_conversation_ids:
+        same_scope = set(running_conversations) == set(requested_conversation_ids)
+    else:
+        same_scope = set(running_talkers) == set(requested_talkers) and set(running_conversations) == set(requested_conversation_ids)
+    reason = ""
+    if not same_event_file:
+        reason = "event_file_mismatch"
+    elif not same_scope:
+        reason = "scope_mismatch"
+    return {
+        "match": bool(same_event_file and same_scope),
+        "reason": reason,
+        "running_scope": {
+            "event_file": str(worker.get("event_file") or ""),
+            "talkers": running_talkers,
+            "conversation_ids": running_conversations,
+        },
+        "requested_scope": {
+            "event_file": str(event_file),
+            "talkers": requested_talkers,
+            "conversation_ids": requested_conversation_ids,
+        },
+    }
+
+
+def _normalize_path_for_compare(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).resolve()).lower()
+    except Exception:
+        return text.lower()
+
+
+def sidebar_agent_stop(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Stop the continuous dialog-agent worker and terminalize its task."""
+
+    payload = payload if isinstance(payload, dict) else {}
+    root = Path(data_dir).resolve()
+    key = str(root)
+    thread: threading.Thread | None = None
+    with _AGENT_LOCK:
+        worker = _AGENT_WORKERS.get(key)
+        if worker and worker.get("stop"):
+            worker["stop"].set()
+            worker["stop_requested"] = True
+            worker["last_status"] = "stopping"
+            worker["last_heartbeat_at"] = time.time()
+            thread = worker.get("thread") if isinstance(worker.get("thread"), threading.Thread) else None
+    if thread is not None:
+        thread.join(timeout=1.0)
+    worker_state = _agent_worker_state(root)
+    finished_tasks = _finish_agent_worker_tasks(root, running=bool(worker_state.get("running")))
+    return {
+        "status": "ok",
+        "worker": worker_state,
+        "agent_state": _agent_public_state(root),
+        "task_manager": build_sidebar_task_manager(root),
+        "finished_tasks": finished_tasks,
+        "message": "Dialog Agent worker stop requested" if worker_state.get("running") else "Dialog Agent worker stopped",
+    }
+
+
+def _agent_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
+    interval = _bounded_float(payload.get("interval_seconds") or payload.get("intervalSeconds"), 2.0, 0.05, 60.0)
+    tick_payload = _agent_worker_tick_payload(payload)
+    try:
+        while not stop_event.is_set():
+            try:
+                pending = _agent_pending_event_snapshot(root, tick_payload)
+                _set_agent_worker_fields(
+                    root,
+                    interval_seconds=interval,
+                    event_file=pending.get("event_file", ""),
+                    event_file_size=pending.get("size", 0),
+                    cursor_offset=pending.get("cursor_offset", 0),
+                    last_heartbeat_at=time.time(),
+                )
+                if pending.get("has_new_events") or pending.get("has_pending_ledger"):
+                    _set_agent_worker_fields(root, last_status="running", last_error="", last_tick_at=time.time())
+                    _upsert_agent_worker_task(
+                        root,
+                        progress=35,
+                        phase="发现新消息，正在运行一次接话",
+                        detail=str(pending.get("event_file") or ""),
+                    )
+                    result = sidebar_agent_tick(root, tick_payload)
+                    agent = result.get("agent") if isinstance(result.get("agent"), dict) else {}
+                    processed_count = int(agent.get("processed_count") or result.get("processed_count") or 0)
+                    proactive_reply_count = int(agent.get("proactive_reply_count") or 0)
+                    proactive_attempt_count = int(agent.get("proactive_attempt_count") or 0)
+                    status = str(result.get("status") or "ok")
+                    pending_after = _agent_pending_event_snapshot(root, tick_payload)
+                    _set_agent_worker_fields(
+                        root,
+                        loops=_agent_worker_loop_count(root) + 1,
+                        event_file_size=pending_after.get("size", 0),
+                        cursor_offset=pending_after.get("cursor_offset", 0),
+                        last_status=status,
+                        last_error=str(result.get("error") or "") if status == "error" else "",
+                        last_tick_at=time.time(),
+                        last_processed_count=processed_count,
+                        last_proactive_reply_count=proactive_reply_count,
+                        last_result={
+                            "status": status,
+                            "processed_count": processed_count,
+                            "proactive_reply_count": proactive_reply_count,
+                            "proactive_attempt_count": proactive_attempt_count,
+                            "job_id": str(agent.get("job_id") or ""),
+                        },
+                    )
+                    _upsert_agent_worker_task(
+                        root,
+                        progress=45,
+                        phase="连续接话运行中，等待新消息",
+                        detail=f"last_processed={processed_count}; proactive={proactive_reply_count}",
+                    )
+                else:
+                    _set_agent_worker_fields(root, last_status="idle", last_error="", last_idle_at=time.time())
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                _set_agent_worker_fields(root, last_status="error", last_error=error, last_tick_at=time.time())
+                _upsert_agent_worker_task(
+                    root,
+                    progress=20,
+                    phase="连续接话遇到错误，等待重试",
+                    detail=error,
+                )
+            stop_event.wait(interval)
+    finally:
+        with _AGENT_LOCK:
+            worker = _AGENT_WORKERS.get(str(root.resolve()), {})
+            worker["stop_requested"] = False
+            if str(worker.get("last_status") or "") not in {"error"}:
+                worker["last_status"] = "stopped"
+            worker["last_heartbeat_at"] = time.time()
+            _AGENT_WORKERS[str(root.resolve())] = worker
+
+
+def _agent_worker_tick_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    tick_payload = dict(payload)
+    tick_payload["loops"] = _bounded_int(tick_payload.get("loops"), 1, 1, 5)
+    for key in ("replay", "ignore_cursor", "ignoreCursor"):
+        tick_payload.pop(key, None)
+    return tick_payload
+
+
+def _agent_requested_talkers(payload: dict[str, Any]) -> list[str]:
+    return _string_list(payload.get("talkers") or payload.get("talker") or [])
+
+
+def _agent_has_requested_scope(payload: dict[str, Any]) -> bool:
+    if _agent_requested_talkers(payload):
+        return True
+    return bool(_string_list(payload.get("conversation_ids") or payload.get("conversationIds") or []))
+
+
+def _agent_requested_conversation_ids(root: Path, payload: dict[str, Any]) -> list[str]:
+    explicit = _string_list(payload.get("conversation_ids") or payload.get("conversationIds") or [])
+    talkers = set(_agent_requested_talkers(payload))
+    if not talkers:
+        return _dedupe_strings(explicit)
+    matched: list[str] = []
+    try:
+        channels = _channel_store(root).list_channels()
+    except Exception:
+        channels = []
+    for channel in channels:
+        aliases = {
+            str(getattr(channel, "conversation_id", "") or "").strip(),
+            str(getattr(channel, "conversation_key", "") or "").strip(),
+            str(getattr(channel, "chat_title", "") or "").strip(),
+        }
+        aliases.update(str(item).strip() for item in getattr(channel, "sender_wechat_ids", []) if str(item).strip())
+        aliases.update(str(item).strip() for item in getattr(channel, "sender_names", []) if str(item).strip())
+        if aliases.intersection(talkers):
+            matched.append(str(channel.conversation_id))
+    return _dedupe_strings([*explicit, *matched])
+
+
+def _agent_cursor_scope_ids(
+    *,
+    requested_scope: bool,
+    requested_talkers: list[str],
+    requested_conversation_ids: list[str],
+) -> list[str] | None:
+    if not requested_scope:
+        return None
+    conversation_ids = _dedupe_strings(requested_conversation_ids)
+    if conversation_ids:
+        return [f"conversation:{item}" for item in conversation_ids]
+    return [f"talker:{item}" for item in _dedupe_strings(requested_talkers)]
+
+
+def _agent_pending_event_snapshot(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    event_file = _backend_event_file_path(root, payload)
+    exists = event_file.exists()
+    try:
+        size = event_file.stat().st_size if exists else 0
+    except OSError:
+        size = 0
+    cursor = _agent_event_cursor(_read_agent_state(root), event_file)
+    try:
+        cursor_offset = max(0, int(cursor.get("read_offset") or 0))
+    except (TypeError, ValueError):
+        cursor_offset = 0
+    has_cursor = bool(cursor)
+    has_new_events = bool(exists and size > 0 and (not has_cursor or size > cursor_offset or size < cursor_offset))
+    requested_talkers = _agent_requested_talkers(payload)
+    requested_conversations = _agent_requested_conversation_ids(root, payload)
+    ledger_pending = _agent_pending_ledger_snapshot(
+        root,
+        conversation_ids=requested_conversations if _agent_has_requested_scope(payload) else None,
+    )
+    return {
+        "event_file": str(event_file),
+        "exists": exists,
+        "size": size,
+        "cursor_offset": cursor_offset,
+        "has_cursor": has_cursor,
+        "has_new_events": has_new_events,
+        "requested_talkers": requested_talkers,
+        "requested_conversation_ids": requested_conversations,
+        **ledger_pending,
+    }
+
+
+def _agent_pending_ledger_snapshot(root: Path, *, conversation_ids: list[str] | None = None) -> dict[str, Any]:
+    pending_user_count = 0
+    blocked_pending_user_count = 0
+    opening_greeting_count = 0
+    pending_conversation_ids: list[str] = []
+    store = ConversationLedgerStore(root)
+    candidates = _dedupe_strings(conversation_ids) if conversation_ids is not None else _agent_conversation_ids_from_ledgers(root)
+    for conversation_id in candidates[:50]:
+        try:
+            entries = [_dataclass_payload(entry) for entry in store.read_entries(conversation_id)]
+        except Exception:
+            continue
+        if not entries:
+            continue
+        last = entries[-1]
+        if str(last.get("conversation_type") or "private") != "private":
+            continue
+        raw_pending = _agent_pending_user_entries(entries)
+        pending = _agent_actionable_pending_user_entries(entries, raw_pending)
+        if raw_pending and not pending:
+            blocked_pending_user_count += len(raw_pending)
+        if pending:
+            pending_user_count += len(pending)
+            pending_conversation_ids.append(conversation_id)
+            continue
+        has_assistant = any(str(item.get("role") or "") == "assistant" for item in entries)
+        if not has_assistant and str(last.get("role") or "") == "self":
+            opening_greeting_count += 1
+            pending_conversation_ids.append(conversation_id)
+    return {
+        "has_pending_ledger": pending_user_count > 0 or opening_greeting_count > 0,
+        "pending_user_count": pending_user_count,
+        "blocked_pending_user_count": blocked_pending_user_count,
+        "opening_greeting_count": opening_greeting_count,
+        "pending_conversation_ids": _dedupe_strings(pending_conversation_ids),
+    }
+
+
+def _agent_worker_loop_count(root: Path) -> int:
+    with _AGENT_LOCK:
+        worker = _AGENT_WORKERS.get(str(root.resolve()), {})
+        return int(worker.get("loops", 0) or 0)
+
+
+def _set_agent_worker_fields(root: Path, **patch: Any) -> None:
+    with _AGENT_LOCK:
+        key = str(root.resolve())
+        worker = dict(_AGENT_WORKERS.get(key, {}))
+        if not worker:
+            return
+        worker.update(patch)
+        _AGENT_WORKERS[key] = worker
+
+
+def _agent_worker_state(root: Path) -> dict[str, Any]:
+    key = str(root.resolve())
+    with _AGENT_LOCK:
+        worker = _AGENT_WORKERS.get(key, {})
+        thread = worker.get("thread")
+        running = bool(isinstance(thread, threading.Thread) and thread.is_alive())
+        return {
+            "running": running,
+            "started_at": worker.get("started_at", 0),
+            "loops": int(worker.get("loops", 0) or 0),
+            "interval_seconds": float(worker.get("interval_seconds", 0) or 0),
+            "event_file": str(worker.get("event_file") or ""),
+            "requested_talkers": list(worker.get("requested_talkers") or [])
+            if isinstance(worker.get("requested_talkers"), list)
+            else [],
+            "requested_conversation_ids": list(worker.get("requested_conversation_ids") or [])
+            if isinstance(worker.get("requested_conversation_ids"), list)
+            else [],
+            "event_file_size": int(worker.get("event_file_size", 0) or 0),
+            "cursor_offset": int(worker.get("cursor_offset", 0) or 0),
+            "last_status": str(worker.get("last_status", "")),
+            "last_error": str(worker.get("last_error", "")),
+            "last_tick_at": worker.get("last_tick_at", 0),
+            "last_heartbeat_at": worker.get("last_heartbeat_at", 0),
+            "last_idle_at": worker.get("last_idle_at", 0),
+            "last_processed_count": int(worker.get("last_processed_count", 0) or 0),
+            "last_result": worker.get("last_result") if isinstance(worker.get("last_result"), dict) else {},
+            "stop_requested": bool(worker.get("stop_requested")),
+        }
+
+
+def _upsert_agent_worker_task(root: Path, *, progress: int, phase: str, detail: str = "") -> dict[str, Any]:
+    return TaskStatusStore(root).create(
+        {
+            "task_id": "agent-worker",
+            "title": "连续对话 Agent",
+            "kind": "Agent",
+            "status": "running",
+            "priority": 85,
+            "progress": progress,
+            "phase": phase,
+            "detail": detail,
+            "finished_at": "",
+            "last_error": "",
+            "concurrency_key": "agent:worker",
+            "resource_class": "llm_interactive",
+            "estimated_cost": 1,
+            "external_id": "agent-worker",
+            "metadata": _worker_task_metadata(
+                scope_label="对话 Agent",
+                worker_kind="agent",
+                last_status="running",
+            ),
+        }
+    )
+
+
+def _finish_agent_worker_tasks(root: Path, *, running: bool) -> list[dict[str, Any]]:
+    return TaskStatusStore(root).finish_external(
+        "agent-worker",
+        {
+            "status": "cancelled" if running else "completed",
+            "progress": 100,
+            "phase": "停止信号已发送" if running else "连续接话已停止",
+            "detail": "user_requested_stop",
+            "actual_cost": 1,
+        },
+    )
 
 
 def build_sidebar_bridge_state(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -917,6 +3541,17 @@ def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | N
         or payload.get("shutdownProcesses")
     ):
         return _schedule_sidebar_history_reset_shutdown(root, payload)
+    if not bool(payload.get("force") or payload.get("forceClear")) and str(payload.get("source") or "") != "shutdown_helper":
+        blockers = _history_clear_active_runtime_blockers(root)
+        if blockers:
+            return {
+                "status": "blocked",
+                "reason": "history_clear_runtime_active",
+                "message": "Stop running Agent/WeFlow history writers first, or use shutdown_processes so cleanup runs after shutdown.",
+                "active_workers": blockers,
+                "policy": "history_clear_requires_idle_history_writers",
+                "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
+            }
     removed: list[dict[str, Any]] = []
     retained_locked: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -949,13 +3584,62 @@ def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | N
         "error_count": len(errors),
         "errors": errors,
         "retained_config": [str(item) for item in sorted(retained)],
+        "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
         "reinitialized": reinitialized,
     }
 
 
+def _history_clear_active_runtime_blockers(root: Path) -> list[dict[str, Any]]:
+    root = root.resolve()
+    key = str(root)
+    blockers: list[dict[str, Any]] = []
+    with _AGENT_LOCK:
+        worker = _AGENT_WORKERS.get(key, {})
+        if _thread_alive(worker.get("thread") if isinstance(worker, dict) else None):
+            blockers.append(
+                {
+                    "worker": "dialog_agent",
+                    "last_status": str(worker.get("last_status") or ""),
+                    "event_file": str(worker.get("event_file") or ""),
+                    "requested_conversation_ids": list(worker.get("requested_conversation_ids") or [])
+                    if isinstance(worker.get("requested_conversation_ids"), list)
+                    else [],
+                }
+            )
+    with _WEFLOW_LOCK:
+        worker = _WEFLOW_WORKERS.get(key, {})
+        if _thread_alive(worker.get("thread") if isinstance(worker, dict) else None):
+            blockers.append(
+                {
+                    "worker": "weflow_background_pull",
+                    "last_status": str(worker.get("last_status") or ""),
+                    "loops": int(worker.get("loops", 0) or 0),
+                }
+            )
+        pull_job = _WEFLOW_PULL_JOBS.get(key, {})
+        if _thread_alive(pull_job.get("thread") if isinstance(pull_job, dict) else None):
+            blockers.append(
+                {
+                    "worker": "weflow_pull_once",
+                    "job_id": str(pull_job.get("job_id") or ""),
+                    "status": str(pull_job.get("status") or ""),
+                }
+            )
+        backfill_job = _WEFLOW_BACKFILL_JOBS.get(key, {})
+        if _thread_alive(backfill_job.get("thread") if isinstance(backfill_job, dict) else None):
+            blockers.append(
+                {
+                    "worker": "weflow_backfill",
+                    "job_id": str(backfill_job.get("job_id") or ""),
+                    "status": str(backfill_job.get("status") or ""),
+                }
+            )
+    return blockers
+
+
 def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
     root = Path(data_dir)
-    persisted = _read_json(root / "weflow_sidebar_state.json", {})
+    persisted = _read_weflow_sidebar_state(root)
     worker = _weflow_worker_state(root)
     token_env = str(persisted.get("token_env") or "WEFLOW_API_TOKEN") if isinstance(persisted, dict) else "WEFLOW_API_TOKEN"
     token_present = bool(persisted.get("token_present")) if isinstance(persisted, dict) else False
@@ -983,6 +3667,8 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "token_env": token_env,
         "token_present": token_present,
         "token_source": token_source,
+        "requested_talkers": persisted.get("talkers", []) if isinstance(persisted.get("talkers"), list) else [],
+        "requested_talker_count": len(persisted.get("talkers", [])) if isinstance(persisted.get("talkers"), list) else 0,
         "hook_event_file": str(root / "hook_events.jsonl"),
         "backend_event_file": str(root / "backend_events.jsonl"),
         "weflow_state_file": str(root / "weflow_bridge_state.json"),
@@ -991,7 +3677,7 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "requires_token_for_pull": True,
             "requires_local_fork_marker": True,
             "allows_non_local_by_default": False,
-            "wechatferry_primary": False,
+            "native_send_bridge_primary": True,
         },
         "config_migration": migration,
         "worker": worker,
@@ -1055,6 +3741,7 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
             if session.get("id") and not is_system_account(session.get("id"))
         ]
         registration = _register_weflow_sessions(data_dir, sessions)
+        sessions = _annotate_weflow_sessions_with_registration(sessions, registration)
         session_store = _upsert_weflow_sessions(data_dir, sessions, source="weflow_live", registration=registration)
         result = {
             "status": "ok",
@@ -1201,7 +3888,7 @@ def run_weflow_backfill_sync(data_dir: str | Path, payload: dict[str, Any]) -> d
 
     The sidebar UI uses the async :func:`sidebar_weflow_backfill` (returns
     immediately with a job it polls). A short-lived CLI process cannot poll a
-    daemon thread — it would exit before the thread ran — so the CLI calls this
+    daemon thread; it would exit before the thread ran, so the CLI calls this
     blocking variant instead. Same forced since=0 / context_only / all-pages
     semantics and system-account filtering.
     """
@@ -1344,17 +4031,18 @@ def sidebar_weflow_cancel_backfill(data_dir: str | Path, payload: dict[str, Any]
 def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(data_dir).resolve()
     key = str(root)
+    worker_payload = _weflow_background_payload(payload)
     with _WEFLOW_LOCK:
         existing = _WEFLOW_WORKERS.get(key)
         if existing and existing.get("thread") and existing["thread"].is_alive():
-            _start_bridge_worker(root, dict(payload))
+            _start_bridge_worker(root, worker_payload)
             result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已经在运行"}
             _append_weflow_operation_history(data_dir, "start", result)
             return result
         stop_event = threading.Event()
         thread = threading.Thread(
             target=_weflow_background_loop,
-            args=(root, dict(payload), stop_event),
+            args=(root, worker_payload, stop_event),
             name="sidebar-weflow-pull",
             daemon=True,
         )
@@ -1369,10 +4057,24 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
     # Start the send-bridge delivery worker alongside the pull worker: the
     # pull->reply->deliver chain needs both halves running. No-op unless the
     # active send driver is bridge_outbox.
-    _start_bridge_worker(root, dict(payload))
+    _start_bridge_worker(root, worker_payload)
     result = {"status": "ok", "worker": _weflow_worker_state(root), "message": "WeFlow 后台拉取已启动"}
     _append_weflow_operation_history(data_dir, "start", result)
     return result
+
+
+def _weflow_background_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    worker_payload = dict(payload)
+    explicit_process = (
+        "process_backend_events" in worker_payload
+        or "processBackendEvents" in worker_payload
+        or "capture_only" in worker_payload
+        or "captureOnly" in worker_payload
+    )
+    if not explicit_process:
+        worker_payload["capture_only"] = True
+        worker_payload["process_backend_events"] = False
+    return worker_payload
 
 
 def sidebar_weflow_stop(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1537,10 +4239,15 @@ def _weflow_dependency_status_snapshot() -> dict[str, Any]:
             {
                 "group": spec["group"],
                 "runtime": spec["runtime"],
+                "purpose": str(spec.get("purpose") or ""),
                 "python": str(python_executable),
                 "runtime_available": runtime_available,
                 "available": bool(group_items) and all(item["available"] for item in group_items),
                 "requirements": str(spec["requirements"].resolve()),
+                "requirements_exists": Path(spec["requirements"]).exists(),
+                "install_command": _dependency_install_command(spec, python_executable),
+                "portable_from_github": True,
+                "reinstallable": bool(spec.get("venv") or spec.get("target") or spec["runtime"] == "main_python"),
                 "missing": [item["package"] for item in group_items if not item["available"]],
                 "items": group_items,
             }
@@ -1552,6 +4259,11 @@ def _weflow_dependency_status_snapshot() -> dict[str, Any]:
         "requirements": {spec["group"]: str(spec["requirements"].resolve()) for spec in _dependency_specs()},
         "duplicate_requirements": duplicate_packages,
         "deduplicated": not duplicate_packages,
+        "migration_notes": [
+            "A fresh GitHub checkout can start with the main Python requirements, then use /api/weflow/install-deps for optional document/OCR/ASR/UI runtimes.",
+            "Large vendor runtimes are reinstallable caches; keep requirements files in git and avoid committing generated virtualenv/node_modules output.",
+            "GPU OCR/ASR dependencies are intentionally not installed by the default light dependency action.",
+        ],
     }
 
 
@@ -1560,6 +4272,7 @@ def _dependency_specs() -> list[dict[str, Any]]:
         {
             "group": "document_runtime",
             "runtime": "main_python",
+            "purpose": "PDF, Office, spreadsheet, and document attachment parsing in the main Python runtime",
             "python": Path(sys.executable),
             "requirements": Path("requirements-document.txt"),
             "modules": {
@@ -1572,6 +4285,7 @@ def _dependency_specs() -> list[dict[str, Any]]:
         {
             "group": "ocr_runtime",
             "runtime": "vendor_ocr_python",
+            "purpose": "lightweight CPU OCR runtime used by file ingestion and runtime probe",
             "python": Path("vendor/ocr-python/Scripts/python.exe"),
             "venv": Path("vendor/ocr-python"),
             "requirements": Path("requirements-ocr-light.txt"),
@@ -1585,6 +4299,7 @@ def _dependency_specs() -> list[dict[str, Any]]:
         {
             "group": "asr_runtime",
             "runtime": "vendor_asr_python",
+            "purpose": "lightweight local ASR runtime used by voice attachment ingestion",
             "python": Path("vendor/asr-python/Scripts/python.exe"),
             "venv": Path("vendor/asr-python"),
             "requirements": Path("requirements-asr-light.txt"),
@@ -1596,12 +4311,23 @@ def _dependency_specs() -> list[dict[str, Any]]:
         {
             "group": "windows_ui_runtime",
             "runtime": "vendor_windows_ui",
+            "purpose": "Windows UI Automation diagnostics for the control console; not used for foreground sending",
             "python": Path(sys.executable),
             "target": Path("vendor/windows-ui"),
             "requirements": Path("requirements-windows-ui.txt"),
             "modules": {"comtypes": "comtypes"},
         },
     ]
+
+
+def _dependency_install_command(spec: dict[str, Any], python_executable: Path) -> list[str]:
+    command = [str(python_executable), "-m", "pip", "install"]
+    if spec.get("target"):
+        command.extend(["--target", str(Path(spec["target"]))])
+    command.extend(["-r", str(Path(spec["requirements"]).resolve())])
+    if spec.get("venv") and not python_executable.exists():
+        return [str(Path(sys.executable)), "-m", "venv", str(Path(spec["venv"])), "&&", *command]
+    return command
 
 
 def _dependency_python(spec: dict[str, Any]) -> Path:
@@ -1680,7 +4406,7 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
         raise ValueError("bridge_id is required")
     status = str(payload.get("status", "")).strip()
     if not is_terminal_bridge_ack_status(status):
-        raise ValueError("status must be sent, failed, or blocked")
+        raise ValueError("status must be sent, accepted, failed, or blocked")
     reason = str(payload.get("reason", "")).strip()
     external_message_id = str(payload.get("external_message_id") or payload.get("externalMessageId") or "").strip()
     extra = payload.get("payload")
@@ -1701,6 +4427,16 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
         external_message_id=str(effective_ack.get("external_message_id", external_message_id)),
     )
     return result
+
+
+def retry_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    bridge_id = str(payload.get("bridge_id") or payload.get("bridgeId") or "").strip()
+    if not bridge_id:
+        raise ValueError("bridge_id is required")
+    reviewer = str(payload.get("reviewer") or "sidebar").strip() or "sidebar"
+    note = str(payload.get("note") or "").strip()
+    _start_bridge_worker(Path(data_dir).resolve(), dict(payload))
+    return retry_bridge_item(data_dir, bridge_id, reviewer=reviewer, note=note)
 
 
 def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1877,7 +4613,7 @@ def _run_weflow_pull_tick(
             # / pull-once never race the shared hook offset and message deduper.
             with _WEFLOW_CONSUMER_LOCK:
                 _emit_weflow_progress(progress_callback, event="consume_started", phase="导入事件并运行 agent")
-                pull = runner.run_once()
+                pull = runner.run_once(process_imported=bool(params["process_backend_events"]))
                 _emit_weflow_progress(
                     progress_callback,
                     event="consume_completed",
@@ -1897,6 +4633,7 @@ def _run_weflow_pull_tick(
             "source": _jsonable(source),
             "pull": pull,
             "media_roots": context["media_roots"],
+            "process_backend_events": bool(params["process_backend_events"]),
             "send_enabled": False,
         }
         recovery = _maybe_recover_empty_weflow_pull(
@@ -2038,7 +4775,7 @@ def _bridge_worker_state(root: Path) -> dict[str, Any]:
     with _BRIDGE_LOCK:
         worker = _BRIDGE_WORKERS.get(key)
         if not worker:
-            return {"running": False, "last_status": "stopped"}
+            return {"running": False, "last_status": "stopped", "worker_id": "", "config_signature": {}}
         thread = worker.get("thread")
         return {
             "running": bool(isinstance(thread, threading.Thread) and thread.is_alive()),
@@ -2047,7 +4784,139 @@ def _bridge_worker_state(root: Path) -> dict[str, Any]:
             "started_at": worker.get("started_at"),
             "restart_count": int(worker.get("restart_count", 0) or 0),
             "last_tick_at": worker.get("last_tick_at"),
+            "stop_requested": bool(worker.get("stop_requested")),
+            "worker_id": str(worker.get("worker_id") or ""),
+            "config_signature": worker.get("config_signature") if isinstance(worker.get("config_signature"), dict) else {},
         }
+
+
+def _bridge_worker_public_state(root: Path) -> dict[str, Any]:
+    """Snapshot covering both sidebar-managed and separately launched workers."""
+
+    root = root.resolve()
+    managed = _bridge_worker_state(root)
+    lock = _bridge_worker_lock_snapshot(root)
+    managed_running = bool(managed.get("running"))
+    lock_alive = bool(lock.get("alive"))
+    if managed_running:
+        source = "sidebar_managed"
+    elif lock_alive:
+        source = "external_process"
+    else:
+        source = "stopped"
+    current_signature: dict[str, Any] = {}
+    try:
+        current_signature = _bridge_worker_config_signature(load_config(root))
+    except Exception:
+        current_signature = {}
+    lock_signature = lock.get("config_signature") if isinstance(lock.get("config_signature"), dict) else {}
+    if lock_alive and lock_signature and current_signature:
+        config_match: bool | None = lock_signature == current_signature
+        config_status = "matched" if config_match else "stale"
+    elif lock_alive:
+        config_match = None
+        config_status = "unknown_legacy_lock"
+    else:
+        config_match = False
+        config_status = "not_running"
+    return {
+        "running": managed_running or lock_alive,
+        "source": source,
+        "pid": lock.get("pid", 0),
+        "pid_alive": lock.get("pid_alive", False),
+        "lock_alive": lock_alive,
+        "lock_path": lock.get("path", ""),
+        "heartbeat_age_seconds": lock.get("heartbeat_age_seconds"),
+        "label": lock.get("label", ""),
+        "backend_name": lock.get("backend_name", ""),
+        "data_dir": lock.get("data_dir", ""),
+        "config_match": config_match,
+        "config_status": config_status,
+        "config_signature": lock_signature or managed.get("config_signature", {}),
+        "expected_config_signature": current_signature,
+        "managed": managed,
+    }
+
+
+def _bridge_worker_lock_snapshot(root: Path) -> dict[str, Any]:
+    path = bridge_worker_lock_path(root)
+    payload: dict[str, Any] = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                payload = raw
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    heartbeat = payload.get("heartbeat_at")
+    heartbeat_age: float | None = None
+    if isinstance(heartbeat, (int, float)):
+        heartbeat_age = max(0.0, time.time() - float(heartbeat))
+    try:
+        pid = int(payload.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    config_signature = payload.get("config_signature") if isinstance(payload.get("config_signature"), dict) else {}
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "alive": bridge_worker_lock_alive(root),
+        "stale_after_seconds": BRIDGE_WORKER_LOCK_STALE_SECONDS,
+        "heartbeat_age_seconds": heartbeat_age,
+        "pid": pid,
+        "pid_alive": _pid_exists(pid) if pid else False,
+        "label": str(payload.get("label") or ""),
+        "acquired_at": payload.get("acquired_at"),
+        "heartbeat_at": heartbeat,
+        "backend_name": str(payload.get("backend_name") or ""),
+        "data_dir": str(payload.get("data_dir") or ""),
+        "config_signature": config_signature,
+    }
+
+
+def _bridge_worker_config_signature(config: Any) -> dict[str, Any]:
+    """Fields that are captured when the bridge worker constructs its backend."""
+
+    return bridge_worker_config_signature(config)
+
+
+def _bridge_worker_should_run(config: Any) -> bool:
+    return (
+        str(getattr(config, "send_driver", "") or "") == "bridge_outbox"
+        and bool(getattr(config, "send_enabled", False))
+    )
+
+
+def ensure_sidebar_bridge_worker(data_dir: str | Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Start the sidebar-managed send bridge when current config requires it."""
+
+    root = Path(data_dir).resolve()
+    _start_bridge_worker(root, dict(payload or {}))
+    return _bridge_worker_public_state(root)
+
+
+def _reconcile_bridge_worker_after_config_change(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Restart or stop an already-running bridge worker after send config edits.
+
+    The worker reads ``config.json`` once at startup to build its backend. If the
+    user switches send backends while the worker is alive, leaving it in place
+    would keep delivering with the old backend. Do not start a brand-new worker
+    from a passive settings save; the next WeFlow start or send-approved action
+    will do that. Existing workers are kept aligned.
+    """
+
+    try:
+        config = load_config(root)
+    except Exception:
+        return _bridge_worker_state(root)
+    worker_state = _bridge_worker_state(root)
+    if not worker_state.get("running"):
+        return worker_state
+    if not _bridge_worker_should_run(config):
+        _stop_bridge_worker(root)
+        return _bridge_worker_state(root)
+    _start_bridge_worker(root, payload)
+    return _bridge_worker_state(root)
 
 
 def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
@@ -2066,12 +4935,15 @@ def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: t
     key = str(root)
     interval = max(0.5, float(payload.get("bridge_interval_seconds") or 2.0))
     max_restarts = int(payload.get("bridge_max_restarts", _BRIDGE_MAX_RESTARTS) or _BRIDGE_MAX_RESTARTS)
+    worker_id = str(payload.get("_bridge_worker_id") or "")
     restart_count = 0
     final_status = ""
 
     def _mark(status: str, error: str = "") -> None:
         with _BRIDGE_LOCK:
             worker = _BRIDGE_WORKERS.get(key, {})
+            if worker_id and str(worker.get("worker_id") or "") != worker_id:
+                return
             worker["last_status"] = status
             if error:
                 worker["last_error"] = error
@@ -2126,26 +4998,53 @@ def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: t
 def _start_bridge_worker(root: Path, payload: dict[str, Any]) -> None:
     """Start the supervised send-bridge worker for this data dir if not running.
 
-    Only starts when the active send driver is bridge_outbox — that is the only
+    Only starts when the active send driver is bridge_outbox; that is the only
     driver whose replies need a bridge to deliver them. Idempotent: a live worker
-    is left as-is.
+    with the same backend config is left as-is; a live worker with stale backend
+    config is stopped and replaced so backend switches take effect.
     """
     key = str(root)
     try:
         config = load_config(root)
     except Exception:
         return
-    if str(getattr(config, "send_driver", "")) != "bridge_outbox":
+    if not _bridge_worker_should_run(config):
         return
+    config_signature = _bridge_worker_config_signature(config)
+    worker_id = f"bridge-worker-{uuid4().hex[:12]}"
+    thread_to_join: threading.Thread | None = None
+    with _BRIDGE_LOCK:
+        existing = _BRIDGE_WORKERS.get(key)
+        thread = existing.get("thread") if existing else None
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            existing_signature = existing.get("config_signature") if isinstance(existing.get("config_signature"), dict) else {}
+            if existing_signature == config_signature:
+                return
+            stop = existing.get("stop")
+            if isinstance(stop, threading.Event):
+                stop.set()
+            existing["stop_requested"] = True
+            existing["last_status"] = "restarting_for_config"
+            _BRIDGE_WORKERS[key] = existing
+            thread_to_join = thread
+    if thread_to_join is not None:
+        thread_to_join.join(timeout=1.5)
+        if thread_to_join.is_alive():
+            return
+    if bridge_worker_lock_alive(root):
+        if not _repair_stale_external_bridge_worker(root, config_signature):
+            return
     with _BRIDGE_LOCK:
         existing = _BRIDGE_WORKERS.get(key)
         thread = existing.get("thread") if existing else None
         if isinstance(thread, threading.Thread) and thread.is_alive():
             return
         stop_event = threading.Event()
+        worker_payload = dict(payload)
+        worker_payload["_bridge_worker_id"] = worker_id
         worker_thread = threading.Thread(
             target=_bridge_worker_supervisor,
-            args=(root, dict(payload), stop_event),
+            args=(root, worker_payload, stop_event),
             name="sidebar-send-bridge",
             daemon=True,
         )
@@ -2155,8 +5054,113 @@ def _start_bridge_worker(root: Path, payload: dict[str, Any]) -> None:
             "started_at": time.time(),
             "last_status": "starting",
             "restart_count": 0,
+            "last_error": "",
+            "stop_requested": False,
+            "worker_id": worker_id,
+            "config_signature": config_signature,
         }
         worker_thread.start()
+
+
+def _repair_stale_external_bridge_worker(root: Path, expected_signature: dict[str, Any]) -> bool:
+    """Stop a stale external bridge worker so a current-config worker can start.
+
+    The send bridge is single-instance by design. A separately launched
+    ``scripts/send_bridge_worker.py`` keeps the lock fresh, so the sidebar cannot
+    replace it via the in-process stop event. We only repair locks that clearly
+    belong to a send-bridge worker for this exact data dir; unknown legacy locks
+    remain a blocker for operator review.
+    """
+
+    lock = _bridge_worker_lock_snapshot(root)
+    if not lock.get("alive"):
+        return True
+    lock_signature = lock.get("config_signature") if isinstance(lock.get("config_signature"), dict) else {}
+    if lock_signature == expected_signature:
+        return False
+    if str(lock.get("label") or "") != "send_bridge_worker":
+        return False
+    lock_data_dir = str(lock.get("data_dir") or "").strip()
+    if not lock_data_dir:
+        return False
+    try:
+        if Path(lock_data_dir).resolve() != root.resolve():
+            return False
+    except OSError:
+        return False
+    try:
+        pid = int(lock.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if not bool(lock.get("pid_alive")):
+        _unlink_bridge_worker_lock_if_owner_matches(root, pid)
+        return not bridge_worker_lock_alive(root)
+    if not _terminate_process_tree(pid):
+        return False
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline and _pid_exists(pid):
+        time.sleep(0.1)
+    if _pid_exists(pid):
+        if not _terminate_process_tree(pid, force=True):
+            return False
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline and _pid_exists(pid):
+            time.sleep(0.1)
+    if _pid_exists(pid):
+        return False
+    _unlink_bridge_worker_lock_if_owner_matches(root, pid)
+    return not bridge_worker_lock_alive(root)
+
+
+def _unlink_bridge_worker_lock_if_owner_matches(root: Path, pid: int) -> None:
+    path = bridge_worker_lock_path(root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    try:
+        owner_pid = int(payload.get("pid") or 0) if isinstance(payload, dict) else 0
+    except (TypeError, ValueError):
+        owner_pid = 0
+    if owner_pid and owner_pid != pid:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("bridge stale lock unlink failed: %s", exc)
+
+
+def _terminate_process_tree(pid: int, *, force: bool = False) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if os.name == "nt":
+        command = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            command.append("/F")
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("bridge stale worker taskkill failed for pid %s: %s", pid, exc)
+            return False
+        return completed.returncode == 0 or not _pid_exists(pid)
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        logger.warning("bridge stale worker terminate failed for pid %s: %s", pid, exc)
+        return False
+    return True
 
 
 def _stop_bridge_worker(root: Path) -> None:
@@ -2171,6 +5175,13 @@ def _stop_bridge_worker(root: Path) -> None:
             thread = worker.get("thread") if isinstance(worker.get("thread"), threading.Thread) else None
     if thread is not None:
         thread.join(timeout=1.0)
+    with _BRIDGE_LOCK:
+        worker = _BRIDGE_WORKERS.get(key)
+        thread = worker.get("thread") if worker else None
+        if worker and not (isinstance(thread, threading.Thread) and thread.is_alive()):
+            worker["last_status"] = "stopped"
+            worker["stop_requested"] = False
+            _BRIDGE_WORKERS[key] = worker
 
 
 def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
@@ -2198,7 +5209,7 @@ def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: thr
                 worker["last_error"] = f"loop_crashed:{type(exc).__name__}: {exc}"
                 worker["last_tick_at"] = time.time()
                 _WEFLOW_WORKERS[key] = worker
-        # A clean stop request means we're done — don't resurrect.
+        # A clean stop request means we're done; do not resurrect.
         if stop_event.is_set():
             break
         # The loop returned/died without a stop request: supervise a restart.
@@ -2247,7 +5258,7 @@ def _weflow_worker_loop(root: Path, payload: dict[str, Any], stop_event: threadi
             _WEFLOW_WORKERS[key] = worker
         _write_weflow_sidebar_state(root, {"last_error": error, **_weflow_public_params(_weflow_params(root, payload))})
         # A held consumer lock means another consumer is legitimately running.
-        # This is a deliberate single-instance refusal, NOT a crash — signal the
+        # This is a deliberate single-instance refusal, NOT a crash; signal the
         # supervisor to stop (no restart) by setting the stop event.
         stop_event.set()
         return
@@ -2355,6 +5366,11 @@ def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
         or (allow_context_only and requested_context_only)
         or (since is not None and since <= 0)
     )
+    capture_only = bool(payload.get("capture_only") or payload.get("captureOnly"))
+    requested_process_backend_events = payload.get("process_backend_events")
+    if requested_process_backend_events is None:
+        requested_process_backend_events = payload.get("processBackendEvents")
+    process_backend_events = not capture_only if requested_process_backend_events is None else bool(requested_process_backend_events)
     return {
         "base_url": str(payload.get("base_url") or payload.get("baseUrl") or "http://127.0.0.1:5031").strip(),
         "token": token,
@@ -2375,6 +5391,7 @@ def _weflow_params(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, A
         "workers": _bounded_int(payload.get("workers"), 2, 1, 16),
         "media": not bool(payload.get("no_media") or payload.get("noMedia") or False),
         "context_only": context_only,
+        "process_backend_events": process_backend_events,
         "extra_roots": _string_list(payload.get("extra_roots") or payload.get("extraRoots") or []),
     }
 
@@ -2460,20 +5477,40 @@ def _normalize_weflow_session(session: dict[str, Any]) -> dict[str, Any]:
 def _register_weflow_sessions(data_dir: str | Path, sessions: list[dict[str, Any]]) -> dict[str, Any]:
     try:
         store = _channel_store(data_dir)
+        config = load_config(data_dir)
     except Exception as exc:
         return {
             "registered_count": 0,
             "registered_channels": [],
+            "skipped_count": 0,
+            "skipped_channels": [],
             "registration_errors": [{"type": type(exc).__name__, "message": str(exc)}],
         }
     registered: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for session in sessions:
         session_id = str(session.get("id") or "").strip()
         if not session_id:
             continue
         try:
-            channel = store.ensure_channel(_weflow_session_channel_message(session))
+            message = _weflow_session_channel_message(session)
+            admission = channel_admission_for_session(
+                session,
+                config,
+                existing_channel=store.get_channel(message.conversation_id) or False,
+            )
+            if not admission.allowed:
+                skipped.append(
+                    {
+                        "id": session_id,
+                        "name": str(session.get("name") or session_id),
+                        "type": str(session.get("type") or ""),
+                        "reason": admission.reason,
+                    }
+                )
+                continue
+            channel = store.ensure_channel(message)
             registered.append(
                 {
                     "id": session_id,
@@ -2488,6 +5525,8 @@ def _register_weflow_sessions(data_dir: str | Path, sessions: list[dict[str, Any
     return {
         "registered_count": len(registered),
         "registered_channels": registered,
+        "skipped_count": len(skipped),
+        "skipped_channels": skipped,
         "registration_errors": errors[:20],
     }
 
@@ -2546,6 +5585,38 @@ def _weflow_sessions_from_payload_and_result(payload: dict[str, Any], result: di
     return sessions
 
 
+def _annotate_weflow_sessions_with_registration(
+    sessions: list[dict[str, Any]],
+    registration: dict[str, Any],
+) -> list[dict[str, Any]]:
+    registered = {
+        str(item.get("id") or ""): item
+        for item in registration.get("registered_channels", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    skipped = {
+        str(item.get("id") or ""): item
+        for item in registration.get("skipped_channels", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    annotated: list[dict[str, Any]] = []
+    for session in sessions:
+        session_id = str(session.get("id") or "").strip()
+        channel = registered.get(session_id, {})
+        blocked = skipped.get(session_id, {})
+        annotated.append(
+            {
+                **session,
+                "conversation_id": channel.get("conversation_id") or "",
+                "conversation_type": channel.get("conversation_type") or "",
+                "chat_title": channel.get("chat_title") or "",
+                "channel_registration_status": "registered" if channel else ("blocked" if blocked else "unknown"),
+                "channel_blocked_reason": str(blocked.get("reason") or "") if blocked else "",
+            }
+        )
+    return annotated
+
+
 def _upsert_weflow_sessions(
     data_dir: str | Path,
     sessions: list[dict[str, Any]],
@@ -2564,6 +5635,11 @@ def _upsert_weflow_sessions(
         for item in (registration or {}).get("registered_channels", [])
         if isinstance(item, dict) and str(item.get("id") or "").strip()
     }
+    skipped = {
+        str(item.get("id") or ""): item
+        for item in (registration or {}).get("skipped_channels", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
     updated = 0
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for session in sessions:
@@ -2573,26 +5649,30 @@ def _upsert_weflow_sessions(
             continue
         existing = items.get(session_id) if isinstance(items.get(session_id), dict) else {}
         channel = channels.get(session_id, {})
+        skipped_channel = skipped.get(session_id, {})
         display_name = _preferred_weflow_display_name(
             normalized.get("name"),
             existing.get("name") if isinstance(existing, dict) else "",
             channel.get("chat_title") if isinstance(channel, dict) else "",
             session_id,
         )
+        channel_status = "registered" if channel else ("blocked" if skipped_channel else str(existing.get("channel_registration_status") or "unknown"))
         merged = {
             **existing,
             **normalized,
             "id": session_id,
             "name": display_name,
             "type": str(normalized.get("type") or existing.get("type") or ("group" if session_id.endswith("@chatroom") else "private")),
-            "conversation_id": channel.get("conversation_id") or existing.get("conversation_id") or "",
-            "conversation_type": channel.get("conversation_type") or existing.get("conversation_type") or "",
+            "conversation_id": channel.get("conversation_id") or ("" if skipped_channel else existing.get("conversation_id") or ""),
+            "conversation_type": channel.get("conversation_type") or ("" if skipped_channel else existing.get("conversation_type") or ""),
             "chat_title": _preferred_weflow_display_name(
                 channel.get("chat_title") if isinstance(channel, dict) else "",
                 existing.get("chat_title") if isinstance(existing, dict) else "",
                 display_name,
                 session_id,
             ),
+            "channel_registration_status": channel_status,
+            "channel_blocked_reason": str(skipped_channel.get("reason") or "") if skipped_channel else "",
             "cached": True,
             "source": source,
             "updated_at": now,
@@ -2737,12 +5817,15 @@ def _weflow_session_is_group(session: dict[str, Any]) -> bool:
 
 
 def _weflow_public_params(params: dict[str, Any]) -> dict[str, Any]:
+    talkers = params.get("talkers") if isinstance(params.get("talkers"), list) else []
     return {
         "base_url": params.get("base_url", ""),
         "token_env": params.get("token_env", "WEFLOW_API_TOKEN"),
         "token_present": bool(params.get("token")),
         "token_source": params.get("token_source", "missing"),
         "allow_non_local": bool(params.get("allow_non_local")),
+        "talkers": list(talkers),
+        "talker_count": len(talkers),
     }
 
 
@@ -2832,12 +5915,18 @@ def _update_weflow_task_progress(root: Path, job_id: str, update: dict[str, Any]
         "concurrency_key": f"weflow:pull:{session_id or job_id}",
         "resource_class": "wechat_io",
         "external_id": job_id,
-        "metadata": {
-            "scope_label": "WeFlow后台拉取",
-            "job_id": job_id,
-            "session_id": session_id,
-            "event": event,
-        },
+        "metadata": _worker_task_metadata(
+            scope_label="WeFlow后台拉取",
+            worker_kind="weflow" if job_id == "worker" else "weflow_job",
+            last_status=status,
+            stale_after_seconds=180.0,
+            extra={
+                "job_id": job_id,
+                "session_id": session_id,
+                "event": event,
+                "worker": job_id == "worker",
+            },
+        ),
     }
     try:
         store.create(payload)
@@ -3053,17 +6142,16 @@ def _weflow_backfill_job_loop(root: Path, payload: dict[str, Any], job_id: str, 
         if stop_event.is_set() and result.get("status") != "cancelled":
             result = {**result, "status": "cancelled"}
         final_status = "cancelled" if result.get("status") == "cancelled" else "completed"
+        final_progress = {
+            "scanned_count": result.get("source", {}).get("scanned_count", 0),
+            "appended_count": result.get("source", {}).get("appended_count", 0),
+            "processed_count": result.get("pull", {}).get("processed_count", 0),
+        }
         _update_backfill_job(
             root,
             job_id,
-            status=final_status,
             result=result,
-            progress={
-                "scanned_count": result.get("source", {}).get("scanned_count", 0),
-                "appended_count": result.get("source", {}).get("appended_count", 0),
-                "processed_count": result.get("pull", {}).get("processed_count", 0),
-                "event": final_status,
-            },
+            progress={**final_progress, "event": "finalizing"},
             force=True,
         )
         _record_weflow_state_safely(
@@ -3072,7 +6160,7 @@ def _weflow_backfill_job_loop(root: Path, payload: dict[str, Any], job_id: str, 
             action="backfill",
             result=result,
         )
-        _update_backfill_job(root, job_id, status=final_status, progress={"event": final_status}, force=True)
+        _update_backfill_job(root, job_id, status=final_status, result=result, progress={**final_progress, "event": final_status}, force=True)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         result = {"status": "error", "error": error, "backfill": True, "backfilled_talkers": payload.get("talkers", [])}
@@ -3262,13 +6350,36 @@ def _weflow_readiness_snapshot(
     }
 
 
+def _read_weflow_sidebar_state(data_dir: str | Path) -> dict[str, Any]:
+    path = Path(data_dir) / "weflow_sidebar_state.json"
+    with _WEFLOW_STATE_FILE_LOCK:
+        legacy = _read_json(path, {})
+        try:
+            return SidebarStateStore(data_dir).read_weflow_state(
+                legacy_state=legacy if isinstance(legacy, dict) else {},
+                history_limit=50,
+            )
+        except Exception:
+            return legacy if isinstance(legacy, dict) else {}
+
+
 def _write_weflow_sidebar_state(data_dir: str | Path, update: dict[str, Any]) -> None:
     path = Path(data_dir) / "weflow_sidebar_state.json"
     with _WEFLOW_STATE_FILE_LOCK:
-        current = _read_json(path, {})
-        payload = current if isinstance(current, dict) else {}
-        payload.update(update)
-        payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            store = SidebarStateStore(data_dir)
+            legacy = _read_json(path, {})
+            current = store.read_weflow_state(legacy_state=legacy if isinstance(legacy, dict) else {}, history_limit=50)
+            payload = current if isinstance(current, dict) else {}
+            payload.update(update)
+            payload["updated_at"] = now
+            payload = store.update_weflow_state(payload)
+        except Exception:
+            current = _read_json(path, {})
+            payload = current if isinstance(current, dict) else {}
+            payload.update(update)
+            payload["updated_at"] = now
         _write_json(path, payload)
 
 
@@ -3297,10 +6408,6 @@ def _record_weflow_state_safely(
 def _append_weflow_operation_history(data_dir: str | Path, action: str, result: dict[str, Any]) -> None:
     path = Path(data_dir) / "weflow_sidebar_state.json"
     with _WEFLOW_STATE_FILE_LOCK:
-        current = _read_json(path, {})
-        payload = current if isinstance(current, dict) else {}
-        existing = payload.get("operation_history")
-        history = existing if isinstance(existing, list) else []
         entry = {
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "action": str(action),
@@ -3308,8 +6415,18 @@ def _append_weflow_operation_history(data_dir: str | Path, action: str, result: 
             "summary": _weflow_operation_summary(result),
             "result": _compact_weflow_history_payload(result),
         }
-        payload["operation_history"] = [entry, *[item for item in history if isinstance(item, dict)]][:50]
-        payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            store = SidebarStateStore(data_dir)
+            legacy = _read_json(path, {})
+            store.read_weflow_state(legacy_state=legacy if isinstance(legacy, dict) else {}, history_limit=50)
+            payload = store.append_weflow_operation_entry(entry, limit=50)
+        except Exception:
+            current = _read_json(path, {})
+            payload = current if isinstance(current, dict) else {}
+            existing = payload.get("operation_history")
+            history = existing if isinstance(existing, list) else []
+            payload["operation_history"] = [entry, *[item for item in history if isinstance(item, dict)]][:50]
+            payload["updated_at"] = entry["time"]
         _write_json(path, payload)
 
 
@@ -3375,6 +6492,26 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _tail_jsonl(path: Path, *, limit: int = 50) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    items: list[dict[str, Any]] = []
+    for line in lines[-max(1, int(limit)) :]:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            payload = {"malformed": True, "preview": line[:500]}
+        if isinstance(payload, dict):
+            items.append(payload)
+    return items
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
@@ -3416,9 +6553,87 @@ def _string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _require_sidebar_channel(data_dir: str | Path, conversation_id: str) -> Any:
+    channel_id = str(conversation_id or "").strip()
+    if not channel_id:
+        raise ValueError("conversation_id is required")
+    channel = _channel_store(data_dir).get_channel(channel_id)
+    if channel is None:
+        raise ValueError(f"conversation channel not found: {channel_id}")
+    return channel
+
+
+def _sidebar_test_reply_candidate(
+    channel: Any,
+    *,
+    text: str,
+    origin: str,
+    attachments: list[dict[str, Any]],
+    review_required: bool = True,
+) -> ReplyCandidate:
+    return ReplyCandidate(
+        message_id=f"{origin}:{uuid4().hex[:12]}",
+        conversation_id=str(channel.conversation_id),
+        text=text,
+        send_mode="confirm" if review_required else "auto",
+        model="sidebar-manual-test",
+        policy_hits=["manual_sidebar_channel_test"],
+        attachments=attachments,
+        send_metadata={
+            "origin": origin,
+            "channel_test": True,
+            "review_required": review_required,
+            "conversation_type": str(getattr(channel, "conversation_type", "") or ""),
+        },
+    )
+
+
+def _safe_upload_filename(name: str) -> str:
+    filename = Path(str(name or "upload.bin")).name.strip() or "upload.bin"
+    invalid = set('<>:"/\\|?*')
+    cleaned = "".join("_" if char in invalid or ord(char) < 32 else char for char in filename)
+    cleaned = cleaned.strip(" .")
+    if not cleaned:
+        cleaned = "upload.bin"
+    if len(cleaned) > 140:
+        suffix = Path(cleaned).suffix[:24]
+        stem = Path(cleaned).stem[: max(1, 140 - len(suffix))]
+        cleaned = f"{stem}{suffix}" if suffix else stem
+    return cleaned
+
+
+def _decode_upload_base64(content_base64: str) -> bytes:
+    raw = str(content_base64 or "").strip()
+    if raw.startswith("data:") and "," in raw:
+        raw = raw.split(",", 1)[1]
+    try:
+        return base64.b64decode(raw, validate=True)
+    except Exception:
+        return base64.b64decode(raw)
+
+
+def _upload_kind_for_name(name: str) -> str:
+    suffix = Path(str(name or "")).suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}:
+        return "image"
+    if suffix in {".ppt", ".pptx", ".key"}:
+        return "presentation"
+    if suffix in {".doc", ".docx", ".pdf", ".txt", ".md", ".xlsx", ".xls", ".csv"}:
+        return "document"
+    return "file"
+
+
 def _bounded_int(value: Any, default: int, lower: int, upper: int) -> int:
     try:
         parsed = int(value)
+    except Exception:
+        parsed = default
+    return min(max(parsed, lower), upper)
+
+
+def _bounded_float(value: Any, default: float, lower: float, upper: float) -> float:
+    try:
+        parsed = float(value)
     except Exception:
         parsed = default
     return min(max(parsed, lower), upper)
@@ -3446,8 +6661,19 @@ def _retained_config_paths(root: Path) -> set[Path]:
         "api_key_models.local.json",
     }
     retained = {(root / name).resolve() for name in names}
-    retained.add((root / "runtime").resolve())
     return retained
+
+
+def _existing_relative_paths(root: Path, relatives: tuple[str, ...]) -> list[str]:
+    existing: list[str] = []
+    for relative in relatives:
+        path = (root / relative).resolve()
+        if path.exists():
+            try:
+                existing.append(str(path.relative_to(root)))
+            except ValueError:
+                continue
+    return sorted(existing)
 
 
 def _remove_history_path(
@@ -3491,11 +6717,10 @@ def _remove_history_path(
 
 
 def _reinitialize_history_runtime_files(root: Path) -> list[str]:
-    """Recreate empty queue/bridge files after a history reset.
+    """Recreate empty review files and report preserved bridge files.
 
-    The reset may clear historical contents, but the sidebar should come back
-    with the send-review and bridge paths readable instead of looking as if the
-    feature was removed.
+    The reset may clear conversation history, but the verified native bridge
+    state is kept intact so a working non-foreground route is not erased.
     """
 
     created: list[str] = []
@@ -3508,6 +6733,18 @@ def _reinitialize_history_runtime_files(root: Path) -> list[str]:
                 created.append(relative)
         except OSError:
             continue
+    try:
+        ConfirmQueue(root / "confirm_queue.jsonl").list_pending()
+        if (root / "confirm_queue.sqlite").exists():
+            created.append("confirm_queue.sqlite")
+    except Exception:
+        pass
+    try:
+        SendAuditLog(root / "send_audit.jsonl").list_recent(limit=1)
+        if (root / "send_audit.sqlite").exists():
+            created.append("send_audit.sqlite")
+    except Exception:
+        pass
     try:
         bridge_snapshot = bridge_state(root, limit=1)
         for key in ("outbox_path", "ack_path"):
@@ -3639,12 +6876,13 @@ def _schedule_sidebar_history_reset_shutdown(root: Path, payload: dict[str, Any]
     )
     return {
         "status": "shutdown_scheduled",
-        "message": "Sidebar and WeFlow will stop and clear history. Reopen the sidebar manually after it closes.",
+        "message": "Sidebar and WeFlow will stop and clear disposable history while preserving send_bridge evidence. Reopen the sidebar manually after it closes.",
         "helper_pid": process.pid,
         "parent_pid": parent_pid,
         "weflow_pid": weflow_pid,
         "manual_reopen_required": True,
         "shutdown_status_file": str(status_path),
+        "preserved_runtime_policy": list(_HISTORY_PRESERVED_RUNTIME_PATHS),
     }
 
 
@@ -3726,25 +6964,7 @@ def _remove_sidebar_history_reset_shutdown_lock(lock_path: Path) -> None:
 
 
 def _pid_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            completed = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except Exception:
-            return False
-        return str(pid) in completed.stdout
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return process_pid_alive(pid)
 
 
 def _int_value(value: Any, default: int) -> int:
@@ -3762,27 +6982,52 @@ def _bridge_worker_alive(data_dir: str | Path) -> bool:
     in-process supervised worker and a separately-launched CLI worker, since
     both write the same lock file with periodic heartbeats.
     """
-    lock_path = Path(data_dir) / "send_bridge" / ".bridge_worker.lock"
-    if not lock_path.exists():
-        return False
-    try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    heartbeat = payload.get("heartbeat_at")
-    if not isinstance(heartbeat, (int, float)):
-        return False
-    # run_bridge_worker uses stale_after_seconds=60; consider the worker alive
-    # only if its heartbeat is fresher than that window.
-    return (time.time() - float(heartbeat)) <= 60.0
+    return bridge_worker_lock_alive(data_dir)
 
 
 def _background_send_status(config: Any, bridge: dict[str, Any], data_dir: str | Path | None = None) -> str:
     if str(getattr(config, "send_driver", "")) == "bridge_outbox":
         if not bool(getattr(config, "send_enabled", False)):
             return "bridge_outbox_configured_disabled"
+        send_backend = _normalize_send_backend(str(getattr(config, "send_backend", "dry_run") or "dry_run"))
+        if send_backend in {"", "dry_run", "dryrun", "mock"}:
+            return "bridge_outbox_dry_run_backend"
+        worker = bridge.get("worker") if isinstance(bridge, dict) else {}
+        if not isinstance(worker, dict) or not worker:
+            worker = _bridge_worker_public_state(Path(data_dir).resolve()) if data_dir is not None else {}
+        if isinstance(worker, dict) and str(worker.get("config_status") or "") == "stale":
+            return "bridge_outbox_worker_stale_config"
+        if isinstance(worker, dict) and str(worker.get("config_status") or "") == "unknown_legacy_lock":
+            return "bridge_outbox_worker_config_unknown"
+        if send_backend == "weflow_http":
+            weflow_status = weflow_http_status(
+                str(getattr(config, "weflow_base_url", "http://127.0.0.1:5031") or "http://127.0.0.1:5031"),
+                token_env=str(getattr(config, "weflow_token_env", "WEFLOW_API_TOKEN") or "WEFLOW_API_TOKEN"),
+                timeout_seconds=min(float(getattr(config, "weflow_send_timeout_seconds", 35.0) or 35.0), 3.0),
+            )
+            if not weflow_status.get("token_present"):
+                return "bridge_outbox_weflow_token_missing"
+            if not weflow_status.get("available"):
+                return "bridge_outbox_weflow_http_unavailable"
+            capabilities = (
+                weflow_status.get("send_capabilities")
+                if isinstance(weflow_status.get("send_capabilities"), dict)
+                else {}
+            )
+            text_capability = capabilities.get("text") if isinstance(capabilities.get("text"), dict) else {}
+            if text_capability.get("supports") is False:
+                return "bridge_outbox_weflow_send_not_supported"
+        if send_backend == "wechat_native_http":
+            hook_status = wechat_native_http_status(
+                str(getattr(config, "wechat_native_base_url", "http://127.0.0.1:30001") or "http://127.0.0.1:30001"),
+                text_path=str(getattr(config, "wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
+                image_path=str(getattr(config, "wechat_native_send_image_path", "/SendImgMsg") or "/SendImgMsg"),
+                file_path=str(getattr(config, "wechat_native_send_file_path", "/send_file_msg") or "/send_file_msg"),
+                status_path=str(getattr(config, "wechat_native_status_path", "/QueryDB/status") or "/QueryDB/status"),
+                timeout_seconds=min(float(getattr(config, "wechat_native_timeout_seconds", 15.0) or 15.0), 3.0),
+            )
+            if not hook_status.get("available"):
+                return "bridge_outbox_wechat_native_http_unavailable"
         # send_enabled + bridge_outbox: replies are queued, but nothing is
         # delivered unless a worker is actually consuming the outbox. Report the
         # real worker liveness instead of a config-only "ready", and flag a
@@ -3792,6 +7037,13 @@ def _background_send_status(config: Any, bridge: dict[str, Any], data_dir: str |
             if pending > 0:
                 return "bridge_outbox_worker_down_backlog"
             return "bridge_outbox_worker_down"
+        if send_backend == "wechat_native_http":
+            active_unverified = int(
+                bridge.get("active_unverified_count", bridge.get("accepted_count", 0) or 0) or 0
+            ) if isinstance(bridge, dict) else 0
+            if active_unverified > 0:
+                return "bridge_outbox_wechat_native_accepted_unverified"
+            return "bridge_outbox_ready"
         return "bridge_outbox_ready"
     return "bridge_outbox_available"
 
@@ -3808,12 +7060,142 @@ def _backend_event_file_path(data_dir: str | Path, payload: dict[str, Any]) -> P
     return resolved
 
 
+def _agent_state_path(root: Path) -> Path:
+    return root / "runtime" / "agent_state.json"
+
+
+def _read_agent_state(root: Path) -> dict[str, Any]:
+    payload = _read_json(_agent_state_path(root), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _agent_public_state(root: Path) -> dict[str, Any]:
+    state = _read_agent_state(root)
+    last_tick = state.get("last_tick") if isinstance(state.get("last_tick"), dict) else {}
+    event_files = state.get("event_files") if isinstance(state.get("event_files"), dict) else {}
+    return {
+        "schema": "dialog_agent_state_v1",
+        "status": str(state.get("status") or "idle"),
+        "storage": str(_agent_state_path(root)),
+        "updated_at": str(state.get("updated_at") or ""),
+        "last_tick": last_tick,
+        "event_file_count": len(event_files),
+        "event_files": event_files,
+        "worker": _agent_worker_state(root),
+    }
+
+
+def _agent_event_cursor(state: dict[str, Any], event_file: Path, *, scope_ids: list[str] | None = None) -> dict[str, Any]:
+    event_files = state.get("event_files") if isinstance(state.get("event_files"), dict) else {}
+    item = event_files.get(_agent_event_file_key(event_file, scope_ids=scope_ids)) if isinstance(event_files, dict) else {}
+    cursor = item.get("cursor") if isinstance(item, dict) and isinstance(item.get("cursor"), dict) else {}
+    return cursor if isinstance(cursor, dict) else {}
+
+
+def _record_agent_tick_state(
+    root: Path,
+    *,
+    event_file: Path,
+    job_id: str,
+    status: str,
+    result: dict[str, Any],
+    snapshot: dict[str, Any],
+    cursor: dict[str, Any],
+    cursor_scope_ids: list[str] | None,
+    cursor_restored: bool,
+    error: str = "",
+) -> dict[str, Any]:
+    state = _read_agent_state(root)
+    event_files = state.get("event_files") if isinstance(state.get("event_files"), dict) else {}
+    now = utc_now_iso()
+    processed_count = int(result.get("processed_count") or 0)
+    proactive_reply_count = int(result.get("proactive_reply_count") or 0)
+    proactive_attempt_count = int(result.get("proactive_attempt_count") or 0)
+    processed_conversation_ids = _agent_processed_conversation_ids(result)
+    requested_talkers = result.get("requested_talkers") if isinstance(result.get("requested_talkers"), list) else []
+    requested_conversation_ids = (
+        result.get("requested_conversation_ids") if isinstance(result.get("requested_conversation_ids"), list) else []
+    )
+    key = _agent_event_file_key(event_file, scope_ids=cursor_scope_ids)
+    summary = {
+        "conversation_count": int(snapshot.get("conversation_count") or 0),
+        "entry_count": int(snapshot.get("entry_count") or 0),
+        "pending_user_count": int(snapshot.get("pending_user_count") or 0),
+        "blocked_pending_user_count": int(snapshot.get("blocked_pending_user_count") or 0),
+        "opening_greeting_count": int(snapshot.get("opening_greeting_count") or 0),
+        "pending_conversation_ids": snapshot.get("pending_conversation_ids")
+        if isinstance(snapshot.get("pending_conversation_ids"), list)
+        else [],
+        "blocked_conversation_ids": snapshot.get("blocked_conversation_ids")
+        if isinstance(snapshot.get("blocked_conversation_ids"), list)
+        else [],
+        "opening_greeting_conversation_ids": snapshot.get("opening_greeting_conversation_ids")
+        if isinstance(snapshot.get("opening_greeting_conversation_ids"), list)
+        else [],
+        "topic_candidates": snapshot.get("topic_candidates") if isinstance(snapshot.get("topic_candidates"), list) else [],
+        "topic_lifecycle_counts": snapshot.get("topic_lifecycle_counts")
+        if isinstance(snapshot.get("topic_lifecycle_counts"), dict)
+        else {},
+        "requested_talkers": requested_talkers,
+        "requested_conversation_ids": requested_conversation_ids,
+        "aggregation_mode": "per_channel",
+    }
+    event_files[key] = {
+        "event_file": str(event_file),
+        "scope_ids": list(cursor_scope_ids or []),
+        "requested_talkers": list(requested_talkers),
+        "requested_conversation_ids": list(requested_conversation_ids),
+        "cursor": cursor if isinstance(cursor, dict) else {},
+        "updated_at": now,
+        "processed_count": processed_count,
+    }
+    state = {
+        "schema": "dialog_agent_state_v1",
+        "status": status,
+        "updated_at": now,
+        "last_tick": {
+            "job_id": job_id,
+            "status": status,
+            "event_file": str(event_file),
+            "processed_count": processed_count,
+            "proactive_reply_count": proactive_reply_count,
+            "proactive_attempt_count": proactive_attempt_count,
+            "proactive_replies": result.get("proactive_replies", []) if isinstance(result.get("proactive_replies"), list) else [],
+            "processed_conversation_ids": processed_conversation_ids,
+            "requested_talkers": requested_talkers,
+            "requested_conversation_ids": requested_conversation_ids,
+            "aggregation_mode": "per_channel",
+            "cursor_restored": bool(cursor_restored),
+            "cursor": cursor if isinstance(cursor, dict) else {},
+            "session_summary": summary,
+            "error": error,
+            "finished_at": now,
+        },
+        "event_files": event_files,
+    }
+    _write_json(_agent_state_path(root), state)
+    return _agent_public_state(root)
+
+
+def _agent_event_file_key(event_file: Path, *, scope_ids: list[str] | None = None) -> str:
+    resolved = str(event_file.resolve())
+    if scope_ids is None:
+        return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+    seed = json.dumps(
+        {"event_file": resolved, "scope_ids": _dedupe_strings(scope_ids)},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def _build_agent_backend_driver(
     config: Any,
     runtime: Any,
     event_file: Path,
     *,
     extra_roots: list[str] | None = None,
+    allowed_conversation_ids: list[str] | None = None,
 ) -> BackendEventJsonlDriver:
     extra_roots = list(extra_roots or [])
     roots = config.file_read_roots + config.wechat_voice_roots + extra_roots
@@ -3829,6 +7211,7 @@ def _build_agent_backend_driver(
         ),
         file_workspace=runtime.file_workspace,
         session_store=runtime.session_store,
+        allowed_conversation_ids=allowed_conversation_ids,
         voice_cache_resolver=_voice_cache_resolver(config, extra_roots=extra_roots),
     )
 
@@ -3840,22 +7223,50 @@ def _agent_session_snapshot(
     conversation_ids: list[str] | None = None,
     limit: int = 8,
 ) -> dict[str, Any]:
-    ids = _agent_conversation_ids(root, runtime=runtime, requested=conversation_ids or [])
+    ids = _agent_conversation_ids(root, runtime=runtime, requested=conversation_ids)
     conversations = [_agent_conversation_snapshot(runtime, conversation_id, limit=limit) for conversation_id in ids[:50]]
     conversations = [item for item in conversations if item]
+    pending_conversation_ids = [
+        str(item.get("conversation_id") or "")
+        for item in conversations
+        if int(item.get("pending_user_count_since_last_assistant", 0) or 0) > 0
+    ]
+    blocked_conversation_ids = [
+        str(item.get("conversation_id") or "")
+        for item in conversations
+        if int(item.get("blocked_pending_user_count", 0) or 0) > 0
+    ]
+    opening_greeting_conversation_ids = [
+        str(item.get("conversation_id") or "")
+        for item in conversations
+        if _agent_can_open_greeting(
+            item,
+            recent_turns=item.get("recent_turns") if isinstance(item.get("recent_turns"), list) else [],
+            last_assistant=str(item.get("last_assistant_reply") or ""),
+        )
+    ]
+    topic_lifecycle_counts = _agent_topic_lifecycle_counts(conversations)
     return {
         "schema": "dialog_agent_session_snapshot_v1",
         "conversation_count": len(conversations),
         "entry_count": sum(int(item.get("entry_count", 0) or 0) for item in conversations),
         "pending_user_count": sum(int(item.get("pending_user_count_since_last_assistant", 0) or 0) for item in conversations),
+        "blocked_pending_user_count": sum(int(item.get("blocked_pending_user_count", 0) or 0) for item in conversations),
+        "opening_greeting_count": len(opening_greeting_conversation_ids),
+        "pending_conversation_ids": _dedupe_strings(pending_conversation_ids),
+        "blocked_conversation_ids": _dedupe_strings(blocked_conversation_ids),
+        "opening_greeting_conversation_ids": _dedupe_strings(opening_greeting_conversation_ids),
         "topic_candidates": _agent_merged_topics(conversations),
+        "topic_lifecycle_counts": topic_lifecycle_counts,
         "conversations": conversations,
     }
 
 
-def _agent_conversation_ids(root: Path, *, runtime: Any, requested: list[str]) -> list[str]:
+def _agent_conversation_ids(root: Path, *, runtime: Any, requested: list[str] | None) -> list[str]:
+    if requested is not None:
+        requested_ids = _dedupe_strings(requested)
+        return requested_ids
     ids: list[str] = []
-    ids.extend(requested)
     try:
         ids.extend(channel.conversation_id for channel in runtime.channel_store.list_channels())
     except Exception:
@@ -3893,9 +7304,16 @@ def _agent_conversation_snapshot(runtime: Any, conversation_id: str, *, limit: i
     except Exception:
         entries = []
     try:
-        session_id = runtime.session_store.current_session_id(conversation_id)
+        session_state = runtime.session_store.state_for_conversation(conversation_id)
     except Exception:
-        session_id = "session_default"
+        session_state = {}
+    session_id = str(session_state.get("current_session_id") or "").strip()
+    if not session_id:
+        try:
+            session_id = runtime.session_store.current_session_id(conversation_id)
+        except Exception:
+            session_id = "session_default"
+        session_state = {"current_session_id": session_id}
     session_entries = [
         entry
         for entry in entries
@@ -3903,21 +7321,35 @@ def _agent_conversation_snapshot(runtime: Any, conversation_id: str, *, limit: i
     ]
     markdown_path = runtime.ledger_store.conversation_markdown_path(conversation_id)
     recent = session_entries[-limit:]
-    user_texts = [_agent_entry_text(entry) for entry in session_entries if str(entry.get("role") or "user") == "user"]
-    assistant_texts = [_agent_entry_text(entry) for entry in session_entries if str(entry.get("role") or "") == "assistant"]
-    pending_user_count = 0
-    for entry in reversed(session_entries):
-        role = str(entry.get("role") or "user")
-        if role == "assistant":
-            break
-        if role == "user":
-            pending_user_count += 1
+    user_texts = [_agent_entry_text(entry) for entry in _agent_user_text_entries(session_entries)]
+    assistant_texts = [
+        _agent_entry_text(entry)
+        for entry in session_entries
+        if str(entry.get("role") or "") == "assistant" and _agent_entry_text(entry)
+    ]
+    raw_pending_entries = _agent_pending_user_entries(session_entries)
+    pending_entries = _agent_actionable_pending_user_entries(session_entries, raw_pending_entries)
+    blocked_pending_count = len(raw_pending_entries) if raw_pending_entries and not pending_entries else 0
+    participants = _agent_participant_summary(session_entries)
+    topic_candidates = _agent_topic_candidates(user_texts[-10:])
     last_entry = session_entries[-1] if session_entries else {}
+    topic_lifecycle = _agent_topic_lifecycle(
+        conversation_id,
+        session_entries,
+        pending_entries=pending_entries,
+        blocked_pending_count=blocked_pending_count,
+        topic_candidates=topic_candidates,
+    )
     return {
         "conversation_id": conversation_id,
         "conversation_type": str(last_entry.get("conversation_type") or ""),
         "chat_title": str(last_entry.get("chat_title") or ""),
         "session_id": session_id,
+        "previous_session_id": str(session_state.get("previous_session_id") or ""),
+        "session_started_at": str(session_state.get("session_started_at") or ""),
+        "session_reset_count": _bounded_int(session_state.get("reset_count"), 0, 0, 1_000_000),
+        "session_reset_reason": str(session_state.get("previous_reset_reason") or ""),
+        "session_reset_message_id": str(session_state.get("previous_reset_message_id") or ""),
         "ledger_markdown": str(markdown_path),
         "ledger_messages": str(markdown_path.with_name("messages.jsonl")),
         "entry_count": len(session_entries),
@@ -3925,19 +7357,484 @@ def _agent_conversation_snapshot(runtime: Any, conversation_id: str, *, limit: i
         "last_message_at": str(last_entry.get("received_at") or last_entry.get("updated_at") or ""),
         "last_user_message": _agent_compact_text(user_texts[-1] if user_texts else "", 240),
         "last_assistant_reply": _agent_compact_text(assistant_texts[-1] if assistant_texts else "", 240),
-        "pending_user_count_since_last_assistant": pending_user_count,
-        "topic_candidates": _agent_topic_candidates(user_texts[-10:]),
+        "pending_user_count_since_last_assistant": len(pending_entries),
+        "blocked_pending_user_count": blocked_pending_count,
+        "participant_count": len(participants),
+        "participants": participants,
+        "pending_user_messages": [_agent_pending_message_payload(entry) for entry in pending_entries],
+        "message_aggregation": _agent_message_aggregation(conversation_id, session_entries, pending_entries, participants, topic_candidates),
+        "topic_candidates": topic_candidates,
+        "topic_lifecycle": topic_lifecycle,
+        "dispatch_preview": _agent_dispatch_preview(conversation_id, session_entries, pending_entries, topic_candidates),
         "recent_turns": [
             {
                 "role": str(entry.get("role") or "user"),
+                "message_id": str(entry.get("message_id") or ""),
+                "sequence": _agent_entry_sequence(entry),
                 "sender_name": str(entry.get("sender_name") or ""),
                 "received_at": str(entry.get("received_at") or ""),
                 "text": _agent_compact_text(_agent_entry_text(entry), 240),
                 "attachment_count": len(entry.get("attachments") if isinstance(entry.get("attachments"), list) else []),
+                "send_status": _agent_entry_send_status(entry),
+                "send_reason": _agent_entry_send_reason(entry),
             }
             for entry in recent
         ],
     }
+
+
+def _agent_generate_proactive_replies(
+    root: Path,
+    *,
+    runtime: Any,
+    snapshot: dict[str, Any],
+    limit: int,
+    enabled: bool = True,
+) -> list[dict[str, Any]]:
+    if not enabled or limit <= 0:
+        return []
+    conversations = snapshot.get("conversations") if isinstance(snapshot.get("conversations"), list) else []
+    candidates = _agent_proactive_candidates(conversations, limit=limit)
+    if not candidates:
+        return []
+    max_workers = _agent_proactive_parallelism(runtime, len(candidates))
+    if max_workers <= 1 or len(candidates) == 1:
+        return [_agent_generate_one_proactive_reply(root, runtime=runtime, candidate=item) for item in candidates]
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent-proactive") as pool:
+        future_to_candidate = {
+            pool.submit(_agent_generate_one_proactive_reply, root, runtime=runtime, candidate=item): item
+            for item in candidates
+        }
+        for future in as_completed(future_to_candidate):
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                candidate = future_to_candidate[future]
+                results.append(
+                    {
+                        "status": "error",
+                        "conversation_id": str(candidate.get("conversation_id") or ""),
+                        "kind": str(candidate.get("kind") or "proactive"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    return sorted(results, key=lambda item: str(item.get("conversation_id") or ""))
+
+
+def _agent_proactive_candidates(conversations: list[Any], *, limit: int) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for conversation in conversations:
+        if not isinstance(conversation, dict):
+            continue
+        if str(conversation.get("conversation_type") or "private") != "private":
+            continue
+        conversation_id = str(conversation.get("conversation_id") or "").strip()
+        if not conversation_id:
+            continue
+        pending = conversation.get("pending_user_messages") if isinstance(conversation.get("pending_user_messages"), list) else []
+        pending_count = int(conversation.get("pending_user_count_since_last_assistant") or len(pending) or 0)
+        last_assistant = str(conversation.get("last_assistant_reply") or "").strip()
+        recent_turns = conversation.get("recent_turns") if isinstance(conversation.get("recent_turns"), list) else []
+        kind = ""
+        if pending_count > 0 and pending:
+            kind = "pending_private_reply"
+        elif _agent_can_open_greeting(conversation, recent_turns=recent_turns, last_assistant=last_assistant):
+            kind = "opening_greeting"
+        if not kind:
+            continue
+        candidates.append(
+            {
+                "kind": kind,
+                "conversation": conversation,
+                "conversation_id": conversation_id,
+                "pending_count": pending_count,
+                "source_watermark": _agent_proactive_source_watermark(conversation, kind=kind),
+                "last_message_at": str(conversation.get("last_message_at") or ""),
+            }
+        )
+    candidates.sort(
+        key=lambda item: (
+            0 if item.get("kind") == "pending_private_reply" else 1,
+            -int(item.get("pending_count") or 0),
+            str(item.get("last_message_at") or ""),
+        )
+    )
+    return candidates[: max(0, limit)]
+
+
+def _agent_can_open_greeting(conversation: dict[str, Any], *, recent_turns: list[Any], last_assistant: str) -> bool:
+    if last_assistant:
+        return False
+    if int(conversation.get("entry_count") or 0) <= 0:
+        return False
+    if not recent_turns:
+        return False
+    last_turn = recent_turns[-1] if isinstance(recent_turns[-1], dict) else {}
+    last_role = str(last_turn.get("role") or "")
+    return last_role == "self"
+
+
+def _agent_generate_one_proactive_reply(root: Path, *, runtime: Any, candidate: dict[str, Any]) -> dict[str, Any]:
+    conversation = candidate.get("conversation") if isinstance(candidate.get("conversation"), dict) else {}
+    kind = str(candidate.get("kind") or "pending_private_reply")
+    conversation_id = str(conversation.get("conversation_id") or "").strip()
+    if not conversation_id:
+        return {"status": "skipped", "reason": "conversation_id_empty", "kind": kind}
+    message = _agent_proactive_message(conversation, kind=kind)
+    speak = SpeakDecision(
+        conversation_id=conversation_id,
+        decision="speak",
+        reason=kind,
+        topic=_agent_proactive_topic(conversation),
+        confidence=1.0,
+        style_context="自然、简短、像真实朋友一样接话",
+    )
+    reply = runtime.conversation.generate_reply(message, speak)
+    if reply is None or not str(reply.text or "").strip():
+        return {"status": "skipped", "reason": "empty_reply", "conversation_id": conversation_id, "kind": kind}
+    if _agent_reply_repeats_recent_assistant(str(reply.text or ""), conversation):
+        return {
+            "status": "skipped",
+            "reason": "repeat_guard_recent_assistant",
+            "conversation_id": conversation_id,
+            "kind": kind,
+        }
+    stale_reason = _agent_stale_proactive_reply_reason(
+        runtime,
+        conversation_id,
+        session_id=str(conversation.get("session_id") or "session_default"),
+        source_watermark=_bounded_int(candidate.get("source_watermark"), 0, 0, 1_000_000_000),
+    )
+    if stale_reason:
+        return {
+            "status": "skipped",
+            "reason": stale_reason,
+            "conversation_id": conversation_id,
+            "kind": kind,
+            "source_watermark": int(candidate.get("source_watermark") or 0),
+        }
+    entry = runtime.ledger_store.append_reply(
+        reply,
+        chat_title=str(conversation.get("chat_title") or ""),
+        conversation_type=str(conversation.get("conversation_type") or "private"),
+        session_id=str(conversation.get("session_id") or "session_default"),
+    )
+    send = runtime.reply_gate.handle(reply)
+    runtime.ledger_store.update_reply_send_result(conversation_id, entry.entry_id, send)
+    try:
+        runtime.event_logger.log(
+            "agent.proactive_reply",
+            {
+                "kind": kind,
+                "reply": asdict(reply),
+                "send": asdict(send),
+                "pending_count": int(candidate.get("pending_count") or 0),
+            },
+            message_id=reply.message_id,
+        )
+    except Exception:
+        pass
+    _record_agent_proactive_tasks(root, conversation=conversation, reply=reply, send=send, kind=kind)
+    return {
+        "status": "ok",
+        "kind": kind,
+        "conversation_id": conversation_id,
+        "message_id": reply.message_id,
+        "send_status": str(getattr(send, "status", "")),
+        "send_reason": str(getattr(send, "reason", "")),
+        "pending_count": int(candidate.get("pending_count") or 0),
+    }
+
+
+def _agent_proactive_message(conversation: dict[str, Any], *, kind: str) -> NormalizedMessage:
+    conversation_id = str(conversation.get("conversation_id") or "")
+    pending = conversation.get("pending_user_messages") if isinstance(conversation.get("pending_user_messages"), list) else []
+    recent_turns = conversation.get("recent_turns") if isinstance(conversation.get("recent_turns"), list) else []
+    source = pending[-5:] if pending else recent_turns[-5:]
+    prompt = _agent_proactive_prompt(conversation, source=source, kind=kind)
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "conversation_id": conversation_id,
+                "kind": kind,
+                "source_watermark": _agent_proactive_source_watermark(conversation, kind=kind),
+                "source": [
+                    {
+                        "message_id": str(item.get("message_id") or ""),
+                        "sequence": int(item.get("sequence") or 0),
+                        "received_at": str(item.get("received_at") or ""),
+                        "text": str(item.get("text") or ""),
+                    }
+                    for item in source
+                    if isinstance(item, dict)
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    sender = _agent_proactive_sender(source, conversation, kind=kind)
+    return NormalizedMessage(
+        message_id=f"agent-proactive-{fingerprint}",
+        conversation_id=conversation_id,
+        conversation_type="private",
+        chat_title=str(conversation.get("chat_title") or sender or conversation_id),
+        sender_name=sender,
+        sender_wechat_id="",
+        text=prompt,
+        is_self=False,
+        received_at=utc_now_iso(),
+        metadata={
+            "source": "agent_proactive_pending_ledger",
+            "proactive_kind": kind,
+            "pending_count": int(conversation.get("pending_user_count_since_last_assistant") or len(pending) or 0),
+            "source_watermark": _agent_proactive_source_watermark(conversation, kind=kind),
+            "original_text": prompt,
+        },
+    )
+
+
+def _agent_proactive_source_watermark(conversation: dict[str, Any], *, kind: str) -> int:
+    pending = conversation.get("pending_user_messages") if isinstance(conversation.get("pending_user_messages"), list) else []
+    recent_turns = conversation.get("recent_turns") if isinstance(conversation.get("recent_turns"), list) else []
+    source = pending[-5:] if pending and kind != "opening_greeting" else recent_turns[-5:]
+    watermark = 0
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        try:
+            watermark = max(watermark, int(item.get("sequence") or 0))
+        except (TypeError, ValueError):
+            continue
+    return watermark
+
+
+def _agent_stale_proactive_reply_reason(
+    runtime: Any,
+    conversation_id: str,
+    *,
+    session_id: str,
+    source_watermark: int,
+) -> str:
+    if source_watermark <= 0:
+        return ""
+    try:
+        entries = [_dataclass_payload(entry) for entry in runtime.ledger_store.read_entries(conversation_id)]
+    except Exception:
+        return ""
+    session_id = str(session_id or "session_default")
+    latest_sequence = 0
+    for entry in entries:
+        if str(entry.get("session_id") or "session_default") != session_id:
+            continue
+        latest_sequence = max(latest_sequence, _agent_entry_sequence(entry))
+    if latest_sequence > source_watermark:
+        return f"stale_linear_context:newer_entry_sequence={latest_sequence}:source_watermark={source_watermark}"
+    return ""
+
+
+def _agent_proactive_prompt(conversation: dict[str, Any], *, source: list[Any], kind: str) -> str:
+    chat_title = str(conversation.get("chat_title") or "对方").strip() or "对方"
+    lines: list[str] = []
+    lines.append("角色说明：user=对方或群友；self=当前微信账号主人手动发言；assistant=你自己此前的回复。")
+    lines.append("请只输出将要发到微信里的单条自然消息，不要写分析、标题或计划。")
+    if kind == "opening_greeting":
+        lines.append(f"请主动给 {chat_title} 发一条自然的微信开场白。")
+        lines.append("语气轻松、克制，不要解释系统，也不要说自己是机器人；可以简单打招呼并自然打开话题。")
+    else:
+        lines.append(f"请接上与 {chat_title} 的当前私聊。")
+        lines.append("下面是当前最新待接状态，请合并理解后只发一条自然回复；不要逐条补答旧历史，self 只作为主人上下文。")
+    source_line_count = 0
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user").strip() or "user"
+        sender = str(item.get("sender_name") or "").strip() or chat_title
+        text = str(item.get("text") or "").strip()
+        attachment_count = int(item.get("attachment_count") or 0)
+        if not text and attachment_count:
+            text = f"[{attachment_count} 个附件]"
+        if text:
+            lines.append(f"{role} {sender}: {text}")
+            source_line_count += 1
+    if source_line_count <= 0:
+        aggregation = conversation.get("message_aggregation") if isinstance(conversation.get("message_aggregation"), dict) else {}
+        summary = str(aggregation.get("summary") or "")
+        if summary:
+            lines.append(summary)
+    return "\n".join(lines).strip()
+
+
+def _agent_proactive_sender(source: list[Any], conversation: dict[str, Any], *, kind: str) -> str:
+    if kind == "opening_greeting":
+        return str(conversation.get("chat_title") or "对方")
+    for item in reversed(source):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "") == "self":
+            continue
+        sender = str(item.get("sender_name") or "").strip()
+        if sender:
+            return sender
+    return str(conversation.get("chat_title") or "对方")
+
+
+def _agent_proactive_topic(conversation: dict[str, Any]) -> str:
+    topics = conversation.get("topic_candidates") if isinstance(conversation.get("topic_candidates"), list) else []
+    if topics and isinstance(topics[0], dict):
+        return str(topics[0].get("title") or "private")
+    return "private"
+
+
+def _agent_reply_repeats_recent_assistant(text: str, conversation: dict[str, Any]) -> bool:
+    current = _agent_repeat_fingerprint(text)
+    if len(current) < 8:
+        return False
+    candidates: list[str] = []
+    last_assistant = str(conversation.get("last_assistant_reply") or "").strip()
+    if last_assistant:
+        candidates.append(last_assistant)
+    recent_turns = conversation.get("recent_turns") if isinstance(conversation.get("recent_turns"), list) else []
+    for item in recent_turns[-8:]:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "") != "assistant":
+            continue
+        candidate = str(item.get("text") or "").strip()
+        if candidate:
+            candidates.append(candidate)
+    for candidate in _dedupe_strings(candidates):
+        previous = _agent_repeat_fingerprint(candidate)
+        if len(previous) < 8:
+            continue
+        if current == previous:
+            return True
+        if _agent_text_similarity(current, previous) >= 0.92:
+            return True
+    return False
+
+
+def _agent_repeat_fingerprint(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    return re.sub(r"\s+", "", normalized)
+
+
+def _agent_text_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    left_grams = _agent_char_grams(left)
+    right_grams = _agent_char_grams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    intersection = len(left_grams.intersection(right_grams))
+    union = len(left_grams.union(right_grams))
+    return intersection / union if union else 0.0
+
+
+def _agent_char_grams(text: str) -> set[str]:
+    if len(text) <= 2:
+        return {text}
+    return {text[index : index + 2] for index in range(len(text) - 1)}
+
+
+def _agent_proactive_parallelism(runtime: Any, candidate_count: int) -> int:
+    if candidate_count <= 0:
+        return 0
+    default = max(1, min(3, candidate_count))
+    scheduler = getattr(runtime, "resource_scheduler", None)
+    schedule = getattr(scheduler, "conversation_parallelism", None)
+    if callable(schedule):
+        try:
+            planned = schedule("interactive")
+            return max(1, min(candidate_count, int(getattr(planned, "max_parallel_conversations", default) or default)))
+        except Exception:
+            return default
+    return default
+
+
+def _record_agent_proactive_tasks(
+    root: Path,
+    *,
+    conversation: dict[str, Any],
+    reply: ReplyCandidate,
+    send: Any,
+    kind: str,
+) -> None:
+    try:
+        store = TaskStatusStore(root)
+        fragment = _agent_safe_id(reply.message_id)
+        conversation_id = str(conversation.get("conversation_id") or reply.conversation_id)
+        session_id = str(conversation.get("session_id") or "session_default")
+        store.create(
+            {
+                "task_id": f"agent-proactive-reply-{fragment}",
+                "title": "主动接话回复",
+                "kind": "reply",
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "scope": f"conversation:{conversation_id}",
+                "topic_id": f"agent-proactive-{fragment}",
+                "topic_title": "主动接话",
+                "resource_class": "llm_interactive",
+                "priority": 80,
+                "estimated_cost": 2,
+                "metadata": {"message_id": reply.message_id, "proactive_kind": kind},
+            }
+        )
+        store.transition(
+            f"agent-proactive-reply-{fragment}",
+            "complete",
+            {"progress": 100, "phase": "主动回复已生成", "detail": reply.summary or reply.text[:160], "actual_cost": 1},
+        )
+        status = str(getattr(send, "status", "") or "")
+        reason = str(getattr(send, "reason", "") or "")
+        bridge_id = _agent_bridge_id_from_reason(reason)
+        send_task_id = f"agent-proactive-send-{fragment}"
+        store.create(
+            {
+                "task_id": send_task_id,
+                "title": "主动接话发送",
+                "kind": "send",
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "scope": f"conversation:{conversation_id}",
+                "topic_id": f"agent-proactive-{fragment}",
+                "topic_title": "主动接话",
+                "resource_class": "send_bridge",
+                "priority": 85,
+                "estimated_cost": 1,
+                "external_id": bridge_id,
+                "metadata": {"message_id": reply.message_id, "send_status": status, "send_reason": reason, "bridge_id": bridge_id},
+            }
+        )
+        if status == "queued_to_bridge":
+            store.update(send_task_id, {"status": "queued", "progress": 70, "phase": "等待非前台桥发送", "detail": reason})
+        elif status in {"sent", "accepted", "skipped"}:
+            store.transition(send_task_id, "complete", {"progress": 100, "phase": "发送链路已完成", "detail": reason})
+        elif status == "queued_for_confirm":
+            store.transition(send_task_id, "wait", {"progress": 45, "phase": "等待人工审核", "detail": reason})
+        else:
+            store.transition(send_task_id, "fail", {"progress": 100, "phase": "发送失败", "detail": reason, "last_error": reason})
+    except Exception:
+        return
+
+
+def _agent_safe_id(value: str) -> str:
+    cleaned = "".join(ch for ch in str(value or "") if ch.isalnum() or ch in {"-", "_", "."})
+    return cleaned[:64] or "unknown"
+
+
+def _agent_bridge_id_from_reason(reason: str) -> str:
+    marker = "bridge:"
+    text = str(reason or "")
+    index = text.rfind(marker)
+    if index < 0:
+        return ""
+    candidate = text[index:].split()[0].strip("，,.;；")
+    return candidate if candidate.startswith(marker) else ""
 
 
 def _agent_processed_conversation_ids(result: dict[str, Any]) -> list[str]:
@@ -3957,11 +7854,362 @@ def _agent_entry_text(entry: dict[str, Any]) -> str:
     blocks = entry.get("text_blocks") if isinstance(entry.get("text_blocks"), list) else []
     parts: list[str] = []
     for block in blocks:
-        if isinstance(block, dict):
-            text = str(block.get("text") or "").strip()
-            if text:
-                parts.append(text)
+        if not _agent_visible_text_block(block):
+            continue
+        text = str(block.get("text") or "").strip()
+        if text:
+            parts.append(text)
     return "\n".join(parts).strip()
+
+
+def _agent_visible_text_block(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    text = str(block.get("text") or "").strip()
+    if not text:
+        return False
+    kind = str(block.get("kind") or "")
+    if kind.startswith("control:") or kind.startswith("attachment:"):
+        return False
+    metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+    return metadata.get("visible_in_context") is not False
+
+
+def _agent_entry_is_control_event(entry: dict[str, Any]) -> bool:
+    blocks = entry.get("text_blocks") if isinstance(entry.get("text_blocks"), list) else []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        kind = str(block.get("kind") or "")
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        if kind.startswith("control:") or str(metadata.get("control_event") or ""):
+            return True
+    return False
+
+
+def _agent_entry_has_actionable_user_content(entry: dict[str, Any]) -> bool:
+    if _agent_entry_is_control_event(entry):
+        return False
+    if _agent_entry_text(entry):
+        return True
+    attachments = entry.get("attachments") if isinstance(entry.get("attachments"), list) else []
+    return any(isinstance(item, dict) for item in attachments)
+
+
+def _agent_pending_user_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pending: list[dict[str, Any]] = []
+    for entry in reversed(entries):
+        role = str(entry.get("role") or "user")
+        if role == "self":
+            break
+        if role == "assistant":
+            if _agent_assistant_entry_settles_pending(entry):
+                break
+            continue
+        if role == "user" and _agent_entry_has_actionable_user_content(entry):
+            pending.append(entry)
+    return list(reversed(pending))
+
+
+def _agent_actionable_pending_user_entries(
+    entries: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    pending = list(pending_entries if pending_entries is not None else _agent_pending_user_entries(entries))
+    if not pending:
+        return []
+    if _agent_pending_blocked_by_unseen_assistant(entries, pending):
+        return []
+    return pending
+
+
+def _agent_pending_blocked_by_unseen_assistant(
+    entries: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+) -> bool:
+    latest_pending_sequence = max((_agent_entry_sequence(item) for item in pending_entries), default=0)
+    if latest_pending_sequence <= 0:
+        return False
+    for entry in entries:
+        if _agent_entry_sequence(entry) <= latest_pending_sequence:
+            continue
+        if str(entry.get("role") or "") != "assistant":
+            continue
+        if not _agent_assistant_entry_settles_pending(entry):
+            return True
+    return False
+
+
+def _agent_assistant_entry_settles_pending(entry: dict[str, Any]) -> bool:
+    status = _agent_entry_send_status(entry)
+    # A failed/candidate reply was generated but never became visible to the
+    # other party. It must not close the pending user turn, but it also blocks
+    # duplicate generation until a newer user message changes the conversation.
+    if status in {"failed", "candidate"}:
+        return False
+    return True
+
+
+def _agent_entry_sequence(entry: dict[str, Any]) -> int:
+    try:
+        return int(entry.get("sequence") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _agent_entry_send_status(entry: dict[str, Any]) -> str:
+    send = entry.get("send") if isinstance(entry.get("send"), dict) else {}
+    return str(send.get("status") or "")
+
+
+def _agent_entry_send_reason(entry: dict[str, Any]) -> str:
+    send = entry.get("send") if isinstance(entry.get("send"), dict) else {}
+    return str(send.get("reason") or "")
+
+
+def _agent_topic_lifecycle(
+    conversation_id: str,
+    entries: list[dict[str, Any]],
+    *,
+    pending_entries: list[dict[str, Any]],
+    blocked_pending_count: int,
+    topic_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    lead_topic = topic_candidates[0] if topic_candidates else {}
+    topic_title = str(lead_topic.get("title") or "对话接续")
+    topic_id = str(lead_topic.get("topic_id") or _agent_topic_id(f"{conversation_id}:{topic_title}"))
+    last_user = _agent_last_entry_by_role(entries, "user")
+    last_assistant = _agent_last_entry_by_role(entries, "assistant")
+    last_user_sequence = _agent_entry_sequence(last_user)
+    last_assistant_sequence = _agent_entry_sequence(last_assistant)
+    latest_pending_sequence = max((_agent_entry_sequence(item) for item in pending_entries), default=0)
+    assistant_status = _agent_entry_send_status(last_assistant)
+    assistant_reason = _agent_entry_send_reason(last_assistant)
+
+    if blocked_pending_count > 0:
+        status = "responded"
+        reason = "assistant_reply_generated_but_not_visible"
+    elif pending_entries:
+        reopened = last_assistant_sequence > 0 and latest_pending_sequence > last_assistant_sequence
+        status = "reopened" if reopened else "open"
+        reason = "new_user_message_after_assistant" if reopened else "pending_user_messages"
+    elif last_assistant:
+        if assistant_status in {"sent", "accepted"}:
+            status = "sent"
+            reason = f"assistant_{assistant_status}"
+        elif assistant_status in {"queued_for_confirm", "queued_to_bridge", "approved", "pending", "candidate"}:
+            status = "responded"
+            reason = f"assistant_waiting_delivery:{assistant_status}"
+        else:
+            status = "closed"
+            reason = "assistant_settled_no_pending"
+    else:
+        status = "closed"
+        reason = "no_pending_user_messages"
+
+    return {
+        "schema": "dialog_agent_topic_lifecycle_v1",
+        "topic_id": topic_id,
+        "topic_title": topic_title,
+        "status": status,
+        "reason": reason,
+        "pending_user_count": len(pending_entries),
+        "blocked_pending_user_count": int(blocked_pending_count or 0),
+        "last_user_message_id": str(last_user.get("message_id") or ""),
+        "last_user_sequence": last_user_sequence,
+        "last_assistant_message_id": str(last_assistant.get("message_id") or ""),
+        "last_assistant_sequence": last_assistant_sequence,
+        "last_assistant_send_status": assistant_status,
+        "last_assistant_send_reason": assistant_reason,
+    }
+
+
+def _agent_last_entry_by_role(entries: list[dict[str, Any]], role: str) -> dict[str, Any]:
+    for entry in reversed(entries):
+        if str(entry.get("role") or "user") != role:
+            continue
+        if role == "user" and not _agent_entry_has_actionable_user_content(entry):
+            continue
+        return entry
+    return {}
+
+
+def _agent_user_entries_with_actionable_content(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in entries
+        if str(entry.get("role") or "user") == "user" and _agent_entry_has_actionable_user_content(entry)
+    ]
+
+
+def _agent_user_text_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for entry in _agent_user_entries_with_actionable_content(entries):
+        if _agent_entry_text(entry):
+            result.append(entry)
+    return result
+
+
+def _agent_topic_lifecycle_counts(conversations: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {"open": 0, "responded": 0, "sent": 0, "closed": 0, "reopened": 0}
+    for conversation in conversations:
+        lifecycle = conversation.get("topic_lifecycle") if isinstance(conversation.get("topic_lifecycle"), dict) else {}
+        status = str(lifecycle.get("status") or "closed")
+        counts[status] = int(counts.get(status, 0)) + 1
+    return counts
+
+
+def _agent_participant_summary(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    participants: dict[str, dict[str, Any]] = {}
+    for entry in _agent_user_entries_with_actionable_content(entries):
+        sender_name = str(entry.get("sender_name") or "").strip() or "unknown"
+        sender_wechat_id = str(entry.get("sender_wechat_id") or "").strip()
+        key = sender_wechat_id or sender_name
+        item = participants.setdefault(
+            key,
+            {
+                "sender_name": sender_name,
+                "sender_wechat_id": sender_wechat_id,
+                "message_count": 0,
+                "last_message_at": "",
+                "recent_texts": [],
+            },
+        )
+        item["message_count"] = int(item["message_count"]) + 1
+        item["last_message_at"] = max(str(item.get("last_message_at") or ""), str(entry.get("received_at") or entry.get("updated_at") or ""))
+        text = _agent_compact_text(_agent_entry_text(entry), 160)
+        if text:
+            item["recent_texts"] = [*item["recent_texts"], text][-3:]
+    return sorted(
+        participants.values(),
+        key=lambda item: (str(item.get("last_message_at") or ""), int(item.get("message_count") or 0)),
+        reverse=True,
+    )
+
+
+def _agent_pending_message_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_id": str(entry.get("message_id") or ""),
+        "sequence": _agent_entry_sequence(entry),
+        "sender_name": str(entry.get("sender_name") or ""),
+        "sender_wechat_id": str(entry.get("sender_wechat_id") or ""),
+        "received_at": str(entry.get("received_at") or ""),
+        "text": _agent_compact_text(_agent_entry_text(entry), 240),
+        "attachment_count": len(entry.get("attachments") if isinstance(entry.get("attachments"), list) else []),
+    }
+
+
+def _agent_message_aggregation(
+    conversation_id: str,
+    entries: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    participants: list[dict[str, Any]],
+    topic_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    recent_user_entries = _agent_user_entries_with_actionable_content(entries)[-12:]
+    pending_senders = _dedupe_strings([str(entry.get("sender_name") or "") for entry in pending_entries])
+    recent_senders = _dedupe_strings([str(entry.get("sender_name") or "") for entry in recent_user_entries])
+    lead_topic = topic_candidates[0] if topic_candidates else {}
+    return {
+        "schema": "conversation_message_aggregation_v1",
+        "conversation_id": conversation_id,
+        "status": "needs_agent_reply" if pending_entries else "settled",
+        "recent_message_count": len(recent_user_entries),
+        "pending_message_count": len(pending_entries),
+        "participant_count": len(participants),
+        "recent_senders": recent_senders,
+        "pending_senders": pending_senders,
+        "lead_topic": {
+            "topic_id": str(lead_topic.get("topic_id") or ""),
+            "title": str(lead_topic.get("title") or ""),
+            "score": int(lead_topic.get("score") or 0),
+        },
+        "summary": _agent_aggregate_summary(recent_user_entries, pending_entries, lead_topic),
+    }
+
+
+def _agent_aggregate_summary(
+    recent_user_entries: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    lead_topic: dict[str, Any],
+) -> str:
+    source = pending_entries or recent_user_entries[-3:]
+    if not source:
+        return ""
+    senders = _dedupe_strings([str(entry.get("sender_name") or "") for entry in source])
+    topic = str(lead_topic.get("title") or "").strip()
+    latest = _agent_compact_text(_agent_entry_text(source[-1]), 120)
+    sender_text = "、".join(senders) if senders else "用户"
+    if topic:
+        return f"{sender_text}围绕“{topic}”继续发言；最新一句：{latest}"
+    return f"{sender_text}继续发言；最新一句：{latest}"
+
+
+def _agent_dispatch_preview(
+    conversation_id: str,
+    entries: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    topic_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    topic = topic_candidates[0] if topic_candidates else {}
+    topic_id = str(topic.get("topic_id") or _agent_topic_id(conversation_id))
+    topic_title = str(topic.get("title") or "对话接续")
+    if pending_entries:
+        tasks.append(
+            {
+                "kind": "reply",
+                "title": "生成接话回复",
+                "conversation_id": conversation_id,
+                "resource_class": "llm_interactive",
+                "concurrency_key": f"conversation:{conversation_id}",
+                "topic_id": topic_id,
+                "topic_title": topic_title,
+                "reason": "pending_user_messages",
+                "estimated_cost": max(1, min(4, len(pending_entries))),
+            }
+        )
+    if len(entries) >= 3:
+        tasks.append(
+            {
+                "kind": "memory",
+                "title": "维护会话记忆",
+                "conversation_id": conversation_id,
+                "resource_class": "llm_background",
+                "concurrency_key": f"memory:{conversation_id}",
+                "topic_id": topic_id,
+                "topic_title": topic_title,
+                "reason": "session_has_context",
+                "estimated_cost": 1,
+            }
+        )
+    incoming_attachment_count = _agent_incoming_attachment_count(entries)
+    if incoming_attachment_count:
+        tasks.append(
+            {
+                "kind": "file",
+                "title": "检查会话文件上下文",
+                "conversation_id": conversation_id,
+                "resource_class": "file_io",
+                "concurrency_key": f"file:{conversation_id}",
+                "topic_id": topic_id,
+                "topic_title": topic_title,
+                "reason": "conversation_has_incoming_attachments",
+                "estimated_cost": min(5, incoming_attachment_count),
+            }
+        )
+    return tasks
+
+
+def _agent_incoming_attachment_count(entries: list[dict[str, Any]]) -> int:
+    count = 0
+    for entry in entries:
+        role = str(entry.get("role") or "user")
+        if role == "assistant" or entry.get("is_self") or role == "self":
+            continue
+        attachments = entry.get("attachments") if isinstance(entry.get("attachments"), list) else []
+        count += len(attachments)
+    return count
 
 
 def _agent_topic_candidates(texts: list[str]) -> list[dict[str, Any]]:
@@ -4294,7 +8542,7 @@ def _validate_probe_url(url: str) -> str:
 
     Delegates to the shared endpoint validator so the model-probe path and the
     live chat send path enforce the same rule (http/https + real host) before
-    the API key is attached — a bad base_url can never leak the key to file://,
+    the API key is attached; a bad base_url can never leak the key to file://,
     ftp://, or a schemeless/hostless destination.
     """
     from app.personal_wechat_bot.llm.openai_client import validate_endpoint_url
@@ -4343,7 +8591,7 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
         persisted_states = state_store.list_states() if state_store is not None else []
         return {
             "status": "ok",
-            "policy": "auto_accept_wechat_contacts_and_groups",
+            "policy": CHANNEL_POLICY,
             "count": 0,
             "total_count": 0,
             "state_schema": "channel_state_v1",
@@ -4380,6 +8628,8 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
             "segment": channel.segment,
             "source_names": channel.source_names,
             "trusted_channel_source": channel.trusted_channel_source,
+            "is_friend": channel.is_friend,
+            "contact_authorization": channel.contact_authorization,
             "updated_at": channel.updated_at,
         }
         projected_state = build_channel_state_projection(
@@ -4398,7 +8648,7 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
     persisted_states = state_store.replace_all(state_records) if state_store is not None else []
     return {
         "status": "ok",
-        "policy": "auto_accept_wechat_contacts_and_groups",
+        "policy": CHANNEL_POLICY,
         "count": len(channels),
         "total_count": len(channels) + len(hidden),
         "state_schema": "channel_state_v1",
@@ -4474,17 +8724,61 @@ def _sidebar_bridge_state(
     channels_state: dict[str, Any] | None = None,
     limit: int = 30,
 ) -> dict[str, Any]:
-    state = bridge_state(data_dir, limit=limit)
-    channels_state = channels_state if isinstance(channels_state, dict) else _channel_state(data_dir)
+    root = Path(data_dir).resolve()
+    state = bridge_state(root, limit=limit)
+    channels_state = channels_state if isinstance(channels_state, dict) else _channel_state(root)
     channels = channels_state.get("items") if isinstance(channels_state.get("items"), list) else []
     bridge_channels = [_bridge_channel_payload(item) for item in channels if isinstance(item, dict)]
     state["channels"] = bridge_channels
     state["channel_count"] = len(bridge_channels)
+    state["item_channels"] = _bridge_item_channels(state.get("items", []), bridge_channels)
+    state["worker"] = _bridge_worker_public_state(root)
     state["contract"] = {
         **(state.get("contract") if isinstance(state.get("contract"), dict) else {}),
-        "channel_sync": "visible service channels are projected into send_bridge.channels; outbox records carry receiver wxid/roomid from the channel registry when available",
+        "channel_sync": "visible service channels are projected into send_bridge.channels; outbox records carry receiver wxid/roomid from the channel registry when available; item_channels groups bridge records by conversation",
     }
     return state
+
+
+def _bridge_item_channels(items: Any, bridge_channels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records = items if isinstance(items, list) else []
+    channel_map = {
+        str(channel.get("conversation_id") or "").strip(): channel
+        for channel in bridge_channels
+        if str(channel.get("conversation_id") or "").strip()
+    }
+    groups: dict[str, dict[str, Any]] = {}
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        conversation_id = str(item.get("conversation_id") or "").strip() or "unknown"
+        group = groups.get(conversation_id)
+        if group is None:
+            channel = channel_map.get(conversation_id, {})
+            group = {
+                "conversation_id": conversation_id,
+                "display_name": str(channel.get("display_name") or "").strip() or conversation_id,
+                "conversation_type": str(channel.get("conversation_type") or ""),
+                "receiver": str(channel.get("receiver") or item.get("receiver") or "").strip(),
+                "bridge_ready": bool(channel.get("bridge_ready") or item.get("receiver")),
+                "count": 0,
+                "latest_at": "",
+                "status_counts": {status: 0 for status in BRIDGE_ITEM_STATUSES},
+                "items": [],
+            }
+            groups[conversation_id] = group
+        group["items"].append(item)
+        group["count"] += 1
+        status = str(item.get("status") or "queued").strip() or "queued"
+        group["status_counts"][status] = int(group["status_counts"].get(status, 0) or 0) + 1
+        latest_at = str(item.get("updated_at") or item.get("created_at") or "")
+        if latest_at > group["latest_at"]:
+            group["latest_at"] = latest_at
+    return sorted(
+        groups.values(),
+        key=lambda item: (str(item.get("latest_at") or ""), str(item.get("display_name") or "")),
+        reverse=True,
+    )
 
 
 def _bridge_channel_payload(channel: dict[str, Any]) -> dict[str, Any]:
@@ -4495,7 +8789,9 @@ def _bridge_channel_payload(channel: dict[str, Any]) -> dict[str, Any]:
     # Mirror bridge_send._channel_receiver so the panel shows the true receiver:
     # prefer the persisted talker id; for groups only a @chatroom id is valid
     # (a member wxid would misroute the reply privately).
-    if _looks_like_wechat_receiver(conversation_key):
+    if conversation_type == "private" and not channel_allows_private_receiver(channel):
+        receiver = ""
+    elif _looks_like_wechat_receiver(conversation_key):
         receiver = conversation_key
     elif conversation_type == "group":
         receiver = next((str(item).strip() for item in sender_ids if str(item).strip().endswith("@chatroom")), "")
@@ -4513,6 +8809,8 @@ def _bridge_channel_payload(channel: dict[str, Any]) -> dict[str, Any]:
         "bridge_ready": bool(receiver),
         "updated_at": str(channel.get("updated_at") or ""),
         "source_names": channel.get("source_names") if isinstance(channel.get("source_names"), list) else [],
+        "is_friend": bool(channel.get("is_friend", False)),
+        "contact_authorization": str(channel.get("contact_authorization") or ""),
     }
 
 
@@ -4547,20 +8845,62 @@ def _sidebar_channel_visible(channel: Any, policy: dict[str, set[str]] | None = 
         return False, "empty_title"
     if title.lower() in {"wechat agent console", "windows powershell", "powershell", "codex"}:
         return False, "tool_window"
+    if _channel_is_unidentified_private(channel, policy or {}):
+        return False, "private_contact_unknown_or_unidentified"
+    if _channel_has_visible_trust(channel, policy or {}):
+        return True, ""
     if _looks_like_probe_fragment(title):
         return False, "probe_fragment"
     if _looks_like_mojibake(title):
         return False, "mojibake"
-    if not _channel_has_visible_trust(channel, policy or {}):
-        return False, "untrusted_legacy_channel"
-    return True, ""
+    return False, "untrusted_legacy_channel"
+
+
+def _channel_is_unidentified_private(channel: Any, policy: dict[str, set[str]]) -> bool:
+    if str(getattr(channel, "conversation_type", "") or "") != "private":
+        return False
+    conversation_id = str(getattr(channel, "conversation_id", "") or "").strip()
+    title = str(getattr(channel, "chat_title", "") or "").strip()
+    identity = str(getattr(channel, "conversation_key", "") or "").strip()
+    sender_ids = [str(item).strip() for item in getattr(channel, "sender_wechat_ids", []) if str(item).strip()]
+    if not identity and sender_ids:
+        identity = sender_ids[0]
+    sender_names = [str(item).strip() for item in getattr(channel, "sender_names", []) if str(item).strip()]
+    if conversation_id in policy.get("bound_ids", set()) or title in policy.get("bound_titles", set()):
+        return False
+    accepted_contacts = policy.get("accepted_contacts", set())
+    accepted_candidates = {identity, title, *sender_ids, *sender_names}
+    accepted_candidates.discard("")
+    if accepted_candidates.intersection(accepted_contacts):
+        return False
+    if identity and not _looks_like_wechat_receiver(identity):
+        return False
+    titles = [title, *sender_names]
+    return not any(_channel_title_identifies_private_contact(title, identity) for title in titles)
+
+
+def _channel_title_identifies_private_contact(title: str, identity: str) -> bool:
+    text = str(title or "").strip()
+    if not text:
+        return False
+    if text == identity and _looks_like_wechat_receiver(identity):
+        return False
+    if _looks_like_wechat_receiver(text):
+        return False
+    if text.lower() in {"unknown", "unknown contact", "unknown user", "未知", "未知联系人", "未知用户", "system", "none", "null"}:
+        return False
+    if _looks_like_mojibake(text):
+        return False
+    if not any(char.isalnum() for char in text):
+        return False
+    return True
 
 
 def _channel_has_visible_trust(channel: Any, policy: dict[str, set[str]]) -> bool:
     if bool(getattr(channel, "trusted_channel_source", False)):
         return True
     source_names = {str(item).strip() for item in getattr(channel, "source_names", []) if str(item).strip()}
-    if source_names.intersection({"backend_events_jsonl", "backend_file_watcher", "manual_backend_event"}):
+    if source_names.intersection({"backend_events_jsonl", "backend_file_watcher", "manual_backend_event", "weflow_discovery", "weflow_pull"}):
         return True
     conversation_id = str(getattr(channel, "conversation_id", "")).strip()
     title = str(getattr(channel, "chat_title", "")).strip()
@@ -4583,18 +8923,27 @@ def _looks_like_probe_fragment(title: str) -> bool:
     lowered = title.lower()
     if any(token in lowered for token in ["driver=", "enabled=", "send_enabled", "not_implemented"]):
         return True
-    if len(title) <= 2 and not re.search(r"[\u4e00-\u9fffA-Za-z]", title):
+    if len(title) <= 2 and not re.search(r"[\u4e00-\u9fffA-Za-z]", title) and not _contains_emoji_symbol(title):
         return True
     return False
 
 
 def _looks_like_mojibake(title: str) -> bool:
-    suspicious = ("�", "锛", "绔", "鐚", "鍟", "娴", "灏", "鏃", "闀", "涓", "鎺", "乬")
+    if _contains_emoji_symbol(title):
+        return False
+    suspicious = ("�", "锟", "锛", "绔", "馃", "鈥", "鐚", "鍟", "娴", "灏", "鏃", "闀", "涓", "鎺", "乬")
     if any(token in title for token in suspicious):
         return True
     non_ascii = sum(1 for char in title if ord(char) > 127)
     if non_ascii >= 2 and not re.search(r"[\u4e00-\u9fff]", title):
         return True
+    return False
+
+
+def _contains_emoji_symbol(value: str) -> bool:
+    for char in str(value or ""):
+        if unicodedata.category(char) == "So" and ord(char) >= 0x2600:
+            return True
     return False
 
 

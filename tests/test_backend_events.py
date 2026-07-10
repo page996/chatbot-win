@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,8 @@ from app.personal_wechat_bot.wechat_driver.backend_events import (
     append_backend_event,
     append_backend_event_payload,
 )
+from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
+from app.personal_wechat_bot.wechat_driver.hook_source_bridge import normalize_weflow_message
 from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import WeChatVoiceCacheResolver
 
 
@@ -478,13 +481,14 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.reason, "backend_event_driver_never_sends")
 
-    def test_polling_runner_auto_registers_unknown_contact_and_stages_attachment(self) -> None:
+    def test_polling_runner_blocks_unknown_private_contact_before_channel_and_attachment(self) -> None:
         note = self.inbox / "note.txt"
         note.write_text("secret", encoding="utf-8")
         append_backend_event(
             self.event_file,
-            chat_title="NOT_PAGE",
-            sender_name="NOT_PAGE",
+            chat_title="wxid_stranger",
+            sender_name="wxid_stranger",
+            sender_wechat_id="wxid_stranger",
             text="ignored",
             attachments=["note.txt"],
         )
@@ -499,11 +503,50 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
 
         result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_forever(max_loops=1)
 
-        self.assertEqual(result["processed"][0]["route"]["action"], "process")
-        self.assertIn("channel auto registered", result["processed"][0]["route"]["reason"])
+        self.assertEqual(result["processed"][0]["route"]["action"], "ignore")
+        self.assertIn("channel_admission_blocked", result["processed"][0]["route"]["reason"])
         staged_files = [item for item in (self.data_dir / "file_workspace").rglob("*") if item.is_file()]
-        self.assertTrue(staged_files)
-        self.assertTrue((self.data_dir / "conversation_channels" / "index.json").exists())
+        self.assertFalse(staged_files)
+        self.assertFalse((self.data_dir / "conversation_channels" / "index.json").exists())
+
+    def test_weflow_hook_import_blocks_explicit_non_friend_private_with_display_name(self) -> None:
+        hook_file = self.data_dir / "hook_events.jsonl"
+        normalized = normalize_weflow_message(
+            {
+                "platformMessageId": "wf-stranger-1",
+                "senderUsername": "wxid_stranger",
+                "accountName": "Readable Stranger",
+                "content": "hello",
+            },
+            session_id="wxid_stranger",
+            session_meta={
+                "displayName": "Readable Stranger",
+                "type": "private",
+                "is_friend": False,
+            },
+        )
+        hook_file.write_text(json.dumps(normalized, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        import_result = HookEventJsonlImporter(
+            hook_file,
+            self.event_file,
+            state_path=self.data_dir / "hook_events_state.json",
+        ).import_new()
+        runtime = build_runtime(self.config)
+        driver = BackendEventJsonlDriver(
+            self.event_file,
+            runtime.file_index,
+            allowed_input_roots=resolve_allowed_roots(self.data_dir, self.config.file_read_roots),
+            allowed_extensions=self.config.file_allowed_extensions,
+            max_input_bytes=self.config.file_max_bytes,
+        )
+
+        result = PollingRunner(runtime, driver, poll_interval_seconds=0).run_forever(max_loops=1)
+
+        self.assertEqual(import_result.appended_count, 1)
+        self.assertEqual(result["processed"][0]["route"]["action"], "ignore")
+        self.assertIn("private_contact_explicitly_not_friend", result["processed"][0]["route"]["reason"])
+        self.assertFalse((self.data_dir / "conversation_channels" / "index.json").exists())
 
     def test_polling_runner_stages_attachment_after_channel_route(self) -> None:
         note = self.inbox / "note.txt"
@@ -540,7 +583,7 @@ class BackendEventJsonlDriverTest(unittest.TestCase):
             self.event_file,
             chat_title="PAGE",
             sender_name="PAGE",
-            text="清空当前对话上下文",
+            text="@bot 清空当前对话上下文",
             attachments=["note.txt"],
         )
         runtime = build_runtime(self.config)

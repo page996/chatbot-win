@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
+from app.personal_wechat_bot.bootstrap import build_runtime
+from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.domain.models import RawWeChatMessage
+from app.personal_wechat_bot.processor.message_processor import MessageProcessor
 from app.personal_wechat_bot.runtime.conversation_scheduler import ConversationScheduler
 
 
@@ -78,6 +83,65 @@ class ConversationSchedulerTest(unittest.TestCase):
         self.assertIn("good-2", raw_ids)
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["raw_id"], "bad")
+
+    def test_scheduler_defers_earlier_live_messages_per_conversation(self) -> None:
+        def handle(raw: RawWeChatMessage) -> dict:
+            return {"raw_id": raw.raw_id, "meta": raw.driver_meta}
+
+        messages = [
+            RawWeChatMessage(raw_id="a1", chat_title="A", sender_name="u", text="first"),
+            RawWeChatMessage(raw_id="a2", chat_title="A", sender_name="u", text="second"),
+            RawWeChatMessage(raw_id="b1", chat_title="B", sender_name="u", text="first"),
+            RawWeChatMessage(raw_id="b2", chat_title="B", sender_name="u", text="second"),
+        ]
+
+        result = ConversationScheduler(handle, max_parallel_conversations=2).process_batch(messages)
+
+        by_raw_id = {item["raw_id"]: item for item in result.processed}
+        self.assertTrue(by_raw_id["a1"]["meta"]["context_only"])
+        self.assertTrue(by_raw_id["a1"]["meta"]["deferred_reply"])
+        self.assertEqual(by_raw_id["a1"]["meta"]["deferred_reply_anchor_raw_id"], "a2")
+        self.assertNotIn("context_only", by_raw_id["a2"]["meta"])
+        self.assertTrue(by_raw_id["b1"]["meta"]["context_only"])
+        self.assertEqual(by_raw_id["b1"]["meta"]["deferred_reply_anchor_raw_id"], "b2")
+        self.assertNotIn("context_only", by_raw_id["b2"]["meta"])
+
+    def test_scheduler_keeps_ledger_linear_for_batched_private_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+            messages = [
+                RawWeChatMessage(
+                    raw_id="m1",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    text="first",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                ),
+                RawWeChatMessage(
+                    raw_id="m2",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    text="second",
+                    observed_at="2026-06-28T01:00:01+00:00",
+                ),
+            ]
+
+            result = ConversationScheduler(processor.process, max_parallel_conversations=1).process_batch(messages)
+
+            self.assertEqual(len(result.processed), 2)
+            self.assertTrue(result.processed[0]["context_only"])
+            self.assertNotIn("reply", result.processed[0])
+            self.assertIn("reply", result.processed[1])
+            conversation_id = result.processed[1]["message"]["conversation_id"]
+            entries = runtime.ledger_store.read_entries(conversation_id)
+            self.assertEqual([entry.role for entry in entries], ["user", "user", "assistant"])
+            self.assertEqual(entries[0].text_blocks[0]["text"], "first")
+            self.assertEqual(entries[1].text_blocks[0]["text"], "second")
+            self.assertTrue(entries[0].text_blocks[0]["metadata"]["context_only"])
+            self.assertTrue(entries[0].text_blocks[0]["metadata"]["deferred_reply"])
 
 
 if __name__ == "__main__":

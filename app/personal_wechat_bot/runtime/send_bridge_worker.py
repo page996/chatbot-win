@@ -1,9 +1,9 @@
-"""Outbox bridge worker: delivers queued messages to WeChat without foreground.
+﻿"""Outbox bridge worker: delivers queued messages to WeChat without foreground.
 
 The reply gate / send drivers only *queue* outgoing messages into
 ``<data_dir>/send_bridge/outbox.jsonl``. This worker is the consumer half: it
 reads the outbox, delivers each not-yet-acked record through a
-:class:`SendBackend` (WeChatFerry in production, dry-run in tests), writes an ack
+:class:`SendBackend` (native HTTP, WeFlow HTTP, or dry-run), writes an ack
 to ``acks.jsonl``, and syncs the confirm queue + conversation ledger so the UI
 and history reflect real delivery.
 
@@ -11,13 +11,13 @@ Design constraints (see the WeFlow concurrency model memory note):
 
 * **Single instance.** Guarded by a :class:`ProcessLock`, so two bridges never
   double-send the same outbox lines.
-* **Serialized sends.** WeChatFerry's ``send_*`` is not thread-safe, so this
-  worker delivers strictly one record at a time, in outbox (FIFO) order. That
-  also preserves per-conversation ordering for free and interleaves fairly
-  across conversations.
+* **Serialized sends.** Native send ports are treated as single-lane resources,
+  so this worker delivers strictly one record at a time, in outbox (FIFO) order.
+  That also preserves per-conversation ordering and interleaves fairly across
+  conversations.
 * **Restart-safe.** The "already resolved" cursor is derived from terminal acks
-  in ``acks.jsonl`` (``sent``/``failed``/``blocked``), not from in-memory state,
-  so a restart never re-sends an already-acked record.
+  in ``acks.jsonl`` (``sent``/``accepted``/``failed``/``blocked``), not from
+  in-memory state, so a restart never re-sends an already-acked record.
 """
 
 from __future__ import annotations
@@ -31,11 +31,12 @@ from typing import Any, Callable
 
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.control.send_commands import sync_bridge_ack_to_send_state
-from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError
+from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError, process_pid_alive
 from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BridgeAckStatus,
     BridgeAckState,
     BridgeOutboxStore,
+    _receiver_authorization_blocker,
     effective_bridge_ack_states,
     is_terminal_bridge_ack_status,
 )
@@ -68,14 +69,36 @@ _MAX_CROSS_TICK_RETRIES = 8
 # resolved records so the files (re-read in full every tick) stay bounded.
 _COMPACT_EVERY_TICKS = 50
 _KEEP_RESOLVED_RECORDS = 500
+BRIDGE_WORKER_LOCK_STALE_SECONDS = 60.0
+_ACCEPTED_REVERIFY_EVERY_SECONDS = 10.0
+_ACCEPTED_REVERIFY_MAX_PER_TICK = 5
+_ACCEPTED_REVERIFY_MAX_ATTEMPTS = 120
+_REAL_SEND_BACKENDS = frozenset({"weflow_http", "wechat_native_http"})
 
 
 # Reason markers for a send whose delivery outcome is genuinely unknown: the
-# wire send may already have landed but the client never confirmed (e.g. a
-# hard-killed WCF RPC subprocess). Such a record must NOT be re-sent — not on a
-# later tick and not within the same tick's attempt loop — because a re-send
-# would duplicate an already-delivered message.
-_UNKNOWN_DELIVERY_MARKERS = ("wcf_rpc_timeout", "unknown_delivery_state")
+# wire send may already have landed but the client never confirmed. Such a
+# record must NOT be re-sent, because a re-send would duplicate an
+# already-delivered message.
+_UNKNOWN_DELIVERY_MARKERS = (
+    "unknown_delivery_state",
+    "weflow_http_send_text_error:timeouterror",
+    "weflow_http_send_file_error:timeouterror",
+    "wechat_native_http_send_text_error:timeouterror",
+    "wechat_native_http_send_image_error:timeouterror",
+    "wechat_native_http_send_file_error:timeouterror",
+)
+
+_PERMANENT_FAILURE_MARKERS = (
+    "unsupported",
+    "http_404",
+    "not_found",
+    "file_not_found",
+    "empty_text",
+    "empty_file_path",
+    "localhost",
+    "non_local",
+)
 
 
 def _is_unknown_delivery_state(reason: str) -> bool:
@@ -83,14 +106,100 @@ def _is_unknown_delivery_state(reason: str) -> bool:
     return any(marker in lowered for marker in _UNKNOWN_DELIVERY_MARKERS)
 
 
+def _is_permanent_failure(reason: str) -> bool:
+    lowered = str(reason or "").lower()
+    return any(marker in lowered for marker in _PERMANENT_FAILURE_MARKERS)
+
+
 def _is_retryable_failure(reason: str) -> bool:
     lowered = str(reason or "").lower()
-    # A hard-killed WCF RPC has unknown delivery state: the message may already
-    # be on the wire but the client never returned. Retrying blindly risks a
-    # duplicate, so quarantine it as terminal failed for operator review.
     if _is_unknown_delivery_state(lowered):
         return False
     return any(marker in lowered for marker in _RETRYABLE_REASON_MARKERS)
+
+
+def bridge_worker_lock_path(data_dir: str | Path) -> Path:
+    return Path(data_dir) / "send_bridge" / ".bridge_worker.lock"
+
+
+def _normalize_send_backend(value: str) -> str:
+    return str(value or "dry_run").strip().lower()
+
+
+def bridge_worker_lock_alive(
+    data_dir: str | Path,
+    *,
+    stale_after_seconds: float = BRIDGE_WORKER_LOCK_STALE_SECONDS,
+    now: float | None = None,
+) -> bool:
+    """True when the send-bridge worker lock has a fresh heartbeat."""
+
+    lock_path = bridge_worker_lock_path(data_dir)
+    if not lock_path.exists():
+        return False
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    heartbeat = payload.get("heartbeat_at")
+    if not isinstance(heartbeat, (int, float)):
+        return False
+    try:
+        pid = int(payload.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid > 0 and not process_pid_alive(pid):
+        return False
+    return ((time.time() if now is None else float(now)) - float(heartbeat)) <= max(
+        1.0, float(stale_after_seconds)
+    )
+
+
+def bridge_worker_config_signature(config: Any) -> dict[str, Any]:
+    """Backend config captured by a send-bridge worker at startup."""
+
+    return {
+        "send_enabled": bool(getattr(config, "send_enabled", False)),
+        "send_driver": str(getattr(config, "send_driver", "") or ""),
+        "send_backend": _normalize_send_backend(str(getattr(config, "send_backend", "dry_run") or "dry_run")),
+        "weflow_base_url": str(getattr(config, "weflow_base_url", "http://127.0.0.1:5031") or "http://127.0.0.1:5031"),
+        "weflow_token_env": str(getattr(config, "weflow_token_env", "WEFLOW_API_TOKEN") or "WEFLOW_API_TOKEN"),
+        "weflow_send_text_path": str(getattr(config, "weflow_send_text_path", "/send/text") or "/send/text"),
+        "weflow_send_file_path": str(getattr(config, "weflow_send_file_path", "/send/file") or "/send/file"),
+        "weflow_send_timeout_seconds": float(getattr(config, "weflow_send_timeout_seconds", 35.0) or 35.0),
+        "wechat_native_base_url": str(
+            getattr(config, "wechat_native_base_url", "http://127.0.0.1:30001") or "http://127.0.0.1:30001"
+        ),
+        "wechat_native_send_text_path": str(getattr(config, "wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
+        "wechat_native_send_image_path": str(getattr(config, "wechat_native_send_image_path", "/SendImgMsg") or "/SendImgMsg"),
+        "wechat_native_send_file_path": str(getattr(config, "wechat_native_send_file_path", "/send_file_msg") or "/send_file_msg"),
+        "wechat_native_status_path": str(getattr(config, "wechat_native_status_path", "/QueryDB/status") or "/QueryDB/status"),
+        "wechat_native_timeout_seconds": float(getattr(config, "wechat_native_timeout_seconds", 15.0) or 15.0),
+        "wechat_native_verify_timeout_seconds": float(getattr(config, "wechat_native_verify_timeout_seconds", 10.0) or 0.0),
+        "wechat_native_file_verify_timeout_seconds": float(
+            getattr(config, "wechat_native_file_verify_timeout_seconds", 45.0) or 0.0
+        ),
+    }
+
+
+def _runtime_send_blocker(data_dir: str | Path, backend_name: str) -> str:
+    backend_name = _normalize_send_backend(backend_name)
+    if backend_name not in _REAL_SEND_BACKENDS:
+        return ""
+    try:
+        config = load_config(data_dir)
+    except Exception as exc:
+        return f"bridge_worker_runtime_config_unavailable:{type(exc).__name__}:{exc}"
+    if str(getattr(config, "send_driver", "") or "") != "bridge_outbox":
+        return f"send_driver_not_bridge_outbox:{getattr(config, 'send_driver', '') or 'missing'}"
+    if not bool(getattr(config, "send_enabled", False)):
+        return "send_enabled_false"
+    config_backend = _normalize_send_backend(str(getattr(config, "send_backend", "") or "dry_run"))
+    if config_backend != backend_name:
+        return f"bridge_worker_runtime_backend_mismatch:worker_backend={backend_name}:config_backend={config_backend}"
+    return ""
 
 
 @dataclass
@@ -172,9 +281,9 @@ class BridgeWorker:
         _deliver writes an 'inflight' ack immediately before the wire send. If
         the process crashes between the send and the terminal ack, the record is
         left with 'inflight' as its latest status. It may already have been
-        delivered, and WeChatFerry returns no message id to dedup against, so
-        re-sending risks a duplicate. The safe choice is to stop retrying and
-        surface it for operator review rather than silently re-send.
+        delivered, and the endpoint may return no message id to dedup against,
+        so re-sending risks a duplicate. The safe choice is to stop retrying
+        and surface it for operator review rather than silently re-send.
         """
         for bridge_id, status in self._effective_ack_status().items():
             if status == BridgeAckStatus.INFLIGHT:
@@ -189,6 +298,10 @@ class BridgeWorker:
         # Re-sync any terminal acks whose ledger/confirm-queue sync previously
         # failed, so a transient state-write error becomes eventually consistent.
         self._reconcile_unsynced_acks()
+        # Some native file sends finish asynchronously after the initial HTTP
+        # ack. Re-check accepted/unverified records by readback only; never
+        # re-send them as part of verification.
+        self._reconcile_accepted_unverified_delivery()
         # Quarantine records whose delivery was interrupted mid-send by a crash
         # (an inflight marker with no terminal ack). These may already have been
         # delivered on the wire, so they must NOT be blindly re-sent.
@@ -248,6 +361,12 @@ class BridgeWorker:
         bridge_id = str(record.get("bridge_id", ""))
         conversation_id = str(record.get("conversation_id", ""))
         kind = str(record.get("kind", "text"))
+        runtime_blocker = _runtime_send_blocker(self.data_dir, str(getattr(self.backend, "name", "")))
+        if runtime_blocker:
+            self.stats.last_error = runtime_blocker
+            self.stats.record("skipped", runtime_blocker)
+            logger.warning("bridge %s skipped before wire send: %s", bridge_id, runtime_blocker)
+            return
         receiver = self._receiver_for(conversation_id, record)
 
         if not receiver:
@@ -255,9 +374,19 @@ class BridgeWorker:
             # a missing receiver as retryable rather than dropping the reply.
             self._fail_or_retry(bridge_id, "missing_receiver")
             return
+        receiver_blocker = _receiver_authorization_blocker(
+            self.data_dir,
+            conversation_id,
+            receiver,
+            backend_name=str(getattr(self.backend, "name", "")),
+        )
+        if receiver_blocker:
+            self._ack(bridge_id, BridgeAckStatus.BLOCKED, receiver_blocker)
+            return
 
         outcome = None
         last_reason = ""
+        last_payload: dict[str, Any] = {}
         # Mark inflight right before the wire send. If we crash between the send
         # and the terminal ack, the next run sees 'inflight' as the latest ack and
         # quarantines the record instead of risking a duplicate re-send.
@@ -283,6 +412,7 @@ class BridgeWorker:
             if outcome.ok:
                 break
             last_reason = outcome.reason
+            last_payload = outcome.payload
             logger.warning(
                 "bridge delivery attempt %d/%d failed for %s: %s",
                 attempt + 1,
@@ -290,24 +420,34 @@ class BridgeWorker:
                 bridge_id,
                 last_reason,
             )
-            # An unknown-delivery-state failure (e.g. a hard-killed WCF RPC) may
-            # already have landed on the wire. Never re-send it in the same tick
-            # for the remaining attempts — that would risk a duplicate. Stop the
-            # loop now and let _fail_or_retry quarantine it as terminal failed.
+            # An unknown-delivery-state failure may already have landed on the
+            # wire. Never re-send it in the same tick for the remaining attempts.
             if _is_unknown_delivery_state(last_reason):
                 logger.warning(
                     "bridge %s: unknown delivery state, not re-sending this tick", bridge_id
+                )
+                break
+            if _is_permanent_failure(last_reason):
+                logger.warning(
+                    "bridge %s: permanent delivery failure, not re-sending this tick", bridge_id
                 )
                 break
             if attempt < self.max_send_attempts - 1:
                 time.sleep(min(2.0, 0.5 * (attempt + 1)))
 
         if outcome is not None and outcome.ok:
-            self._ack(bridge_id, BridgeAckStatus.SENT, outcome.reason, external_message_id=outcome.external_message_id)
+            ack_status = BridgeAckStatus.SENT if getattr(outcome, "delivery_verified", True) else BridgeAckStatus.ACCEPTED
+            self._ack(
+                bridge_id,
+                ack_status,
+                outcome.reason,
+                external_message_id=outcome.external_message_id,
+                payload=outcome.payload,
+            )
             return
-        self._fail_or_retry(bridge_id, last_reason or "send_failed")
+        self._fail_or_retry(bridge_id, last_reason or "send_failed", payload=last_payload)
 
-    def _fail_or_retry(self, bridge_id: str, reason: str) -> None:
+    def _fail_or_retry(self, bridge_id: str, reason: str, *, payload: dict[str, Any] | None = None) -> None:
         """Ack a delivery failure as retryable (stays pending) or terminal.
 
         A transient reason (backend down, receiver momentarily unavailable) is
@@ -321,11 +461,15 @@ class BridgeWorker:
                     bridge_id,
                     BridgeAckStatus.RETRY,
                     reason,
-                    payload={"retry_attempt": prior_retries + 1, "max_retries": _MAX_CROSS_TICK_RETRIES},
+                    payload={
+                        **(payload or {}),
+                        "retry_attempt": prior_retries + 1,
+                        "max_retries": _MAX_CROSS_TICK_RETRIES,
+                    },
                 )
                 return
             reason = f"retries_exhausted:{reason}"
-        self._ack(bridge_id, BridgeAckStatus.FAILED, reason)
+        self._ack(bridge_id, BridgeAckStatus.FAILED, reason, payload=payload)
 
     def _retry_count(self, bridge_id: str) -> int:
         """Number of non-terminal retry acks already recorded for this record."""
@@ -342,7 +486,7 @@ class BridgeWorker:
         # Legacy outbox records did not carry a receiver. Recover it from the
         # channel registry (roomid for groups, wxid for private) rather than
         # blindly using the hashed conversation_id, which is never a valid
-        # wcf receiver and would misroute group replies.
+        # WeChat receiver and would misroute group replies.
         from app.personal_wechat_bot.wechat_driver.bridge_send import (
             _channel_receiver,
             _looks_like_wechat_receiver,
@@ -351,7 +495,7 @@ class BridgeWorker:
         resolved = _channel_receiver(self.data_dir, conversation_id)
         if resolved:
             return resolved
-        # Only fall back to the conversation_id when it is itself a valid wcf
+        # Only fall back to the conversation_id when it is itself a valid WeChat
         # receiver (a raw wxid/roomid). A hashed conversation_id is not, so
         # returning it would misroute or fail on the wire; yield "" instead so
         # _deliver treats it as missing_receiver (retryable until the channel is
@@ -427,6 +571,9 @@ class BridgeWorker:
     def _synced_marker_path(self) -> Path:
         return self.data_dir / "send_bridge" / "synced_acks.json"
 
+    def _accepted_reverify_marker_path(self) -> Path:
+        return self.data_dir / "send_bridge" / "accepted_reverify.json"
+
     def _load_synced(self) -> set[str]:
         path = self._synced_marker_path()
         if not path.exists():
@@ -451,6 +598,88 @@ class BridgeWorker:
             tmp.replace(path)
         except OSError as exc:  # pragma: no cover - best effort
             logger.error("bridge synced-marker write failed: %s", exc)
+
+    def _load_accepted_reverify_marker(self) -> dict[str, dict[str, Any]]:
+        path = self._accepted_reverify_marker_path()
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        items = payload.get("items") if isinstance(payload, dict) else {}
+        if not isinstance(items, dict):
+            return {}
+        return {str(key): value for key, value in items.items() if isinstance(value, dict)}
+
+    def _save_accepted_reverify_marker(self, marker: dict[str, dict[str, Any]]) -> None:
+        path = self._accepted_reverify_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps({"items": marker}, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:  # pragma: no cover - best effort
+            logger.error("bridge accepted-reverify marker write failed: %s", exc)
+
+    def _reconcile_accepted_unverified_delivery(self) -> None:
+        verifier = getattr(self.backend, "verify_accepted_bridge_record", None)
+        if not callable(verifier):
+            return
+        outbox = self.store._read_all(self.store.outbox_path)
+        ack_states = effective_bridge_ack_states(self.store._read_all(self.store.ack_path))
+        marker = self._load_accepted_reverify_marker()
+        now = time.time()
+        changed = False
+        checked = 0
+        for record in outbox:
+            if checked >= _ACCEPTED_REVERIFY_MAX_PER_TICK:
+                break
+            bridge_id = str(record.get("bridge_id", ""))
+            if not bridge_id:
+                continue
+            ack_state = ack_states.get(bridge_id)
+            if ack_state is None or ack_state.status != BridgeAckStatus.ACCEPTED:
+                continue
+            ack = ack_state.ack
+            payload = ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
+            if payload.get("delivery_verified") is True:
+                continue
+            item_marker = marker.get(bridge_id, {})
+            attempts = int(item_marker.get("attempts") or 0)
+            if attempts >= _ACCEPTED_REVERIFY_MAX_ATTEMPTS:
+                continue
+            last_checked = float(item_marker.get("last_checked_at") or 0.0)
+            if now - last_checked < _ACCEPTED_REVERIFY_EVERY_SECONDS:
+                continue
+            marker[bridge_id] = {
+                **item_marker,
+                "attempts": attempts + 1,
+                "last_checked_at": now,
+            }
+            checked += 1
+            changed = True
+            try:
+                outcome = verifier(record, ack)
+            except Exception as exc:  # pragma: no cover - backend recheck must not stop worker
+                reason = f"accepted_reverify_error:{type(exc).__name__}:{exc}"
+                self.stats.last_error = reason
+                marker[bridge_id]["last_error"] = reason
+                logger.warning("bridge %s accepted reverify failed: %s", bridge_id, reason)
+                continue
+            if outcome is None or not getattr(outcome, "ok", False) or not getattr(outcome, "delivery_verified", False):
+                continue
+            marker[bridge_id]["verified_at"] = now
+            self._ack(
+                bridge_id,
+                BridgeAckStatus.SENT,
+                str(outcome.reason or "accepted_reverified_sent"),
+                external_message_id=str(outcome.external_message_id or ""),
+                payload=outcome.payload,
+            )
+        if changed:
+            live_ids = {str(item.get("bridge_id", "")) for item in outbox if str(item.get("bridge_id", ""))}
+            self._save_accepted_reverify_marker({key: value for key, value in marker.items() if key in live_ids})
 
     def _reconcile_unsynced_acks(self) -> None:
         """Re-run ledger/confirm-queue sync for terminal acks that never synced.
@@ -508,11 +737,21 @@ def run_bridge_worker(
     config = load_config(data_dir)
     backend = build_send_backend(config)
     worker = BridgeWorker(data_dir, backend)
+    config_signature = bridge_worker_config_signature(config)
 
-    lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+    lock_path = bridge_worker_lock_path(data_dir)
     lock: ProcessLock | None = None
     if lock_enabled:
-        lock = ProcessLock(lock_path, label="send_bridge_worker", stale_after_seconds=60.0)
+        lock = ProcessLock(
+            lock_path,
+            label="send_bridge_worker",
+            stale_after_seconds=BRIDGE_WORKER_LOCK_STALE_SECONDS,
+            metadata={
+                "data_dir": str(data_dir.resolve()),
+                "backend_name": getattr(backend, "name", ""),
+                "config_signature": config_signature,
+            },
+        )
         try:
             lock.acquire()
         except ProcessLockError as exc:
@@ -526,6 +765,12 @@ def run_bridge_worker(
     try:
         iterations = 0
         while True:
+            runtime_blocker = _runtime_send_blocker(data_dir, str(getattr(backend, "name", "")))
+            if runtime_blocker:
+                worker.stats.last_error = runtime_blocker
+                worker.stats.record("skipped", runtime_blocker)
+                logger.warning("send bridge worker stopped by runtime config: %s", runtime_blocker)
+                break
             worker.run_once()
             if lock is not None:
                 lock.heartbeat()

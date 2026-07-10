@@ -22,6 +22,15 @@ CLEAR_CONTEXT_PHRASES = (
     "reset context",
     "clear context",
 )
+AGENT_MENTION_MARKERS = (
+    "@bot",
+    "@agent",
+    "@ai",
+    "@助手",
+    "@小助手",
+    "@机器人",
+    "@微信助手",
+)
 
 
 class ConversationSessionStore:
@@ -46,12 +55,15 @@ class ConversationSessionStore:
             session_id = str(state.get("current_session_id", "")).strip()
             if session_id:
                 return session_id
+            now = utc_now_iso()
             self._write_state(
                 conversation_id,
                 {
                     "conversation_id": conversation_id,
                     "current_session_id": DEFAULT_SESSION_ID,
-                    "created_at": utc_now_iso(),
+                    "created_at": now,
+                    "session_started_at": now,
+                    "reset_count": 0,
                 },
             )
             return DEFAULT_SESSION_ID
@@ -63,9 +75,29 @@ class ConversationSessionStore:
     def current_session_id_for_message(self, message: NormalizedMessage) -> str:
         return self.current_session_id_for_conversation(message.conversation_id, message.chat_title)
 
+    def state_for_conversation(self, conversation_id: str, chat_title: str = "") -> dict[str, Any]:
+        if chat_title:
+            self._remember_segment(conversation_id, chat_title)
+        with self._conversation_lock(conversation_id):
+            state = self._read_state(conversation_id)
+            if not str(state.get("current_session_id", "")).strip():
+                now = utc_now_iso()
+                self._write_state(
+                    conversation_id,
+                    {
+                        "conversation_id": conversation_id,
+                        "current_session_id": DEFAULT_SESSION_ID,
+                        "created_at": now,
+                        "session_started_at": now,
+                        "reset_count": 0,
+                    },
+                )
+                state = self._read_state(conversation_id)
+            return dict(state)
+
     def maybe_reset_for_message(self, message: NormalizedMessage) -> str | None:
         self._remember_segment(message.conversation_id, message.chat_title)
-        if not is_reset_command(message.text):
+        if not is_reset_command(message.text, metadata=message.metadata):
             return None
         return self.reset_session(
             message.conversation_id,
@@ -76,13 +108,20 @@ class ConversationSessionStore:
     def reset_session(self, conversation_id: str, *, reason: str, message_id: str = "") -> str:
         session_id = _new_session_id()
         with self._conversation_lock(conversation_id):
+            previous_state = self._read_state(conversation_id)
+            previous_session_id = str(previous_state.get("current_session_id") or DEFAULT_SESSION_ID).strip() or DEFAULT_SESSION_ID
+            now = utc_now_iso()
             self._write_state(
                 conversation_id,
                 {
                     "conversation_id": conversation_id,
                     "current_session_id": session_id,
+                    "previous_session_id": previous_session_id,
                     "previous_reset_reason": reason,
                     "previous_reset_message_id": message_id,
+                    "session_started_at": now,
+                    "reset_count": _safe_int(previous_state.get("reset_count"), 0) + 1,
+                    "created_at": previous_state.get("created_at") or now,
                 },
             )
             self._append_event(
@@ -91,9 +130,10 @@ class ConversationSessionStore:
                     "type": "session.reset",
                     "conversation_id": conversation_id,
                     "session_id": session_id,
+                    "previous_session_id": previous_session_id,
                     "reason": reason,
                     "message_id": message_id,
-                    "created_at": utc_now_iso(),
+                    "created_at": now,
                 },
             )
         return session_id
@@ -193,12 +233,48 @@ class ConversationSessionStore:
                 pass
 
 
-def is_reset_command(text: str) -> bool:
+def is_reset_command(text: str, *, metadata: dict[str, Any] | None = None) -> bool:
     normalized = _normalize_text(text)
     if not normalized:
         return False
+    if not _has_agent_mention(text, metadata or {}):
+        return False
     for phrase in CLEAR_CONTEXT_PHRASES:
         if _normalize_text(phrase) in normalized:
+            return True
+    return False
+
+
+def _has_agent_mention(text: str, metadata: dict[str, Any]) -> bool:
+    for key in ("mentioned_self", "is_mentioned", "is_at_self", "at_self"):
+        if bool(metadata.get(key)):
+            return True
+    mentions = metadata.get("mentions") or metadata.get("at_list") or metadata.get("atList")
+    if isinstance(mentions, list) and _mention_list_targets_self(mentions):
+        return True
+    normalized = _normalize_text(text)
+    if "@" not in normalized:
+        return False
+    if any(_normalize_text(marker) in normalized for marker in AGENT_MENTION_MARKERS):
+        return True
+    # WeFlow/WeChat text often preserves the display mention but not structured
+    # mention metadata. Treat only a leading bare @ before the reset phrase as
+    # explicit; a trailing @ is more likely to be a mention of someone else.
+    return any(_normalize_text(f"@{phrase}") in normalized for phrase in CLEAR_CONTEXT_PHRASES)
+
+
+def _mention_list_targets_self(mentions: list[Any]) -> bool:
+    markers = ("self", "bot", "agent", "ai", "assistant", "助手", "小助手", "机器人", "微信助手")
+    for item in mentions:
+        if isinstance(item, dict):
+            values = [item.get(key) for key in ("self", "is_self", "mentioned_self", "name", "display_name", "wxid", "id")]
+            if any(value is True for value in values):
+                return True
+            text = " ".join(str(value or "") for value in values)
+        else:
+            text = str(item or "")
+        normalized = _normalize_text(text)
+        if normalized and any(_normalize_text(marker) in normalized for marker in markers):
             return True
     return False
 
@@ -217,3 +293,10 @@ def _stale_lock(path: Path, *, max_age_seconds: float = 60.0) -> bool:
         return time.time() - path.stat().st_mtime > max_age_seconds
     except OSError:
         return False
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

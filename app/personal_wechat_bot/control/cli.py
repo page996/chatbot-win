@@ -26,9 +26,16 @@ from app.personal_wechat_bot.control.commands import (
 from app.personal_wechat_bot.control.audit import (
     build_artifact_cleanup_report,
     build_plan_audit,
+    build_storage_migration_status,
 )
 from app.personal_wechat_bot.control.preflight import build_preflight_report
-from app.personal_wechat_bot.control.sidebar_api import cleanup_sidebar_channels, delete_sidebar_channel, run_weflow_backfill_sync
+from app.personal_wechat_bot.control.sidebar_api import (
+    cleanup_sidebar_channels,
+    delete_sidebar_channel,
+    run_weflow_backfill_sync,
+    sidebar_diagnostics_export,
+    sidebar_native_migration_probe,
+)
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
 from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
 from app.personal_wechat_bot.control.sidebar_window import run_sidebar_window
@@ -38,6 +45,7 @@ from app.personal_wechat_bot.control.send_commands import (
     list_send_audit,
     probe_send_controls,
     reject_confirm_item,
+    retry_bridge_item,
     send_approved_confirm_item,
     set_send_controls,
 )
@@ -83,11 +91,9 @@ from app.personal_wechat_bot.wechat_driver.voice_cache_resolver import (
 )
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
-    WcfCallbackServerConfig,
     WeFlowHttpBridge,
     append_hook_source_event,
     require_weflow_ready,
-    run_wcf_callback_server,
     weflow_health_status,
 )
 
@@ -131,11 +137,38 @@ def build_parser() -> argparse.ArgumentParser:
     send_driver_probe = sub.add_parser("send-driver-probe")
     send_driver_probe.add_argument("--driver", default=None)
 
+    diagnostics_export = sub.add_parser("diagnostics-export")
+    diagnostics_export.add_argument("--limit", type=int, default=50)
+    diagnostics_export.add_argument("--no-persist", action="store_true")
+
+    native_migration_probe = sub.add_parser("native-migration-probe")
+    native_migration_probe.add_argument("--no-persist", action="store_true")
+    native_migration_probe.add_argument("--force-scan", action="store_true")
+    native_migration_probe.add_argument("--timeout-seconds", type=float, default=None)
+    native_migration_probe.add_argument("--max-depth", type=int, default=None)
+    native_migration_probe.add_argument("--max-entries", type=int, default=None)
+    native_migration_probe.add_argument("--limit", type=int, default=None)
+    native_migration_probe.add_argument("--no-cleanup-sizes", action="store_true")
+
     send_controls = sub.add_parser("set-send-controls")
     send_controls.add_argument("--mode", choices=["dry_run", "confirm", "auto"], default=None)
     send_controls.add_argument("--enable", action="store_true")
     send_controls.add_argument("--disable", action="store_true")
     send_controls.add_argument("--driver", default=None)
+    send_controls.add_argument("--backend", default=None)
+    send_controls.add_argument("--weflow-base-url", default=None)
+    send_controls.add_argument("--weflow-token-env", default=None)
+    send_controls.add_argument("--weflow-send-text-path", default=None)
+    send_controls.add_argument("--weflow-send-file-path", default=None)
+    send_controls.add_argument("--weflow-send-timeout-seconds", type=float, default=None)
+    send_controls.add_argument("--wechat-native-base-url", default=None)
+    send_controls.add_argument("--wechat-native-send-text-path", default=None)
+    send_controls.add_argument("--wechat-native-send-image-path", default=None)
+    send_controls.add_argument("--wechat-native-send-file-path", default=None)
+    send_controls.add_argument("--wechat-native-status-path", default=None)
+    send_controls.add_argument("--wechat-native-timeout-seconds", type=float, default=None)
+    send_controls.add_argument("--wechat-native-verify-timeout-seconds", type=float, default=None)
+    send_controls.add_argument("--wechat-native-file-verify-timeout-seconds", type=float, default=None)
     send_controls.add_argument("--confirm-required", choices=["true", "false"], default=None)
     send_controls.add_argument("--max-chars", type=int, default=None)
     send_controls.add_argument("--min-interval-seconds", type=int, default=None)
@@ -152,9 +185,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     bridge_ack_parser = sub.add_parser("send-bridge-ack")
     bridge_ack_parser.add_argument("bridge_id")
-    bridge_ack_parser.add_argument("--status", choices=["sent", "failed", "blocked"], required=True)
+    bridge_ack_parser.add_argument("--status", choices=["sent", "accepted", "failed", "blocked"], required=True)
     bridge_ack_parser.add_argument("--reason", default="")
     bridge_ack_parser.add_argument("--external-message-id", default="")
+
+    bridge_retry_parser = sub.add_parser("send-bridge-retry")
+    bridge_retry_parser.add_argument("bridge_id")
+    bridge_retry_parser.add_argument("--reviewer", default="cli")
+    bridge_retry_parser.add_argument("--note", default="")
 
     confirm_approve = sub.add_parser("confirm-approve")
     confirm_approve.add_argument("queue_id")
@@ -174,6 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup_artifacts = sub.add_parser("cleanup-artifacts")
     cleanup_artifacts.add_argument("--apply", action="store_true")
+
+    storage_status = sub.add_parser("storage-status")
+    storage_status.add_argument("--no-sizes", action="store_true")
+    storage_status.add_argument("--max-entries-per-component", type=int, default=5000)
 
     maintain_memory = sub.add_parser("maintain-memory")
     maintain_memory.add_argument("--conversation-id", required=True)
@@ -264,7 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     append_hook_source = sub.add_parser("append-hook-source-event")
     append_hook_source.add_argument("--hook-event-file", default=None)
-    append_hook_source.add_argument("--source", choices=["raw", "weflow-push", "weflow-message", "wcf-callback"], default="raw")
+    append_hook_source.add_argument("--source", choices=["raw", "weflow-push", "weflow-message"], default="raw")
     append_hook_source.add_argument("--payload-json", default="")
     append_hook_source.add_argument("--payload-file", default="")
 
@@ -327,12 +369,6 @@ def build_parser() -> argparse.ArgumentParser:
     listen_weflow.add_argument("--max-seconds", type=float, default=None)
     listen_weflow.add_argument("--forever", action="store_true")
     listen_weflow.add_argument("--allow-non-local", action="store_true")
-
-    wcf_sink = sub.add_parser("wcf-callback-sink")
-    wcf_sink.add_argument("--hook-event-file", default=None)
-    wcf_sink.add_argument("--host", default="127.0.0.1")
-    wcf_sink.add_argument("--port", type=int, default=8791)
-    wcf_sink.add_argument("--path", default="/callback")
 
     migrate_conv = sub.add_parser("migrate-conversations")
     migrate_conv.add_argument("--map", required=True, help="path to migration map JSON")
@@ -507,6 +543,30 @@ def main(argv: list[str] | None = None) -> None:
         result = probe_send_controls(args.data_dir, driver=args.driver)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command == "diagnostics-export":
+        result = sidebar_diagnostics_export(
+            args.data_dir,
+            {"limit": args.limit, "persist": not bool(args.no_persist)},
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "native-migration-probe":
+        payload = {
+            "persist": not bool(args.no_persist),
+            "force_scan": bool(args.force_scan),
+            "include_cleanup_sizes": not bool(args.no_cleanup_sizes),
+        }
+        if args.timeout_seconds is not None:
+            payload["timeout_seconds"] = args.timeout_seconds
+        if args.max_depth is not None:
+            payload["max_depth"] = args.max_depth
+        if args.max_entries is not None:
+            payload["max_entries"] = args.max_entries
+        if args.limit is not None:
+            payload["limit"] = args.limit
+        result = sidebar_native_migration_probe(args.data_dir, payload)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "set-send-controls":
         if args.enable and args.disable:
             raise SystemExit("--enable and --disable cannot both be used")
@@ -521,6 +581,20 @@ def main(argv: list[str] | None = None) -> None:
             mode=args.mode,
             enabled=enabled,
             driver=args.driver,
+            backend=args.backend,
+            weflow_base_url=args.weflow_base_url,
+            weflow_token_env=args.weflow_token_env,
+            weflow_send_text_path=args.weflow_send_text_path,
+            weflow_send_file_path=args.weflow_send_file_path,
+            weflow_send_timeout_seconds=args.weflow_send_timeout_seconds,
+            wechat_native_base_url=args.wechat_native_base_url,
+            wechat_native_send_text_path=args.wechat_native_send_text_path,
+            wechat_native_send_image_path=args.wechat_native_send_image_path,
+            wechat_native_send_file_path=args.wechat_native_send_file_path,
+            wechat_native_status_path=args.wechat_native_status_path,
+            wechat_native_timeout_seconds=args.wechat_native_timeout_seconds,
+            wechat_native_verify_timeout_seconds=args.wechat_native_verify_timeout_seconds,
+            wechat_native_file_verify_timeout_seconds=args.wechat_native_file_verify_timeout_seconds,
             confirm_required=confirm_required,
             max_chars=args.max_chars,
             min_interval_seconds=args.min_interval_seconds,
@@ -548,6 +622,15 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    if args.command == "send-bridge-retry":
+        result = retry_bridge_item(
+            args.data_dir,
+            args.bridge_id,
+            reviewer=args.reviewer,
+            note=args.note,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "confirm-approve":
         result = approve_confirm_item(args.data_dir, args.queue_id, reviewer=args.reviewer, note=args.note)
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -566,6 +649,14 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "cleanup-artifacts":
         result = build_artifact_cleanup_report(args.data_dir, apply=args.apply)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "storage-status":
+        result = build_storage_migration_status(
+            args.data_dir,
+            include_sizes=not bool(args.no_sizes),
+            max_entries_per_component=args.max_entries_per_component,
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "maintain-memory":
@@ -755,17 +846,6 @@ def main(argv: list[str] | None = None) -> None:
             max_seconds=args.max_seconds,
         )
         print(json.dumps({**result.__dict__, "weflow_ready": weflow_ready, "send_enabled": False}, ensure_ascii=False, indent=2))
-        return
-    if args.command == "wcf-callback-sink":
-        hook_event_file = args.hook_event_file or str(Path(args.data_dir) / "hook_events.jsonl")
-        run_wcf_callback_server(
-            WcfCallbackServerConfig(
-                hook_event_file=hook_event_file,
-                host=args.host,
-                port=args.port,
-                path=args.path,
-            )
-        )
         return
     if args.command == "migrate-conversations":
         result = _run_migrate_conversations(args)

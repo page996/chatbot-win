@@ -61,6 +61,7 @@ class BackendEventJsonlDriver:
         voice_cache_resolver: WeChatVoiceCacheResolver | None = None,
         session_store: ConversationSessionStore | None = None,
         context_store: ConversationSessionStore | None = None,
+        allowed_conversation_ids: list[str] | None = None,
     ):
         self.event_path = Path(event_path)
         self.file_index = file_index
@@ -81,10 +82,41 @@ class BackendEventJsonlDriver:
         )
         self.voice_cache_resolver = voice_cache_resolver
         self.session_store = session_store or context_store
+        self.allowed_conversation_ids = (
+            None
+            if allowed_conversation_ids is None
+            else {str(item or "").strip() for item in allowed_conversation_ids if str(item or "").strip()}
+        )
         self._seen_event_ids: set[str] = set()
         self._seen_message_raw_ids: set[str] = set()
         self._read_offset = 0
         self._line_no = 0
+
+    def cursor(self) -> dict[str, Any]:
+        return {
+            "event_path": str(self.event_path),
+            "read_offset": self._read_offset,
+            "line_no": self._line_no,
+        }
+
+    def restore_cursor(self, cursor: dict[str, Any] | None) -> bool:
+        if not isinstance(cursor, dict):
+            return False
+        if not any(key in cursor for key in ("event_path", "read_offset", "line_no")):
+            return False
+        event_path = str(cursor.get("event_path") or "").strip()
+        if event_path and Path(event_path) != self.event_path:
+            return False
+        try:
+            read_offset = max(0, int(cursor.get("read_offset") or 0))
+            line_no = max(0, int(cursor.get("line_no") or 0))
+        except (TypeError, ValueError):
+            return False
+        self._read_offset = read_offset
+        self._line_no = line_no
+        self._seen_event_ids.clear()
+        self._seen_message_raw_ids.clear()
+        return True
 
     def health_check(self) -> bool:
         return self.event_path.exists() and self.event_path.is_file()
@@ -135,12 +167,18 @@ class BackendEventJsonlDriver:
         messages: list[RawWeChatMessage] = []
         for index, history_event in enumerate(event.history):
             raw = self._to_raw_message(history_event, line_no=line_no, history_index=index, context_only=True)
-            if raw is not None:
+            if raw is not None and self._raw_in_scope(raw):
                 messages.append(raw)
         current = self._to_raw_message(event, line_no=line_no)
-        if current is not None:
+        if current is not None and self._raw_in_scope(current):
             messages.append(current)
         return messages
+
+    def _raw_in_scope(self, raw: RawWeChatMessage) -> bool:
+        if self.allowed_conversation_ids is None:
+            return True
+        conversation_id = str(raw.driver_meta.get("conversation_id_hint") or "").strip()
+        return bool(conversation_id and conversation_id in self.allowed_conversation_ids)
 
     def send_message(self, conversation_id: str, text: str) -> SendResult:
         return SendResult(

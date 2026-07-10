@@ -63,6 +63,61 @@ class RuntimeCardStoreTest(unittest.TestCase):
             self.assertIn("Description: 稳定、清醒、直接", prompt)
             self.assertIn("Personality: 温和但会指出风险", prompt)
 
+    def test_channel_override_can_customize_persona_and_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RuntimeCardStore(Path(tmp) / "data")
+            saved = store.apply_action(
+                "save-persona",
+                {"name": "ChannelPersona", "content": "Use a precise channel-specific voice."},
+            )
+            persona_id = saved["card"]["card_id"]
+            store.apply_action("equip-persona", {"card_id": "persona.default_wechat_friend"})
+
+            store.apply_action(
+                "set-channel-persona",
+                {"conversation_id": "conv-special", "card_id": persona_id},
+            )
+            store.apply_action(
+                "set-channel-skills",
+                {"conversation_id": "conv-special", "card_ids": ["skill.foreground_dialogue"]},
+            )
+
+            global_prompt = "\n".join(store.prompt_lines())
+            channel_prompt = "\n".join(store.prompt_lines(conversation_id="conv-special"))
+
+            self.assertIn("persona.default_wechat_friend", global_prompt)
+            self.assertIn("skill.file_workspace_agent", global_prompt)
+            self.assertIn("ChannelPersona", channel_prompt)
+            self.assertIn("skill.foreground_dialogue", channel_prompt)
+            self.assertNotIn("persona.default_wechat_friend", channel_prompt)
+            self.assertNotIn("skill.file_workspace_agent", channel_prompt)
+            self.assertIn("conv-special", store.state()["state"]["channel_overrides"])
+
+    def test_ledger_context_uses_channel_specific_runtime_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            runtime_cards = RuntimeCardStore(data_dir)
+            saved = runtime_cards.apply_action(
+                "save-persona",
+                {"name": "ConvTwoPersona", "content": "Only conv2 should see this persona."},
+            )
+            runtime_cards.apply_action("equip-persona", {"card_id": "persona.default_wechat_friend"})
+            runtime_cards.apply_action(
+                "set-channel-persona",
+                {"conversation_id": "conv2", "card_id": saved["card"]["card_id"]},
+            )
+            ledger = ConversationLedgerStore(data_dir)
+            conv1_message = _message("conv1-msg", "conv1 text", session_id="session_default", conversation_id="conv1")
+            conv2_message = _message("conv2-msg", "conv2 text", session_id="session_default", conversation_id="conv2")
+            ledger.append_message(conv1_message)
+            ledger.append_message(conv2_message)
+
+            conv1_rendered = LedgerContextAssembler(ledger, runtime_cards=runtime_cards).build_snapshot(conv1_message).render_for_prompt()
+            conv2_rendered = LedgerContextAssembler(ledger, runtime_cards=runtime_cards).build_snapshot(conv2_message).render_for_prompt()
+
+            self.assertNotIn("Only conv2 should see this persona.", conv1_rendered)
+            self.assertIn("Only conv2 should see this persona.", conv2_rendered)
+
     def test_runtime_cards_are_not_session_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -83,10 +138,10 @@ class RuntimeCardStoreTest(unittest.TestCase):
             self.assertNotIn("旧会话", rendered)
 
 
-def _message(message_id: str, text: str, *, session_id: str) -> NormalizedMessage:
+def _message(message_id: str, text: str, *, session_id: str, conversation_id: str = "conv1") -> NormalizedMessage:
     return NormalizedMessage(
         message_id=message_id,
-        conversation_id="conv1",
+        conversation_id=conversation_id,
         conversation_type="private",
         chat_title="PAGE",
         sender_name="PAGE",

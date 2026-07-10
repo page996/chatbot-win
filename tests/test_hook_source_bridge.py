@@ -13,8 +13,8 @@ from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
     HookEventJsonlWriter,
     WEFLOW_LOCAL_BUILD_FLAVOR,
     WeFlowHttpBridge,
+    _weflow_session_pull_admitted,
     append_hook_source_event,
-    normalize_wcf_callback,
     normalize_weflow_message,
     normalize_weflow_push_event,
     weflow_health_status,
@@ -60,6 +60,34 @@ class HookSourceBridgeTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         self.assertIn("TOKEN", result["message"])
+
+    def test_weflow_session_pull_blocks_display_only_private_wxid(self) -> None:
+        self.assertFalse(
+            _weflow_session_pull_admitted(
+                {"id": "wxid_stranger", "displayName": "Readable Stranger", "type": "private"}
+            )
+        )
+        self.assertFalse(
+            _weflow_session_pull_admitted(
+                {"id": "temp-private", "displayName": "微信用户", "type": "private"}
+            )
+        )
+        self.assertFalse(
+            _weflow_session_pull_admitted(
+                {
+                    "id": "temp-private",
+                    "displayName": "Readable Stranger",
+                    "type": "private",
+                    "banner": "对方还不是你的朋友",
+                }
+            )
+        )
+        self.assertTrue(
+            _weflow_session_pull_admitted(
+                {"id": "wxid_friend", "displayName": "Readable Friend", "type": "private", "is_friend": True}
+            )
+        )
+        self.assertTrue(_weflow_session_pull_admitted({"id": "12345@chatroom", "name": "Study Room", "type": "group"}))
 
     def test_weflow_message_normalizes_attachment_and_quote(self) -> None:
         normalized = normalize_weflow_message(
@@ -276,24 +304,40 @@ class HookSourceBridgeTest(unittest.TestCase):
         self.assertEqual(normalized["recall"]["target_raw_id"], "weflow:message:12345@chatroom:wf-msg-1")
         self.assertEqual(event.recall["target_raw_id"], "weflow:message:12345@chatroom:wf-msg-1")
 
-    def test_wcf_callback_normalizes_group_media_message(self) -> None:
-        normalized = normalize_wcf_callback(
+    def test_weflow_message_normalizes_group_media_message(self) -> None:
+        normalized = normalize_weflow_message(
             {
-                "id": "wcf-1",
-                "type": 3,
-                "sender": "wxid_member",
-                "roomid": "12345@chatroom",
+                "platformMessageId": "wf-media-1",
+                "localType": 3,
+                "senderUsername": "wxid_member",
                 "content": "image",
-                "thumb": "C:\\WeChat\\thumb.jpg",
-                "is_group": True,
-            }
+                "mediaLocalPath": "C:\\WeChat\\thumb.jpg",
+                "mediaType": "image",
+            },
+            session_id="12345@chatroom",
+            session_meta={"name": "Study Room", "type": "group"},
         )
         event = hook_event_from_payload(normalized)
 
-        self.assertEqual(normalized["source"], "wechatferry_callback")
+        self.assertEqual(normalized["source"], "weflow_http_raw")
         self.assertEqual(normalized["attachments"][0]["kind"], "image")
         self.assertEqual(event.conversation_key, "12345@chatroom")
         self.assertEqual(event.sender_wechat_id, "wxid_member")
+
+    def test_weflow_message_marks_self_from_owner_data_path(self) -> None:
+        normalized = normalize_weflow_message(
+            {
+                "rawid": "wf-self-1",
+                "sessionName": "Friend",
+                "sender": "wxid_owner123",
+                "content": "manual owner message",
+                "timestamp": 1719900001,
+                "dbPath": r"E:\WeChat-doc\xwechat_files\wxid_owner123_abcd\db_storage\message\message_0.db",
+            },
+            session_id="wxid_friend",
+        )
+
+        self.assertTrue(normalized["is_self"])
 
     def test_append_hook_source_event_writes_normalized_jsonl(self) -> None:
         result = append_hook_source_event(

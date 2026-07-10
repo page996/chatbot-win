@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -20,7 +21,7 @@ from app.personal_wechat_bot.domain.models import ReplyCandidate
 from app.personal_wechat_bot.domain.models import NormalizedMessage
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
-from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxStore
+from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
 
 
 def _edge_executable() -> Path | None:
@@ -55,7 +56,7 @@ class SidebarServerTest(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertEqual(state["status"], "ok")
-            self.assertIn("微信 Agent 审计面板", index)
+            self.assertIn("微信 Agent 后台控制台", index)
             self.assertIn("清空历史数据", index)
             self.assertIn('input id="modelName" type="text"', index)
             self.assertIn('list="modelNameOptions"', index)
@@ -66,6 +67,16 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("deepseek-v4-pro", index)
             self.assertIn("<strong>API 密钥池</strong>", index)
             self.assertIn('id="agentTickButton"', index)
+            self.assertIn('id="agentStartButton"', index)
+            self.assertIn('id="agentStopButton"', index)
+            self.assertIn('id="agentStatusSummary"', index)
+            self.assertIn('id="diagnosticsExportButton"', index)
+            self.assertIn('id="storageStatusButton"', index)
+            self.assertIn('id="nativeMigrationProbeButton"', index)
+            self.assertIn('id="sendBackendSelect"', index)
+            removed_backend = "w" + "cf"
+            self.assertNotIn(f'value="{removed_backend}"', index)
+            self.assertIn('value="wechat_native_http"', index)
             self.assertIn("对话 Agent", index)
             self.assertIn("locked-note", index)
             self.assertNotIn('id="weflowContextOnly"', index)
@@ -92,14 +103,15 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("controlsDirty", script)
             self.assertIn("controlsSaving", script)
             self.assertIn("markControlsDirty", script)
-            self.assertIn("delayedQueueAction", script)
-            self.assertIn("countdown", script)
+            self.assertNotIn("delayedQueueAction", script)
+            self.assertNotIn("countdown", script)
             self.assertIn("force: true", script)
             self.assertIn("setActiveStatus", script)
             self.assertIn("setStatusMessage", script)
             self.assertIn("probeNow", script)
             self.assertIn("renderBridge", script)
             self.assertIn("/api/bridge/ack", script)
+            self.assertIn("/api/bridge/retry", script)
             self.assertIn("renderRuntimeCards", script)
             self.assertIn("/api/runtime-cards/", script)
             self.assertIn("probeRuntimeGpu", script)
@@ -131,8 +143,71 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("channel_pinned", script)
             self.assertIn("channelLaneOpenState", script)
             self.assertIn("runAgentTick", script)
+            self.assertIn("runAgentWorkerAction", script)
+            self.assertIn("agentWorkerStatusText", script)
+            self.assertIn("selectedSendBackend", script)
+            self.assertIn("dry_run_not_delivered", script)
+            self.assertIn("bridge_outbox_dry_run_backend", script)
+            self.assertIn("topicProgressText", script)
+            self.assertIn("renderAgentStatus", script)
+            self.assertIn("exportDiagnosticsBundle", script)
+            self.assertIn("/api/diagnostics/export", script)
+            self.assertIn("inspectStorageStatus", script)
+            self.assertIn("/api/storage/status", script)
+            self.assertIn("nativeMigrationProbe", script)
+            self.assertIn("/api/native/migration-probe", script)
+            self.assertIn("diagnostic:native-migration", script)
+            self.assertIn("diagnostic:export", script)
+            self.assertIn("history:storage-status", script)
             self.assertIn("/api/agent/tick", script)
+            self.assertIn("/api/agent/${action}", script)
             self.assertIn("agent:tick", script)
+            self.assertIn("agent:worker", script)
+
+    def test_sidebar_buttons_are_bound_or_form_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                index = urlopen(f"http://{host}:{port}/", timeout=5).read().decode("utf-8")
+                script = urlopen(f"http://{host}:{port}/app.js", timeout=5).read().decode("utf-8")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            button_ids = set(re.findall(r"<button[^>]+id=\"([^\"]+)\"", index))
+            task_bound = set(re.findall(r"bindTaskButton\(\"#([^\"]+)\"", script))
+            listener_bound = set(re.findall(r"\$\(('#|\"#)([^'\"]+)['\"]\)\??\.addEventListener", script))
+            listener_ids = {item[1] for item in listener_bound}
+            form_owned = {"saveModelConfig"}
+
+            self.assertEqual(button_ids - task_bound - listener_ids - form_owned, set())
+
+    def test_sidebar_api_calls_are_routed_by_server(self) -> None:
+        script = Path("app/personal_wechat_bot/ui/sidebar/app.js").read_text(encoding="utf-8")
+        server_source = Path("app/personal_wechat_bot/control/sidebar_server.py").read_text(encoding="utf-8")
+
+        static_calls = set(re.findall(r"api\(\s*['\"](/api/[^'\"]+)['\"]", script))
+        template_calls = set(re.findall(r"api\(\s*`(/api/[^`]+)`", script))
+        exact_routes = set(re.findall(r"parsed\.path == \"([^\"]+)\"", server_source))
+        dynamic_templates = {
+            "/api/agent/${action}",
+            "/api/channels/${encodeURIComponent(id)}/test-file",
+            "/api/channels/${encodeURIComponent(id)}/test-reply",
+            "/api/channels/delete/${encodeURIComponent(conversationId)}",
+            "/api/queue/${encodeURIComponent(queueId)}/${action}",
+            "/api/queue/${encodeURIComponent(queueId)}/remove",
+            "/api/runtime-cards/${action}",
+            "/api/weflow/${action}",
+        }
+
+        self.assertEqual(static_calls - exact_routes, set())
+        self.assertEqual(template_calls - dynamic_templates, set())
 
     def test_sidebar_server_serves_wechat_probe_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -277,6 +352,40 @@ class SidebarServerTest(unittest.TestCase):
             self.assertEqual(state["status"], "ok")
             self.assertEqual(state["pending_count"], 1)
             self.assertEqual(ack["status"], "ok")
+
+    def test_sidebar_server_serves_bridge_retry_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("private-1", "hello")
+            store.append_ack(
+                record["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="wechat_native_http_send_text_error:ConnectionRefusedError:refused",
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/bridge/retry",
+                    data=json.dumps({"bridge_id": record["bridge_id"], "reviewer": "tester"}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with mock.patch("app.personal_wechat_bot.control.sidebar_api._start_bridge_worker"):
+                    retry = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+                state = json.loads(urlopen(f"http://{host}:{port}/api/bridge", timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(retry["status"], "ok")
+            self.assertTrue(any(item["bridge_id"] == retry["new_bridge_id"] for item in state["items"]))
+            self.assertEqual(state["pending_count"], 1)
 
     def test_sidebar_server_serves_runtime_cards_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -633,6 +742,59 @@ class SidebarServerTest(unittest.TestCase):
             self.assertEqual(payload["status"], "ok")
             self.assertEqual(payload["schema"], "local_resource_audit_v1")
 
+    def test_sidebar_server_routes_native_migration_probe_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                with mock.patch(
+                    "app.personal_wechat_bot.control.sidebar_server.sidebar_native_migration_probe",
+                    return_value={"status": "ready", "schema": "native_migration_probe_v1"},
+                ):
+                    request = Request(
+                        f"http://{host}:{port}/api/native/migration-probe",
+                        data=json.dumps({"persist": False}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "ready")
+            self.assertEqual(payload["schema"], "native_migration_probe_v1")
+
+    def test_sidebar_server_routes_storage_status_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                request = Request(
+                    f"http://{host}:{port}/api/storage/status",
+                    data=json.dumps({"include_sizes": False}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["schema"], "storage_migration_status_v1")
+            self.assertIn("migration_boundaries", payload)
+
     def test_sidebar_server_routes_agent_tick_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -660,6 +822,46 @@ class SidebarServerTest(unittest.TestCase):
 
             self.assertEqual(payload["status"], "ok")
             self.assertEqual(payload["agent"]["processed_count"], 0)
+
+    def test_sidebar_server_routes_agent_worker_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                with mock.patch(
+                    "app.personal_wechat_bot.control.sidebar_server.sidebar_agent_start",
+                    return_value={"status": "ok", "worker": {"running": True}},
+                ), mock.patch(
+                    "app.personal_wechat_bot.control.sidebar_server.sidebar_agent_stop",
+                    return_value={"status": "ok", "worker": {"running": False}},
+                ):
+                    start_request = Request(
+                        f"http://{host}:{port}/api/agent/start",
+                        data=json.dumps({"interval_seconds": 0.1}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    start_payload = json.loads(urlopen(start_request, timeout=5).read().decode("utf-8"))
+                    stop_request = Request(
+                        f"http://{host}:{port}/api/agent/stop",
+                        data=json.dumps({}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    stop_payload = json.loads(urlopen(stop_request, timeout=5).read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(start_payload["status"], "ok")
+            self.assertTrue(start_payload["worker"]["running"])
+            self.assertEqual(stop_payload["status"], "ok")
+            self.assertFalse(stop_payload["worker"]["running"])
 
     def test_sidebar_server_routes_weflow_backfill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

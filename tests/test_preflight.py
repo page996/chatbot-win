@@ -26,14 +26,17 @@ class PreflightTest(unittest.TestCase):
 
             self.assertEqual(report["mode"], "dry_run")
             self.assertFalse(report["send_policy"]["send_enabled"])
-            self.assertFalse(report["send_policy"]["real_send_implemented"])
+            self.assertTrue(report["send_policy"]["real_send_implemented"])
             self.assertTrue(report["wechat_access"]["read_only"])
-            self.assertEqual(report["accepted_conversations"]["mode"], "channel_auto_accept")
+            self.assertEqual(report["accepted_conversations"]["mode"], "channel_admission_guarded")
             self.assertEqual(report["legacy_whitelist"]["mode"], "compatibility_alias_not_used_for_routing")
             self.assertEqual(
                 report["conversation_channels"]["policy"],
-                "auto_accept_wechat_contacts_and_groups",
+                "verified_or_identified_wechat_channels",
             )
+            self.assertNotIn("poll-clipboard", report["wechat_access"]["fallback_inputs"])
+            self.assertNotIn("poll-clipboard", report["wechat_access"]["available_inputs"])
+            self.assertIn("poll-clipboard", report["wechat_access"]["removed_inputs"])
             self.assertNotIn("poll-ocr-window", report["wechat_access"]["fallback_inputs"])
             self.assertNotIn("poll-ocr-window", report["wechat_access"]["debug_inputs"])
             self.assertIn("wechat-capture", report["wechat_access"]["debug_inputs"])
@@ -41,8 +44,12 @@ class PreflightTest(unittest.TestCase):
             self.assertEqual(report["wechat_access"]["page_ocr_ingestion"], "disabled")
             self.assertEqual(report["tools"]["ocr"]["name"], "vision.ocr")
             self.assertEqual(report["tools"]["ocr"]["scope"], "tool_layer_file_workspace_only")
-            self.assertTrue(report["conversation_channels"]["auto_register_private"])
+            self.assertEqual(report["tools"]["web_search"]["name"], "web.search")
+            self.assertFalse(report["tools"]["web_search"]["uses_browser"])
+            self.assertIn("deep", report["tools"]["web_search"]["levels"])
+            self.assertEqual(report["conversation_channels"]["auto_register_private"], "identified_or_accepted_only")
             self.assertTrue(report["conversation_channels"]["auto_register_groups"])
+            self.assertTrue(report["conversation_channels"]["blocks_unknown_private"])
 
     def test_preflight_warns_when_provider_key_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,7 +174,7 @@ class PreflightTest(unittest.TestCase):
 
             report = build_preflight_report(config)
 
-            # wcf delivers by wxid/roomid, so no manual foreground binding is required.
+            # The bridge delivers by wxid/roomid, so no manual foreground binding is required.
             self.assertNotIn(
                 "bridge_outbox requires at least one manually captured WeChat channel binding",
                 report["warnings"],

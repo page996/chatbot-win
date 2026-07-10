@@ -74,11 +74,11 @@ class HookMessagePullRunner:
             finally:
                 self._lock = None
 
-    def run_once(self) -> dict[str, Any]:
+    def run_once(self, *, process_imported: bool = True) -> dict[str, Any]:
         if self._lock is not None:
             self._lock.heartbeat()
         if not self.consume_lock_enabled:
-            return self._run_once_locked()
+            return self._run_once_locked(process_imported=process_imported)
         with blocking_process_lock(
             self.consume_lock_path(),
             label="hook_consume_tick",
@@ -90,12 +90,14 @@ class HookMessagePullRunner:
             # lock go stale while we blocked.
             if self._lock is not None:
                 self._lock.heartbeat()
-            return self._run_once_locked()
+            return self._run_once_locked(process_imported=process_imported)
 
-    def _run_once_locked(self) -> dict[str, Any]:
+    def _run_once_locked(self, *, process_imported: bool) -> dict[str, Any]:
         imported = self.importer.import_new()
         if int(imported.appended_count or 0) <= 0:
             poll_result = {"status": "ok", "processed": [], "skipped_reason": "no_new_hook_imports"}
+        elif not process_imported:
+            poll_result = {"status": "ok", "processed": [], "skipped_reason": "capture_only_handoff_to_dialog_agent"}
         else:
             poll_result = self.polling_runner.run_once()
         processed = poll_result.get("processed", [])

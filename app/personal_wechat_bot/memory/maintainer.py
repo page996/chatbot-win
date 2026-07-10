@@ -36,6 +36,7 @@ class MemoryMaintenanceResult:
 @dataclass
 class MemoryDraft:
     summary_lines: list[str] = field(default_factory=list)
+    file_lines: list[str] = field(default_factory=list)
     preferences: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     entities: dict[str, Any] = field(default_factory=dict)
 
@@ -127,7 +128,9 @@ class MemoryMaintainer:
         if not root.exists():
             return results
         for conversation_dir in sorted(item for item in root.iterdir() if item.is_dir()):
-            conversation_id = conversation_dir.name
+            conversation_id = _conversation_id_from_ledger_dir(conversation_dir)
+            if not conversation_id:
+                continue
             session_ids = self._session_ids(conversation_id)
             for session_id in session_ids:
                 results.append(self.maintain(conversation_id, session_id=session_id))
@@ -166,6 +169,7 @@ class MemoryMaintainer:
             urls.extend(_entry_urls(entry))
 
         draft.summary_lines = draft.summary_lines[-self.max_summary_lines :]
+        draft.file_lines = [_file_summary_line(item) for item in files[-40:]]
         draft.entities = {
             "conversation": {
                 "chat_title": chat_title,
@@ -193,7 +197,7 @@ class MemoryMaintainer:
         state: dict[str, Any],
     ) -> None:
         memory_dir.mkdir(parents=True, exist_ok=True)
-        summary = _render_summary(conversation_id, session_id, draft.summary_lines)
+        summary = _render_summary(conversation_id, session_id, draft.summary_lines, draft.file_lines)
         _write_text_atomic(memory_dir / "summary.md", summary)
         _write_json_atomic(memory_dir / "preferences.json", draft.preferences)
         _write_json_atomic(memory_dir / "entities.json", draft.entities)
@@ -217,9 +221,18 @@ class MemoryMaintainer:
             return
         if not parsed:
             return
-        summary = _render_llm_summary(conversation_id, session_id, parsed, fallback.summary_lines)
+        summary = _render_llm_summary(
+            conversation_id,
+            session_id,
+            parsed,
+            fallback.summary_lines,
+            fallback.file_lines,
+        )
         preferences = parsed.get("preferences") if isinstance(parsed.get("preferences"), dict) else fallback.preferences
-        entities = parsed.get("entities") if isinstance(parsed.get("entities"), dict) else fallback.entities
+        entities = _merge_entity_files(
+            parsed.get("entities") if isinstance(parsed.get("entities"), dict) else fallback.entities,
+            fallback.entities,
+        )
         state = _read_json(memory_dir / "maintenance_state.json")
         state["llm_memory_updated_at"] = utc_now_iso()
         state["llm_memory_status"] = "updated"
@@ -231,6 +244,25 @@ class MemoryMaintainer:
 
 def _entry_session_id(entry: dict[str, Any]) -> str:
     return str(entry.get("session_id") or DEFAULT_SESSION_ID)
+
+
+def _conversation_id_from_ledger_dir(conversation_dir: Path) -> str:
+    messages_path = conversation_dir / "messages.jsonl"
+    if not messages_path.exists():
+        return ""
+    try:
+        with messages_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    return str(payload.get("conversation_id") or "").strip()
+                return ""
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return ""
 
 
 def _entry_text(entry: dict[str, Any]) -> str:
@@ -278,21 +310,74 @@ def _collect_preferences(preferences: dict[str, list[dict[str, Any]]], entry: di
 
 def _entry_files(entry: dict[str, Any]) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
+    origin = _entry_origin(entry)
+    direction = "outgoing" if origin in {"agent", "owner_manual"} else "incoming"
     for attachment in entry.get("attachments", []):
         if not isinstance(attachment, dict):
             continue
+        send = attachment.get("send") if isinstance(attachment.get("send"), dict) else {}
         files.append(
-            {
+            _clean_empty(
+                {
                 "name": attachment.get("name", ""),
                 "file_id": attachment.get("file_id", ""),
                 "kind": attachment.get("kind", ""),
                 "status": attachment.get("status", ""),
+                "source": attachment.get("source", ""),
+                "origin": origin,
+                "direction": direction,
+                "entry_role": str(entry.get("role") or ""),
                 "sequence": int(entry.get("sequence", 0) or 0),
                 "manifest_path": _nested(attachment, "workspace", "manifest_path"),
                 "content_path": _nested(attachment, "artifacts", "content_path"),
-            }
+                "send_status": send.get("status", ""),
+                "send_reason": send.get("reason", ""),
+                "bridge_id": send.get("bridge_id") or send.get("message_id") or "",
+                "external_message_id": send.get("external_message_id", ""),
+                }
+            )
         )
     return files
+
+
+def _file_summary_line(file: dict[str, Any]) -> str:
+    sequence = int(file.get("sequence", 0) or 0)
+    parts = [f"- #{sequence:06d}" if sequence else "-"]
+    for key in (
+        "name",
+        "kind",
+        "origin",
+        "direction",
+        "status",
+        "send_status",
+        "send_reason",
+        "bridge_id",
+        "external_message_id",
+        "file_id",
+        "manifest_path",
+        "content_path",
+    ):
+        value = str(file.get(key, "")).strip()
+        if value:
+            parts.append(f"{key}={_compact(value, 180)}")
+    return " ".join(parts)
+
+
+def _entry_origin(entry: dict[str, Any]) -> str:
+    role = str(entry.get("role") or "")
+    if role == "assistant":
+        return "agent"
+    if entry.get("is_self") or role == "self":
+        return "owner_manual"
+    return "user"
+
+
+def _clean_empty(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if value not in ("", None, [], {})
+    }
 
 
 def _entry_urls(entry: dict[str, Any]) -> list[str]:
@@ -336,7 +421,7 @@ def _nested(payload: dict[str, Any], section: str, key: str) -> str:
     return str(value.get(key, ""))
 
 
-def _render_summary(conversation_id: str, session_id: str, lines: list[str]) -> str:
+def _render_summary(conversation_id: str, session_id: str, lines: list[str], file_lines: list[str]) -> str:
     header = [
         "# Session Memory Summary",
         "",
@@ -348,8 +433,13 @@ def _render_summary(conversation_id: str, session_id: str, lines: list[str]) -> 
         "## Recent Durable Notes",
         "",
     ]
-    body = lines or ["- No active session entries yet."]
-    return "\n".join([*header, *body, ""])
+    body = lines or [
+        "- No active session text entries yet." if file_lines else "- No active session entries yet."
+    ]
+    result = [*header, *body, ""]
+    if file_lines:
+        result.extend(["## Recent Files", "", *file_lines, ""])
+    return "\n".join(result)
 
 
 def _memory_prompt(conversation_id: str, session_id: str, entries: list[dict[str, Any]]) -> str:
@@ -383,6 +473,7 @@ def _render_llm_summary(
     session_id: str,
     parsed: dict[str, Any],
     fallback_lines: list[str],
+    fallback_file_lines: list[str],
 ) -> str:
     summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
     lines = [
@@ -408,8 +499,52 @@ def _render_llm_summary(
             lines.extend(f"- {str(item).strip()}" for item in values if str(item).strip())
             lines.append("")
     if len(lines) <= 7:
-        lines.extend(["## Recent Durable Notes", "", *(fallback_lines or ["- No active session entries yet."]), ""])
+        fallback_body = fallback_lines or [
+            "- No active session text entries yet." if fallback_file_lines else "- No active session entries yet."
+        ]
+        lines.extend(["## Recent Durable Notes", "", *fallback_body, ""])
+    if fallback_file_lines:
+        lines.extend(["## Recent Files", "", *fallback_file_lines, ""])
     return "\n".join(lines)
+
+
+def _merge_entity_files(parsed_entities: dict[str, Any], fallback_entities: dict[str, Any]) -> dict[str, Any]:
+    result = dict(parsed_entities)
+    fallback_files = fallback_entities.get("files") if isinstance(fallback_entities.get("files"), list) else []
+    if not fallback_files:
+        return result
+    parsed_files = result.get("files") if isinstance(result.get("files"), list) else []
+    merged = list(parsed_files)
+    indexes: dict[tuple[str, ...], int] = {}
+    for index, item in enumerate(merged):
+        for key in _entity_file_keys(item):
+            indexes[key] = index
+    for item in fallback_files:
+        keys = _entity_file_keys(item)
+        matched_index = next((indexes[key] for key in keys if key in indexes), None)
+        if matched_index is not None:
+            current = merged[matched_index]
+            merged[matched_index] = {**current, **item} if isinstance(current, dict) else item
+            for key in keys:
+                indexes[key] = matched_index
+            continue
+        merged.append(item)
+        for key in keys:
+            indexes[key] = len(merged) - 1
+    result["files"] = merged[-80:]
+    return result
+
+
+def _entity_file_keys(item: Any) -> list[tuple[str, ...]]:
+    if not isinstance(item, dict):
+        value = str(item).strip()
+        return [("value", value)] if value else []
+    keys: list[tuple[str, ...]] = []
+    for key in ("bridge_id", "file_id", "content_path", "manifest_path", "name"):
+        value = str(item.get(key, "")).strip()
+        if value:
+            keys.append((key, value))
+    return keys
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:

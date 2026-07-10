@@ -22,10 +22,14 @@ class ConversationSessionStoreTest(unittest.TestCase):
 
             first = store.current_session_id("conv1")
             second = ConversationSessionStore(Path(tmp)).current_session_id("conv1")
+            state = json.loads((Path(tmp) / "conversation_sessions" / "conv1" / "state.json").read_text(encoding="utf-8"))
 
             self.assertEqual(first, DEFAULT_SESSION_ID)
             self.assertEqual(second, DEFAULT_SESSION_ID)
+            self.assertEqual(store.state_for_conversation("conv1")["current_session_id"], DEFAULT_SESSION_ID)
             self.assertTrue((Path(tmp) / "conversation_sessions" / "conv1" / "state.json").exists())
+            self.assertEqual(state["session_started_at"], state["created_at"])
+            self.assertEqual(state["reset_count"], 0)
 
     def test_current_session_recovers_existing_hash_only_state_after_readable_channel_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -117,13 +121,24 @@ class ConversationSessionStoreTest(unittest.TestCase):
             self.assertNotEqual(new_session, DEFAULT_SESSION_ID)
             self.assertEqual(store.current_session_id("conv1"), new_session)
             self.assertEqual(state["current_session_id"], new_session)
+            self.assertEqual(state["previous_session_id"], DEFAULT_SESSION_ID)
+            self.assertEqual(state["reset_count"], 1)
+            self.assertTrue(state["session_started_at"])
             self.assertEqual(events[-1]["type"], "session.reset")
+            self.assertEqual(events[-1]["session_id"], new_session)
+            self.assertEqual(events[-1]["previous_session_id"], DEFAULT_SESSION_ID)
             self.assertFalse(hasattr(store, "record_message"))
             self.assertFalse(hasattr(store, "build_snapshot"))
 
     def test_reset_detector_accepts_chinese_and_english_variants(self) -> None:
-        self.assertTrue(is_reset_command("清空当前对话上下文"))
-        self.assertTrue(is_reset_command("please reset context now"))
+        self.assertTrue(is_reset_command("@bot 清空当前对话上下文"))
+        self.assertTrue(is_reset_command("please @agent reset context now"))
+        self.assertTrue(is_reset_command("清空上下文", metadata={"mentioned_self": True}))
+        self.assertTrue(is_reset_command("清空上下文", metadata={"mentions": [{"name": "bot"}]}))
+        self.assertFalse(is_reset_command("清空当前对话上下文"))
+        self.assertFalse(is_reset_command("please reset context now"))
+        self.assertFalse(is_reset_command("清空上下文 @小王"))
+        self.assertFalse(is_reset_command("清空上下文", metadata={"mentions": [{"name": "wxid_other"}]}))
         self.assertFalse(is_reset_command("继续分析这个文件"))
 
 

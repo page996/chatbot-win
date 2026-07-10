@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.weflow == "on" and weflow_result.get("status") == "error":
             return 2
     _write_sidebar_launch_state(data_dir, args, weflow_result)
+    bridge_result = ensure_send_bridge_worker(data_dir)
+    if bridge_result.get("status") not in {"skipped", "ok"}:
+        print(json.dumps(bridge_result, ensure_ascii=False, indent=2), flush=True)
 
     if args.mode == "server":
         from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
@@ -68,6 +71,20 @@ def main(argv: list[str] | None = None) -> int:
     print("Close this window or press Ctrl+C to stop the local frontend.", flush=True)
     run_sidebar_window(data_dir, poll_interval_ms=args.interval_ms)
     return 0
+
+
+def ensure_send_bridge_worker(data_dir: Path) -> dict[str, object]:
+    try:
+        from app.personal_wechat_bot.control.sidebar_api import ensure_sidebar_bridge_worker
+
+        worker = ensure_sidebar_bridge_worker(data_dir, {"source": "start_sidebar_frontend"})
+        return {"status": "ok", "component": "send_bridge_worker", "worker": worker}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "component": "send_bridge_worker",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def ensure_weflow_started(

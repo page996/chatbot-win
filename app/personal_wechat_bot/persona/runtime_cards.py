@@ -66,6 +66,7 @@ DEFAULT_STATE = {
     "enabled_skill_ids": ["skill.file_workspace_agent", "skill.foreground_dialogue"],
     "equipped_persona_id": "persona.default_wechat_friend",
     "equipped_task_ids": [],
+    "channel_overrides": {},
 }
 
 
@@ -120,8 +121,9 @@ class RuntimeCardStore:
                 return card
         return None
 
-    def active_cards(self) -> dict[str, Any]:
+    def active_cards(self, conversation_id: str = "") -> dict[str, Any]:
         state = self._read_state()
+        state = _effective_state_for_channel(state, conversation_id)
         skills = [
             card
             for card_id in state.get("enabled_skill_ids", [])
@@ -139,8 +141,8 @@ class RuntimeCardStore:
         ]
         return {"skills": skills, "persona": persona, "tasks": tasks}
 
-    def prompt_lines(self) -> list[str]:
-        active = self.active_cards()
+    def prompt_lines(self, conversation_id: str = "") -> list[str]:
+        active = self.active_cards(conversation_id=conversation_id)
         lines: list[str] = []
         if active["skills"]:
             lines.append("Skill cards:")
@@ -175,6 +177,36 @@ class RuntimeCardStore:
             card = self._save_card(payload, card_type="task")
             self._equip_task(card.card_id)
             return {"status": "ok", "card": asdict(card), "state": self.state()}
+        if action == "set-channel-persona":
+            return self._set_channel_persona(
+                str(payload.get("conversation_id") or payload.get("conversationId") or "").strip(),
+                str(payload.get("card_id", "")).strip(),
+            )
+        if action == "clear-channel-persona":
+            return self._clear_channel_key(
+                str(payload.get("conversation_id") or payload.get("conversationId") or "").strip(),
+                "equipped_persona_id",
+            )
+        if action == "enable-channel-skill":
+            return self._enable_channel_skill(
+                str(payload.get("conversation_id") or payload.get("conversationId") or "").strip(),
+                str(payload.get("card_id", "")).strip(),
+            )
+        if action == "disable-channel-skill":
+            return self._disable_channel_skill(
+                str(payload.get("conversation_id") or payload.get("conversationId") or "").strip(),
+                str(payload.get("card_id", "")).strip(),
+            )
+        if action == "set-channel-skills":
+            return self._set_channel_skills(
+                str(payload.get("conversation_id") or payload.get("conversationId") or "").strip(),
+                payload.get("card_ids") or payload.get("cardIds") or [],
+            )
+        if action == "clear-channel-skills":
+            return self._clear_channel_key(
+                str(payload.get("conversation_id") or payload.get("conversationId") or "").strip(),
+                "enabled_skill_ids",
+            )
         raise ValueError(f"unknown runtime card action: {action}")
 
     def _enable_skill(self, card_id: str) -> dict[str, Any]:
@@ -215,6 +247,86 @@ class RuntimeCardStore:
         self._write_state({**state, "equipped_task_ids": equipped})
         return {"status": "ok", "state": self.state()}
 
+    def _set_channel_persona(self, conversation_id: str, card_id: str) -> dict[str, Any]:
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+        card = self.get_card(card_id)
+        if card is None or card.card_type != "persona":
+            raise ValueError("persona card not found")
+        state = self._read_state()
+        override = _channel_override(state, conversation_id)
+        override["equipped_persona_id"] = card_id
+        self._write_channel_override(state, conversation_id, override)
+        return {"status": "ok", "state": self.state()}
+
+    def _enable_channel_skill(self, conversation_id: str, card_id: str) -> dict[str, Any]:
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+        card = self.get_card(card_id)
+        if card is None or card.card_type != "skill":
+            raise ValueError("skill card not found")
+        state = self._read_state()
+        override = _channel_override(state, conversation_id)
+        current = override.get("enabled_skill_ids")
+        if not isinstance(current, list):
+            current = [str(item) for item in state.get("enabled_skill_ids", [])]
+        override["enabled_skill_ids"] = _append_unique([str(item) for item in current], card_id)
+        self._write_channel_override(state, conversation_id, override)
+        return {"status": "ok", "state": self.state()}
+
+    def _disable_channel_skill(self, conversation_id: str, card_id: str) -> dict[str, Any]:
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+        state = self._read_state()
+        override = _channel_override(state, conversation_id)
+        current = override.get("enabled_skill_ids")
+        if not isinstance(current, list):
+            current = [str(item) for item in state.get("enabled_skill_ids", [])]
+        override["enabled_skill_ids"] = [str(item) for item in current if str(item) != card_id]
+        self._write_channel_override(state, conversation_id, override)
+        return {"status": "ok", "state": self.state()}
+
+    def _set_channel_skills(self, conversation_id: str, card_ids: Any) -> dict[str, Any]:
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+        if isinstance(card_ids, str):
+            raw_ids = [item.strip() for item in card_ids.split(",")]
+        elif isinstance(card_ids, list):
+            raw_ids = [str(item).strip() for item in card_ids]
+        else:
+            raw_ids = []
+        skill_ids: list[str] = []
+        for card_id in raw_ids:
+            if not card_id:
+                continue
+            card = self.get_card(card_id)
+            if card is None or card.card_type != "skill":
+                raise ValueError(f"skill card not found: {card_id}")
+            skill_ids = _append_unique(skill_ids, card_id)
+        state = self._read_state()
+        override = _channel_override(state, conversation_id)
+        override["enabled_skill_ids"] = skill_ids
+        self._write_channel_override(state, conversation_id, override)
+        return {"status": "ok", "state": self.state()}
+
+    def _clear_channel_key(self, conversation_id: str, key: str) -> dict[str, Any]:
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+        state = self._read_state()
+        override = _channel_override(state, conversation_id)
+        override.pop(key, None)
+        self._write_channel_override(state, conversation_id, override)
+        return {"status": "ok", "state": self.state()}
+
+    def _write_channel_override(self, state: dict[str, Any], conversation_id: str, override: dict[str, Any]) -> None:
+        overrides = dict(state.get("channel_overrides", {})) if isinstance(state.get("channel_overrides"), dict) else {}
+        clean = _clean_channel_override(override)
+        if clean:
+            overrides[conversation_id] = clean
+        else:
+            overrides.pop(conversation_id, None)
+        self._write_state({**state, "channel_overrides": overrides})
+
     def _save_card(self, payload: dict[str, Any], *, card_type: CardType) -> RuntimeCard:
         name = str(payload.get("name", "")).strip() or ("人物卡" if card_type == "persona" else "任务卡")
         metadata = _metadata_from_payload(payload, card_type)
@@ -254,6 +366,14 @@ class RuntimeCardStore:
         state["equipped_task_ids"] = [
             str(item) for item in state.get("equipped_task_ids", []) if str(item).strip()
         ]
+        raw_overrides = state.get("channel_overrides")
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = {}
+        state["channel_overrides"] = {
+            str(conversation_id): _clean_channel_override(override)
+            for conversation_id, override in raw_overrides.items()
+            if str(conversation_id).strip() and isinstance(override, dict) and _clean_channel_override(override)
+        }
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
@@ -283,6 +403,42 @@ def _card_from_payload(payload: dict[str, Any]) -> RuntimeCard | None:
 
 def _append_unique(values: list[str], value: str) -> list[str]:
     return [*values, value] if value and value not in values else values
+
+
+def _effective_state_for_channel(state: dict[str, Any], conversation_id: str) -> dict[str, Any]:
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id:
+        return state
+    overrides = state.get("channel_overrides") if isinstance(state.get("channel_overrides"), dict) else {}
+    override = overrides.get(conversation_id) if isinstance(overrides.get(conversation_id), dict) else {}
+    if not override:
+        return state
+    effective = dict(state)
+    if isinstance(override.get("enabled_skill_ids"), list):
+        effective["enabled_skill_ids"] = [str(item) for item in override.get("enabled_skill_ids", []) if str(item).strip()]
+    if str(override.get("equipped_persona_id") or "").strip():
+        effective["equipped_persona_id"] = str(override.get("equipped_persona_id")).strip()
+    if isinstance(override.get("equipped_task_ids"), list):
+        effective["equipped_task_ids"] = [str(item) for item in override.get("equipped_task_ids", []) if str(item).strip()]
+    return effective
+
+
+def _channel_override(state: dict[str, Any], conversation_id: str) -> dict[str, Any]:
+    overrides = state.get("channel_overrides") if isinstance(state.get("channel_overrides"), dict) else {}
+    current = overrides.get(conversation_id) if isinstance(overrides.get(conversation_id), dict) else {}
+    return _clean_channel_override(current)
+
+
+def _clean_channel_override(value: dict[str, Any]) -> dict[str, Any]:
+    clean: dict[str, Any] = {}
+    if isinstance(value.get("enabled_skill_ids"), list):
+        clean["enabled_skill_ids"] = [str(item) for item in value.get("enabled_skill_ids", []) if str(item).strip()]
+    persona = str(value.get("equipped_persona_id") or "").strip()
+    if persona:
+        clean["equipped_persona_id"] = persona
+    if isinstance(value.get("equipped_task_ids"), list):
+        clean["equipped_task_ids"] = [str(item) for item in value.get("equipped_task_ids", []) if str(item).strip()]
+    return clean
 
 
 def _safe_id(value: str) -> str:

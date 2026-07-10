@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cmp_to_key
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable, Iterator
@@ -23,6 +22,97 @@ from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_acco
 
 WEFLOW_LOCAL_BUILD_FLAVOR = "chatbot-win-local-fork"
 ProgressCallback = Callable[[dict[str, Any]], None]
+WEFLOW_FRIEND_TRUE_KEYS = (
+    "is_friend",
+    "isFriend",
+    "friend",
+    "is_contact",
+    "isContact",
+    "contact",
+    "in_contacts",
+    "inContacts",
+    "in_address_book",
+    "inAddressBook",
+)
+WEFLOW_NON_FRIEND_TRUE_KEYS = (
+    "is_stranger",
+    "isStranger",
+    "stranger",
+    "non_friend",
+    "nonFriend",
+    "is_non_friend",
+    "isNonFriend",
+    "temporary",
+    "is_temporary",
+    "isTemporary",
+)
+WEFLOW_RELATION_KEYS = (
+    "relationship",
+    "relation",
+    "contact_status",
+    "contactStatus",
+    "friend_status",
+    "friendStatus",
+    "verifyFlag",
+    "verify_flag",
+)
+WEFLOW_NON_FRIEND_VALUES = frozenset(
+    {
+        "unknown",
+        "stranger",
+        "non_friend",
+        "nonfriend",
+        "not_friend",
+        "temporary",
+        "temp",
+        "stranger_from_group",
+        "group_only",
+    }
+)
+WEFLOW_FRIEND_VALUES = frozenset({"friend", "contact", "contacts", "accepted", "verified", "known"})
+WEFLOW_PLACEHOLDER_NAMES = frozenset(
+    {
+        "unknown",
+        "unknown contact",
+        "unknown user",
+        "unknown friend",
+        "wechat user",
+        "weixin user",
+        "未知",
+        "未知联系人",
+        "未知用户",
+        "微信用户",
+        "微信联系人",
+        "system",
+        "none",
+        "null",
+    }
+)
+WEFLOW_NON_FRIEND_TEXT_KEYS = (
+    "banner",
+    "notice",
+    "tip",
+    "hint",
+    "subtitle",
+    "description",
+    "relation_text",
+    "relationText",
+    "relationship_text",
+    "relationshipText",
+    "friend_tip",
+    "friendTip",
+    "verify_content",
+    "verifyContent",
+    "status_text",
+    "statusText",
+)
+WEFLOW_NON_FRIEND_TEXT_MARKERS = (
+    "对方还不是你的朋友",
+    "还不是你的朋友",
+    "不是你的朋友",
+    "not your friend",
+    "not a friend",
+)
 
 
 class WeFlowPullCancelled(RuntimeError):
@@ -70,14 +160,6 @@ class WeFlowSseResult:
     last_event_id: str = ""
     errors: tuple[dict[str, str], ...] = ()
     state_path: str = ""
-
-
-@dataclass(frozen=True)
-class WcfCallbackServerConfig:
-    hook_event_file: str | Path
-    host: str = "127.0.0.1"
-    port: int = 8791
-    path: str = "/callback"
 
 
 def weflow_health_status(
@@ -208,8 +290,18 @@ class WeFlowHttpBridge:
         errors: list[dict[str, str]] = []
         media_export_paths: set[str] = set()
         _raise_if_cancelled(cancel_event)
-        if talkers:
-            sessions = [{"id": item, "name": item, "type": "group" if item.endswith("@chatroom") else "private"} for item in talkers]
+        explicit_talkers = bool(talkers)
+        if explicit_talkers:
+            sessions = _weflow_sessions_from_talkers(talkers or [])
+            try:
+                discovered_sessions = self.list_sessions(limit=min(5000, max(session_limit, len(sessions), 1000)))
+            except Exception:
+                # Older or test WeFlow bridges may expose raw message pulls
+                # without a sessions endpoint. Keep the explicit pull working;
+                # unidentified private channels are still blocked downstream.
+                discovered_sessions = []
+            else:
+                sessions = _merge_explicit_weflow_sessions(sessions, discovered_sessions)
         else:
             try:
                 sessions = self.list_sessions(limit=session_limit)
@@ -234,6 +326,8 @@ class WeFlowHttpBridge:
             for session in sessions
             if not is_system_account(_session_id_from_meta(session))
         ]
+        if not explicit_talkers:
+            sessions = [session for session in sessions if _weflow_session_pull_admitted(session)]
         sessions = _dedupe_weflow_sessions(sessions)
         _emit_progress(progress_callback, event="sessions", session_count=len(sessions), scanned_count=0, appended_count=0)
 
@@ -707,8 +801,6 @@ def append_hook_source_event(
         elif source == "weflow-message":
             session_id = str(payload.get("sessionId") or payload.get("talker") or payload.get("session_id") or "").strip()
             appended = writer.append(normalize_weflow_message(payload, session_id=session_id, session_meta=payload))
-        elif source == "wcf-callback":
-            appended = writer.append(normalize_wcf_callback(payload))
         else:
             appended = writer.append(payload)
     except Exception as exc:
@@ -757,6 +849,16 @@ def normalize_weflow_push_event(payload: dict[str, Any]) -> dict[str, Any]:
         "timestamp": timestamp,
         "is_self": _weflow_is_self(payload),
         "is_group": _session_type_is_group(payload, session_id),
+        "source_payload": _weflow_source_payload(
+            "weflow_push",
+            conversation_key=session_id,
+            session_meta=payload,
+            message=payload,
+            context_only=bool(payload.get("context_only") or payload.get("contextOnly")),
+            message_type=_first_text(payload, "messageType", "message_type", "type"),
+            server_id=rawid,
+            msg_id=rawid,
+        ),
         "raw": payload,
     }
     avatar = _first_text(payload, "avatarUrl", "avatar")
@@ -841,6 +943,21 @@ def normalize_weflow_message(
         "app_msg_type": _first_text(message, "xmlType", "xml_type"),
         "context_only": bool(context_only),
         "capture_phase": "history_backfill" if context_only else "incremental",
+        "source_payload": _weflow_source_payload(
+            "weflow_http_raw",
+            conversation_key=talker,
+            session_meta=meta,
+            message=message,
+            context_only=bool(context_only),
+            message_type=message_type,
+            local_type=local_type,
+            media_export_path=media_export_path,
+            sort_key=_first_text(message, "sortSeq", "sort_seq"),
+            server_id=server_id,
+            local_id=local_id,
+            message_key=message_key,
+            msg_id=server_id or local_id,
+        ),
         "raw": {"message": message, "session": meta},
     }
     voice_payload = _weflow_voice(message, attachments)
@@ -850,88 +967,6 @@ def normalize_weflow_message(
     if quote_payload:
         result["quote"] = quote_payload
     return {key: value for key, value in result.items() if value not in ("", None, [])}
-
-
-def normalize_wcf_callback(payload: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise ValueError("WCF callback payload must be a JSON object")
-    is_group = _truthy(payload.get("is_group") or payload.get("isGroup"))
-    roomid = _first_text(payload, "roomid", "roomId")
-    sender = _first_text(payload, "sender", "senderWxid", "sender_id")
-    talker = roomid if is_group and roomid else sender
-    if not talker:
-        raise ValueError("WCF callback missing sender/roomid")
-    msg_id = _first_text(payload, "id", "msgid", "msgId")
-    message_type = _first_text(payload, "type", "msgType", "messageType")
-    result: dict[str, Any] = {
-        "source": "wechatferry_callback",
-        "event_type": "message",
-        "talker": talker,
-        "talker_name": roomid or sender or talker,
-        "sender_id": sender,
-        "sender_name": sender or "unknown",
-        "msgid": msg_id,
-        "raw_id": f"wcf:message:{talker}:{msg_id or int(time.time() * 1000)}",
-        "message_type": message_type,
-        "text": _first_text(payload, "content", "text"),
-        "is_self": _truthy(payload.get("is_self") or payload.get("isSelf")),
-        "is_group": is_group,
-        "observed_at": utc_now_iso(),
-        "raw": payload,
-    }
-    attachments = []
-    for key, kind in (("thumb", "image"), ("extra", _wcf_media_kind(message_type))):
-        value = _first_text(payload, key)
-        if value and _looks_like_path(value):
-            attachments.append({"path": value, "kind": kind or "file"})
-    if attachments:
-        result["attachments"] = attachments
-    return {key: value for key, value in result.items() if value not in ("", None, [])}
-
-
-def run_wcf_callback_server(config: WcfCallbackServerConfig) -> None:
-    _require_local_host(config.host)
-    writer = HookEventJsonlWriter(config.hook_event_file)
-    path = config.path if config.path.startswith("/") else f"/{config.path}"
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-        def do_GET(self) -> None:
-            if self.path.split("?", 1)[0] != "/health":
-                self._send_json(404, {"status": "not_found"})
-                return
-            self._send_json(200, {"status": "ok", "hook_event_file": str(writer.path), "send_enabled": False})
-
-        def do_POST(self) -> None:
-            if self.path.split("?", 1)[0] != path:
-                self._send_json(404, {"status": "not_found"})
-                return
-            length = _safe_int(self.headers.get("Content-Length"), 0)
-            try:
-                raw = self.rfile.read(length).decode("utf-8")
-                payload = json.loads(raw or "{}")
-                appended = writer.append(normalize_wcf_callback(payload))
-            except Exception as exc:
-                self._send_json(400, {"status": "error", "type": type(exc).__name__, "message": str(exc)})
-                return
-            self._send_json(200, {"status": "ok", "appended_count": 1 if appended else 0, "send_enabled": False})
-
-        def _send_json(self, code: int, payload: dict[str, Any]) -> None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-    server = ThreadingHTTPServer((config.host, config.port), Handler)
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-
 
 def _weflow_attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
     attachments: list[dict[str, Any]] = []
@@ -999,14 +1034,37 @@ def _weflow_voice(message: dict[str, Any], attachments: list[dict[str, Any]]) ->
 
 
 def _weflow_is_self(message: dict[str, Any]) -> bool:
-    return _truthy(
+    if _truthy(
         message.get("isSend")
         or message.get("is_send")
         or message.get("isSelf")
         or message.get("fromMe")
         or message.get("from_me")
         or message.get("self")
+    ):
+        return True
+    sender_id = _first_text(
+        message,
+        "sender",
+        "senderUsername",
+        "senderId",
+        "fromUser",
+        "fromUserName",
+        "account",
+        "accountId",
     )
+    return bool(sender_id and sender_id in _weflow_owner_wxids(message))
+
+
+def _weflow_owner_wxids(message: dict[str, Any]) -> set[str]:
+    try:
+        raw = json.dumps(message, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        raw = str(message)
+    owner_ids: set[str] = set()
+    for match in re.finditer(r"(?:xwechat_files|WeChat Files)(?:\\\\|[\\/])(wxid_[A-Za-z0-9]+)(?:_[A-Za-z0-9]+)?", raw, re.IGNORECASE):
+        owner_ids.add(match.group(1))
+    return owner_ids
 
 
 def _weflow_quote(message: dict[str, Any]) -> dict[str, str]:
@@ -1165,6 +1223,217 @@ def _session_id_from_meta(session: dict[str, Any]) -> str:
     return str(session.get("id") or session.get("username") or session.get("talker") or session.get("sessionId") or "").strip()
 
 
+def _weflow_sessions_from_talkers(talkers: list[str]) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    for item in talkers:
+        session_id = str(item or "").strip()
+        if not session_id:
+            continue
+        sessions.append({"id": session_id, "name": session_id, "type": "group" if session_id.endswith("@chatroom") else "private"})
+    return sessions
+
+
+def _merge_explicit_weflow_sessions(
+    explicit_sessions: list[dict[str, Any]],
+    discovered_sessions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    discovered_by_id: dict[str, dict[str, Any]] = {}
+    for session in discovered_sessions:
+        if not isinstance(session, dict):
+            continue
+        for session_id in _weflow_session_identity_candidates(session):
+            discovered_by_id.setdefault(session_id, session)
+
+    merged_sessions: list[dict[str, Any]] = []
+    for explicit in explicit_sessions:
+        session_id = _session_id_from_meta(explicit)
+        discovered = discovered_by_id.get(session_id, {})
+        if discovered:
+            merged_sessions.append({**discovered, **explicit, "id": session_id})
+        else:
+            merged_sessions.append(explicit)
+    return merged_sessions
+
+
+def _weflow_session_identity_candidates(session: dict[str, Any]) -> list[str]:
+    values = [
+        session.get("id"),
+        session.get("username"),
+        session.get("talker"),
+        session.get("sessionId"),
+        session.get("session_id"),
+    ]
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _weflow_session_pull_admitted(session: dict[str, Any]) -> bool:
+    session_id = _session_id_from_meta(session)
+    if not session_id:
+        return False
+    if _session_type_is_group(session, session_id):
+        return True
+    if _weflow_explicit_non_friend(session):
+        return False
+    if _weflow_explicit_friend(session):
+        return True
+    if _looks_like_private_wechat_receiver(session_id):
+        return False
+    for value in (
+        _first_text(session, "remark", "remarkName"),
+        _first_text(session, "displayName", "display_name"),
+        _first_text(session, "nickName", "nickname"),
+        _first_text(session, "name"),
+    ):
+        text = str(value or "").strip()
+        if _weflow_session_title_identifies_contact(text, session_id):
+            return True
+    return False
+
+
+def _weflow_session_title_identifies_contact(value: str, session_id: str) -> bool:
+    text = str(value or "").strip()
+    if not text or text == session_id:
+        return False
+    if text.lower() in WEFLOW_PLACEHOLDER_NAMES:
+        return False
+    if _looks_like_wechat_receiver(text):
+        return False
+    return any(ch.isalnum() for ch in text)
+
+
+def _weflow_source_payload(
+    source: str,
+    *,
+    conversation_key: str,
+    session_meta: dict[str, Any],
+    message: dict[str, Any],
+    context_only: bool,
+    message_type: str = "",
+    local_type: str = "",
+    media_export_path: str = "",
+    sort_key: str = "",
+    server_id: str = "",
+    local_id: str = "",
+    message_key: str = "",
+    msg_id: str = "",
+) -> dict[str, Any]:
+    session_type = _first_text(session_meta, "sessionType", "type", "session_type")
+    payload: dict[str, Any] = {
+        "source": source,
+        "adapter": source,
+        "conversation_key": conversation_key,
+        "talker_id": conversation_key,
+        "talker": conversation_key,
+        "session_id": conversation_key,
+        "session_type": session_type,
+        "is_group": _session_type_is_group(session_meta, conversation_key),
+        "message_type": message_type,
+        "sort_key": sort_key,
+        "server_id": server_id,
+        "local_id": local_id,
+        "message_key": message_key,
+        "local_type": local_type,
+        "msg_id": msg_id,
+        "media_export_path": media_export_path,
+        "context_only": bool(context_only),
+    }
+    for key in (
+        "remark",
+        "remarkName",
+        "displayName",
+        "display_name",
+        "nickName",
+        "nickname",
+        "name",
+        "username",
+        "sessionName",
+        "talkerName",
+        *WEFLOW_FRIEND_TRUE_KEYS,
+        *WEFLOW_NON_FRIEND_TRUE_KEYS,
+        *WEFLOW_RELATION_KEYS,
+    ):
+        value = _first_present_value(session_meta, message, key=key)
+        if value is not None:
+            payload[key] = value
+    session_identity = _compact_weflow_session_identity(session_meta)
+    if session_identity:
+        payload["session"] = session_identity
+    return {key: value for key, value in payload.items() if value not in ("", None, [], {})}
+
+
+def _compact_weflow_session_identity(session: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(session, dict):
+        return {}
+    keys = (
+        "id",
+        "username",
+        "talker",
+        "sessionId",
+        "session_id",
+        "type",
+        "sessionType",
+        "session_type",
+        "remark",
+        "remarkName",
+        "displayName",
+        "display_name",
+        "nickName",
+        "nickname",
+        "name",
+        *WEFLOW_FRIEND_TRUE_KEYS,
+        *WEFLOW_NON_FRIEND_TRUE_KEYS,
+        *WEFLOW_RELATION_KEYS,
+    )
+    result: dict[str, Any] = {}
+    for key in keys:
+        if key in session and session.get(key) not in ("", None, [], {}):
+            result[key] = session.get(key)
+    return result
+
+
+def _first_present_value(*payloads: dict[str, Any], key: str) -> Any:
+    for payload in payloads:
+        if isinstance(payload, dict) and key in payload:
+            return payload.get(key)
+    return None
+
+
+def _weflow_explicit_friend(payload: dict[str, Any]) -> bool:
+    for key in WEFLOW_FRIEND_TRUE_KEYS:
+        if key in payload and _truthy(payload.get(key)):
+            return True
+    for key in WEFLOW_RELATION_KEYS:
+        value = str(payload.get(key) or "").strip().lower()
+        if value in WEFLOW_FRIEND_VALUES:
+            return True
+    return False
+
+
+def _weflow_explicit_non_friend(payload: dict[str, Any]) -> bool:
+    for key in WEFLOW_NON_FRIEND_TRUE_KEYS:
+        if key in payload and _truthy(payload.get(key)):
+            return True
+    for key in WEFLOW_FRIEND_TRUE_KEYS:
+        if key in payload and payload.get(key) is False:
+            return True
+    for key in WEFLOW_RELATION_KEYS:
+        value = str(payload.get(key) or "").strip().lower()
+        if value in WEFLOW_NON_FRIEND_VALUES:
+            return True
+    for key in WEFLOW_NON_FRIEND_TEXT_KEYS:
+        value = str(payload.get(key) or "").strip().lower()
+        if value and any(marker in value for marker in WEFLOW_NON_FRIEND_TEXT_MARKERS):
+            return True
+    return False
+
+
 def _dedupe_weflow_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep one worker lane per talker while preserving discovery order."""
 
@@ -1246,13 +1515,9 @@ def _message_id_from_raw_id(value: str) -> str:
 
 
 def _weflow_message_raw_id(session_id: str, message_id: str) -> str:
-    if message_id.startswith(("weflow:", "hook:", "wcf:")):
+    if message_id.startswith(("weflow:", "hook:")):
         return message_id
     return f"weflow:message:{session_id}:{message_id}" if message_id else ""
-
-
-def _wcf_media_kind(message_type: str) -> str:
-    return {"3": "image", "34": "audio", "43": "video", "49": "file"}.get(str(message_type), "file")
 
 
 def _raise_if_cancelled(cancel_event: Event | None) -> None:
@@ -1349,6 +1614,11 @@ def _preferred_display_name(*values: Any) -> str:
 def _looks_like_wechat_receiver(value: str) -> bool:
     text = str(value or "").strip()
     return bool(text.startswith(("wxid_", "gh_")) or text.endswith("@chatroom"))
+
+
+def _looks_like_private_wechat_receiver(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text.startswith(("wxid_", "gh_")))
 
 
 def _truthy(value: Any) -> bool:

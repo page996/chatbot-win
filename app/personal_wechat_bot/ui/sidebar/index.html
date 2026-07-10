@@ -1,9 +1,9 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>微信 Agent 审计面板</title>
+    <title>微信 Agent 后台控制台</title>
     <link rel="stylesheet" href="/styles.css?v=20260708-light-runtime" />
   </head>
   <body>
@@ -12,7 +12,7 @@
         <div class="brand">
           <div class="mark">A</div>
           <div>
-            <h1>微信 Agent 审计面板</h1>
+            <h1>微信 Agent 后台控制台</h1>
             <p id="readinessLine">正在读取运行状态</p>
           </div>
         </div>
@@ -101,6 +101,14 @@
               <select id="driverSelect"></select>
             </label>
             <label class="driver-select">
+              <span>桥后端</span>
+              <select id="sendBackendSelect">
+                <option value="wechat_native_http">wechat_native_http（PC WeChat Native）</option>
+                <option value="dry_run">dry_run（只演练）</option>
+                <option value="weflow_http">weflow_http（WeFlow/4.x）</option>
+              </select>
+            </label>
+            <label class="driver-select">
               <span>文件处理上限（MB）</span>
               <input id="fileMaxMb" type="number" min="1" max="2048" step="1" value="20" />
             </label>
@@ -124,6 +132,10 @@
               <button class="metric" data-status="queued_to_bridge">
                 <span>入桥</span>
                 <strong id="bridgeQueuedCount">0</strong>
+              </button>
+              <button class="metric" data-status="accepted">
+                <span>未验</span>
+                <strong id="acceptedCount">0</strong>
               </button>
               <button class="metric" data-status="rejected">
                 <span>拒绝</span>
@@ -151,7 +163,7 @@
               <button id="bridgeRefreshButton" class="ghost small">刷新</button>
             </div>
             <div id="bridgeList" class="bridge-list"></div>
-            <p class="bridge-help">说明：非前台桥是“桥接发送队列”，用于把已批准的回复交给后台/外部桥接器处理；仅手动抓取并绑定过的微信通道会进入这里。</p>
+            <p class="bridge-help">说明：非前台桥是“桥接发送队列”，用于把已批准的回复交给后台/本地微信 Native 端口处理；在库通道解析出 wxid/roomid 后即可进入这里。</p>
           </div>
           <div id="runtimePanel" hidden>
             <div class="runtime-summary">
@@ -179,9 +191,32 @@
               <div id="personaList" class="card-list"></div>
               <form id="personaForm" class="card-form">
                 <input id="personaCardName" type="text" placeholder="新人物卡名称" />
-                <textarea id="personaCardContent" rows="5" placeholder="人物设定、语气、边界、示例说话风格"></textarea>
+                <textarea id="personaCardDescription" rows="2" placeholder="Description：身份定位、关系感、边界"></textarea>
+                <textarea id="personaCardPersonality" rows="2" placeholder="Personality：语气、性格、表达偏好"></textarea>
+                <textarea id="personaCardScenario" rows="2" placeholder="Scenario：当前通道适用场景"></textarea>
+                <textarea id="personaCardMesExample" rows="3" placeholder="Example messages：几条理想回复示例"></textarea>
+                <textarea id="personaCardContent" rows="5" placeholder="完整人物卡内容；留空时会由上方字段组合"></textarea>
                 <button class="primary" type="submit">保存并装备人物卡</button>
               </form>
+            </section>
+
+            <section class="runtime-section">
+              <div class="section-head">
+                <h2>通道人设覆盖</h2>
+                <span id="channelOverrideCount">0</span>
+              </div>
+              <form id="channelRuntimeForm" class="card-form channel-runtime-form">
+                <input id="channelOverrideConversationId" type="text" list="channelOverrideConversationOptions" placeholder="conversation_id，例如 private-1" />
+                <datalist id="channelOverrideConversationOptions"></datalist>
+                <select id="channelOverridePersonaSelect" aria-label="通道人物卡"></select>
+                <input id="channelOverrideSkillIds" type="text" placeholder="技能 card_id，逗号分隔；留空表示无技能" />
+                <div class="form-actions">
+                  <button class="primary" type="submit">保存通道覆盖</button>
+                  <button id="clearChannelPersonaButton" class="ghost" type="button">清人物卡</button>
+                  <button id="clearChannelSkillsButton" class="ghost" type="button">清技能</button>
+                </div>
+              </form>
+              <div id="channelOverrideList" class="card-list channel-override-list"></div>
             </section>
 
             <section class="runtime-section">
@@ -316,6 +351,7 @@
               <div class="action-row">
                 <button id="weflowDepsButton" class="ghost small" data-tooltip="检查 OCR、PDF、表格等可选依赖是否可用。">依赖检查</button>
                 <button id="weflowInstallButton" class="ghost small" data-tooltip="安装轻量 OCR/ASR 与文档依赖；GPU 依赖需按 GPU 档单独安装。">安装依赖</button>
+                <button id="nativeMigrationProbeButton" class="ghost small" data-tooltip="检查本机微信版本、Native HTTP、消息路径候选和 hook 历史残留清理清单。">Native 探测</button>
               </div>
             </section>
           </div>
@@ -353,7 +389,12 @@
               <strong>对话 Agent</strong>
               <span>读取会话文件、聚合主题并运行一次接话管线</span>
             </div>
-            <button id="agentTickButton" class="primary small">运行一次接话</button>
+            <div class="agent-command-actions">
+              <button id="agentTickButton" class="ghost small">运行一次接话</button>
+              <button id="agentStartButton" class="primary small">启动连续接话</button>
+              <button id="agentStopButton" class="ghost small">停止连续接话</button>
+            </div>
+            <div id="agentStatusSummary" class="agent-status-summary"></div>
           </div>
           <div id="resourceSchedulerSummary" class="resource-scheduler-summary"></div>
           <div id="resourcePoolGrid" class="resource-grid"></div>
@@ -386,9 +427,13 @@
         <section class="maintenance-panel">
           <div class="section-head">
             <h2>历史数据</h2>
-            <button id="clearHistoryDataButton" class="danger small">清空历史数据</button>
+            <div class="section-head-actions">
+              <button id="storageStatusButton" class="ghost small">存储边界</button>
+              <button id="clearHistoryDataButton" class="danger small">清空历史数据</button>
+            </div>
           </div>
           <p class="section-copy">清空对话、队列、文件中间层和 WeFlow 运行历史；保留侧边栏配置、模型配置、密钥池和技能/人设。清理后请手动重新打开 sidebar。</p>
+          <pre id="storageStatusBox" class="status-box storage-status-box" hidden></pre>
         </section>
 
         <section class="audit">
@@ -408,7 +453,10 @@
         <section class="inspector">
           <div class="section-head">
             <h2>微信窗口诊断</h2>
-            <button id="toggleProbe" class="ghost small">详情</button>
+            <div class="section-head-actions">
+              <button id="diagnosticsExportButton" class="ghost small">导出诊断</button>
+              <button id="toggleProbe" class="ghost small">详情</button>
+            </div>
           </div>
           <p id="diagnosticDetail" class="diagnostic-copy">句柄只用于确认当前抓到的是微信窗口，不负责读取聊天内容。</p>
           <div id="handleList" class="handle-list"></div>

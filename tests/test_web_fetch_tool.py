@@ -44,6 +44,33 @@ class WebFetchToolTest(unittest.TestCase):
             self.assertIn("Hello page text.", content)
             self.assertNotIn("ignored()", content)
 
+    def test_blocks_login_wall_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "login.html").write_text(
+                "<html><body><p>请登录后继续查看完整内容。</p></body></html>",
+                encoding="utf-8",
+            )
+            server = _LocalServer(root)
+            server.start()
+            try:
+                tool = WebFetchTool(root / "outputs", FileIndex(root / "files.sqlite"))
+                result = tool.run(
+                    ToolCallRequest(
+                        tool_name="web.fetch",
+                        call_id="call-login",
+                        conversation_id="conv1",
+                        requested_by="test",
+                        arguments={"url": server.url("/login.html")},
+                    )
+                )
+            finally:
+                server.stop()
+
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.error, "login_or_paywall_detected")
+            self.assertEqual(result.payload["content_kind"], "text")
+
     def test_file_url_enters_local_file_workspace_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

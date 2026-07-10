@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.personal_wechat_bot.config.schema import BotConfig
+from app.personal_wechat_bot.conversation.channel_admission import channel_admission_for_message
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.domain.models import NormalizedMessage, RouteDecision
 from app.personal_wechat_bot.router.deduper import Deduper
@@ -39,7 +40,22 @@ class Router:
             return RouteDecision(message.message_id, message.conversation_id, "duplicate", "message already processed")
 
         trusted_channel = _trusted_channel_source(message)
-        channel = self.channel_store.ensure_channel(message) if self.channel_store is not None and trusted_channel else None
+        channel = None
+        if self.channel_store is not None and trusted_channel:
+            existing = self.channel_store.get_channel(message.conversation_id)
+            admission = channel_admission_for_message(
+                message,
+                self.config,
+                existing_channel=existing or False,
+            )
+            if not admission.allowed:
+                return RouteDecision(
+                    message.message_id,
+                    message.conversation_id,
+                    "ignore",
+                    f"channel_admission_blocked:{admission.reason}:{admission.identity}",
+                )
+            channel = self.channel_store.ensure_channel(message)
         channel_reason = "channel auto registered" if channel is not None else "auto accepted conversation"
         if message.conversation_type == "private":
             return RouteDecision(message.message_id, message.conversation_id, "process", channel_reason)

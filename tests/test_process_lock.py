@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -59,12 +60,25 @@ class ProcessLockTest(unittest.TestCase):
 
     def test_fresh_heartbeat_blocks_takeover(self) -> None:
         self.path.write_text(
-            json.dumps({"pid": 999999, "label": "alive", "heartbeat_at": time.time()}),
+            json.dumps({"pid": os.getpid(), "label": "alive", "heartbeat_at": time.time()}),
             encoding="utf-8",
         )
         lock = ProcessLock(self.path, label="intruder", stale_after_seconds=60.0)
         with self.assertRaises(ProcessLockError):
             lock.acquire()
+
+    def test_dead_pid_with_fresh_heartbeat_is_taken_over(self) -> None:
+        self.path.write_text(
+            json.dumps({"pid": 999999, "label": "dead", "heartbeat_at": time.time()}),
+            encoding="utf-8",
+        )
+        lock = ProcessLock(self.path, label="fresh", stale_after_seconds=60.0)
+        lock.acquire()
+        try:
+            holder = json.loads(self.path.read_text(encoding="utf-8"))
+            self.assertEqual(holder["label"], "fresh")
+        finally:
+            lock.release()
 
     def test_heartbeat_updates_timestamp(self) -> None:
         lock = ProcessLock(self.path, label="hb")

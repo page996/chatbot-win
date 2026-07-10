@@ -36,6 +36,10 @@ def _normalize_send_driver(name: str) -> str:
     return _DEPRECATED_SEND_DRIVERS.get(cleaned, cleaned)
 
 
+def _normalize_send_backend(name: str) -> str:
+    return str(name or "").strip().lower()
+
+
 def _bool_from_json(raw: dict[str, Any], name: str, default: bool) -> bool:
     value = raw.get(name, default)
     if value is None:
@@ -121,10 +125,20 @@ def load_config(data_dir: str | Path = "data") -> BotConfig:
         data_dir=str(root),
         send_enabled=_bool_from_json(raw, "send_enabled", False),
         send_driver=_normalize_send_driver(raw.get("send_driver", "not_implemented")),
-        send_backend=str(raw.get("send_backend", "dry_run")),
-        wcf_host=str(raw.get("wcf_host", "127.0.0.1")),
-        wcf_port=int(raw.get("wcf_port", 10086)),
-        wcf_send_timeout_seconds=float(raw.get("wcf_send_timeout_seconds", 15.0)),
+        send_backend=_normalize_send_backend(raw.get("send_backend", "dry_run")),
+        weflow_base_url=str(raw.get("weflow_base_url", "http://127.0.0.1:5031") or "http://127.0.0.1:5031"),
+        weflow_token_env=str(raw.get("weflow_token_env", "WEFLOW_API_TOKEN") or "WEFLOW_API_TOKEN"),
+        weflow_send_text_path=str(raw.get("weflow_send_text_path", "/send/text") or "/send/text"),
+        weflow_send_file_path=str(raw.get("weflow_send_file_path", "/send/file") or "/send/file"),
+        weflow_send_timeout_seconds=float(raw.get("weflow_send_timeout_seconds", 35.0)),
+        wechat_native_base_url=str(raw.get("wechat_native_base_url", "http://127.0.0.1:30001") or "http://127.0.0.1:30001"),
+        wechat_native_send_text_path=str(raw.get("wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
+        wechat_native_send_image_path=str(raw.get("wechat_native_send_image_path", "/SendImgMsg") or "/SendImgMsg"),
+        wechat_native_send_file_path=str(raw.get("wechat_native_send_file_path", "/send_file_msg") or "/send_file_msg"),
+        wechat_native_status_path=str(raw.get("wechat_native_status_path", "/QueryDB/status") or "/QueryDB/status"),
+        wechat_native_timeout_seconds=float(raw.get("wechat_native_timeout_seconds", 15.0)),
+        wechat_native_verify_timeout_seconds=float(raw.get("wechat_native_verify_timeout_seconds", 10.0)),
+        wechat_native_file_verify_timeout_seconds=float(raw.get("wechat_native_file_verify_timeout_seconds", 45.0)),
         send_confirm_required=_bool_from_json(raw, "send_confirm_required", True),
         send_max_chars=int(raw.get("send_max_chars", 800)),
         send_min_interval_seconds=int(raw.get("send_min_interval_seconds", 5)),

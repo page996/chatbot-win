@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import LedgerContextAssembler
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
-from app.personal_wechat_bot.domain.models import NormalizedMessage
+from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer
 
 
@@ -106,6 +107,241 @@ class MemoryMaintainerTest(unittest.TestCase):
             self.assertIn("新会话内容", new_summary)
             self.assertNotIn("默认会话内容", new_summary)
 
+    def test_maintain_all_recovers_conversation_id_from_readable_ledger_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationLedgerStore(root)
+            store.append_message(_message("old", "默认会话内容"))
+            store.append_message(_message("new", "新会话内容", metadata={"session_id": "session_new"}))
+
+            results = MemoryMaintainer(ConversationLedgerStore(root)).maintain_all()
+
+            by_session = {result.session_id: result for result in results}
+            segment = conversation_segment("conv1", "PAGE")
+            self.assertEqual({result.conversation_id for result in results}, {"conv1"})
+            self.assertIn(DEFAULT_SESSION_ID, by_session)
+            self.assertIn("session_new", by_session)
+            self.assertTrue((root / "conversation_ledgers" / segment / "memory" / "summary.md").exists())
+            self.assertTrue(
+                (root / "conversation_ledgers" / segment / "sessions" / "session_new" / "memory" / "summary.md").exists()
+            )
+            self.assertFalse((root / "conversation_ledgers" / "PAGE_con" / "memory" / "summary.md").exists())
+
+    def test_agent_outgoing_file_memory_keeps_origin_and_send_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = ConversationLedgerStore(data_dir)
+            file_path = data_dir / "agent-result.txt"
+            file_path.write_text("result", encoding="utf-8")
+            reply = ReplyCandidate(
+                message_id="reply-file",
+                conversation_id="conv1",
+                text="已生成文件。",
+                send_mode="confirm",
+                model="fake",
+                attachments=[
+                    {
+                        "path": str(file_path),
+                        "name": "agent-result.txt",
+                        "kind": "document",
+                    }
+                ],
+            )
+            entry = store.append_reply(reply)
+            store.update_reply_send_result(
+                "conv1",
+                entry.entry_id,
+                SendResult(
+                    message_id="bridge:conv1:text",
+                    conversation_id="conv1",
+                    status="queued_to_bridge",
+                    reason="queued_to_non_foreground_bridge:bridge:conv1:text",
+                    details={
+                        "kind": "multi_part_send",
+                        "text": {
+                            "status": "queued_to_bridge",
+                            "reason": "queued_to_non_foreground_bridge:bridge:conv1:text",
+                            "message_id": "bridge:conv1:text",
+                        },
+                        "files": [
+                            {
+                                "path": str(file_path),
+                                "name": "agent-result.txt",
+                                "status": "sent",
+                                "reason": "wechat_native_http_send_file_verified",
+                                "message_id": "bridge:conv1:file",
+                            }
+                        ],
+                        "bridge_ids": ["bridge:conv1:text", "bridge:conv1:file"],
+                        "part_count": 2,
+                    },
+                ),
+            )
+            store.update_bridge_send_result(
+                "conv1",
+                "bridge:conv1:file",
+                status="sent",
+                reason="wechat_native_http_send_file_verified",
+                external_message_id="ext-file",
+            )
+
+            result = MemoryMaintainer(store).maintain("conv1")
+            summary = Path(result.summary_path).read_text(encoding="utf-8")
+            entities = json.loads(Path(result.entities_path).read_text(encoding="utf-8"))
+            rendered = LedgerContextAssembler(store).build_snapshot(_message("current", "收到")).render_for_prompt()
+            file_entity = entities["files"][0]
+
+            self.assertIn("Recent Files", summary)
+            self.assertIn("agent-result.txt", summary)
+            self.assertIn("origin=agent", summary)
+            self.assertIn("direction=outgoing", summary)
+            self.assertIn("send_status=sent", summary)
+            self.assertIn("bridge_id=bridge:conv1:file", summary)
+            self.assertEqual(file_entity["name"], "agent-result.txt")
+            self.assertEqual(file_entity["origin"], "agent")
+            self.assertEqual(file_entity["direction"], "outgoing")
+            self.assertEqual(file_entity["send_status"], "sent")
+            self.assertEqual(file_entity["bridge_id"], "bridge:conv1:file")
+            self.assertEqual(file_entity["external_message_id"], "ext-file")
+            self.assertIn("origin=agent", rendered)
+            self.assertIn("direction=outgoing", rendered)
+            self.assertIn("send_status=sent", rendered)
+            self.assertIn("bridge_id=bridge:conv1:file", rendered)
+
+    def test_file_only_agent_reply_is_visible_in_memory_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = ConversationLedgerStore(data_dir)
+            file_path = data_dir / "only-file.txt"
+            file_path.write_text("file result", encoding="utf-8")
+            reply = ReplyCandidate(
+                message_id="reply-only-file",
+                conversation_id="conv1",
+                text="",
+                send_mode="confirm",
+                model="fake",
+                attachments=[
+                    {
+                        "path": str(file_path),
+                        "name": "only-file.txt",
+                        "kind": "document",
+                    }
+                ],
+            )
+            entry = store.append_reply(reply)
+            store.update_reply_send_result(
+                "conv1",
+                entry.entry_id,
+                SendResult(
+                    message_id="bridge:conv1:fileonly",
+                    conversation_id="conv1",
+                    status="queued_to_bridge",
+                    reason="queued_to_non_foreground_bridge:bridge:conv1:fileonly",
+                    details={
+                        "kind": "file_send",
+                        "files": [
+                            {
+                                "path": str(file_path),
+                                "name": "only-file.txt",
+                                "status": "sent",
+                                "reason": "wechat_native_http_send_file_verified",
+                                "message_id": "bridge:conv1:fileonly",
+                            }
+                        ],
+                        "bridge_ids": ["bridge:conv1:fileonly"],
+                        "part_count": 1,
+                    },
+                ),
+            )
+            store.update_bridge_send_result(
+                "conv1",
+                "bridge:conv1:fileonly",
+                status="sent",
+                reason="wechat_native_http_send_file_verified",
+                external_message_id="ext-file-only",
+            )
+
+            result = MemoryMaintainer(store).maintain("conv1")
+            summary = Path(result.summary_path).read_text(encoding="utf-8")
+
+            self.assertIn("No active session text entries yet", summary)
+            self.assertIn("Recent Files", summary)
+            self.assertIn("only-file.txt", summary)
+            self.assertIn("origin=agent", summary)
+            self.assertIn("direction=outgoing", summary)
+            self.assertIn("send_status=sent", summary)
+            self.assertIn("bridge_id=bridge:conv1:fileonly", summary)
+
+    def test_llm_memory_preserves_deterministic_file_send_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = ConversationLedgerStore(data_dir)
+            file_path = data_dir / "llm-file.txt"
+            file_path.write_text("file result", encoding="utf-8")
+            reply = ReplyCandidate(
+                message_id="reply-llm-file",
+                conversation_id="conv1",
+                text="file attached",
+                send_mode="confirm",
+                model="fake",
+                attachments=[
+                    {
+                        "path": str(file_path),
+                        "name": "llm-file.txt",
+                        "kind": "document",
+                    }
+                ],
+            )
+            entry = store.append_reply(reply)
+            store.update_reply_send_result(
+                "conv1",
+                entry.entry_id,
+                SendResult(
+                    message_id="bridge:conv1:llmfile",
+                    conversation_id="conv1",
+                    status="queued_to_bridge",
+                    reason="queued_to_non_foreground_bridge:bridge:conv1:llmfile",
+                    details={
+                        "files": [
+                            {
+                                "path": str(file_path),
+                                "name": "llm-file.txt",
+                                "status": "sent",
+                                "reason": "wechat_native_http_send_file_verified",
+                                "message_id": "bridge:conv1:llmfile",
+                            }
+                        ],
+                        "bridge_ids": ["bridge:conv1:llmfile"],
+                    },
+                ),
+            )
+            store.update_bridge_send_result(
+                "conv1",
+                "bridge:conv1:llmfile",
+                status="sent",
+                reason="wechat_native_http_send_file_verified",
+                external_message_id="ext-llm-file",
+            )
+            llm = _JsonMemoryLLM(
+                {
+                    "summary": {"conversation_review": "remember the attachment"},
+                    "preferences": {},
+                    "entities": {"files": [{"name": "llm-file.txt"}]},
+                }
+            )
+
+            result = MemoryMaintainer(store, llm=llm).maintain("conv1")
+            summary = Path(result.summary_path).read_text(encoding="utf-8")
+            entities = json.loads(Path(result.entities_path).read_text(encoding="utf-8"))
+            file_entity = entities["files"][0]
+
+            self.assertIn("Recent Files", summary)
+            self.assertIn("bridge_id=bridge:conv1:llmfile", summary)
+            self.assertEqual(file_entity["name"], "llm-file.txt")
+            self.assertEqual(file_entity["send_status"], "sent")
+            self.assertEqual(file_entity["bridge_id"], "bridge:conv1:llmfile")
+            self.assertEqual(file_entity["external_message_id"], "ext-llm-file")
+
 
 def _message(message_id: str, text: str, *, metadata: dict | None = None) -> NormalizedMessage:
     return NormalizedMessage(
@@ -120,6 +356,16 @@ def _message(message_id: str, text: str, *, metadata: dict | None = None) -> Nor
         received_at="2026-06-29T00:00:00+08:00",
         metadata=metadata or {},
     )
+
+
+class _JsonMemoryLLM:
+    model = "fake"
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def generate_reply(self, prompt: str, *, workload: str = "interactive") -> str:
+        return json.dumps(self.payload, ensure_ascii=False)
 
 
 if __name__ == "__main__":

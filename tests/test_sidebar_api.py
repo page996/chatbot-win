@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
-from app.personal_wechat_bot.config.loader import create_default_config, load_config, save_config
+from app.personal_wechat_bot.config.loader import create_default_config, load_config, persistent_config_dir, save_config
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.control import sidebar_api
-from app.personal_wechat_bot.control.send_commands import set_send_controls
+from app.personal_wechat_bot.control.send_commands import (
+    send_approved_confirm_item,
+    set_send_controls,
+    sync_bridge_ack_to_send_state,
+)
 from app.personal_wechat_bot.control.sidebar_api import (
     ack_sidebar_bridge_item,
     add_api_key,
@@ -28,7 +36,11 @@ from app.personal_wechat_bot.control.sidebar_api import (
     list_api_keys,
     probe_model_fetch,
     remove_api_key,
+    retry_sidebar_bridge_item,
     set_model_config,
+    sidebar_channel_test_file,
+    sidebar_channel_test_reply,
+    sidebar_diagnostics_export,
     sidebar_resource_audit,
     sidebar_weflow_backfill,
     sidebar_weflow_cancel_backfill,
@@ -40,14 +52,17 @@ from app.personal_wechat_bot.control.sidebar_api import (
 )
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
-from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage
+from app.personal_wechat_bot.conversation.session_store import ConversationSessionStore
+from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage, SendResult
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.domain.models import ReplyCandidate
 from app.personal_wechat_bot.normalizer.normalizer import MessageNormalizer
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
+from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
 from app.personal_wechat_bot.router.deduper import Deduper
 from app.personal_wechat_bot.router.router import Router
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+from app.personal_wechat_bot.reply_gate.send_audit import SendAuditLog
 
 
 class SidebarApiTest(unittest.TestCase):
@@ -74,6 +89,40 @@ class SidebarApiTest(unittest.TestCase):
         )
 
         self.assertEqual(session["name"], "wxid_alice")
+
+    def test_weflow_session_registration_blocks_unidentified_private_contact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            result = sidebar_api._register_weflow_sessions(
+                data_dir,
+                [
+                    {"id": "wxid_unknown", "name": "wxid_unknown", "type": "private"},
+                    {"id": "wxid_alice", "name": "Alice", "type": "private", "is_friend": True},
+                ],
+            )
+
+            self.assertEqual(result["registered_count"], 1)
+            self.assertEqual(result["registered_channels"][0]["id"], "wxid_alice")
+            self.assertEqual(result["skipped_count"], 1)
+            self.assertEqual(result["skipped_channels"][0]["id"], "wxid_unknown")
+            self.assertIn("private_contact_unknown", result["skipped_channels"][0]["reason"])
+            unknown_id = conversation_id_for("private", "wxid_unknown")
+            self.assertIsNone(sidebar_api._channel_store(data_dir).get_channel(unknown_id))
+            store = sidebar_api._upsert_weflow_sessions(
+                data_dir,
+                [
+                    {"id": "wxid_unknown", "name": "wxid_unknown", "type": "private"},
+                    {"id": "wxid_alice", "name": "Alice", "type": "private", "is_friend": True},
+                ],
+                source="test",
+                registration=result,
+            )
+            cached = json.loads(Path(store["store"]).read_text(encoding="utf-8"))["sessions"]
+            self.assertEqual(cached["wxid_unknown"]["channel_registration_status"], "blocked")
+            self.assertEqual(cached["wxid_unknown"]["conversation_id"], "")
+            self.assertEqual(cached["wxid_alice"]["channel_registration_status"], "registered")
 
     def test_weflow_params_ignore_stale_context_only_for_incremental_pull(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,15 +152,168 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("audit", state)
             self.assertIn("send_bridge", state)
             self.assertIn("runtime_cards", state)
+            self.assertIn("agent", state)
+            self.assertEqual(state["agent"]["status"], "idle")
             self.assertIn("queued_to_bridge", state["queues"])
-            self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_available")
+            self.assertEqual(state["queues"]["by_channel"]["count"], 1)
+            self.assertEqual(state["queues"]["pending"]["channels"][0]["conversation_id"], "private-1")
+            self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_configured_disabled")
+            self.assertIn("native_migration", state)
             self.assertIn("skill.file_workspace_agent", [item["card_id"] for item in state["runtime_cards"]["active"]["skills"]])
+
+    def test_native_migration_probe_persists_supported_version_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            message_root = Path(tmp) / "Documents" / "xwechat_files"
+            (message_root / "wxid_alice" / "Msg").mkdir(parents=True)
+            (message_root / "wxid_alice" / "Msg" / "MSG0.db").write_bytes(b"sqlite")
+            process = {
+                "pid": 123,
+                "name": "Weixin",
+                "path": r"C:\Program Files\Tencent\Weixin\Weixin.exe",
+                "root": r"C:\Program Files\Tencent\Weixin",
+                "product_version": "4.1.10.53",
+                "file_version": "4.1.10.53",
+            }
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={
+                    "status": "available",
+                    "available": True,
+                    "health": {"WeChatVersion": "4.1.10.53", "dataDir": str(message_root)},
+                    "send_capabilities": {},
+                    "reason": "",
+                },
+            ), mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api._wechat_native_processes",
+                return_value=[process],
+            ), mock.patch.dict(
+                os.environ,
+                {"WECHAT_NATIVE_MESSAGE_ROOT": str(message_root)},
+                clear=False,
+            ):
+                result = sidebar_api.sidebar_native_migration_probe(
+                    data_dir,
+                    {"persist": True, "include_cleanup_sizes": False, "max_depth": 3, "max_entries": 100},
+                )
+                state = sidebar_api.build_sidebar_native_migration_state(data_dir)
+
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["version_gate"]["gate"], "supported")
+            self.assertTrue(result["message_path_candidates"][0]["exists"])
+            self.assertIn("cleanup_manifest", result)
+            cleanup_paths = {item["relative_path"] for item in result["cleanup_manifest"]["items"]}
+            self.assertIn("vendor/reference/WeChat-Hook-aixed/.git", cleanup_paths)
+            self.assertIn("vendor/reference/WeChat-Hook-aixed/x64_Version", cleanup_paths)
+            self.assertIn("vendor/reference/WeFlow-gitcode/.git", cleanup_paths)
+            manifest = result["deploy_manifest"]
+            self.assertEqual(manifest["schema"], "native_deploy_manifest_v1")
+            required_paths = {item["relative_path"]: item for item in manifest["required_paths"]}
+            self.assertTrue(required_paths["vendor/artifacts/wechat-native-411053/version.dll"]["required"])
+            self.assertIn("scripts/deploy_wechat_native_hook.ps1", required_paths)
+            self.assertIn("requirements-document.txt", {item["relative_path"] for item in manifest["optional_dependency_paths"]})
+            self.assertIn("install_python_dependencies", [item["step"] for item in manifest["operator_steps"]])
+            self.assertTrue((data_dir / "native_diagnostics" / "native-migration-latest.json").exists())
+            self.assertEqual(state["latest"]["status"], "ready")
+            self.assertIn("deploy_manifest", state["latest"])
+
+    def test_native_migration_probe_uses_extra_version_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            message_root = Path(tmp) / "xwechat_files"
+            (message_root / "Msg").mkdir(parents=True)
+            (message_root / "Msg" / "MSG0.db").write_bytes(b"sqlite")
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={
+                    "status": "available",
+                    "available": True,
+                    "health": {"IsLogin": 1},
+                    "send_capabilities": {},
+                    "reason": "",
+                },
+            ), mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api._wechat_native_extra_http_probes",
+                return_value=[
+                    {
+                        "endpoint": "/debug/status",
+                        "status": "ok",
+                        "payload": {"version": "4.1.10.53", "dataDir": str(message_root)},
+                    }
+                ],
+            ), mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api._wechat_native_processes",
+                return_value=[],
+            ):
+                result = sidebar_api.sidebar_native_migration_probe(
+                    data_dir,
+                    {"persist": False, "include_cleanup_sizes": False, "max_depth": 2, "max_entries": 100},
+                )
+
+            self.assertEqual(result["version_gate"]["gate"], "supported")
+            self.assertTrue(result["message_scan"]["deep_scan"])
+            self.assertEqual(result["message_path_candidates"][0]["scan_status"], "scanned")
+
+    def test_sidebar_queues_are_grouped_by_conversation_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir, conversation_id="private-1", sender_wechat_id="wxid_alice", chat_title="Alice")
+            _ensure_test_channel(data_dir, conversation_id="private-2", sender_wechat_id="wxid_bob", chat_title="Bob")
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            alice_id = queue.enqueue(_reply(message_id="alice-message", conversation_id="private-1", text="hello alice"))
+            bob_id = queue.enqueue(_reply(message_id="bob-message", conversation_id="private-2", text="hello bob"))
+            queue.approve(bob_id, reviewer="test")
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(state["queues"]["pending"]["count"], 1)
+            self.assertEqual(state["queues"]["approved"]["count"], 1)
+            self.assertEqual(state["queues"]["pending"]["items"][0]["queue_id"], alice_id)
+            self.assertEqual(state["queues"]["pending"]["channels"][0]["display_name"], "Alice")
+            self.assertEqual(state["queues"]["pending"]["channels"][0]["status_counts"]["pending"], 1)
+            self.assertEqual(state["queues"]["approved"]["channels"][0]["display_name"], "Bob")
+            grouped = {item["conversation_id"]: item for item in state["queues"]["by_channel"]["channels"]}
+            self.assertEqual(grouped["private-1"]["statuses"]["pending"]["items"][0]["queue_id"], alice_id)
+            self.assertEqual(grouped["private-2"]["statuses"]["approved"]["items"][0]["queue_id"], bob_id)
+
+    def test_sidebar_audit_is_grouped_by_conversation_channel_even_after_queue_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir, conversation_id="private-1", sender_wechat_id="wxid_alice", chat_title="Alice")
+            _ensure_test_channel(data_dir, conversation_id="private-2", sender_wechat_id="wxid_bob", chat_title="Bob")
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            alice_id = queue.enqueue(_reply(message_id="alice-message", conversation_id="private-1", text="hello alice"))
+            bob_id = queue.enqueue(_reply(message_id="bob-message", conversation_id="private-2", text="hello bob"))
+
+            sidebar_queue_action(data_dir, "remove", alice_id, {"reviewer": "test"})
+            sidebar_queue_action(data_dir, "approve", bob_id, {"reviewer": "test"})
+            state = build_sidebar_state(data_dir)
+
+            grouped = {item["conversation_id"]: item for item in state["audit"]["channels"]}
+            self.assertEqual(grouped["private-1"]["display_name"], "Alice")
+            self.assertEqual(grouped["private-1"]["phase_counts"]["pending"], 1)
+            self.assertEqual(grouped["private-1"]["phases"]["pending"]["items"][0]["queue_id"], alice_id)
+            self.assertEqual(grouped["private-1"]["phases"]["pending"]["items"][0]["conversation_id"], "private-1")
+            self.assertEqual(grouped["private-1"]["phases"]["pending"]["items"][0]["channel_display_name"], "Alice")
+            self.assertEqual(grouped["private-1"]["phases"]["pending"]["items"][0]["phase"], "pending")
+            self.assertEqual(grouped["private-2"]["display_name"], "Bob")
+            self.assertEqual(grouped["private-2"]["phase_counts"]["approved"], 1)
+            self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["queue_id"], bob_id)
+            self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["conversation_id"], "private-2")
+            self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["channel_display_name"], "Bob")
+            self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["phase"], "approved")
 
     def test_sidebar_state_restores_config_from_persistent_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
             (data_dir / "config.json").unlink()
 
             state = build_sidebar_state(data_dir)
@@ -121,14 +323,88 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["config"]["send_driver"], "bridge_outbox")
             self.assertTrue((data_dir / "config.json").exists())
 
+    def test_update_sidebar_controls_persists_wechat_native_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            result = update_sidebar_controls(
+                data_dir,
+                {
+                    "mode": "confirm",
+                    "send_enabled": True,
+                    "send_driver": "bridge_outbox",
+                    "send_backend": "wechat_native_http",
+                    "wechat_native_base_url": "http://127.0.0.1:30001",
+                    "wechat_native_send_text_path": "/custom-text",
+                    "wechat_native_status_path": "/custom-status",
+                    "wechat_native_verify_timeout_seconds": 2.5,
+                    "wechat_native_file_verify_timeout_seconds": 33.0,
+                },
+            )
+            config = load_config(data_dir)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(config.send_backend, "wechat_native_http")
+            self.assertEqual(config.wechat_native_base_url, "http://127.0.0.1:30001")
+            self.assertEqual(config.wechat_native_send_text_path, "/custom-text")
+            self.assertEqual(config.wechat_native_status_path, "/custom-status")
+            self.assertEqual(config.wechat_native_verify_timeout_seconds, 2.5)
+            self.assertEqual(config.wechat_native_file_verify_timeout_seconds, 33.0)
+
     def test_history_clear_preserves_sidebar_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+            from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
+
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "preserve bridge evidence", receiver="wxid_a")
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.SENT, reason="native_verified")
+            lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+            lock_path.write_text(
+                json.dumps({"pid": os.getpid(), "label": "send_bridge_worker", "heartbeat_at": time.time()}),
+                encoding="utf-8",
+            )
+            synced_path = data_dir / "send_bridge" / "synced_acks.json"
+            synced_path.write_text(json.dumps({"seen": [record["bridge_id"]]}), encoding="utf-8")
+            reverify_path = data_dir / "send_bridge" / "accepted_reverify.json"
+            reverify_path.write_text(json.dumps({record["bridge_id"]: {"attempts": 1}}), encoding="utf-8")
+            ConfirmQueue(data_dir / "confirm_queue.jsonl").enqueue(_reply(message_id="pending-before-clear"))
+            SendAuditLog(data_dir / "send_audit.jsonl").append(
+                "confirm_approve",
+                queue_id="pending-before-clear",
+                status="approved",
+            )
+            self.assertTrue((data_dir / "confirm_queue.sqlite").exists())
+            self.assertTrue((data_dir / "send_audit.sqlite").exists())
+            outbox_before = (data_dir / "send_bridge" / "outbox.jsonl").read_text(encoding="utf-8")
+            acks_before = (data_dir / "send_bridge" / "acks.jsonl").read_text(encoding="utf-8")
+            lock_before = lock_path.read_text(encoding="utf-8")
+            synced_before = synced_path.read_text(encoding="utf-8")
+            reverify_before = reverify_path.read_text(encoding="utf-8")
             (data_dir / "conversation_ledgers").mkdir()
             (data_dir / "conversation_ledgers" / "old.md").write_text("history", encoding="utf-8")
             (data_dir / "backend_events.jsonl").write_text("{}\n", encoding="utf-8")
+            (data_dir / "hook_events.jsonl").write_text("{}\n", encoding="utf-8")
+            (data_dir / "hook_events.jsonl.raw_ids.json").write_text(json.dumps({"old-hook": True}), encoding="utf-8")
+            (data_dir / "hook_events_state.json.consumer.lock").write_text(
+                json.dumps({"pid": 999999, "label": "old-consumer"}),
+                encoding="utf-8",
+            )
+            RuntimeCardStore(data_dir).apply_action(
+                "save-task",
+                {"name": "persistent launch card", "content": "survive history clear"},
+            )
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            agent_state_path = runtime_dir / "agent_state.json"
+            launch_path = runtime_dir / "sidebar_launch.json"
+            resource_audit_path = runtime_dir / "resource_audit.json"
+            agent_state_path.write_text(json.dumps({"cursor": 123, "status": "old"}), encoding="utf-8")
+            launch_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+            resource_audit_path.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
 
             result = clear_sidebar_history_data(data_dir)
             state = build_sidebar_state(data_dir)
@@ -137,11 +413,127 @@ class SidebarApiTest(unittest.TestCase):
             self.assertFalse((data_dir / "conversation_ledgers").exists())
             self.assertFalse((data_dir / "conversation_channels").exists())
             self.assertFalse((data_dir / "backend_events.jsonl").exists())
+            self.assertFalse((data_dir / "hook_events.jsonl.raw_ids.json").exists())
+            self.assertFalse((data_dir / "hook_events_state.json.consumer.lock").exists())
             self.assertTrue((data_dir / "config.json").exists())
             self.assertTrue((data_dir / "confirm_queue.jsonl").exists())
+            self.assertTrue((data_dir / "confirm_queue.sqlite").exists())
+            self.assertTrue((data_dir / "send_audit.sqlite").exists())
+            self.assertEqual(ConfirmQueue(data_dir / "confirm_queue.jsonl").list_pending(), [])
+            self.assertEqual(SendAuditLog(data_dir / "send_audit.jsonl").list_recent(limit=10), [])
             self.assertTrue((data_dir / "send_bridge" / "outbox.jsonl").exists())
             self.assertTrue((data_dir / "send_bridge" / "acks.jsonl").exists())
+            self.assertEqual((data_dir / "send_bridge" / "outbox.jsonl").read_text(encoding="utf-8"), outbox_before)
+            self.assertEqual((data_dir / "send_bridge" / "acks.jsonl").read_text(encoding="utf-8"), acks_before)
+            self.assertEqual(lock_path.read_text(encoding="utf-8"), lock_before)
+            self.assertEqual(synced_path.read_text(encoding="utf-8"), synced_before)
+            self.assertEqual(reverify_path.read_text(encoding="utf-8"), reverify_before)
+            self.assertFalse(agent_state_path.exists())
+            self.assertTrue(launch_path.exists())
+            self.assertTrue(resource_audit_path.exists())
+            self.assertIn("runtime/agent_state.json", {item["relative_path"] for item in result["removed"]})
+            self.assertIn(str(Path("send_bridge") / "outbox.jsonl"), result["preserved_runtime"])
+            self.assertIn(str(Path("send_bridge") / "acks.jsonl"), result["preserved_runtime"])
+            self.assertIn(str(Path("send_bridge") / "synced_acks.json"), result["preserved_runtime"])
+            self.assertIn(str(Path("send_bridge") / "accepted_reverify.json"), result["preserved_runtime"])
+            self.assertIn(str(Path("send_bridge") / ".bridge_worker.lock"), result["preserved_runtime"])
             self.assertEqual(state["config"]["mode"], "confirm")
+            self.assertIn("survive history clear", "\n".join(RuntimeCardStore(data_dir).prompt_lines()))
+
+    def test_history_clear_preserves_migrated_config_runtime_cards_and_bridge_evidence_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            config.accepted_contacts.add("wxid_friend")
+            config.accepted_groups.add("family@chatroom")
+            config.search_blocklist = ["ads.example", "login.example"]
+            config.wechat_native_base_url = "http://127.0.0.1:30001"
+            config.wechat_native_send_text_path = "/custom-text"
+            config.wechat_native_status_path = "/custom-status"
+            config.providers["chat"].api_key_file = "api_keys.local.md"
+            config.llm = config.providers["chat"]
+            save_config(config)
+            (data_dir / "api_keys.local.md").write_text("sk-history-clear-secret", encoding="utf-8")
+            sidecar = persistent_config_dir(data_dir)
+            self.assertTrue((sidecar / "config.json").exists())
+
+            cards = RuntimeCardStore(data_dir)
+            persona = cards.apply_action(
+                "save-persona",
+                {"name": "channel persona", "content": "channel-specific warmth"},
+            )["card"]
+            cards.apply_action(
+                "set-channel-persona",
+                {"conversation_id": "private-1", "card_id": persona["card_id"]},
+            )
+            cards.apply_action(
+                "set-channel-skills",
+                {"conversation_id": "private-1", "card_ids": ["skill.foreground_dialogue"]},
+            )
+
+            from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
+
+            bridge = BridgeOutboxStore(data_dir)
+            record = bridge.enqueue("private-1", "preserved bridge text", receiver="wxid_friend")
+            bridge.append_ack(record["bridge_id"], status=BridgeAckStatus.ACCEPTED, reason="native_accepted_unverified")
+            (data_dir / "send_bridge" / "synced_acks.json").write_text(
+                json.dumps({"seen": [record["bridge_id"]]}),
+                encoding="utf-8",
+            )
+
+            ledger = ConversationLedgerStore(data_dir)
+            message = NormalizedMessage(
+                message_id="history-user-1",
+                conversation_id="private-1",
+                conversation_type="private",
+                chat_title="Alice",
+                sender_name="Alice",
+                sender_wechat_id="wxid_friend",
+                text="old session line",
+                is_self=False,
+                received_at="2026-07-10T00:00:00+08:00",
+                metadata={"session_id": "session_old"},
+            )
+            ledger.append_message(message)
+            memory_dir = ledger.conversation_markdown_path("private-1").parent / "sessions" / "session_old" / "memory"
+            memory_dir.mkdir(parents=True, exist_ok=True)
+            (memory_dir / "summary.md").write_text("old derived memory", encoding="utf-8")
+            ConversationSessionStore(data_dir).reset_session(
+                "private-1",
+                reason="test_history_clear",
+                message_id="history-user-1",
+            )
+            (data_dir / "file_workspace" / "private-1" / "session_old").mkdir(parents=True, exist_ok=True)
+            (data_dir / "agent_workspace" / "old-task").mkdir(parents=True, exist_ok=True)
+
+            result = clear_sidebar_history_data(data_dir)
+            after = load_config(data_dir)
+            runtime_state = RuntimeCardStore(data_dir).state()
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(after.accepted_contacts, {"wxid_friend"})
+            self.assertEqual(after.accepted_groups, {"family@chatroom"})
+            self.assertEqual(after.search_blocklist, ["ads.example", "login.example"])
+            self.assertEqual(after.wechat_native_send_text_path, "/custom-text")
+            self.assertEqual(after.wechat_native_status_path, "/custom-status")
+            self.assertEqual(after.providers["chat"].api_key_file, "api_keys.local.md")
+            self.assertTrue((data_dir / "api_keys.local.md").exists())
+            self.assertTrue((sidecar / "config.json").exists())
+            self.assertIn(
+                "private-1",
+                runtime_state["state"]["channel_overrides"],
+            )
+            self.assertIn("channel-specific warmth", "\n".join(RuntimeCardStore(data_dir).prompt_lines("private-1")))
+            self.assertFalse((data_dir / "conversation_ledgers").exists())
+            self.assertFalse((data_dir / "conversation_sessions").exists())
+            self.assertFalse((data_dir / "file_workspace").exists())
+            self.assertFalse((data_dir / "agent_workspace").exists())
+            self.assertTrue((data_dir / "send_bridge" / "outbox.jsonl").exists())
+            self.assertTrue((data_dir / "send_bridge" / "acks.jsonl").exists())
+            self.assertTrue((data_dir / "send_bridge" / "synced_acks.json").exists())
+            self.assertIn(str(Path("send_bridge") / "outbox.jsonl"), result["preserved_runtime"])
+            self.assertIn(str(Path("send_bridge") / "acks.jsonl"), result["preserved_runtime"])
 
     def test_history_clear_removes_scheduler_authority_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,6 +562,138 @@ class SidebarApiTest(unittest.TestCase):
             self.assertFalse((data_dir / "channel_state.sqlite").exists())
             self.assertFalse((data_dir / "channel_state.sqlite-shm").exists())
             self.assertFalse((data_dir / "channel_state.sqlite-wal").exists())
+
+    def test_weflow_sidebar_state_migrates_legacy_json_projection_to_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            legacy_path = data_dir / "weflow_sidebar_state.json"
+            legacy_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "http://127.0.0.1:5039",
+                        "talkers": ["wxid_alice"],
+                        "operation_history": [
+                            {
+                                "time": "2026-07-10T00:00:00Z",
+                                "action": "legacy",
+                                "status": "ok",
+                                "summary": "legacy imported",
+                                "result": {"status": "ok"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+            legacy_path.unlink()
+            sqlite_state = sidebar_api.build_sidebar_weflow_state(data_dir)
+
+            self.assertEqual(state["base_url"], "http://127.0.0.1:5039")
+            self.assertEqual(sqlite_state["base_url"], "http://127.0.0.1:5039")
+            self.assertEqual(sqlite_state["requested_talkers"], ["wxid_alice"])
+            self.assertEqual(sqlite_state["operation_history"][0]["action"], "legacy")
+            self.assertTrue((data_dir / "sidebar_state.sqlite").exists())
+
+    def test_weflow_operation_history_uses_sqlite_under_concurrent_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            errors: list[Exception] = []
+
+            def worker(index: int) -> None:
+                try:
+                    sidebar_api._append_weflow_operation_history(data_dir, f"tick-{index}", {"status": "ok", "count": index})
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(index,)) for index in range(64)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+
+            self.assertEqual(errors, [])
+            self.assertTrue((data_dir / "sidebar_state.sqlite").exists())
+            self.assertTrue((data_dir / "weflow_sidebar_state.json").exists())
+            self.assertEqual(len(state["operation_history"]), 50)
+            self.assertTrue(all(item["action"].startswith("tick-") for item in state["operation_history"]))
+
+    def test_history_clear_resets_weflow_runtime_traces_but_keeps_preferences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            sidebar_api._write_weflow_sidebar_state(
+                data_dir,
+                {
+                    "base_url": "http://127.0.0.1:5039",
+                    "talkers": ["wxid_alice"],
+                    "last_health": {"status": "ok", "fork_ok": True},
+                    "last_pull": {"status": "ok", "count": 2},
+                    "pull_job": {"job_id": "pull-old", "status": "completed"},
+                    "operation_history": [
+                        {
+                            "time": "2026-07-10T00:00:00Z",
+                            "action": "old",
+                            "status": "ok",
+                            "summary": "old runtime trace",
+                            "result": {"status": "ok"},
+                        }
+                    ],
+                },
+            )
+
+            result = clear_sidebar_history_data(data_dir)
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(state["base_url"], "http://127.0.0.1:5039")
+            self.assertEqual(state["requested_talkers"], ["wxid_alice"])
+            self.assertEqual(state["last_health"], {})
+            self.assertEqual(state["last_pull"], {})
+            self.assertEqual(state["pull_job"], {})
+            self.assertEqual(state["operation_history"], [])
+            self.assertTrue((data_dir / "sidebar_state.sqlite").exists())
+
+    def test_history_clear_blocks_while_history_writer_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            event_file = data_dir / "backend_events.jsonl"
+            event_file.write_text("{}\n", encoding="utf-8")
+            stop = threading.Event()
+            thread = threading.Thread(target=stop.wait, daemon=True)
+            thread.start()
+            key = str(data_dir.resolve())
+            try:
+                with mock.patch.dict(
+                    sidebar_api._AGENT_WORKERS,
+                    {
+                        key: {
+                            "thread": thread,
+                            "last_status": "running",
+                            "event_file": str(event_file),
+                            "requested_conversation_ids": ["conv-active"],
+                        }
+                    },
+                    clear=True,
+                ):
+                    blocked = clear_sidebar_history_data(data_dir)
+                    self.assertTrue(event_file.exists())
+                    forced = clear_sidebar_history_data(data_dir, {"source": "shutdown_helper"})
+            finally:
+                stop.set()
+                thread.join(timeout=1.0)
+
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertEqual(blocked["reason"], "history_clear_runtime_active")
+            self.assertEqual(blocked["active_workers"][0]["worker"], "dialog_agent")
+            self.assertEqual(forced["status"], "ok")
+            self.assertFalse(event_file.exists())
 
     def test_resource_audit_is_cached_and_injected_into_task_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +751,42 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(manager["scheduler"]["llm_gate"]["total"]["max_parallel"], pools["llm"]["max_parallel"])
             self.assertEqual(manager["scheduler"]["resource_scheduler"]["interactive"]["file_io"], 4)
             self.assertEqual(manager["scheduler"]["resource_audit"]["recommendation"]["reason"], "test recommendation")
+
+    def test_diagnostics_export_captures_core_state_without_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            config = create_default_config(data_dir)
+            config.weflow_token_env = "SECRET_WEFLOW_TOKEN"
+            save_config(config)
+            os.environ["SECRET_WEFLOW_TOKEN"] = "super-secret-token"
+            self.addCleanup(lambda: os.environ.pop("SECRET_WEFLOW_TOKEN", None))
+            (data_dir / "backend_events.jsonl").write_text(
+                json.dumps({"message_id": "m1", "token": "do-not-leak", "text": "hello"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            (data_dir / "send_audit.jsonl").write_text(
+                json.dumps({"action": "probe", "api_key": "sk-secret"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            export = sidebar_diagnostics_export(data_dir, {"limit": 5})
+            serialized = json.dumps(export, ensure_ascii=False)
+
+            self.assertEqual(export["status"], "ok")
+            self.assertEqual(export["schema"], "sidebar_diagnostics_export_v1")
+            self.assertIn("task_manager", export)
+            self.assertIn("send_bridge", export)
+            self.assertIn("readiness", export)
+            self.assertIn("driver_probe", export)
+            self.assertIn("storage_migration", export)
+            self.assertEqual(export["storage_migration"]["schema"], "storage_migration_status_v1")
+            self.assertIn("recent_backend_events", export)
+            self.assertTrue(Path(export["export_path"]).exists())
+            self.assertNotIn("super-secret-token", serialized)
+            self.assertNotIn("do-not-leak", serialized)
+            self.assertNotIn("sk-secret", serialized)
+            self.assertEqual(export["recent_backend_events"][0]["token"], "<redacted>")
+            self.assertEqual(export["recent_send_audit_raw"][0]["api_key"], "<redacted>")
 
     def test_history_clear_tolerates_locked_weflow_process_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,6 +871,7 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("--weflow-pid", command)
             self.assertIn("5678", command)
             self.assertTrue(result["manual_reopen_required"])
+            self.assertIn("send_bridge/outbox.jsonl", result["preserved_runtime_policy"])
 
     def test_history_clear_with_shutdown_deduplicates_active_helper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,7 +915,7 @@ class SidebarApiTest(unittest.TestCase):
             )
             normalizer = MessageNormalizer()
             visible = normalizer.normalize(RawWeChatMessage("1", "PAGE", "PAGE", "hello", driver_meta={"source": "backend_events_jsonl"}))
-            noisy = normalizer.normalize(RawWeChatMessage("2", "+25", "+25", "8/10/16", driver_meta={"source": "backend_events_jsonl"}))
+            noisy = normalizer.normalize(RawWeChatMessage("2", "+25", "+25", "8/10/16", driver_meta={"source": "windows_snapshot"}))
             assert visible is not None and noisy is not None
             store.ensure_channel(visible)
             store.ensure_channel(noisy)
@@ -364,6 +925,115 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["channels"]["count"], 1)
             self.assertEqual(state["channels"]["hidden_count"], 1)
             self.assertEqual(state["channels"]["items"][0]["chat_title"], "PAGE")
+
+    def test_sidebar_channel_state_hides_unaccepted_emoji_only_private_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            message = MessageNormalizer().normalize(
+                RawWeChatMessage(
+                    "emoji-1",
+                    "🎧",
+                    "🎧",
+                    "hello",
+                    sender_wechat_id="wxid_emoji_friend",
+                    driver_meta={
+                        "source": "weflow_discovery",
+                        "trusted_channel_source": True,
+                        "conversation_key": "wxid_emoji_friend",
+                    },
+                )
+            )
+            assert message is not None
+            store.ensure_channel(message)
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(state["channels"]["count"], 0)
+            self.assertEqual(state["channels"]["hidden_count"], 1)
+            self.assertEqual(state["channels"]["hidden_reasons"]["private_contact_unknown_or_unidentified"], 1)
+
+    def test_sidebar_channel_state_keeps_accepted_emoji_only_private_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            config.accepted_contacts.add("wxid_emoji_friend")
+            save_config(config)
+            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            message = MessageNormalizer().normalize(
+                RawWeChatMessage(
+                    "emoji-accepted-1",
+                    "🎧",
+                    "🎧",
+                    "hello",
+                    sender_wechat_id="wxid_emoji_friend",
+                    driver_meta={
+                        "source": "weflow_discovery",
+                        "trusted_channel_source": True,
+                        "conversation_key": "wxid_emoji_friend",
+                    },
+                )
+            )
+            assert message is not None
+            store.ensure_channel(message)
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(state["channels"]["count"], 1)
+            self.assertEqual(state["channels"]["hidden_count"], 0)
+            self.assertEqual(state["channels"]["items"][0]["chat_title"], "🎧")
+
+    def test_sidebar_channel_state_hides_legacy_weflow_symbol_title_without_friend_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            config = load_config(data_dir)
+            key_pool = ApiKeyPool(config.providers.get("chat", config.llm), data_dir)
+            store = ConversationChannelStore(
+                data_dir,
+                key_pool,
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            message = MessageNormalizer().normalize(
+                RawWeChatMessage(
+                    "symbol-1",
+                    "!",
+                    "!",
+                    "hello",
+                    sender_wechat_id="wxid_symbol_friend",
+                    driver_meta={"source": "weflow_discovery", "conversation_key": "wxid_symbol_friend"},
+                )
+            )
+            assert message is not None
+            channel = store.ensure_channel(message)
+            channel_path = next((data_dir / "conversation_channels").glob("*/channel.json"))
+            payload = json.loads(channel_path.read_text(encoding="utf-8"))
+            payload["trusted_channel_source"] = False
+            payload["source_names"] = ["weflow_discovery"]
+            channel_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(channel.chat_title, "!")
+            self.assertEqual(state["channels"]["count"], 0)
+            self.assertEqual(state["channels"]["hidden_count"], 1)
+            self.assertEqual(state["channels"]["hidden_reasons"]["private_contact_unknown_or_unidentified"], 1)
 
     def test_router_does_not_register_windows_snapshot_channels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,6 +1108,48 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual([item["chat_title"] for item in state["channels"]["items"]], ["PAGE"])
             self.assertEqual(state["channels"]["hidden_reasons"]["untrusted_legacy_channel"], 1)
 
+    def test_sidebar_hides_legacy_trusted_unidentified_private_weflow_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_ghost")
+            channel_path = data_dir / "conversation_channels" / "wxid_ghost_legacy" / "channel.json"
+            channel_path.parent.mkdir(parents=True, exist_ok=True)
+            channel_path.write_text(
+                json.dumps(
+                    {
+                        "conversation_id": conversation_id,
+                        "conversation_type": "private",
+                        "chat_title": "馃帶",
+                        "segment": "wxid_ghost_legacy",
+                        "status": "active",
+                        "key_slots": 1,
+                        "api_key_refs": [],
+                        "session_scope": "per_conversation_current_session",
+                        "backend_dir": "",
+                        "context_dir": "",
+                        "file_workspace_dir": "",
+                        "sender_names": ["wxid_ghost", "馃帶"],
+                        "sender_wechat_ids": ["wxid_ghost"],
+                        "conversation_key": "wxid_ghost",
+                        "source_names": ["weflow_discovery", "backend_events_jsonl"],
+                        "trusted_channel_source": True,
+                        "created_at": "2026-07-08T00:00:00+00:00",
+                        "updated_at": "2026-07-08T00:00:00+00:00",
+                        "next_key_index": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(state["channels"]["count"], 0)
+            self.assertEqual(state["channels"]["hidden_count"], 1)
+            self.assertEqual(state["channels"]["hidden_reasons"]["private_contact_unknown_or_unidentified"], 1)
+            self.assertEqual(state["send_bridge"]["channels"], [])
+
     def test_sidebar_cleanup_hidden_channels_deletes_only_hidden_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -454,7 +1166,7 @@ class SidebarApiTest(unittest.TestCase):
                 RawWeChatMessage("1", "PAGE", "PAGE", "hello", driver_meta={"source": "backend_events_jsonl"})
             )
             hidden = MessageNormalizer().normalize(
-                RawWeChatMessage("2", "+25", "+25", "8/10/16", driver_meta={"source": "backend_events_jsonl"})
+                RawWeChatMessage("2", "+25", "+25", "8/10/16", driver_meta={"source": "windows_snapshot"})
             )
             assert trusted is not None and hidden is not None
             store.ensure_channel(trusted)
@@ -467,7 +1179,7 @@ class SidebarApiTest(unittest.TestCase):
             state = build_sidebar_state(data_dir)
 
             self.assertEqual(result["deleted_conversation_ids"], [hidden.conversation_id])
-            self.assertEqual(result["cleanups"][0]["cleanup_policy"], "wechat_preserve")
+            self.assertEqual(result["cleanups"][0]["cleanup_policy"], "non_wechat_purge")
             self.assertEqual(state["channels"]["count"], 1)
             self.assertEqual(state["channels"]["hidden_count"], 0)
             self.assertIsNotNone(store.get_channel(trusted.conversation_id))
@@ -562,6 +1274,7 @@ class SidebarApiTest(unittest.TestCase):
                         "source": "weflow_discovery",
                         "trusted_channel_source": True,
                         "conversation_key": "wxid_real_alice",
+                        "is_friend": True,
                     },
                 )
             )
@@ -574,6 +1287,105 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["channels"][0]["display_name"], "Alice")
             self.assertEqual(state["channels"][0]["receiver"], "wxid_real_alice")
             self.assertTrue(state["channels"][0]["bridge_ready"])
+
+    def test_sidebar_bridge_items_are_grouped_by_conversation_channel(self) -> None:
+        from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir, conversation_id="private-1", sender_wechat_id="wxid_alice", chat_title="Alice")
+            _ensure_test_channel(data_dir, conversation_id="private-2", sender_wechat_id="wxid_bob", chat_title="Bob")
+            store = BridgeOutboxStore(data_dir)
+            alice = store.enqueue("private-1", "hello alice", receiver="wxid_alice")
+            bob = store.enqueue("private-2", "hello bob", receiver="wxid_bob")
+            store.append_ack(bob["bridge_id"], status=BridgeAckStatus.ACCEPTED, reason="native_accepted_unverified")
+
+            state = build_sidebar_bridge_state(data_dir)
+
+            grouped = {item["conversation_id"]: item for item in state["item_channels"]}
+            self.assertEqual(grouped["private-1"]["display_name"], "Alice")
+            self.assertEqual(grouped["private-1"]["status_counts"]["queued"], 1)
+            self.assertEqual(grouped["private-1"]["items"][0]["bridge_id"], alice["bridge_id"])
+            self.assertEqual(grouped["private-2"]["display_name"], "Bob")
+            self.assertEqual(grouped["private-2"]["status_counts"]["accepted"], 1)
+            self.assertEqual(grouped["private-2"]["items"][0]["bridge_id"], bob["bridge_id"])
+
+    def test_sidebar_send_audit_is_grouped_by_channel_and_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir, conversation_id="private-1", sender_wechat_id="wxid_alice", chat_title="Alice")
+            _ensure_test_channel(data_dir, conversation_id="private-2", sender_wechat_id="wxid_bob", chat_title="Bob")
+            audit = SendAuditLog(data_dir / "send_audit.jsonl")
+            audit.append("queue_pending", queue_id="q-pending", status="pending", payload={"conversation_id": "private-1"})
+            audit.append("confirm_approve", queue_id="q-approved", status="approved", payload={"conversation_id": "private-1"})
+            audit.append(
+                "confirm_send_attempt",
+                queue_id="q-queued",
+                status="queued_to_bridge",
+                payload={"conversation_id": "private-1", "bridge_id": "bridge-private-1"},
+            )
+            audit.append("confirm_reject", queue_id="q-rejected", status="rejected", payload={"conversation_id": "private-1"})
+            audit.append(
+                "confirm_send_blocked",
+                queue_id="q-blocked",
+                status="blocked",
+                reason="receiver_not_admitted",
+                payload={"conversation_id": "private-1"},
+            )
+            audit.append(
+                "bridge_ack_sync",
+                queue_id="q-accepted",
+                status="accepted",
+                payload={"conversation_id": "private-2", "ack_status": "accepted", "bridge_id": "bridge-private-2a"},
+            )
+            audit.append(
+                "bridge_ack_sync",
+                queue_id="q-sent",
+                status="sent",
+                payload={"conversation_id": "private-2", "ack_status": "sent", "bridge_id": "bridge-private-2s"},
+            )
+            audit.append(
+                "confirm_send_attempt",
+                queue_id="q-failed",
+                status="failed",
+                reason="native_http_failed",
+                payload={"conversation_id": "private-2"},
+            )
+            audit.append(
+                "ledger_sync_recovered",
+                queue_id="q-recovered",
+                status="",
+                payload={"conversation_id": "private-2"},
+            )
+            audit.append(
+                "operator_note",
+                queue_id="q-other",
+                status="",
+                payload={"conversation_id": "private-2"},
+            )
+
+            state = build_sidebar_state(data_dir)
+            channels = {item["conversation_id"]: item for item in state["audit"]["channels"]}
+
+            self.assertEqual(channels["private-1"]["display_name"], "Alice")
+            self.assertEqual(channels["private-1"]["phase_counts"]["pending"], 1)
+            self.assertEqual(channels["private-1"]["phase_counts"]["approved"], 1)
+            self.assertEqual(channels["private-1"]["phase_counts"]["queued_to_bridge"], 1)
+            self.assertEqual(channels["private-1"]["phase_counts"]["rejected"], 1)
+            self.assertEqual(channels["private-1"]["phase_counts"]["blocked"], 1)
+            self.assertEqual(channels["private-2"]["display_name"], "Bob")
+            self.assertEqual(channels["private-2"]["phase_counts"]["accepted"], 1)
+            self.assertEqual(channels["private-2"]["phase_counts"]["sent"], 1)
+            self.assertEqual(channels["private-2"]["phase_counts"]["failed"], 1)
+            self.assertEqual(channels["private-2"]["phase_counts"]["resolved"], 1)
+            self.assertEqual(channels["private-2"]["phase_counts"]["other"], 1)
+            self.assertEqual(state["audit"]["phases"]["resolved"]["count"], 1)
+            self.assertEqual(
+                state["audit"]["phases"]["resolved"]["channels"][0]["items"][0]["conversation_id"],
+                "private-2",
+            )
 
     def test_sidebar_state_projects_channel_state_files_and_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -843,7 +1655,7 @@ class SidebarApiTest(unittest.TestCase):
         lock = threading.Lock()
 
         class FakeRunner:
-            def run_once(self_inner) -> dict:
+            def run_once(self_inner, *, process_imported: bool = True) -> dict:
                 with lock:
                     overlap["active"] += 1
                     overlap["max"] = max(overlap["max"], overlap["active"])
@@ -873,6 +1685,7 @@ class SidebarApiTest(unittest.TestCase):
                 "workers": 1,
                 "media": True,
                 "context_only": False,
+                "process_backend_events": True,
                 "hook_event_file": "hook.jsonl",
                 "backend_event_file": "backend.jsonl",
             },
@@ -891,7 +1704,78 @@ class SidebarApiTest(unittest.TestCase):
             thread.join()
         self.assertEqual(overlap["max"], 1)
 
-    def test_weflow_pull_once_registers_requested_talker_in_local_library(self) -> None:
+    def test_weflow_background_start_defaults_to_capture_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            captured: dict[str, Any] = {}
+            stop_event = threading.Event()
+
+            def fake_loop(root, payload, stop):
+                captured.update(payload)
+                stop_event.set()
+
+            with mock.patch.object(sidebar_api, "_weflow_background_loop", side_effect=fake_loop), mock.patch.object(
+                sidebar_api, "_start_bridge_worker"
+            ):
+                result = sidebar_api.sidebar_weflow_start(data_dir, {"interval_seconds": 1})
+                stop_event.wait(1)
+                sidebar_api.sidebar_weflow_stop(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(captured["capture_only"])
+            self.assertFalse(captured["process_backend_events"])
+
+    def test_weflow_pull_tick_can_import_without_processing_backend_events(self) -> None:
+        calls: list[bool] = []
+
+        class FakeRunner:
+            def run_once(self, *, process_imported: bool = True) -> dict:
+                calls.append(process_imported)
+                return {
+                    "status": "ok",
+                    "processed_count": 0,
+                    "processed": [],
+                    "poll": {"skipped_reason": "capture_only_handoff_to_dialog_agent"},
+                }
+
+        class FakeSource:
+            status = "ok"
+            scanned_count = 1
+            appended_count = 1
+
+        fake_bridge = mock.Mock()
+        fake_bridge.base_url = "http://127.0.0.1:5031"
+        fake_bridge.pull_once.return_value = FakeSource()
+        context = {
+            "params": {
+                "talkers": [],
+                "session_limit": 100,
+                "message_limit": 100,
+                "max_pages": 1,
+                "max_messages": 0,
+                "since": None,
+                "lookback_seconds": 300,
+                "workers": 1,
+                "media": True,
+                "context_only": False,
+                "process_backend_events": False,
+                "hook_event_file": "hook.jsonl",
+                "backend_event_file": "backend.jsonl",
+            },
+            "bridge": fake_bridge,
+            "runner": FakeRunner(),
+            "weflow_ready": {},
+            "media_roots": [],
+        }
+
+        result = sidebar_api._run_weflow_pull_tick(context)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["process_backend_events"])
+        self.assertEqual(calls, [False])
+
+    def test_weflow_pull_once_blocks_unidentified_requested_talker_in_local_library(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -910,7 +1794,9 @@ class SidebarApiTest(unittest.TestCase):
 
             self.assertEqual(result["session_store"]["status"], "ok")
             self.assertIn("wxid_user", {item["id"] for item in sessions})
-            self.assertTrue(any(item["conversation_key"] == "wxid_user" for item in channels))
+            cached = next(item for item in sessions if item["id"] == "wxid_user")
+            self.assertEqual(cached["channel_registration_status"], "blocked")
+            self.assertFalse(any(item["conversation_key"] == "wxid_user" for item in channels))
 
     def test_weflow_pull_once_can_run_as_background_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -981,7 +1867,7 @@ class SidebarApiTest(unittest.TestCase):
                     "sender_wechat_id": "wxid_alice",
                     "text": "今天有点累",
                     "observed_at": "2026-07-08T09:01:00+08:00",
-                    "source_payload": {"conversation_key": "wxid_alice", "talker_id": "wxid_alice"},
+                    "source_payload": {"conversation_key": "wxid_alice", "talker_id": "wxid_alice", "is_friend": True},
                 },
             )
 
@@ -1004,6 +1890,1272 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(entries[-1].send["status"], "skipped")
             task_statuses = {item["kind"]: item["status"] for item in result["task_manager"]["tasks"]}
             self.assertEqual(task_statuses["Agent"], "completed")
+            self.assertTrue(result["agent"]["cursor"]["read_offset"] > 0)
+            self.assertFalse(result["agent"]["cursor_restored"])
+            self.assertEqual(result["agent_state"]["last_tick"]["processed_count"], 1)
+
+            second = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(second["status"], "ok")
+            self.assertEqual(second["agent"]["processed_count"], 0)
+            self.assertTrue(second["agent"]["cursor_restored"])
+            self.assertEqual(len(ConversationLedgerStore(data_dir).read_entries(conversation_id)), len(entries))
+
+    def test_sidebar_agent_tick_without_scope_keeps_global_pending_scan_after_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            ledger = ConversationLedgerStore(data_dir)
+            alice_id = conversation_id_for("private", "wxid_alice")
+            bob_id = conversation_id_for("private", "wxid_bob")
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="bob-pending-1",
+                    conversation_id=bob_id,
+                    conversation_type="private",
+                    chat_title="Bob",
+                    sender_name="Bob",
+                    sender_wechat_id="wxid_bob",
+                    text="Bob pending hello",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+            append_sidebar_backend_event(
+                data_dir,
+                {
+                    "raw_id": "agent-tick-alice-1",
+                    "chat_title": "Alice",
+                    "sender_name": "Alice",
+                    "sender_wechat_id": "wxid_alice",
+                    "text": "Alice new event",
+                    "observed_at": "2026-07-08T09:01:00+08:00",
+                    "source_payload": {"conversation_key": "wxid_alice", "talker_id": "wxid_alice", "is_friend": True},
+                },
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["processed_count"], 1)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 1)
+            self.assertEqual(result["session_snapshot"]["after"]["pending_user_count"], 0)
+            self.assertEqual(ledger.read_entries(alice_id)[-1].role, "assistant")
+            self.assertEqual(ledger.read_entries(bob_id)[-1].role, "assistant")
+            self.assertEqual(set(result["agent"]["processed_conversation_ids"]), {alice_id, bob_id})
+
+    def test_sidebar_agent_tick_scoped_cursor_does_not_consume_other_talkers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            ledger = ConversationLedgerStore(data_dir)
+            alice_id = conversation_id_for("private", "wxid_scope_alice")
+            bob_id = conversation_id_for("private", "wxid_scope_bob")
+            append_sidebar_backend_event(
+                data_dir,
+                {
+                    "raw_id": "scoped-agent-alice-1",
+                    "chat_title": "Scope Alice",
+                    "sender_name": "Scope Alice",
+                    "sender_wechat_id": "wxid_scope_alice",
+                    "text": "Alice scoped event",
+                    "observed_at": "2026-07-08T09:01:00+08:00",
+                    "source_payload": {
+                        "conversation_key": "wxid_scope_alice",
+                        "talker_id": "wxid_scope_alice",
+                        "is_friend": True,
+                    },
+                },
+            )
+            append_sidebar_backend_event(
+                data_dir,
+                {
+                    "raw_id": "scoped-agent-bob-1",
+                    "chat_title": "Scope Bob",
+                    "sender_name": "Scope Bob",
+                    "sender_wechat_id": "wxid_scope_bob",
+                    "text": "Bob scoped event",
+                    "observed_at": "2026-07-08T09:02:00+08:00",
+                    "source_payload": {
+                        "conversation_key": "wxid_scope_bob",
+                        "talker_id": "wxid_scope_bob",
+                        "is_friend": True,
+                    },
+                },
+            )
+
+            alice = sidebar_api.sidebar_agent_tick(
+                data_dir,
+                {"talkers": ["wxid_scope_alice"], "conversation_ids": [alice_id]},
+            )
+            bob = sidebar_api.sidebar_agent_tick(
+                data_dir,
+                {"talkers": ["wxid_scope_bob"], "conversation_ids": [bob_id]},
+            )
+            alice_repeat = sidebar_api.sidebar_agent_tick(
+                data_dir,
+                {"talkers": ["wxid_scope_alice"], "conversation_ids": [alice_id]},
+            )
+
+            self.assertEqual(alice["agent"]["processed_count"], 1)
+            self.assertEqual(alice["agent"]["processed_conversation_ids"], [alice_id])
+            self.assertEqual(bob["agent"]["processed_count"], 1)
+            self.assertEqual(bob["agent"]["processed_conversation_ids"], [bob_id])
+            self.assertEqual(alice_repeat["agent"]["processed_count"], 0)
+            self.assertEqual(ledger.read_entries(alice_id)[-1].role, "assistant")
+            self.assertEqual(ledger.read_entries(bob_id)[-1].role, "assistant")
+            self.assertEqual(alice["agent_state"]["event_file_count"], 1)
+            self.assertEqual(bob["agent_state"]["event_file_count"], 2)
+
+    def test_agent_requested_conversation_ids_accepts_channel_display_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            conversation_id = conversation_id_for("private", "wxid_alias_friend")
+            runtime.channel_store.ensure_channel(
+                NormalizedMessage(
+                    message_id="alias-channel-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Display Alias",
+                    sender_name="Sender Alias",
+                    sender_wechat_id="wxid_alias_friend",
+                    text="hello",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "backend_events_jsonl"},
+                )
+            )
+
+            by_title = sidebar_api._agent_requested_conversation_ids(data_dir, {"talkers": ["Display Alias"]})
+            by_sender = sidebar_api._agent_requested_conversation_ids(data_dir, {"talkers": ["Sender Alias"]})
+
+            self.assertEqual(by_title, [conversation_id])
+            self.assertEqual(by_sender, [conversation_id])
+
+    def test_sidebar_agent_tick_survives_missing_task_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            with mock.patch.object(sidebar_api.TaskStatusStore, "transition", side_effect=KeyError("task not found")):
+                result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["processed_count"], 0)
+            self.assertEqual(result["agent_state"]["last_tick"]["status"], "ok")
+
+    def test_sidebar_agent_tick_is_serialized_across_concurrent_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            active = 0
+            max_active = 0
+            guard = threading.Lock()
+            errors: list[BaseException] = []
+
+            def fake_run(_runner, max_loops=1):
+                nonlocal active, max_active
+                with guard:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                with guard:
+                    active -= 1
+                return {"status": "ok", "processed_count": 0, "processed": []}
+
+            def worker() -> None:
+                try:
+                    sidebar_api.sidebar_agent_tick(data_dir, {})
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with mock.patch("app.personal_wechat_bot.control.sidebar_api.PollingRunner.run_forever", fake_run):
+                threads = [threading.Thread(target=worker) for _ in range(4)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(max_active, 1)
+
+    def test_sidebar_agent_tick_replies_to_pending_context_only_private_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_live_friend")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="context-only-live-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Live Friend",
+                    sender_name="Live Friend",
+                    sender_wechat_id="wxid_live_friend",
+                    text="我通过了你的朋友验证请求，现在我们可以开始聊天了",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["processed_count"], 0)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 1)
+            after = result["session_snapshot"]["after"]
+            self.assertEqual(after["pending_user_count"], 0)
+            entries = ledger.read_entries(conversation_id)
+            self.assertEqual(entries[-1].role, "assistant")
+            second = sidebar_api.sidebar_agent_tick(data_dir, {})
+            self.assertEqual(second["agent"]["proactive_reply_count"], 0)
+            self.assertEqual(len(ledger.read_entries(conversation_id)), len(entries))
+
+    def test_sidebar_agent_tick_ignores_old_session_pending_after_context_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_reset_friend")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="old-session-pending-user",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Reset Friend",
+                    sender_name="Reset Friend",
+                    sender_wechat_id="wxid_reset_friend",
+                    text="this was pending before reset",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+            new_session_id = ConversationSessionStore(data_dir).reset_session(
+                conversation_id,
+                reason="test_context_reset",
+                message_id="manual-reset",
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["processed_count"], 0)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 0)
+            before = result["session_snapshot"]["before"]["conversations"][0]
+            after = result["session_snapshot"]["after"]["conversations"][0]
+            self.assertEqual(before["session_id"], new_session_id)
+            self.assertEqual(before["previous_session_id"], "session_default")
+            self.assertEqual(before["session_reset_count"], 1)
+            self.assertEqual(before["session_reset_reason"], "test_context_reset")
+            self.assertEqual(before["session_reset_message_id"], "manual-reset")
+            self.assertTrue(before["session_started_at"])
+            self.assertEqual(before["entry_count"], 0)
+            self.assertEqual(before["total_entry_count"], 1)
+            self.assertEqual(before["pending_user_count_since_last_assistant"], 0)
+            self.assertEqual(before["pending_user_messages"], [])
+            self.assertEqual(after["pending_user_count_since_last_assistant"], 0)
+            self.assertEqual(len(ledger.read_entries(conversation_id)), 1)
+
+    def test_sidebar_agent_tick_ignores_session_reset_control_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_reset_control")
+            ledger = ConversationLedgerStore(data_dir)
+            new_session_id = ConversationSessionStore(data_dir).reset_session(
+                conversation_id,
+                reason="clear_current_context_command",
+                message_id="clear-context-message",
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="clear-context-message",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Reset Control",
+                    sender_name="Reset Control",
+                    sender_wechat_id="wxid_reset_control",
+                    text="@bot 清空当前对话上下文",
+                    is_self=False,
+                    received_at="2026-07-08T09:01:00+08:00",
+                    metadata={
+                        "source": "test",
+                        "session_id": new_session_id,
+                        "context_only": True,
+                        "control_event": "session_reset",
+                        "reset_session_id": new_session_id,
+                    },
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["processed_count"], 0)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 0)
+            before = result["session_snapshot"]["before"]["conversations"][0]
+            self.assertEqual(before["session_id"], new_session_id)
+            self.assertEqual(before["entry_count"], 1)
+            self.assertEqual(before["pending_user_count_since_last_assistant"], 0)
+            self.assertEqual(before["pending_user_messages"], [])
+            self.assertEqual(before["participant_count"], 0)
+            self.assertEqual(before["message_aggregation"]["status"], "settled")
+            self.assertEqual(before["last_user_message"], "")
+
+    def test_sidebar_agent_tick_tracks_proactive_confirm_waiting_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=False, driver="bridge_outbox")
+            conversation_id = conversation_id_for("private", "wxid_confirm_friend")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="confirm-pending-user-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Confirm Friend",
+                    sender_name="Confirm Friend",
+                    sender_wechat_id="wxid_confirm_friend",
+                    text="这个问题需要你现在接一下",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["proactive_reply_count"], 1)
+            self.assertEqual(result["session_snapshot"]["after"]["pending_user_count"], 0)
+            conversation = result["session_snapshot"]["after"]["conversations"][0]
+            self.assertEqual(conversation["topic_lifecycle"]["status"], "responded")
+            self.assertIn("queued_for_confirm", conversation["topic_lifecycle"]["reason"])
+            entries = ledger.read_entries(conversation_id)
+            self.assertEqual(entries[-1].role, "assistant")
+            self.assertEqual(entries[-1].send["status"], "queued_for_confirm")
+            self.assertEqual(ConfirmQueue(data_dir / "confirm_queue.jsonl").list_by_status("pending")[0]["reply"]["conversation_id"], conversation_id)
+
+    def test_sidebar_agent_tick_tracks_proactive_auto_bridge_waiting_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(
+                data_dir,
+                mode="auto",
+                enabled=True,
+                driver="bridge_outbox",
+                backend="dry_run",
+                confirm_required=False,
+            )
+            conversation_id = conversation_id_for("private", "wxid_auto_bridge_friend")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="auto-bridge-pending-user-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Auto Bridge Friend",
+                    sender_name="Auto Bridge Friend",
+                    sender_wechat_id="wxid_auto_bridge_friend",
+                    text="are you there?",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["proactive_reply_count"], 1)
+            self.assertEqual(result["session_snapshot"]["after"]["pending_user_count"], 0)
+            conversation = result["session_snapshot"]["after"]["conversations"][0]
+            self.assertEqual(conversation["topic_lifecycle"]["status"], "responded")
+            self.assertIn("queued_to_bridge", conversation["topic_lifecycle"]["reason"])
+            entries = ledger.read_entries(conversation_id)
+            self.assertEqual(entries[-1].role, "assistant")
+            self.assertEqual(entries[-1].send["status"], "queued_to_bridge")
+            bridge = sidebar_api.build_sidebar_bridge_state(data_dir)
+            grouped = {item["conversation_id"]: item for item in bridge["item_channels"]}
+            self.assertEqual(grouped[conversation_id]["status_counts"]["queued"], 1)
+
+    def test_sidebar_agent_tick_replies_to_all_pending_private_channels_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            ledger = ConversationLedgerStore(data_dir)
+            conversation_ids: list[str] = []
+            for index in range(5):
+                talker = f"wxid_live_friend_{index}"
+                conversation_id = conversation_id_for("private", talker)
+                conversation_ids.append(conversation_id)
+                ledger.append_message(
+                    NormalizedMessage(
+                        message_id=f"context-only-live-{index}",
+                        conversation_id=conversation_id,
+                        conversation_type="private",
+                        chat_title=f"Live Friend {index}",
+                        sender_name=f"Live Friend {index}",
+                        sender_wechat_id=talker,
+                        text=f"第 {index} 个待接私聊",
+                        is_self=False,
+                        received_at=f"2026-07-08T09:0{index}:00+08:00",
+                        metadata={"source": "test", "context_only": True},
+                    )
+                )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["agent"]["processed_count"], 0)
+            self.assertEqual(result["agent"]["proactive_attempt_count"], 5)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 5)
+            self.assertEqual(set(result["agent"]["processed_conversation_ids"]), set(conversation_ids))
+            self.assertEqual(result["session_snapshot"]["after"]["pending_user_count"], 0)
+            for conversation_id in conversation_ids:
+                self.assertEqual(ledger.read_entries(conversation_id)[-1].role, "assistant")
+
+    def test_sidebar_agent_tick_does_not_repeat_failed_unseen_reply_until_new_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_live_friend")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="pending-user-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Live Friend",
+                    sender_name="Live Friend",
+                    sender_wechat_id="wxid_live_friend",
+                    text="你在吗",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+            failed_reply = ReplyCandidate(
+                message_id="failed-reply-1",
+                conversation_id=conversation_id,
+                text="在的",
+                send_mode="auto",
+                model="fake",
+            )
+            failed_entry = ledger.append_reply(
+                failed_reply,
+                chat_title="Live Friend",
+                conversation_type="private",
+                session_id="session_default",
+            )
+            ledger.update_reply_send_result(
+                conversation_id,
+                failed_entry.entry_id,
+                {"status": "failed", "reason": "wechat_native_backend_unavailable:ConnectionRefusedError:refused", "message_id": "bridge:failed"},
+            )
+
+            blocked = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(blocked["agent"]["proactive_reply_count"], 0)
+            self.assertEqual(blocked["session_snapshot"]["after"]["pending_user_count"], 0)
+            self.assertEqual(blocked["session_snapshot"]["after"]["blocked_pending_user_count"], 1)
+            summary = blocked["agent_state"]["last_tick"]["session_summary"]
+            self.assertEqual(summary["blocked_pending_user_count"], 1)
+            self.assertEqual(summary["blocked_conversation_ids"], [conversation_id])
+
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="pending-user-2",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Live Friend",
+                    sender_name="Live Friend",
+                    sender_wechat_id="wxid_live_friend",
+                    text="刚才没收到，你还在吗",
+                    is_self=False,
+                    received_at="2026-07-08T09:02:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            resumed = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(resumed["agent"]["proactive_reply_count"], 1)
+
+    def test_sidebar_agent_tick_reports_opening_greeting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_new_friend")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="self-open-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="New Friend",
+                    sender_name="Me",
+                    sender_wechat_id="wxid_self",
+                    text="我通过了你的朋友验证请求，现在我们可以开始聊天了",
+                    is_self=True,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            before = result["session_snapshot"]["before"]
+            self.assertEqual(before["opening_greeting_count"], 1)
+            self.assertEqual(before["opening_greeting_conversation_ids"], [conversation_id])
+            self.assertEqual(result["agent"]["proactive_reply_count"], 1)
+            summary = result["agent_state"]["last_tick"]["session_summary"]
+            self.assertEqual(summary["opening_greeting_count"], 0)
+
+    def test_sidebar_agent_tick_treats_self_messages_as_human_not_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_three_party")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="manual-self-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Three Party",
+                    sender_name="Me",
+                    sender_wechat_id="wxid_self",
+                    text="一会儿我会接入 Agent，你先随便聊聊",
+                    is_self=True,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="friend-after-self-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Three Party",
+                    sender_name="Three Party",
+                    sender_wechat_id="wxid_three_party",
+                    text="好的",
+                    is_self=False,
+                    received_at="2026-07-08T09:01:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            self.assertEqual(result["agent"]["processed_count"], 0)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 1)
+            entries = ledger.read_entries(conversation_id)
+            self.assertEqual([entry.role for entry in entries], ["self", "user", "assistant"])
+
+    def test_sidebar_agent_tick_self_message_settles_older_failed_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_owner_takeover")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="old-user-before-self",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Owner Takeover",
+                    sender_name="Owner Takeover",
+                    sender_wechat_id="wxid_owner_takeover",
+                    text="哪个群？我在里面吗",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+            failed_reply = ReplyCandidate(
+                message_id="failed-before-owner-takeover",
+                conversation_id=conversation_id,
+                text="我确认一下",
+                send_mode="auto",
+                model="fake",
+            )
+            failed_entry = ledger.append_reply(
+                failed_reply,
+                chat_title="Owner Takeover",
+                conversation_type="private",
+                session_id="session_default",
+            )
+            ledger.update_reply_send_result(
+                conversation_id,
+                failed_entry.entry_id,
+                {"status": "failed", "reason": "wechat_native_backend_unavailable:ConnectionRefusedError:refused"},
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="manual-owner-takeover",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Owner Takeover",
+                    sender_name="Me",
+                    sender_wechat_id="wxid_self",
+                    text="我来答这个：你不在，我拉你了",
+                    is_self=True,
+                    received_at="2026-07-08T09:02:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            before = result["session_snapshot"]["before"]["conversations"][0]
+            self.assertEqual(before["pending_user_count_since_last_assistant"], 0)
+            self.assertEqual(before["blocked_pending_user_count"], 0)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 0)
+            self.assertEqual(len(ledger.read_entries(conversation_id)), 3)
+
+    def test_sidebar_agent_tick_after_self_only_replies_to_new_user_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_owner_boundary")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="old-user-before-owner-boundary",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Owner Boundary",
+                    sender_name="Owner Boundary",
+                    sender_wechat_id="wxid_owner_boundary",
+                    text="哪个群？我在里面吗",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+            failed_reply = ReplyCandidate(
+                message_id="failed-before-owner-boundary",
+                conversation_id=conversation_id,
+                text="我确认一下",
+                send_mode="auto",
+                model="fake",
+            )
+            failed_entry = ledger.append_reply(
+                failed_reply,
+                chat_title="Owner Boundary",
+                conversation_type="private",
+                session_id="session_default",
+            )
+            ledger.update_reply_send_result(
+                conversation_id,
+                failed_entry.entry_id,
+                {"status": "failed", "reason": "wechat_native_backend_unavailable:ConnectionRefusedError:refused"},
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="manual-owner-boundary",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Owner Boundary",
+                    sender_name="Me",
+                    sender_wechat_id="wxid_self",
+                    text="你不在，我拉你了",
+                    is_self=True,
+                    received_at="2026-07-08T09:02:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="new-user-after-owner-boundary",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Owner Boundary",
+                    sender_name="Owner Boundary",
+                    sender_wechat_id="wxid_owner_boundary",
+                    text="好的，拉我一下",
+                    is_self=False,
+                    received_at="2026-07-08T09:03:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            before = result["session_snapshot"]["before"]["conversations"][0]
+            self.assertEqual(before["pending_user_count_since_last_assistant"], 1)
+            self.assertEqual(before["pending_user_messages"][0]["message_id"], "new-user-after-owner-boundary")
+            self.assertEqual(before["blocked_pending_user_count"], 0)
+            self.assertEqual(result["agent"]["proactive_reply_count"], 1)
+            self.assertEqual(result["agent"]["proactive_replies"][0]["pending_count"], 1)
+            self.assertEqual([entry.role for entry in ledger.read_entries(conversation_id)], ["user", "assistant", "self", "user", "assistant"])
+
+    def test_sidebar_agent_worker_processes_new_events_and_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_worker_alice")
+            started = sidebar_api.sidebar_agent_start(data_dir, {"interval_seconds": 0.05})
+            try:
+                self.assertEqual(started["status"], "ok")
+                self.assertTrue(started["worker"]["running"])
+                again = sidebar_api.sidebar_agent_start(data_dir, {"interval_seconds": 0.05})
+                self.assertEqual(again["status"], "ok")
+                self.assertTrue(again["worker"]["running"])
+
+                append_sidebar_backend_event(
+                    data_dir,
+                    {
+                        "raw_id": "agent-worker-message-1",
+                        "chat_title": "Worker Alice",
+                        "sender_name": "Worker Alice",
+                        "sender_wechat_id": "wxid_worker_alice",
+                        "text": "worker should pick this up",
+                        "observed_at": "2026-07-08T09:10:00+08:00",
+                        "source_payload": {
+                            "conversation_key": "wxid_worker_alice",
+                            "talker_id": "wxid_worker_alice",
+                            "is_friend": True,
+                        },
+                    },
+                )
+
+                deadline = threading.Event()
+                for _ in range(80):
+                    state = sidebar_api.build_sidebar_agent_state(data_dir)
+                    last_tick = state.get("last_tick") if isinstance(state.get("last_tick"), dict) else {}
+                    worker = state.get("worker") if isinstance(state.get("worker"), dict) else {}
+                    if int(last_tick.get("processed_count") or 0) >= 1 and int(worker.get("loops") or 0) >= 1:
+                        break
+                    deadline.wait(0.05)
+
+                state = sidebar_api.build_sidebar_agent_state(data_dir)
+                self.assertGreaterEqual(state["worker"]["loops"], 1)
+                self.assertEqual(state["last_tick"]["processed_count"], 1)
+                entries = ConversationLedgerStore(data_dir).read_entries(conversation_id)
+                self.assertEqual(entries[-1].role, "assistant")
+                tasks = sidebar_api.build_sidebar_task_manager(data_dir)["tasks"]
+                self.assertTrue(any(item.get("external_id") == "agent-worker" for item in tasks))
+            finally:
+                stopped = sidebar_api.sidebar_agent_stop(data_dir, {})
+
+            self.assertEqual(stopped["status"], "ok")
+            self.assertFalse(stopped["worker"]["running"])
+            self.assertTrue(stopped["finished_tasks"])
+            self.assertEqual(stopped["finished_tasks"][0]["external_id"], "agent-worker")
+
+    def test_sidebar_agent_worker_blocks_restart_with_different_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            alice_id = conversation_id_for("private", "wxid_worker_scope_alice")
+            bob_id = conversation_id_for("private", "wxid_worker_scope_bob")
+            started = sidebar_api.sidebar_agent_start(
+                data_dir,
+                {
+                    "interval_seconds": 1,
+                    "talkers": ["wxid_worker_scope_alice"],
+                    "conversation_ids": [alice_id],
+                },
+            )
+            try:
+                self.assertEqual(started["status"], "ok")
+                self.assertTrue(started["worker"]["running"])
+
+                blocked = sidebar_api.sidebar_agent_start(
+                    data_dir,
+                    {
+                        "interval_seconds": 1,
+                        "talkers": ["wxid_worker_scope_bob"],
+                        "conversation_ids": [bob_id],
+                    },
+                )
+
+                self.assertEqual(blocked["status"], "blocked")
+                self.assertEqual(blocked["reason"], "agent_worker_scope_mismatch")
+                self.assertEqual(blocked["running_scope"]["conversation_ids"], [alice_id])
+                self.assertEqual(blocked["requested_scope"]["conversation_ids"], [bob_id])
+                self.assertTrue(blocked["worker"]["running"])
+            finally:
+                sidebar_api.sidebar_agent_stop(data_dir, {})
+
+    def test_sidebar_agent_worker_allows_restart_alias_for_same_conversation_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            conversation_id = conversation_id_for("private", "wxid_worker_alias")
+            runtime.channel_store.ensure_channel(
+                NormalizedMessage(
+                    message_id="worker-alias-channel-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Worker Alias",
+                    sender_name="Worker Sender Alias",
+                    sender_wechat_id="wxid_worker_alias",
+                    text="hello",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "backend_events_jsonl"},
+                )
+            )
+            started = sidebar_api.sidebar_agent_start(
+                data_dir,
+                {"interval_seconds": 1, "talkers": ["Worker Alias"], "conversation_ids": [conversation_id]},
+            )
+            try:
+                self.assertEqual(started["status"], "ok")
+                again = sidebar_api.sidebar_agent_start(
+                    data_dir,
+                    {"interval_seconds": 1, "talkers": ["wxid_worker_alias"], "conversation_ids": [conversation_id]},
+                )
+
+                self.assertEqual(again["status"], "ok")
+                self.assertEqual(again["message"], "Dialog Agent worker is already running")
+                self.assertTrue(again["worker"]["running"])
+            finally:
+                sidebar_api.sidebar_agent_stop(data_dir, {})
+
+    def test_sidebar_agent_snapshot_aggregates_multi_user_group_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("group", "room_alpha@chatroom")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="group-msg-a",
+                    conversation_id=conversation_id,
+                    conversation_type="group",
+                    chat_title="Alpha Group",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="Agent 什么时候能连续工作？",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="group-msg-b",
+                    conversation_id=conversation_id,
+                    conversation_type="group",
+                    chat_title="Alpha Group",
+                    sender_name="Bob",
+                    sender_wechat_id="wxid_bob",
+                    text="我也想看主题聚合和任务分发。",
+                    is_self=False,
+                    received_at="2026-07-08T09:01:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+
+            result = sidebar_api.sidebar_agent_tick(data_dir, {})
+
+            conversation = result["session_snapshot"]["after"]["conversations"][0]
+            aggregation = conversation["message_aggregation"]
+            dispatch = conversation["dispatch_preview"]
+
+            self.assertEqual(result["agent"]["processed_count"], 0)
+            self.assertEqual(conversation["participant_count"], 2)
+            self.assertEqual(conversation["pending_user_count_since_last_assistant"], 2)
+            self.assertEqual(aggregation["status"], "needs_agent_reply")
+            self.assertEqual(set(aggregation["pending_senders"]), {"Alice", "Bob"})
+            self.assertTrue(any(item["resource_class"] == "llm_interactive" for item in dispatch))
+            self.assertTrue(any(item["title"] for item in conversation["topic_candidates"]))
+
+    def test_sidebar_agent_snapshot_excludes_group_owner_messages_from_pending_and_participants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("group", "room_owner_scope")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="group-owner-1",
+                    conversation_id=conversation_id,
+                    conversation_type="group",
+                    chat_title="Owner Group",
+                    sender_name="Me",
+                    sender_wechat_id="wxid_self",
+                    text="这个我已经处理了，大家不用再等 Agent。",
+                    is_self=True,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test", "context_only": True},
+                )
+            )
+            runtime = build_runtime(load_config(data_dir))
+
+            snapshot = sidebar_api._agent_session_snapshot(data_dir, runtime=runtime, conversation_ids=[conversation_id])
+
+            conversation = snapshot["conversations"][0]
+            aggregation = conversation["message_aggregation"]
+            self.assertEqual(conversation["pending_user_count_since_last_assistant"], 0)
+            self.assertEqual(conversation["participant_count"], 0)
+            self.assertEqual(aggregation["status"], "settled")
+            self.assertEqual(aggregation["pending_senders"], [])
+            self.assertEqual(aggregation["recent_senders"], [])
+
+    def test_agent_snapshot_reports_topic_lifecycle_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            ledger = ConversationLedgerStore(data_dir)
+
+            open_id = conversation_id_for("private", "wxid_lifecycle_open")
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="lifecycle-open-user",
+                    conversation_id=open_id,
+                    conversation_type="private",
+                    chat_title="Lifecycle Open",
+                    sender_name="Lifecycle Open",
+                    sender_wechat_id="wxid_lifecycle_open",
+                    text="这个问题还没回复",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+
+            sent_id = conversation_id_for("private", "wxid_lifecycle_sent")
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="lifecycle-sent-user",
+                    conversation_id=sent_id,
+                    conversation_type="private",
+                    chat_title="Lifecycle Sent",
+                    sender_name="Lifecycle Sent",
+                    sender_wechat_id="wxid_lifecycle_sent",
+                    text="这条已经回复了吗",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+            sent_reply = ledger.append_reply(
+                ReplyCandidate(
+                    message_id="lifecycle-sent-reply",
+                    conversation_id=sent_id,
+                    text="已经回复了",
+                    send_mode="auto",
+                    model="fake",
+                ),
+                chat_title="Lifecycle Sent",
+                conversation_type="private",
+            )
+            ledger.update_reply_send_result(
+                sent_id,
+                sent_reply.entry_id,
+                {"status": "sent", "reason": "wechat_native_http_send_text_verified"},
+            )
+
+            responded_id = conversation_id_for("private", "wxid_lifecycle_responded")
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="lifecycle-responded-user",
+                    conversation_id=responded_id,
+                    conversation_type="private",
+                    chat_title="Lifecycle Responded",
+                    sender_name="Lifecycle Responded",
+                    sender_wechat_id="wxid_lifecycle_responded",
+                    text="失败回复不能重复生成",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+            failed_reply = ledger.append_reply(
+                ReplyCandidate(
+                    message_id="lifecycle-failed-reply",
+                    conversation_id=responded_id,
+                    text="这条还没送达",
+                    send_mode="auto",
+                    model="fake",
+                ),
+                chat_title="Lifecycle Responded",
+                conversation_type="private",
+            )
+            ledger.update_reply_send_result(
+                responded_id,
+                failed_reply.entry_id,
+                {"status": "failed", "reason": "wechat_native_backend_unavailable"},
+            )
+
+            reopened_id = conversation_id_for("private", "wxid_lifecycle_reopened")
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="lifecycle-reopened-user-1",
+                    conversation_id=reopened_id,
+                    conversation_type="private",
+                    chat_title="Lifecycle Reopened",
+                    sender_name="Lifecycle Reopened",
+                    sender_wechat_id="wxid_lifecycle_reopened",
+                    text="先回答了一个问题",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+            reopened_reply = ledger.append_reply(
+                ReplyCandidate(
+                    message_id="lifecycle-reopened-reply",
+                    conversation_id=reopened_id,
+                    text="先答这个",
+                    send_mode="auto",
+                    model="fake",
+                ),
+                chat_title="Lifecycle Reopened",
+                conversation_type="private",
+            )
+            ledger.update_reply_send_result(
+                reopened_id,
+                reopened_reply.entry_id,
+                {"status": "sent", "reason": "wechat_native_http_send_text_verified"},
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="lifecycle-reopened-user-2",
+                    conversation_id=reopened_id,
+                    conversation_type="private",
+                    chat_title="Lifecycle Reopened",
+                    sender_name="Lifecycle Reopened",
+                    sender_wechat_id="wxid_lifecycle_reopened",
+                    text="我又补充一个新问题",
+                    is_self=False,
+                    received_at="2026-07-08T09:02:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+
+            closed_id = conversation_id_for("private", "wxid_lifecycle_closed")
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="lifecycle-closed-self",
+                    conversation_id=closed_id,
+                    conversation_type="private",
+                    chat_title="Lifecycle Closed",
+                    sender_name="Me",
+                    sender_wechat_id="wxid_self",
+                    text="我手动处理了这个话题",
+                    is_self=True,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+            runtime = build_runtime(load_config(data_dir))
+
+            snapshot = sidebar_api._agent_session_snapshot(
+                data_dir,
+                runtime=runtime,
+                conversation_ids=[open_id, sent_id, responded_id, reopened_id, closed_id],
+            )
+
+            statuses = {
+                item["conversation_id"]: item["topic_lifecycle"]["status"]
+                for item in snapshot["conversations"]
+            }
+            self.assertEqual(statuses[open_id], "open")
+            self.assertEqual(statuses[sent_id], "sent")
+            self.assertEqual(statuses[responded_id], "responded")
+            self.assertEqual(statuses[reopened_id], "reopened")
+            self.assertEqual(statuses[closed_id], "closed")
+            self.assertEqual(
+                snapshot["topic_lifecycle_counts"],
+                {"open": 1, "responded": 1, "sent": 1, "closed": 1, "reopened": 1},
+            )
+
+    def test_agent_self_echo_confirms_assistant_entry_without_repeat_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_agent_echo")
+            ledger = ConversationLedgerStore(data_dir)
+            reply = ReplyCandidate(
+                message_id="agent-reply-echo",
+                conversation_id=conversation_id,
+                text="我已经收到，稍后补充。",
+                send_mode="auto",
+                model="fake",
+            )
+            entry = ledger.append_reply(reply, chat_title="Agent Echo", conversation_type="private")
+            ledger.update_reply_send_result(
+                conversation_id,
+                entry.entry_id,
+                SendResult(
+                    message_id="bridge:agent-echo",
+                    conversation_id=conversation_id,
+                    status="queued_to_bridge",
+                    reason="queued_to_non_foreground_bridge:bridge:agent-echo",
+                ),
+            )
+
+            result = ledger.append_message_result(
+                NormalizedMessage(
+                    message_id="weflow-self-echo",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="Agent Echo",
+                    sender_name="Me",
+                    sender_wechat_id="wxid_self",
+                    text="我已经收到，稍后补充。",
+                    is_self=True,
+                    received_at="2026-07-08T09:01:00+08:00",
+                    metadata={"source": "weflow"},
+                )
+            )
+            tick = sidebar_api.sidebar_agent_tick(data_dir, {})
+            entries = ledger.read_entries(conversation_id)
+
+            self.assertEqual(result.status, "self_echo_confirmed")
+            self.assertEqual([item.role for item in entries], ["assistant"])
+            self.assertEqual(entries[0].send["status"], "sent")
+            self.assertEqual(entries[0].send["reason"], "queued_to_non_foreground_bridge:bridge:agent-echo")
+            self.assertEqual(entries[0].send["echo_message_id"], "weflow-self-echo")
+            self.assertTrue(entries[0].send["echo_confirmed_at"])
+            self.assertEqual(tick["agent"]["processed_count"], 0)
+            self.assertEqual(tick["agent"]["proactive_reply_count"], 0)
+
+    def test_agent_repeat_guard_blocks_highly_similar_proactive_reply(self) -> None:
+        conversation = {
+            "last_assistant_reply": "我已经收到，稍后补充这份资料的重点。",
+            "recent_turns": [
+                {
+                    "role": "assistant",
+                    "text": "我已经收到，稍后补充这份资料的重点。",
+                }
+            ],
+        }
+
+        repeated = sidebar_api._agent_reply_repeats_recent_assistant(
+            "我已经收到，稍后补充这份资料的重点。",
+            conversation,
+        )
+        fresh = sidebar_api._agent_reply_repeats_recent_assistant(
+            "这次我先按你新发的表格口径整理重点。",
+            conversation,
+        )
+
+        self.assertTrue(repeated)
+        self.assertFalse(fresh)
+
+    def test_agent_proactive_reply_skips_when_newer_linear_message_arrives_during_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = conversation_id_for("private", "wxid_linear_race")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="linear-race-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",  # type: ignore[arg-type]
+                    chat_title="Linear Race",
+                    sender_name="Alice",
+                    text="第一句，等你回复",
+                    is_self=False,
+                    received_at="2026-07-10T00:00:00+00:00",
+                    sender_wechat_id="wxid_linear_race",
+                )
+            )
+            real_runtime = build_runtime(load_config(data_dir))
+            snapshot = sidebar_api._agent_session_snapshot(data_dir, runtime=real_runtime, conversation_ids=[conversation_id])
+            conversation = snapshot["conversations"][0]
+            watermark = conversation["pending_user_messages"][0]["sequence"]
+            candidate = {
+                "kind": "pending_private_reply",
+                "conversation": conversation,
+                "conversation_id": conversation_id,
+                "pending_count": 1,
+                "source_watermark": watermark,
+            }
+
+            class _RaceConversation:
+                def generate_reply(self, message, speak):
+                    ledger.append_message(
+                        NormalizedMessage(
+                            message_id="linear-race-2",
+                            conversation_id=conversation_id,
+                            conversation_type="private",  # type: ignore[arg-type]
+                            chat_title="Linear Race",
+                            sender_name="Alice",
+                            text="第二句，生成期间新来的内容",
+                            is_self=False,
+                            received_at="2026-07-10T00:00:01+00:00",
+                            sender_wechat_id="wxid_linear_race",
+                        )
+                    )
+                    return ReplyCandidate(
+                        message_id="agent-stale-reply",
+                        conversation_id=conversation_id,
+                        text="这是只看过第一句的过期回复",
+                        send_mode="confirm",
+                        model="fake",
+                    )
+
+            runtime = SimpleNamespace(
+                ledger_store=ledger,
+                conversation=_RaceConversation(),
+                reply_gate=SimpleNamespace(handle=lambda reply: self.fail("stale reply must not be sent")),
+                event_logger=SimpleNamespace(log=lambda *args, **kwargs: None),
+            )
+
+            result = sidebar_api._agent_generate_one_proactive_reply(data_dir, runtime=runtime, candidate=candidate)
+            entries = ledger.read_entries(conversation_id)
+
+            self.assertEqual(result["status"], "skipped")
+            self.assertIn("stale_linear_context", result["reason"])
+            self.assertEqual([entry.role for entry in entries], ["user", "user"])
+            self.assertEqual([entry.message_id for entry in entries], ["linear-race-1", "linear-race-2"])
+
+    def test_agent_dispatch_preview_only_schedules_file_work_for_incoming_attachments(self) -> None:
+        entries = [
+            {"role": "user", "is_self": False, "attachments": [], "sequence": 1},
+            {
+                "role": "assistant",
+                "is_self": True,
+                "attachments": [{"name": "agent-result.csv", "source": "tool_result"}],
+                "sequence": 2,
+            },
+            {"role": "user", "is_self": False, "attachments": [], "sequence": 3},
+        ]
+
+        outgoing_only = sidebar_api._agent_dispatch_preview(
+            "conv1",
+            entries,
+            [entries[-1]],
+            [{"topic_id": "topic-1", "title": "followup"}],
+        )
+        with_incoming = sidebar_api._agent_dispatch_preview(
+            "conv1",
+            [
+                *entries,
+                {
+                    "role": "user",
+                    "is_self": False,
+                    "attachments": [{"name": "user-input.pdf", "source": "weflow"}],
+                    "sequence": 4,
+                },
+            ],
+            [entries[-1]],
+            [{"topic_id": "topic-1", "title": "followup"}],
+        )
+
+        self.assertFalse(any(item["kind"] == "file" for item in outgoing_only))
+        incoming_file_tasks = [item for item in with_incoming if item["kind"] == "file"]
+        self.assertEqual(len(incoming_file_tasks), 1)
+        self.assertEqual(incoming_file_tasks[0]["reason"], "conversation_has_incoming_attachments")
 
     def test_sidebar_controls_update_mode_and_send_switch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1016,6 +3168,7 @@ class SidebarApiTest(unittest.TestCase):
                     "mode": "confirm",
                     "send_enabled": True,
                     "send_driver": "bridge_outbox",
+                    "send_backend": "wechat_native_http",
                     "ocr_mode": "gpu",
                     "asr_mode": "cpu",
                     "file_max_bytes": 32 * 1024 * 1024,
@@ -1027,9 +3180,11 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(config.mode, "confirm")
             self.assertTrue(config.send_enabled)
             self.assertEqual(config.send_driver, "bridge_outbox")
+            self.assertEqual(config.send_backend, "wechat_native_http")
             self.assertEqual(config.ocr_mode, "gpu")
             self.assertEqual(config.asr_mode, "cpu")
             self.assertEqual(config.file_max_bytes, 32 * 1024 * 1024)
+            self.assertEqual(build_sidebar_state(data_dir)["config"]["send_backend"], "wechat_native_http")
             self.assertEqual(build_sidebar_state(data_dir)["config"]["ocr_mode"], "gpu")
             self.assertEqual(build_sidebar_state(data_dir)["config"]["file_max_bytes"], 32 * 1024 * 1024)
 
@@ -1152,6 +3307,289 @@ class SidebarApiTest(unittest.TestCase):
             self.assertTrue(removed["removed"])
             self.assertIsNone(queue.get(queue_id))
 
+    def test_channel_test_reply_creates_pending_review_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir)
+
+            result = sidebar_channel_test_reply(
+                data_dir,
+                "private-1",
+                {"text": "probe reply", "talkers": ["wxid_alice"], "require_scope": True},
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["item"]["status"], "pending")
+            self.assertEqual(result["reply"]["text"], "probe reply")
+            pending = build_sidebar_state(data_dir)["queues"]["pending"]
+            self.assertEqual(pending["count"], 1)
+            entry = ConversationLedgerStore(data_dir).read_entries("private-1")[-1]
+            self.assertEqual(entry.role, "assistant")
+            self.assertEqual(entry.text_blocks[0]["text"], "probe reply")
+            self.assertEqual(entry.send["metadata"]["origin"], "sidebar_channel_test_reply")
+
+    def test_channel_test_file_upload_creates_file_only_review_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir)
+
+            result = sidebar_channel_test_file(
+                data_dir,
+                "private-1",
+                {
+                    "file": {
+                        "name": "report.txt",
+                        "mime_type": "text/plain",
+                        "content_base64": base64.b64encode(b"hello file").decode("ascii"),
+                    },
+                    "talkers": ["wxid_alice"],
+                    "require_scope": True,
+                },
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(Path(result["stored_path"]).exists())
+            self.assertEqual(Path(result["stored_path"]).read_bytes(), b"hello file")
+            self.assertEqual(result["item"]["status"], "pending")
+            reply = result["item"]["reply"]
+            self.assertEqual(reply["text"], "")
+            self.assertEqual(reply["attachments"][0]["name"], "report.txt")
+            entry = ConversationLedgerStore(data_dir).read_entries("private-1")[-1]
+            self.assertEqual(entry.attachments[0]["path"], result["stored_path"])
+
+    def test_channel_test_reply_blocks_without_selected_talker_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir)
+
+            result = sidebar_channel_test_reply(data_dir, "private-1", {"text": "probe reply"})
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("send_scope_required", result["reason"])
+            self.assertEqual(ConfirmQueue(data_dir / "confirm_queue.jsonl").list_by_status("pending"), [])
+            self.assertEqual(ConversationLedgerStore(data_dir).read_entries("private-1"), [])
+
+    def test_channel_test_file_blocks_when_selected_talker_scope_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir)
+
+            result = sidebar_channel_test_file(
+                data_dir,
+                "private-1",
+                {
+                    "file": {
+                        "name": "report.txt",
+                        "mime_type": "text/plain",
+                        "content_base64": base64.b64encode(b"hello file").decode("ascii"),
+                    },
+                    "talkers": ["wxid_other"],
+                    "require_scope": True,
+                },
+            )
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("send_scope_mismatch", result["reason"])
+            self.assertFalse((data_dir / "outgoing_uploads").exists())
+            self.assertEqual(ConversationLedgerStore(data_dir).read_entries("private-1"), [])
+
+    def test_channel_test_reply_auto_mode_dispatches_without_confirm_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="auto", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
+            _ensure_test_channel(data_dir)
+            executor = mock.Mock()
+            executor.execute_auto.return_value = SendResult(
+                "bridge:test",
+                "private-1",
+                "queued_to_bridge",
+                "queued_to_non_foreground_bridge:bridge:test",
+            )
+
+            with mock.patch.object(sidebar_api, "_start_bridge_worker") as start_worker, mock.patch.object(
+                sidebar_api, "build_send_driver", return_value=mock.Mock()
+            ), mock.patch.object(sidebar_api, "GuardedSendExecutor", return_value=executor):
+                result = sidebar_channel_test_reply(
+                    data_dir,
+                    "private-1",
+                    {"text": "probe reply", "talkers": ["wxid_alice"], "require_scope": True},
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["dispatch_mode"], "auto")
+            self.assertEqual(result["queue_id"], "")
+            self.assertEqual(result["send_result"]["status"], "queued_to_bridge")
+            self.assertEqual(result["reply"]["send_mode"], "auto")
+            self.assertFalse(result["reply"]["send_metadata"]["review_required"])
+            self.assertEqual(ConfirmQueue(data_dir / "confirm_queue.jsonl").list_by_status("pending"), [])
+            start_worker.assert_called_once()
+            executor.execute_auto.assert_called_once()
+
+    def test_agent_requested_talkers_map_to_registered_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir, conversation_id="conv-alice", sender_wechat_id="wxid_alice")
+            _ensure_test_channel(data_dir, conversation_id="conv-bob", sender_wechat_id="wxid_bob")
+
+            ids = sidebar_api._agent_requested_conversation_ids(
+                data_dir,
+                {"talkers": ["wxid_bob"]},
+            )
+
+            self.assertEqual(ids, ["conv-bob"])
+
+    def test_agent_session_snapshot_respects_requested_talker_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir, conversation_id="conv-alice", sender_wechat_id="wxid_alice")
+            _ensure_test_channel(data_dir, conversation_id="conv-bob", sender_wechat_id="wxid_bob")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="alice-1",
+                    conversation_id="conv-alice",
+                    conversation_type="private",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="alice pending message",
+                    is_self=False,
+                    received_at="2026-07-09T00:00:00+00:00",
+                    metadata={},
+                )
+            )
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="bob-1",
+                    conversation_id="conv-bob",
+                    conversation_type="private",
+                    chat_title="Bob",
+                    sender_name="Bob",
+                    sender_wechat_id="wxid_bob",
+                    text="bob pending message",
+                    is_self=False,
+                    received_at="2026-07-09T00:00:01+00:00",
+                    metadata={},
+                )
+            )
+            requested = sidebar_api._agent_requested_conversation_ids(data_dir, {"talkers": ["wxid_bob"]})
+            runtime = build_runtime(load_config(data_dir))
+
+            snapshot = sidebar_api._agent_session_snapshot(data_dir, runtime=runtime, conversation_ids=requested)
+
+            self.assertEqual(snapshot["conversation_count"], 1)
+            self.assertEqual(snapshot["pending_user_count"], 1)
+            self.assertEqual([item["conversation_id"] for item in snapshot["conversations"]], ["conv-bob"])
+
+    def test_agent_requested_talker_scope_does_not_fallback_when_unmatched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            _ensure_test_channel(data_dir, conversation_id="conv-alice", sender_wechat_id="wxid_alice")
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="alice-1",
+                    conversation_id="conv-alice",
+                    conversation_type="private",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="alice pending message",
+                    is_self=False,
+                    received_at="2026-07-09T00:00:00+00:00",
+                    metadata={},
+                )
+            )
+            requested = sidebar_api._agent_requested_conversation_ids(data_dir, {"talkers": ["wxid_missing"]})
+            runtime = build_runtime(load_config(data_dir))
+
+            snapshot = sidebar_api._agent_session_snapshot(data_dir, runtime=runtime, conversation_ids=requested)
+            pending = sidebar_api._agent_pending_event_snapshot(data_dir, {"talkers": ["wxid_missing"]})
+
+            self.assertEqual(requested, [])
+            self.assertEqual(snapshot["conversation_count"], 0)
+            self.assertEqual(snapshot["pending_user_count"], 0)
+            self.assertFalse(pending["has_pending_ledger"])
+            self.assertEqual(pending["pending_user_count"], 0)
+
+    def test_send_queue_ledger_sync_handles_attachment_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="attachment-message",
+                    conversation_id="private-1",
+                    conversation_type="private",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="please read this deck",
+                    is_self=False,
+                    received_at="2026-07-08T09:00:00+08:00",
+                    metadata={
+                        "attachments": [
+                            {
+                                "name": "deck.pptx",
+                                "kind": "presentation",
+                                "status": "blocked",
+                                "reason": "presentation parsing skipped for safety",
+                                "parse": {"summary": "a long deck summary that must be compacted for markdown rendering"},
+                            }
+                        ]
+                    },
+                )
+            )
+            reply = _reply()
+            ledger.append_reply(reply, chat_title="Alice")
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(reply)
+
+            approved = sidebar_queue_action(data_dir, "approve", queue_id, {"reviewer": "test"})
+
+            self.assertEqual(approved["item"]["status"], "approved")
+            audit = build_sidebar_state(data_dir)["audit"]["items"]
+            self.assertFalse(any(item.get("action") == "ledger_sync_failed" for item in audit))
+
+    def test_dry_run_bridge_ack_is_synced_as_not_delivered_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="auto", enabled=True, driver="bridge_outbox", backend="dry_run")
+            reply = _reply()
+            ConversationLedgerStore(data_dir).append_reply(reply, chat_title="Alice")
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(reply)
+            queue.approve(queue_id, reviewer="test")
+
+            sent = send_approved_confirm_item(data_dir, queue_id)
+            bridge_id = sent["send_result"]["message_id"]
+            synced = sync_bridge_ack_to_send_state(
+                data_dir,
+                bridge_id,
+                status="sent",
+                reason="dry_run_not_delivered:text",
+            )
+
+            self.assertEqual(sent["status"], "queued_to_bridge")
+            self.assertEqual(synced["status"], "ok")
+            item = queue.get(queue_id)
+            self.assertEqual(item["status"], "sent")
+            self.assertEqual(item["note"], "dry_run_not_delivered:text")
+            state = build_sidebar_state(data_dir)
+            self.assertEqual(state["capture"]["background_send_status"], "bridge_outbox_dry_run_backend")
+            send_task = next(task for task in state["task_manager"]["tasks"] if task["task_id"].startswith("send-"))
+            self.assertEqual(send_task["phase"], "非前台桥演练完成，未投递微信")
+
     def test_sidebar_bridge_state_and_ack_are_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -1167,12 +3605,36 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(state["status"], "ok")
             self.assertEqual(state["ack_count"], 1)
 
+    def test_sidebar_bridge_retry_requeues_failed_item(self) -> None:
+        from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "retry me")
+            store.append_ack(
+                rec["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="wechat_native_http_send_text_error:ConnectionRefusedError:refused",
+            )
+
+            with mock.patch("app.personal_wechat_bot.control.sidebar_api._start_bridge_worker") as start_worker:
+                result = retry_sidebar_bridge_item(data_dir, {"bridge_id": rec["bridge_id"], "reviewer": "tester"})
+            state = build_sidebar_bridge_state(data_dir)
+            retry = next(item for item in state["items"] if item["bridge_id"] == result["new_bridge_id"])
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(retry["status"], "queued")
+            self.assertEqual(retry["retry_of"], rec["bridge_id"])
+            start_worker.assert_called_once()
+
     def test_sidebar_manual_ack_rejects_nonterminal_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
 
-            with self.assertRaisesRegex(ValueError, "sent, failed, or blocked"):
+            with self.assertRaisesRegex(ValueError, "sent, accepted, failed, or blocked"):
                 ack_sidebar_bridge_item(
                     data_dir,
                     {"bridge_id": "bridge:test", "status": "retry", "reason": "not_final"},
@@ -1591,6 +4053,11 @@ class SidebarDependencyStatusTest(unittest.TestCase):
             self.assertIn("ocr_runtime", {item["group"] for item in result["groups"]})
             self.assertIn("asr_runtime", {item["group"] for item in result["groups"]})
             self.assertEqual(result["duplicate_requirements"], {})
+            self.assertTrue(result["migration_notes"])
+            for group in result["groups"]:
+                self.assertIn("install_command", group)
+                self.assertIn("requirements_exists", group)
+                self.assertTrue(group["portable_from_github"])
 
 
 class SidebarWorkspaceCleanupApiTest(unittest.TestCase):
@@ -1632,13 +4099,45 @@ class SidebarWorkspaceCleanupApiTest(unittest.TestCase):
             self.assertEqual(result["keep_min"], 50)
 
 
-def _reply() -> ReplyCandidate:
+def _reply(
+    *,
+    message_id: str = "message-1",
+    conversation_id: str = "private-1",
+    text: str = "hello",
+) -> ReplyCandidate:
     return ReplyCandidate(
-        message_id="message-1",
-        conversation_id="private-1",
-        text="hello",
+        message_id=message_id,
+        conversation_id=conversation_id,
+        text=text,
         send_mode="confirm",
         model="fake",
+    )
+
+
+def _ensure_test_channel(
+    data_dir: Path,
+    *,
+    conversation_id: str = "private-1",
+    sender_wechat_id: str = "wxid_alice",
+    chat_title: str = "Alice",
+) -> None:
+    sidebar_api._channel_store(data_dir).ensure_channel(
+        NormalizedMessage(
+            message_id=f"channel-{conversation_id}",
+            conversation_id=conversation_id,
+            conversation_type="private",
+            chat_title=chat_title,
+            sender_name=chat_title,
+            sender_wechat_id=sender_wechat_id,
+            text="hello",
+            is_self=False,
+            received_at="2026-07-09T00:00:00+00:00",
+            metadata={
+                "source": "weflow_discovery",
+                "trusted_channel_source": True,
+                "conversation_key": sender_wechat_id,
+            },
+        )
     )
 
 
@@ -1684,7 +4183,7 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = (Path(tmp) / "data").resolve()
             create_default_config(data_dir)
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
             stop = threading.Event()
             alive_thread = threading.Thread(target=lambda: stop.wait(2), daemon=True)
             alive_thread.start()
@@ -1739,7 +4238,7 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
             create_default_config(data_dir)
             # bridge_outbox + dry_run backend: worker delivers (acks) without a
             # live WeChat. enqueue a record for the worker to pick up.
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
             root = data_dir.resolve()
             store = BridgeOutboxStore(root)
             rec = store.enqueue("wxid_a", "deliver me")
@@ -1769,7 +4268,8 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
     def test_start_bridge_worker_noop_when_driver_not_bridge_outbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
-            create_default_config(data_dir)  # default driver is not_implemented
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="dry_run", enabled=False, driver="not_implemented")
             root = data_dir.resolve()
             sidebar_api._start_bridge_worker(root, {})
             try:
@@ -1777,22 +4277,350 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
             finally:
                 sidebar_api._stop_bridge_worker(root)
 
+    def test_start_bridge_worker_noop_when_external_worker_lock_is_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+            root = data_dir.resolve()
+            lock_path = root / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps({"pid": os.getpid(), "label": "send_bridge_worker", "heartbeat_at": time.time()}),
+                encoding="utf-8",
+            )
+
+            with mock.patch("app.personal_wechat_bot.runtime.send_bridge_worker.run_bridge_worker") as run_worker:
+                sidebar_api._start_bridge_worker(root, {"bridge_interval_seconds": 0.1})
+                time.sleep(0.1)
+
+            self.assertFalse(sidebar_api._bridge_worker_state(root)["running"])
+            run_worker.assert_not_called()
+
+    def test_start_bridge_worker_repairs_stale_external_worker_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = (Path(tmp) / "data").resolve()
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+            old_signature = sidebar_api._bridge_worker_config_signature(load_config(data_dir))
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
+            root = data_dir.resolve()
+            lock_path = root / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 123456,
+                        "label": "send_bridge_worker",
+                        "heartbeat_at": time.time(),
+                        "data_dir": str(root),
+                        "backend_name": "dry_run",
+                        "config_signature": old_signature,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            started = threading.Event()
+
+            def fake_run(_root, *, stop_event=None, **_kwargs):
+                started.set()
+                if stop_event is not None:
+                    stop_event.wait(1)
+
+            try:
+                with mock.patch("app.personal_wechat_bot.control.sidebar_api.bridge_worker_lock_alive", side_effect=[True, True, False]), mock.patch.object(
+                    sidebar_api, "_pid_exists", side_effect=[True, False, False, False]
+                ), mock.patch.object(sidebar_api, "_terminate_process_tree", return_value=True) as terminate, mock.patch(
+                    "app.personal_wechat_bot.runtime.send_bridge_worker.run_bridge_worker",
+                    side_effect=fake_run,
+                ):
+                    sidebar_api._start_bridge_worker(root, {"bridge_interval_seconds": 0.1})
+                    self.assertTrue(started.wait(1), "bridge worker was not restarted after stale external repair")
+
+                terminate.assert_called_once_with(123456)
+                self.assertTrue(sidebar_api._bridge_worker_state(root)["running"])
+            finally:
+                sidebar_api._stop_bridge_worker(root)
+
+    def test_start_bridge_worker_restarts_when_backend_config_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = (Path(tmp) / "data").resolve()
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+            calls: list[str] = []
+
+            def fake_run(root, *, stop_event=None, **_kwargs):
+                calls.append(load_config(root).send_backend)
+                while stop_event is not None and not stop_event.is_set():
+                    time.sleep(0.02)
+
+            try:
+                with mock.patch("app.personal_wechat_bot.runtime.send_bridge_worker.run_bridge_worker", side_effect=fake_run):
+                    sidebar_api._start_bridge_worker(data_dir, {"bridge_interval_seconds": 0.1})
+                    deadline = time.time() + 2
+                    while time.time() < deadline and calls != ["dry_run"]:
+                        time.sleep(0.02)
+
+                    set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
+                    sidebar_api._start_bridge_worker(data_dir, {"bridge_interval_seconds": 0.1})
+                    deadline = time.time() + 2
+                    while time.time() < deadline and (len(calls) < 2 or calls[-1] != "wechat_native_http"):
+                        time.sleep(0.02)
+
+                self.assertGreaterEqual(len(calls), 2)
+                self.assertEqual(calls[0], "dry_run")
+                self.assertEqual(calls[-1], "wechat_native_http")
+                self.assertEqual(sidebar_api._bridge_worker_state(data_dir)["config_signature"]["send_backend"], "wechat_native_http")
+            finally:
+                sidebar_api._stop_bridge_worker(data_dir)
+
+    def test_update_controls_stops_running_bridge_worker_when_send_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = (Path(tmp) / "data").resolve()
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+
+            def fake_run(root, *, stop_event=None, **_kwargs):
+                while stop_event is not None and not stop_event.is_set():
+                    time.sleep(0.02)
+
+            try:
+                with mock.patch("app.personal_wechat_bot.runtime.send_bridge_worker.run_bridge_worker", side_effect=fake_run):
+                    sidebar_api._start_bridge_worker(data_dir, {"bridge_interval_seconds": 0.1})
+                    deadline = time.time() + 2
+                    while time.time() < deadline and not sidebar_api._bridge_worker_state(data_dir)["running"]:
+                        time.sleep(0.02)
+
+                    result = update_sidebar_controls(
+                        data_dir,
+                        {"mode": "confirm", "send_enabled": False, "send_driver": "bridge_outbox", "send_backend": "dry_run"},
+                    )
+
+                self.assertEqual(result["status"], "ok")
+                self.assertFalse(result["bridge_worker"]["running"])
+                self.assertEqual(result["bridge_worker"]["last_status"], "stopped")
+            finally:
+                sidebar_api._stop_bridge_worker(data_dir)
+
     def test_background_send_status_reports_worker_down(self) -> None:
         # bridge_outbox + send_enabled but no live worker lock: the status must
         # reflect that nothing is delivering, not a config-only "ready".
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
             config = load_config(data_dir)
 
             # No worker lock at all -> worker down.
-            status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
             self.assertEqual(status, "bridge_outbox_worker_down")
 
             # A pending backlog with no live worker -> down-with-backlog.
-            status = sidebar_api._background_send_status(config, {"pending_count": 3}, data_dir)
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 3}, data_dir)
             self.assertEqual(status, "bridge_outbox_worker_down_backlog")
+
+    def test_background_send_status_reports_wechat_native_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
+            config = load_config(data_dir)
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": False, "reason": "wechat_native_not_login"},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 3}, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_wechat_native_http_unavailable")
+
+    def test_background_send_status_reports_weflow_token_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="weflow_http")
+            config = load_config(data_dir)
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.weflow_http_status",
+                return_value={"available": False, "token_present": False, "reason": ""},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_weflow_token_missing")
+
+    def test_background_send_status_reports_weflow_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="weflow_http")
+            config = load_config(data_dir)
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.weflow_http_status",
+                return_value={"available": False, "token_present": True, "reason": "http_404"},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_weflow_http_unavailable")
+
+    def test_background_send_status_reports_weflow_send_not_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="weflow_http")
+            config = load_config(data_dir)
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.weflow_http_status",
+                return_value={
+                    "available": True,
+                    "token_present": True,
+                    "reason": "",
+                    "send_capabilities": {"text": {"supports": False}},
+                },
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_weflow_send_not_supported")
+
+    def test_background_send_status_reports_stale_worker_before_weflow_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+            old_config = load_config(data_dir)
+            stale_signature = sidebar_api._bridge_worker_config_signature(old_config)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="weflow_http")
+            current_config = load_config(data_dir)
+            lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "label": "send_bridge_worker",
+                        "heartbeat_at": time.time(),
+                        "backend_name": "dry_run",
+                        "config_signature": stale_signature,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.weflow_http_status",
+                return_value={
+                    "available": True,
+                    "token_present": True,
+                    "reason": "",
+                    "send_capabilities": {"text": {"supports": False}},
+                },
+            ):
+                bridge = sidebar_api.build_sidebar_bridge_state(data_dir)
+                status = sidebar_api._background_send_status(current_config, bridge, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_worker_stale_config")
+
+    def test_background_send_status_ignores_dead_stale_worker_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+            old_config = load_config(data_dir)
+            stale_signature = sidebar_api._bridge_worker_config_signature(old_config)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="weflow_http")
+            current_config = load_config(data_dir)
+            lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 99999999,
+                        "label": "send_bridge_worker",
+                        "heartbeat_at": time.time(),
+                        "backend_name": "dry_run",
+                        "config_signature": stale_signature,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.weflow_http_status",
+                return_value={
+                    "available": True,
+                    "token_present": True,
+                    "reason": "",
+                    "send_capabilities": {"text": {"supports": False}},
+                },
+            ):
+                bridge = sidebar_api.build_sidebar_bridge_state(data_dir)
+                status = sidebar_api._background_send_status(current_config, bridge, data_dir)
+
+            self.assertEqual(bridge["worker"]["config_status"], "not_running")
+            self.assertEqual(status, "bridge_outbox_weflow_send_not_supported")
+
+    def test_background_send_status_reports_wechat_native_unavailable_without_worker_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
+            config = load_config(data_dir)
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": False, "reason": "wechat_native_not_login"},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_wechat_native_http_unavailable")
+
+    def test_background_send_status_reports_weflow_ready_when_worker_lock_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="weflow_http")
+            config = load_config(data_dir)
+            lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps({"pid": os.getpid(), "label": "send_bridge_worker", "heartbeat_at": time.time()}),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.weflow_http_status",
+                return_value={"available": True, "token_present": True, "reason": ""},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_worker_config_unknown")
+
+            lock_payload = {
+                "pid": os.getpid(),
+                "label": "send_bridge_worker",
+                "heartbeat_at": time.time(),
+                "backend_name": "weflow_http",
+                "config_signature": sidebar_api._bridge_worker_config_signature(config),
+            }
+            lock_path.write_text(json.dumps(lock_payload), encoding="utf-8")
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.weflow_http_status",
+                return_value={"available": True, "token_present": True, "reason": ""},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 0}, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_ready")
 
     def test_background_send_status_ready_when_worker_lock_fresh(self) -> None:
         import json as _json
@@ -1800,18 +4628,93 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
             config = load_config(data_dir)
 
             # Simulate a live worker by writing a fresh heartbeat lock.
             lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             lock_path.write_text(
-                _json.dumps({"pid": 1234, "label": "send_bridge_worker", "heartbeat_at": time.time()}),
+                _json.dumps({"pid": os.getpid(), "label": "send_bridge_worker", "heartbeat_at": time.time()}),
                 encoding="utf-8",
             )
-            status = sidebar_api._background_send_status(config, {"pending_count": 2}, data_dir)
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ):
+                status = sidebar_api._background_send_status(config, {"pending_count": 2}, data_dir)
+            self.assertEqual(status, "bridge_outbox_worker_config_unknown")
+
+            lock_payload = {
+                "pid": os.getpid(),
+                "label": "send_bridge_worker",
+                "heartbeat_at": time.time(),
+                "backend_name": "wechat_native_http",
+                "config_signature": sidebar_api._bridge_worker_config_signature(config),
+            }
+            lock_path.write_text(_json.dumps(lock_payload), encoding="utf-8")
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ), mock.patch.dict(os.environ, {"WEFLOW_API_TOKEN": "token"}, clear=False):
+                status = sidebar_api._background_send_status(config, {"pending_count": 2}, data_dir)
             self.assertEqual(status, "bridge_outbox_ready")
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ), mock.patch.dict(os.environ, {}, clear=True):
+                status = sidebar_api._background_send_status(
+                    config,
+                    {"pending_count": 2, "active_unverified_count": 0},
+                    data_dir,
+                )
+            self.assertEqual(status, "bridge_outbox_ready")
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ), mock.patch.dict(os.environ, {}, clear=True):
+                status = sidebar_api._background_send_status(
+                    config,
+                    {"pending_count": 0, "active_unverified_count": 1},
+                    data_dir,
+                )
+            self.assertEqual(status, "bridge_outbox_wechat_native_accepted_unverified")
+
+    def test_background_send_status_reports_stale_worker_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
+            old_config = load_config(data_dir)
+            stale_signature = sidebar_api._bridge_worker_config_signature(old_config)
+            set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="wechat_native_http")
+            current_config = load_config(data_dir)
+            lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "label": "send_bridge_worker",
+                        "heartbeat_at": time.time(),
+                        "backend_name": "dry_run",
+                        "config_signature": stale_signature,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ):
+                bridge = sidebar_api.build_sidebar_bridge_state(data_dir)
+                status = sidebar_api._background_send_status(current_config, bridge, data_dir)
+
+            self.assertEqual(status, "bridge_outbox_worker_stale_config")
+            self.assertEqual(bridge["worker"]["config_status"], "stale")
 
 
 if __name__ == "__main__":

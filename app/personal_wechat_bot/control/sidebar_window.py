@@ -405,7 +405,7 @@ def flatten_queue_items(
 
 def queue_counts(
     state: dict[str, Any],
-    statuses: tuple[str, ...] = ("pending", "approved", "queued_to_bridge", "failed", "rejected", "sent"),
+    statuses: tuple[str, ...] = ("pending", "approved", "queued_to_bridge", "accepted", "failed", "rejected", "sent"),
 ) -> dict[str, int]:
     queues = state.get("queues", {})
     counts: dict[str, int] = {}

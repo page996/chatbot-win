@@ -26,10 +26,18 @@ from app.personal_wechat_bot.control.sidebar_api import (
     list_api_keys,
     probe_model_fetch,
     remove_api_key,
+    retry_sidebar_bridge_item,
     set_model_config,
+    sidebar_native_migration_probe,
+    sidebar_storage_migration_status,
+    sidebar_agent_start,
+    sidebar_agent_stop,
     sidebar_agent_tick,
+    sidebar_channel_test_file,
+    sidebar_channel_test_reply,
     sidebar_queue_action,
     sidebar_channel_state_action,
+    sidebar_diagnostics_export,
     sidebar_runtime_probe,
     sidebar_runtime_card_action,
     sidebar_resource_audit,
@@ -87,6 +95,12 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/weflow/status":
                 self._json(build_sidebar_weflow_state(data_dir))
                 return
+            if parsed.path == "/api/diagnostics/export":
+                self._json(sidebar_diagnostics_export(data_dir, {"persist": False}))
+                return
+            if parsed.path == "/api/storage/status":
+                self._json(sidebar_storage_migration_status(data_dir, {"include_sizes": True}))
+                return
             if parsed.path == "/api/keys":
                 self._json(list_api_keys(data_dir))
                 return
@@ -103,7 +117,7 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             # whose host matches our own Host header. A cross-site page trying to
             # drive these mutating endpoints (add/remove keys, model-config,
             # probe -> key egress) fails this check and is rejected before any
-            # handler — and before any API key is touched.
+            # handler execution and before any API key is touched.
             csrf_error = self._csrf_check()
             if csrf_error:
                 self._json({"status": "error", "error": csrf_error}, status=403)
@@ -118,6 +132,9 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/bridge/ack":
                     self._json(ack_sidebar_bridge_item(data_dir, payload))
+                    return
+                if parsed.path == "/api/bridge/retry":
+                    self._json(retry_sidebar_bridge_item(data_dir, payload))
                     return
                 if parsed.path == "/api/audit/clear":
                     self._json(clear_sidebar_send_audit(data_dir))
@@ -173,8 +190,23 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/resources/audit":
                     self._json(sidebar_resource_audit(data_dir, payload))
                     return
+                if parsed.path == "/api/diagnostics/export":
+                    self._json(sidebar_diagnostics_export(data_dir, payload))
+                    return
+                if parsed.path == "/api/storage/status":
+                    self._json(sidebar_storage_migration_status(data_dir, payload))
+                    return
+                if parsed.path == "/api/native/migration-probe":
+                    self._json(sidebar_native_migration_probe(data_dir, payload))
+                    return
                 if parsed.path == "/api/agent/tick":
                     self._json(sidebar_agent_tick(data_dir, payload))
+                    return
+                if parsed.path == "/api/agent/start":
+                    self._json(sidebar_agent_start(data_dir, payload))
+                    return
+                if parsed.path == "/api/agent/stop":
+                    self._json(sidebar_agent_stop(data_dir, payload))
                     return
                 if parsed.path == "/api/tasks":
                     self._json(sidebar_task_action(data_dir, payload))
@@ -192,6 +224,14 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/channels/cleanup-hidden":
                     self._json(cleanup_sidebar_channels(data_dir, hidden_only=True))
+                    return
+                if len(parts) == 4 and parts[:2] == ["api", "channels"] and parts[3] == "test-reply":
+                    _, _, conversation_id, _ = parts
+                    self._json(sidebar_channel_test_reply(data_dir, unquote(conversation_id), payload))
+                    return
+                if len(parts) == 4 and parts[:2] == ["api", "channels"] and parts[3] == "test-file":
+                    _, _, conversation_id, _ = parts
+                    self._json(sidebar_channel_test_file(data_dir, unquote(conversation_id), payload))
                     return
                 if len(parts) == 4 and parts[:3] == ["api", "channels", "delete"]:
                     _, _, _, conversation_id = parts

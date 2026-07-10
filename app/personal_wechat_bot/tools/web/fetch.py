@@ -12,6 +12,7 @@ from app.personal_wechat_bot.domain.models import ToolCallRequest, ToolCallResul
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.base import ToolManifest
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
+from app.personal_wechat_bot.tools.web.search import fetched_text_block_reason
 
 
 class WebFetchTool:
@@ -102,6 +103,22 @@ class WebFetchTool:
             text = _html_to_text(text)
         else:
             text = _normalize_text(text)
+        block_reason = fetched_text_block_reason(text)
+        if block_reason:
+            return ToolCallResult(
+                call_id=request.call_id,
+                tool_name=self.manifest.name,
+                status="blocked",
+                summary="web.fetch blocked a restricted or unsafe page",
+                error=block_reason,
+                payload={
+                    "url_id": url_id,
+                    "url": url,
+                    "content_type": content_type,
+                    "content_kind": content_kind,
+                    "truncated": truncated,
+                },
+            )
 
         output = self.output_dir / f"{url_id}.md"
         output.write_text(

@@ -66,13 +66,13 @@ def build_preflight_report(
             "read_only": not write_access_configured,
             "write_access_configured": write_access_configured,
             "primary_inputs": ["poll-backend-events", "poll-snapshot", "poll-fake"],
-            "fallback_inputs": ["wechat-snapshot", "poll-clipboard"],
+            "fallback_inputs": ["wechat-snapshot"],
             "debug_inputs": ["wechat-capture"],
             "deprecated_inputs": ["ocr-snapshot", "poll-ocr-window", "ocr-window-diagnose"],
+            "removed_inputs": ["poll-clipboard"],
             "available_inputs": [
                 "poll-backend-events",
                 "wechat-snapshot",
-                "poll-clipboard",
                 "poll-snapshot",
                 "poll-fake",
                 "wechat-capture",
@@ -83,7 +83,7 @@ def build_preflight_report(
             "registered_send_drivers": registered_send_drivers(),
             "manual_bound_channels": {
                 "count": len(manual_bound_channels),
-                "policy": "bridge_outbox_manual_captured_channels_only",
+                "policy": "bridge_outbox_receiver_from_channel_registry",
                 "items": [
                     {
                         "conversation_id": item.conversation_id,
@@ -122,7 +122,7 @@ def build_preflight_report(
             "max_concurrency": chat_provider.max_concurrency,
         },
         "accepted_conversations": {
-            "mode": "channel_auto_accept",
+            "mode": "channel_admission_guarded",
             "contacts_count": len(config.accepted_contacts),
             "groups_count": len(config.accepted_groups),
             "contacts": sorted(config.accepted_contacts) if show_accepted else None,
@@ -138,8 +138,9 @@ def build_preflight_report(
         },
         "conversation_channels": {
             "policy": CHANNEL_POLICY,
-            "auto_register_private": True,
+            "auto_register_private": "identified_or_accepted_only",
             "auto_register_groups": True,
+            "blocks_unknown_private": True,
             "private_key_slots": 1,
             "group_key_slots": 2,
             "storage": str(Path(config.data_dir).resolve() / "conversation_channels"),
@@ -170,6 +171,16 @@ def build_preflight_report(
             "group_cooldown_seconds": config.group_cooldown_seconds,
             "conversation_scheduler": "single_conversation_serial_global_limited_parallel",
             "confirm_queue": str(Path(config.data_dir).resolve() / "confirm_queue.jsonl"),
+            "confirm_queue_authority": str(Path(config.data_dir).resolve() / "confirm_queue.sqlite"),
+            "send_audit": str(Path(config.data_dir).resolve() / "send_audit.jsonl"),
+            "send_audit_authority": str(Path(config.data_dir).resolve() / "send_audit.sqlite"),
+            "state_storage_policy": {
+                "conversation_ledger": "markdown_truth_source",
+                "confirm_queue": "sqlite_authority_jsonl_projection",
+                "send_audit": "jsonl_evidence_sqlite_index",
+                "sidebar_state": "sqlite_authority_json_projection",
+                "send_bridge": "jsonl_evidence_preserved_on_history_clear",
+            },
         },
         "tools": {
             "ocr": {
@@ -187,6 +198,13 @@ def build_preflight_report(
                 "name": "web.fetch",
                 "scope": "http_text_only",
                 "available": True,
+            },
+            "web_search": {
+                "name": "web.search",
+                "scope": "http_search_scored_filtered_concurrent_fetch",
+                "available": True,
+                "levels": ["light", "standard", "deep"],
+                "uses_browser": False,
             },
             "asr": {
                 "name": "voice.local_asr",
@@ -259,7 +277,7 @@ def _warnings(config: BotConfig, api_key_present: bool, *, manual_bound_count: i
     if config.send_enabled and config.mode != "confirm" and config.send_confirm_required:
         warnings.append("send is enabled but mode is not confirm while send_confirm_required is true")
     if not config.accepted_contacts and not config.accepted_groups:
-        warnings.append("no accepted contacts or groups recorded yet; new WeChat conversations will auto-register channels")
+        warnings.append("no accepted contacts or groups recorded yet; unknown private WeChat conversations will be blocked")
     chat_provider = config.providers.get("chat", config.llm)
     if chat_provider.base_url and not api_key_present:
         warnings.append(f"chat provider base_url is configured but {chat_provider.api_key_env} is missing")

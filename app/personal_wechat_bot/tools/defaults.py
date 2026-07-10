@@ -13,6 +13,7 @@ from app.personal_wechat_bot.tools.search.model_relevance_filter import FakeMode
 from app.personal_wechat_bot.tools.vision.ocr_tool import OcrImageTool
 from app.personal_wechat_bot.tools.voice.asr_tool import LocalAsrTool
 from app.personal_wechat_bot.tools.web.fetch import WebFetchTool
+from app.personal_wechat_bot.tools.web.search import WebSearchTool
 from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
 from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
@@ -69,5 +70,12 @@ def register_default_tools(
             file_index,
             file_workspace=file_workspace,
             attachment_parser=attachment_parser,
+        )
+    )
+    registry.register(
+        WebSearchTool(
+            data_root / "tool_outputs" / "web_search",
+            file_index,
+            blocklist=config.search_blocklist,
         )
     )

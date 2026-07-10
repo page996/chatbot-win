@@ -1,8 +1,9 @@
 """Entry point for the non-foreground send bridge.
 
 Consumes ``<data_dir>/send_bridge/outbox.jsonl`` and delivers each queued
-message to WeChat via the configured send backend (WeChatFerry in production,
-dry-run otherwise), then writes acks and syncs the confirm queue + ledger.
+message to WeChat via the configured send backend (local Native HTTP or
+WeFlow HTTP; dry-run otherwise), then writes acks and syncs the confirm queue
+and ledger.
 
 Usage:
     python scripts/send_bridge_worker.py --data-dir data
@@ -10,8 +11,8 @@ Usage:
     python scripts/send_bridge_worker.py --data-dir data --interval 2
 
 The send backend is chosen by ``send_backend`` in config.json (default
-``dry_run``). Set it to ``wcf`` and ensure a WeChatFerry RPC server is running
-to deliver for real.
+``dry_run``). Use ``wechat_native_http`` for the project-owned local PC WeChat
+native port, or ``weflow_http`` when a WeFlow fork exposes send capability.
 """
 
 from __future__ import annotations

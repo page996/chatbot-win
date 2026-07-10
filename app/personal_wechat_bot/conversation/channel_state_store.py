@@ -241,7 +241,8 @@ def build_channel_state_projection(
     ledger_entries = [dict(item) for item in (ledger_entries or []) if isinstance(item, dict)]
     active_tasks = [item for item in _ordered_tasks(tasks) if str(item.get("status") or "") in ACTIVE_TASK_STATUSES]
     terminal_tasks = [item for item in _ordered_tasks(tasks) if str(item.get("status") or "") in TERMINAL_TASK_STATUSES]
-    current_task = active_tasks[0] if active_tasks else (_ordered_tasks(tasks)[0] if tasks else {})
+    terminal_history = sorted(terminal_tasks, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    current_task = active_tasks[0] if active_tasks else {}
     topics = _topic_history(tasks)
     reply_state = _reply_state(ledger_entries)
     file_states = _file_states(ledger_entries)
@@ -265,13 +266,13 @@ def build_channel_state_projection(
         active_tasks=active_tasks[:20],
         waiting_tasks=[item for item in active_tasks if str(item.get("status") or "") in {"waiting", "blocked"}][:12],
         paused_tasks=[item for item in active_tasks if str(item.get("status") or "") == "paused"][:12],
-        task_history=terminal_tasks[:20],
+        task_history=terminal_history[:20],
         file_states=file_states[:40],
         reply_state=reply_state,
         resource_audit={
-            "estimated_cost": sum(_int(item.get("estimated_cost"), 0) for item in tasks),
-            "actual_cost": sum(_int(item.get("actual_cost"), 0) for item in tasks),
-            "resources": _resource_pools(tasks),
+            "estimated_cost": sum(_int(item.get("estimated_cost"), 0) for item in active_tasks),
+            "actual_cost": sum(_int(item.get("actual_cost"), 0) for item in active_tasks),
+            "resources": _resource_pools(active_tasks),
         },
         control=control,
         last_user_message_at=last_user,
@@ -360,13 +361,26 @@ def _reply_state(entries: list[dict[str, Any]]) -> dict[str, Any]:
         return {"status": "idle", "last_reply_at": "", "last_send_status": ""}
     latest = sorted(assistant_entries, key=lambda item: str(item.get("received_at") or item.get("created_at") or ""))[-1]
     send = latest.get("send") if isinstance(latest.get("send"), dict) else {}
+    status = str(send.get("status") or "drafted")
+    reason = str(send.get("reason") or "")
+    historical = _reply_send_failure_is_historical(status, reason)
     return {
-        "status": str(send.get("status") or "drafted"),
+        "status": status,
         "last_reply_at": str(latest.get("received_at") or latest.get("created_at") or ""),
         "last_send_status": str(send.get("status") or ""),
+        "last_send_reason": reason,
+        "historical": historical,
+        "problem": status == "failed" and not historical,
         "last_reply_entry_id": str(latest.get("entry_id") or ""),
         "last_reply_message_id": str(latest.get("message_id") or ""),
     }
+
+
+def _reply_send_failure_is_historical(status: str, reason: str) -> bool:
+    if str(status or "") != "failed":
+        return False
+    text = str(reason or "").lower()
+    return any(marker in text for marker in ("manual_sidebar_failed", "send_driver_not_configured", "send_driver_missing"))
 
 
 def _file_states(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -466,10 +480,6 @@ def _effective_status(payload: dict[str, Any], control: dict[str, Any]) -> str:
         return status
     if payload.get("active_tasks"):
         return "active"
-    reply = payload.get("reply_state") if isinstance(payload.get("reply_state"), dict) else {}
-    reply_status = str(reply.get("status") or "")
-    if reply_status and reply_status != "idle":
-        return reply_status
     return "idle"
 
 
@@ -482,4 +492,3 @@ def _int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-

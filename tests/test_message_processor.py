@@ -102,7 +102,7 @@ class MessageProcessorTest(unittest.TestCase):
             self.assertIn(f"reply-{message_id}", lane_task_ids)
             self.assertIn(f"send-{message_id}", lane_task_ids)
 
-    def test_processor_auto_registers_unknown_private_and_group_channels(self) -> None:
+    def test_processor_blocks_unknown_private_but_auto_registers_group_channel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
@@ -135,10 +135,137 @@ class MessageProcessorTest(unittest.TestCase):
             channels = runtime.channel_store.list_channels()
             channel_types = {item.conversation_type for item in channels}
 
-            self.assertEqual(private_result["route"]["action"], "process")
+            self.assertEqual(private_result["route"]["action"], "ignore")
+            self.assertTrue(private_result["blocked"])
+            self.assertIn("private_contact_unknown_or_unidentified", private_result["route"]["reason"])
             self.assertEqual(group_result["route"]["action"], "process")
-            self.assertEqual(channel_types, {"private", "group"})
+            self.assertEqual(channel_types, {"group"})
             self.assertTrue((data_dir / "conversation_channels" / "index.json").exists())
+
+    def test_processor_blocks_wechat_user_placeholder_private_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+
+            result = MessageProcessor(runtime).process(
+                RawWeChatMessage(
+                    raw_id="private-wechat-user-placeholder",
+                    chat_title="微信用户",
+                    sender_name="微信用户",
+                    text="deliver me",
+                    observed_at="2026-07-10T08:07:00+00:00",
+                    driver_meta={"source": "backend_events_jsonl", "banner": "对方还不是你的朋友"},
+                )
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["route"]["action"], "ignore")
+            self.assertTrue(result["blocked"])
+            self.assertIn("private_contact_explicitly_not_friend", result["route"]["reason"])
+            self.assertEqual(runtime.channel_store.list_channels(), [])
+
+    def test_processor_auto_registers_explicit_friend_private_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+
+            result = MessageProcessor(runtime).process(
+                RawWeChatMessage(
+                    raw_id="private-friend",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="hello",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"source": "backend_events_jsonl", "conversation_key": "wxid_alice", "is_friend": True},
+                )
+            )
+            channels = runtime.channel_store.list_channels()
+
+            self.assertEqual(result["route"]["action"], "process")
+            self.assertEqual(len(channels), 1)
+            self.assertTrue(channels[0].is_friend)
+
+    def test_processor_blocks_legacy_unidentified_existing_private_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            legacy = runtime.normalizer.normalize(
+                RawWeChatMessage(
+                    raw_id="legacy-channel-seed",
+                    chat_title="wxid_ghost",
+                    sender_name="wxid_ghost",
+                    sender_wechat_id="wxid_ghost",
+                    text="legacy",
+                    driver_meta={
+                        "source": "weflow_discovery",
+                        "trusted_channel_source": True,
+                        "conversation_key": "wxid_ghost",
+                    },
+                )
+            )
+            assert legacy is not None
+            runtime.channel_store.ensure_channel(legacy)
+
+            result = MessageProcessor(runtime).process(
+                RawWeChatMessage(
+                    raw_id="legacy-channel-new",
+                    chat_title="wxid_ghost",
+                    sender_name="wxid_ghost",
+                    sender_wechat_id="wxid_ghost",
+                    text="should not open",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"source": "backend_events_jsonl", "conversation_key": "wxid_ghost"},
+                )
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["route"]["action"], "ignore")
+            self.assertIn("private_contact_unknown_or_unidentified", result["route"]["reason"])
+            self.assertTrue(result["blocked"])
+            self.assertEqual(runtime.ledger_store.read_entries(legacy.conversation_id), [])
+
+    def test_processor_keeps_identified_existing_private_channel_when_incoming_title_is_wxid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            legacy = runtime.normalizer.normalize(
+                RawWeChatMessage(
+                    raw_id="identified-channel-seed",
+                    chat_title="Alice",
+                    sender_name="Alice",
+                    sender_wechat_id="wxid_alice",
+                    text="legacy",
+                    driver_meta={
+                        "source": "weflow_discovery",
+                        "trusted_channel_source": True,
+                        "conversation_key": "wxid_alice",
+                        "is_friend": True,
+                    },
+                )
+            )
+            assert legacy is not None
+            runtime.channel_store.ensure_channel(legacy)
+
+            result = MessageProcessor(runtime).process(
+                RawWeChatMessage(
+                    raw_id="identified-channel-new",
+                    chat_title="wxid_alice",
+                    sender_name="wxid_alice",
+                    sender_wechat_id="wxid_alice",
+                    text="hello again",
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"source": "backend_events_jsonl", "conversation_key": "wxid_alice"},
+                )
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["route"]["action"], "process")
+            self.assertNotIn("blocked", result)
 
     def test_processor_skips_duplicate_dedupe_key_without_rewriting_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -149,6 +276,7 @@ class MessageProcessorTest(unittest.TestCase):
             meta = {
                 "source": "backend_events_jsonl",
                 "conversation_key": "wxid_page",
+                "is_friend": True,
                 "local_id": "1",
                 "create_time": "100",
                 "sort_key": "100",
@@ -221,7 +349,7 @@ class MessageProcessorTest(unittest.TestCase):
                     raw_id="clear-context",
                     chat_title="PAGE",
                     sender_name="PAGE",
-                    text=CLEAR_CONTEXT_PHRASES[0],
+                    text=f"@bot {CLEAR_CONTEXT_PHRASES[0]}",
                     observed_at="2026-06-28T01:00:00+00:00",
                 )
             )
@@ -231,8 +359,38 @@ class MessageProcessorTest(unittest.TestCase):
             entries = runtime.ledger_store.read_entries(result["message"]["conversation_id"])
             self.assertNotEqual(session_id, DEFAULT_SESSION_ID)
             self.assertEqual(result["context"]["session_id"], session_id)
+            self.assertTrue(result["context_only"])
+            self.assertNotIn("reply", result)
             self.assertEqual(entries[0].session_id, session_id)
             self.assertEqual(entries[-1].session_id, session_id)
+            self.assertEqual(entries[0].text_blocks[0]["kind"], "control:session_reset")
+            self.assertFalse(entries[0].text_blocks[0]["metadata"]["visible_in_context"])
+            markdown = runtime.ledger_store.conversation_markdown_path(result["message"]["conversation_id"]).read_text(encoding="utf-8")
+            self.assertIn("[control:session_reset status=applied", markdown)
+            self.assertIn("hidden_text=true", markdown)
+            self.assertNotIn(CLEAR_CONTEXT_PHRASES[0], markdown)
+
+    def test_processor_does_not_reset_session_for_unmentioned_clear_context_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime = build_runtime(load_config(data_dir))
+            processor = MessageProcessor(runtime)
+
+            result = processor.process(
+                RawWeChatMessage(
+                    raw_id="clear-context-bare",
+                    chat_title="PAGE",
+                    sender_name="PAGE",
+                    text=CLEAR_CONTEXT_PHRASES[0],
+                    observed_at="2026-06-28T01:00:00+00:00",
+                    driver_meta={"context_only": True},
+                )
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["message"]["metadata"]["session_id"], DEFAULT_SESSION_ID)
+            self.assertNotIn("context", result)
 
     def test_first_backend_attachment_message_uses_one_segment_for_all_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,6 +419,7 @@ class MessageProcessorTest(unittest.TestCase):
                 sender_wechat_id="wxid_first_title",
                 text="please read",
                 attachments=["note.txt"],
+                source_payload={"is_friend": True},
             )
             raw = driver.read_new_messages()[0]
 

@@ -39,11 +39,21 @@ class BotConfig:
     mode: Mode = "dry_run"
     data_dir: str = "data"
     send_enabled: bool = False
-    send_driver: str = "not_implemented"
-    send_backend: str = "dry_run"
-    wcf_host: str = "127.0.0.1"
-    wcf_port: int = 10086
-    wcf_send_timeout_seconds: float = 15.0
+    send_driver: str = "bridge_outbox"
+    send_backend: str = "wechat_native_http"
+    weflow_base_url: str = "http://127.0.0.1:5031"
+    weflow_token_env: str = "WEFLOW_API_TOKEN"
+    weflow_send_text_path: str = "/send/text"
+    weflow_send_file_path: str = "/send/file"
+    weflow_send_timeout_seconds: float = 35.0
+    wechat_native_base_url: str = "http://127.0.0.1:30001"
+    wechat_native_send_text_path: str = "/SendTextMsg"
+    wechat_native_send_image_path: str = "/SendImgMsg"
+    wechat_native_send_file_path: str = "/send_file_msg"
+    wechat_native_status_path: str = "/QueryDB/status"
+    wechat_native_timeout_seconds: float = 15.0
+    wechat_native_verify_timeout_seconds: float = 10.0
+    wechat_native_file_verify_timeout_seconds: float = 45.0
     send_confirm_required: bool = True
     send_max_chars: int = 800
     send_min_interval_seconds: int = 5
@@ -124,13 +134,15 @@ class BotConfig:
     asr_mode: str = "auto"  # auto | cpu | gpu
     search_blocklist: list[str] = field(
         default_factory=lambda: [
-            "baidu.com",
-            "baike.baidu.com",
-            "zhihu.com",
-            "csdn.net",
-            "sohu.com",
-            "163.com",
-            "qq.com",
+            "doubleclick.net",
+            "googlesyndication.com",
+            "googleadservices.com",
+            "taboola.com",
+            "outbrain.com",
+            "casino",
+            "gambling",
+            "porn",
+            "xxx",
         ]
     )
 

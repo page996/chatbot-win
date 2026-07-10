@@ -13,7 +13,7 @@ ConversationType = Literal["private", "group"]
 RouteAction = Literal["process", "ignore", "duplicate", "blocked"]
 SpeakAction = Literal["speak", "silent", "wait"]
 SendMode = Literal["dry_run", "confirm", "auto"]
-SendStatus = Literal["skipped", "queued_for_confirm", "queued_to_bridge", "sent", "failed"]
+SendStatus = Literal["skipped", "queued_for_confirm", "queued_to_bridge", "accepted", "sent", "failed"]
 ToolStatus = Literal["queued", "running", "completed", "failed", "blocked"]
 
 
@@ -110,6 +110,7 @@ class SendResult:
     status: SendStatus
     reason: str
     sent_at: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

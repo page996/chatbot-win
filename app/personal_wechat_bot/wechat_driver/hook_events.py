@@ -462,7 +462,7 @@ def _voice_payload(payload: dict[str, Any], *, attachments: tuple[HookAttachment
         key: value
         for key, value in {
             "status": status,
-            "source": source or "wechat_hook_event",
+            "source": source or "wechat_native_event",
             "text": voice_text,
             "duration": duration,
             "audio_path": audio_path,
@@ -505,7 +505,7 @@ def _quote_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "received_at": _first_text(quote, "received_at", "receivedAt", "create_time", "createTime"),
     }
     cleaned = {key: value for key, value in result.items() if value}
-    return {**cleaned, "source": "wechat_hook_event"} if cleaned else {}
+    return {**cleaned, "source": "wechat_native_event"} if cleaned else {}
 
 
 def _recall_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -543,7 +543,10 @@ def _source_payload(
     batch_count: int = 1,
     import_sequence: int = 0,
 ) -> dict[str, Any]:
-    source = str(event.raw.get("source") or "wechat_hook_jsonl")
+    source = str(event.raw.get("source") or "wechat_native_jsonl")
+    upstream_source_payload = event.raw.get("source_payload")
+    upstream_source_payload = dict(upstream_source_payload) if isinstance(upstream_source_payload, dict) else {}
+    upstream_source_payload.pop("hook", None)
     source_file = str(source_path) if source_path is not None else ""
     message_key = _first_text(event.raw, "message_key", "messageKey")
     create_time = _first_text(event.raw, "create_time", "createTime")
@@ -551,6 +554,7 @@ def _source_payload(
     media_export_path = _first_text(event.raw, "media_export_path", "mediaExportPath")
     context_only = bool(event.raw.get("context_only") or event.raw.get("contextOnly"))
     return {
+        **upstream_source_payload,
         "source": source,
         "adapter": source,
         "conversation_key": event.conversation_key,
@@ -631,7 +635,7 @@ def _payload_items(payload: Any) -> list[dict[str, Any]]:
 
 def _canonical_payload(payload: dict[str, Any]) -> dict[str, Any]:
     merged = dict(payload)
-    for key in ("data", "payload", "message", "msg", "wx_msg", "wxMsg", "wcf_message", "wcfMessage", "extra"):
+    for key in ("data", "payload", "message", "msg", "wx_msg", "wxMsg", "extra"):
         value = payload.get(key)
         if isinstance(value, dict):
             merged = {**value, **merged}

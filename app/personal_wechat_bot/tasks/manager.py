@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -16,6 +17,7 @@ from app.personal_wechat_bot.tasks.scheduler_store import SchedulerStore
 ACTIVE_STATUSES = {"queued", "running", "waiting", "paused", "blocked"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 VALID_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
+_BRIDGE_ID_RE = re.compile(r"(?:^|[^A-Za-z0-9_])(?P<id>bridge:[^\s,;，；。)）\]】]+)")
 
 
 def _now_iso() -> str:
@@ -232,7 +234,7 @@ class TaskStatusStore:
 
         def mutate(tasks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[str, str, dict[str, Any]]]]:
             filtered = [dict(item) for item in tasks if isinstance(item, dict) and not _is_ephemeral_ui_task(item)]
-            updated_tasks = _repair_stale_external_tasks(filtered)
+            updated_tasks = _repair_stale_external_tasks(filtered, data_dir=self.data_dir)
             claimed: list[dict[str, Any]] = []
             events: list[tuple[str, str, dict[str, Any]]] = []
             resource_active = _active_by_resource(updated_tasks)
@@ -318,9 +320,10 @@ class TaskStatusStore:
         tasks = self.scheduler_store.list_tasks()
         if tasks:
             filtered = [dict(item) for item in tasks if isinstance(item, dict) and not _is_ephemeral_ui_task(item)]
-            repaired = _repair_stale_external_tasks(filtered)
-            if repaired != filtered:
-                self._persist_tasks(repaired)
+            repaired = _repair_stale_external_tasks(filtered, data_dir=self.data_dir)
+            if filtered != tasks or repaired != filtered:
+                repaired = self.scheduler_store.update_tasks_atomically(self._repair_tasks_atomically)
+                self._write_projection_from_sqlite()
             return repaired
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -328,10 +331,17 @@ class TaskStatusStore:
             return []
         raw = payload.get("tasks", []) if isinstance(payload, dict) else []
         tasks = [dict(item) for item in raw if isinstance(item, dict) and not _is_ephemeral_ui_task(item)]
-        return _repair_stale_external_tasks(tasks)
+        return _repair_stale_external_tasks(tasks, data_dir=self.data_dir)
 
     def _write_tasks(self, tasks: list[dict[str, Any]]) -> None:
         self._persist_tasks(tasks)
+
+    def _repair_tasks_atomically(
+        self, tasks: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[str, str, dict[str, Any]]]]:
+        filtered = [dict(item) for item in tasks if isinstance(item, dict) and not _is_ephemeral_ui_task(item)]
+        repaired = _repair_stale_external_tasks(filtered, data_dir=self.data_dir)
+        return repaired, repaired, []
 
     def _persist_tasks(self, tasks: list[dict[str, Any]]) -> None:
         tasks = sorted(tasks, key=lambda item: str(item.get("updated_at", "")), reverse=True)[:500]
@@ -461,7 +471,7 @@ def _counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def _repair_stale_external_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _repair_stale_external_tasks(tasks: list[dict[str, Any]], *, data_dir: str | Path | None = None) -> list[dict[str, Any]]:
     terminal_by_external: dict[str, dict[str, Any]] = {}
     for task in tasks:
         external_id = str(task.get("external_id") or "")
@@ -471,7 +481,11 @@ def _repair_stale_external_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, 
         if current is None or str(task.get("updated_at") or "") >= str(current.get("updated_at") or ""):
             terminal_by_external[external_id] = task
     if not terminal_by_external:
-        return tasks
+        repaired = _repair_bridge_send_tasks(tasks, data_dir=data_dir)
+        repaired = _repair_reply_tasks_from_ledger(repaired, data_dir=data_dir)
+        repaired = _repair_obsolete_send_backend_blockers(repaired, data_dir=data_dir)
+        repaired = _repair_stale_worker_tasks(repaired)
+        return _repair_dry_run_send_task_phases(repaired)
     repaired: list[dict[str, Any]] = []
     for task in tasks:
         external_id = str(task.get("external_id") or "")
@@ -488,6 +502,480 @@ def _repair_stale_external_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, 
             patched["phase"] = str(terminal.get("phase") or "后台任务已结束")
             patched["finished_at"] = str(terminal.get("finished_at") or terminal.get("updated_at") or _now_iso())
             patched["updated_at"] = max(str(task.get("updated_at") or ""), str(terminal.get("updated_at") or ""))
+            patched["priority_score"] = task_priority_score(patched)
+            repaired.append(patched)
+        else:
+            repaired.append(task)
+    repaired = _repair_bridge_send_tasks(repaired, data_dir=data_dir)
+    repaired = _repair_reply_tasks_from_ledger(repaired, data_dir=data_dir)
+    repaired = _repair_obsolete_send_backend_blockers(repaired, data_dir=data_dir)
+    repaired = _repair_stale_worker_tasks(repaired)
+    return _repair_dry_run_send_task_phases(repaired)
+
+
+def _repair_bridge_send_tasks(tasks: list[dict[str, Any]], *, data_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    if data_dir is None:
+        return tasks
+    states = _bridge_ack_states(data_dir)
+    if not states:
+        return tasks
+    repaired: list[dict[str, Any]] = []
+    for task in tasks:
+        if str(task.get("kind") or "") != "send" or str(task.get("status") or "") not in ACTIVE_STATUSES:
+            repaired.append(task)
+            continue
+        bridge_ids = _task_bridge_ids(task)
+        if not bridge_ids:
+            repaired.append(task)
+            continue
+        primary_bridge_id = bridge_ids[0]
+        ack_states = {bridge_id: states.get(bridge_id) for bridge_id in bridge_ids}
+        pending_bridge_ids = [
+            bridge_id
+            for bridge_id, ack_state in ack_states.items()
+            if ack_state is None or not bool(getattr(ack_state, "terminal", False))
+        ]
+        if pending_bridge_ids:
+            patched = dict(task)
+            if not str(patched.get("external_id") or ""):
+                patched["external_id"] = primary_bridge_id
+                metadata = patched.get("metadata") if isinstance(patched.get("metadata"), dict) else {}
+                patched["metadata"] = {**metadata, "bridge_id": primary_bridge_id, "bridge_ids": bridge_ids}
+                patched["priority_score"] = task_priority_score(patched)
+            repaired.append(patched)
+            continue
+        aggregate_status = _aggregate_bridge_task_ack_status(
+            [str(getattr(ack_state, "status", "") or "") for ack_state in ack_states.values() if ack_state is not None]
+        )
+        reason = _bridge_task_ack_summary(bridge_ids, ack_states)
+        final_status = "completed" if aggregate_status in {"sent", "accepted"} else "failed"
+        finished_at = max(
+            [
+                str((getattr(ack_state, "ack", {}) if isinstance(getattr(ack_state, "ack", {}), dict) else {}).get("created_at") or "")
+                for ack_state in ack_states.values()
+                if ack_state is not None
+            ]
+            or [_now_iso()]
+        )
+        if not finished_at:
+            finished_at = _now_iso()
+        bridge_acks = _bridge_task_ack_metadata(bridge_ids, ack_states)
+        patched = dict(task)
+        patched["status"] = final_status
+        patched["progress"] = 100
+        patched["external_id"] = str(task.get("external_id") or primary_bridge_id)
+        patched["phase"] = _bridge_task_phase(final_status, reason, ack_status=aggregate_status)
+        patched["detail"] = reason
+        patched["last_error"] = "" if final_status == "completed" else reason
+        patched["finished_at"] = str(patched.get("finished_at") or finished_at)
+        patched["updated_at"] = max(str(task.get("updated_at") or ""), finished_at)
+        metadata = patched.get("metadata") if isinstance(patched.get("metadata"), dict) else {}
+        patched["metadata"] = {
+            **metadata,
+            "bridge_id": str(metadata.get("bridge_id") or primary_bridge_id),
+            "bridge_ids": bridge_ids,
+            "bridge_acks": bridge_acks,
+            "aggregate_bridge_status": aggregate_status,
+        }
+        patched["priority_score"] = task_priority_score(patched)
+        repaired.append(patched)
+    return repaired
+
+
+def _repair_reply_tasks_from_ledger(tasks: list[dict[str, Any]], *, data_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    if data_dir is None:
+        return tasks
+    assistant_replies = _assistant_reply_messages(data_dir)
+    if not assistant_replies:
+        return tasks
+    repaired: list[dict[str, Any]] = []
+    for task in tasks:
+        if str(task.get("kind") or "") != "reply" or str(task.get("status") or "") not in ACTIVE_STATUSES:
+            repaired.append(task)
+            continue
+        message_id = _task_message_id(task)
+        reply = assistant_replies.get(message_id)
+        if not reply:
+            repaired.append(task)
+            continue
+        send = reply.get("send") if isinstance(reply.get("send"), dict) else {}
+        finished_at = str(reply.get("updated_at") or reply.get("created_at") or _now_iso())
+        patched = dict(task)
+        patched["status"] = "completed"
+        patched["progress"] = 100
+        patched["phase"] = "reply candidate recorded"
+        patched["detail"] = str(send.get("reason") or _entry_text(reply))[:500]
+        patched["finished_at"] = finished_at
+        patched["updated_at"] = max(str(task.get("updated_at") or ""), finished_at)
+        patched["actual_cost"] = max(1, _int(task.get("actual_cost"), 0))
+        patched["priority_score"] = task_priority_score(patched)
+        repaired.append(patched)
+    return repaired
+
+
+def _repair_stale_worker_tasks(tasks: list[dict[str, Any]], *, now: float | None = None) -> list[dict[str, Any]]:
+    """Terminalize explicit worker records whose heartbeat/PID proves they died."""
+
+    current_time = time.time() if now is None else float(now)
+    repaired: list[dict[str, Any]] = []
+    for task in tasks:
+        if str(task.get("status") or "") != "running" or not _is_worker_task(task):
+            repaired.append(task)
+            continue
+        reason = _worker_stale_reason(task, now=current_time)
+        if not reason:
+            repaired.append(task)
+            continue
+        final_status = _worker_terminal_status(task, reason)
+        patched = dict(task)
+        finished_at = _now_iso()
+        patched["status"] = final_status
+        patched["progress"] = 100
+        patched["phase"] = _worker_terminal_phase(task, final_status)
+        patched["detail"] = reason
+        patched["last_error"] = "" if final_status == "completed" else reason
+        patched["finished_at"] = str(patched.get("finished_at") or finished_at)
+        patched["updated_at"] = max(str(task.get("updated_at") or ""), str(patched["finished_at"]))
+        patched["actual_cost"] = max(1, _int(task.get("actual_cost"), 0))
+        metadata = patched.get("metadata") if isinstance(patched.get("metadata"), dict) else {}
+        patched["metadata"] = {**metadata, "worker_reconciled": True, "worker_terminal_reason": reason}
+        patched["priority_score"] = task_priority_score(patched)
+        repaired.append(patched)
+    return repaired
+
+
+def _is_worker_task(task: dict[str, Any]) -> bool:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if metadata.get("worker") is True:
+        return True
+    scope = str(task.get("concurrency_key") or task.get("scope") or "")
+    external_id = str(task.get("external_id") or "")
+    return scope in {"agent:worker", "weflow:pull:worker", "send_bridge:worker"} or external_id in {
+        "agent-worker",
+        "worker",
+        "send-bridge-worker",
+    }
+
+
+def _worker_stale_reason(task: dict[str, Any], *, now: float) -> str:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    pid = _int(metadata.get("worker_pid", metadata.get("pid")), 0)
+    if pid > 0:
+        try:
+            from app.personal_wechat_bot.runtime.process_lock import process_pid_alive
+
+            if not process_pid_alive(pid):
+                return f"worker_pid_not_alive:{pid}"
+        except Exception:
+            return ""
+    heartbeat = _float_first(
+        metadata.get("worker_heartbeat_at"),
+        metadata.get("heartbeat_at"),
+        metadata.get("last_heartbeat_at"),
+        metadata.get("last_tick_at"),
+    )
+    if heartbeat <= 0:
+        return ""
+    stale_after = max(1.0, _float_first(metadata.get("worker_stale_after_seconds"), metadata.get("stale_after_seconds"), 120.0))
+    if now - heartbeat > stale_after:
+        return f"worker_heartbeat_stale:age={now - heartbeat:.1f}s:limit={stale_after:.1f}s"
+    return ""
+
+
+def _worker_terminal_status(task: dict[str, Any], reason: str) -> str:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    last_status = str(metadata.get("last_status") or task.get("phase") or task.get("detail") or "").lower()
+    if "crash" in last_status or "error" in last_status or "failed" in last_status or "heartbeat_stale" in reason:
+        return "failed"
+    return "completed"
+
+
+def _worker_terminal_phase(task: dict[str, Any], final_status: str) -> str:
+    kind = str(task.get("kind") or "").lower()
+    if "weflow" in kind:
+        return "WeFlow worker stopped" if final_status == "completed" else "WeFlow worker stale"
+    if "bridge" in kind:
+        return "send bridge worker stopped" if final_status == "completed" else "send bridge worker stale"
+    if "agent" in kind:
+        return "agent worker stopped" if final_status == "completed" else "agent worker stale"
+    return "worker stopped" if final_status == "completed" else "worker stale"
+
+
+def _repair_obsolete_send_backend_blockers(
+    tasks: list[dict[str, Any]],
+    *,
+    data_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    if data_dir is None:
+        return tasks
+    try:
+        from app.personal_wechat_bot.config.loader import load_config
+
+        config = load_config(data_dir)
+        backend = str(getattr(config, "send_backend", "") or "").strip().lower()
+        mode = str(getattr(config, "mode", "") or "").strip().lower()
+        confirm_required = bool(getattr(config, "send_confirm_required", True))
+    except Exception:
+        return tasks
+    if backend == "weflow_http":
+        return tasks
+    worker_config_matched = _bridge_worker_config_is_matched(data_dir)
+    approved_queue_message_ids = _approved_queue_message_ids(data_dir)
+    markers = (
+        "weflow_backend_unavailable",
+        "weflow_text_send_not_supported",
+        "native-not-implemented",
+    )
+    repaired: list[dict[str, Any]] = []
+    for task in tasks:
+        status = str(task.get("status") or "")
+        message_id = _task_message_id(task)
+        queue_still_approved = bool(message_id and message_id in approved_queue_message_ids)
+        evidence = " ".join(str(task.get(key) or "") for key in ("detail", "last_error", "phase"))
+        can_repair_terminal_queue_mismatch = (
+            queue_still_approved
+            and status in TERMINAL_STATUSES
+            and (
+                "obsolete_send_backend_blocker" in evidence
+                or "obsolete_bridge_worker_stale_config" in evidence
+                or "bridge_worker_stale_config" in evidence
+            )
+        )
+        if (
+            str(task.get("kind") or "") != "send"
+            or (status not in ACTIVE_STATUSES and not can_repair_terminal_queue_mismatch)
+        ):
+            repaired.append(task)
+            continue
+        reason = ""
+        if (
+            mode == "auto"
+            and not confirm_required
+            and status == "queued"
+            and not str(task.get("external_id") or "").strip()
+            and message_id.startswith("sidebar_channel_test_")
+        ):
+            reason = "obsolete_sidebar_confirm_test_task:auto_mode_active"
+        elif any(marker in evidence for marker in markers):
+            reason = f"obsolete_send_backend_blocker:current_backend={backend or 'unknown'}"
+        elif "bridge_worker_stale_config" in evidence and worker_config_matched:
+            reason = f"obsolete_bridge_worker_stale_config:current_backend={backend or 'unknown'}"
+        if not reason:
+            repaired.append(task)
+            continue
+        patched = dict(task)
+        now = _now_iso()
+        if queue_still_approved and not reason.startswith("obsolete_sidebar_confirm_test_task"):
+            patched["status"] = "queued"
+            patched["progress"] = max(55, _int(patched.get("progress"), 0))
+            patched["phase"] = "发送阻断已解除，等待重新投递"
+            patched["detail"] = reason
+            patched["blocker"] = ""
+            patched["last_error"] = ""
+            patched["finished_at"] = ""
+            patched["updated_at"] = max(str(task.get("updated_at") or ""), now)
+        else:
+            patched["status"] = "cancelled" if reason.startswith("obsolete_sidebar_confirm_test_task") else "failed"
+            patched["progress"] = 100
+            patched["phase"] = "旧发送后端阻断已失效"
+            patched["detail"] = reason
+            patched["last_error"] = reason
+            patched["finished_at"] = str(patched.get("finished_at") or now)
+            patched["updated_at"] = max(str(task.get("updated_at") or ""), str(patched["finished_at"]))
+        if not str(patched.get("updated_at") or ""):
+            patched["updated_at"] = now
+        patched["priority_score"] = task_priority_score(patched)
+        repaired.append(patched)
+    return repaired
+
+
+def _approved_queue_message_ids(data_dir: str | Path) -> set[str]:
+    try:
+        from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+
+        items = ConfirmQueue(Path(data_dir) / "confirm_queue.jsonl").list_by_status("approved")
+    except Exception:
+        return set()
+    ids: set[str] = set()
+    for item in items:
+        reply = item.get("reply") if isinstance(item, dict) and isinstance(item.get("reply"), dict) else {}
+        message_id = str(reply.get("message_id") or "").strip()
+        if message_id:
+            ids.add(message_id)
+    return ids
+
+
+def _bridge_worker_config_is_matched(data_dir: str | Path) -> bool:
+    try:
+        from app.personal_wechat_bot.config.loader import load_config
+        from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
+
+        driver = build_send_driver(load_config(data_dir))
+        probe = getattr(driver, "probe", None)
+        if not callable(probe):
+            return False
+        result = probe()
+        backend = getattr(result, "backend", {}) if result is not None else {}
+        if not isinstance(backend, dict):
+            return False
+        worker = backend.get("worker_config") if isinstance(backend.get("worker_config"), dict) else {}
+        return bool(worker.get("config_match") is True and worker.get("config_status") == "matched")
+    except Exception:
+        return False
+
+
+def _bridge_ack_states(data_dir: str | Path) -> dict[str, Any]:
+    ack_path = Path(data_dir) / "send_bridge" / "acks.jsonl"
+    if not ack_path.exists():
+        return {}
+    try:
+        from app.personal_wechat_bot.wechat_driver.bridge_send import effective_bridge_ack_states
+
+        records = []
+        for line in ack_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                records.append(payload)
+        return effective_bridge_ack_states(records)
+    except Exception:
+        return {}
+
+
+def _assistant_reply_messages(data_dir: str | Path) -> dict[str, dict[str, Any]]:
+    root = Path(data_dir) / "conversation_ledgers"
+    if not root.exists():
+        return {}
+    replies: dict[str, dict[str, Any]] = {}
+    for messages_path in root.glob("*/messages.jsonl"):
+        try:
+            lines = messages_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict) or str(item.get("role") or "") != "assistant":
+                continue
+            message_id = str(item.get("message_id") or "").strip()
+            if message_id:
+                replies[message_id] = item
+    return replies
+
+
+def _task_bridge_id(task: dict[str, Any]) -> str:
+    ids = _task_bridge_ids(task)
+    return ids[0] if ids else ""
+
+
+def _task_bridge_ids(task: dict[str, Any]) -> list[str]:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    ids: list[str] = []
+    raw_bridge_ids = metadata.get("bridge_ids") if isinstance(metadata.get("bridge_ids"), list) else []
+    ids.extend(str(item).strip() for item in raw_bridge_ids if str(item).strip())
+    for value in (
+        task.get("external_id"),
+        metadata.get("bridge_id"),
+        metadata.get("send_reason"),
+        task.get("detail"),
+        task.get("last_error"),
+    ):
+        text = str(value or "").strip()
+        if text.startswith("bridge:"):
+            ids.append(text.strip("，,.;；"))
+        ids.extend(match.group("id").strip("，,.;；") for match in _BRIDGE_ID_RE.finditer(text))
+    return _dedupe_nonempty(ids)
+
+
+def _dedupe_nonempty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _aggregate_bridge_task_ack_status(statuses: list[str]) -> str:
+    normalized = [str(item or "").strip() for item in statuses if str(item or "").strip()]
+    if any(item in {"failed", "blocked"} for item in normalized):
+        return "failed"
+    if any(item == "accepted" for item in normalized):
+        return "accepted"
+    if normalized and all(item == "sent" for item in normalized):
+        return "sent"
+    return normalized[-1] if normalized else "failed"
+
+
+def _bridge_task_ack_summary(bridge_ids: list[str], ack_states: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for bridge_id in bridge_ids:
+        ack_state = ack_states.get(bridge_id)
+        status = str(getattr(ack_state, "status", "") or "queued")
+        ack = getattr(ack_state, "ack", {}) if ack_state is not None else {}
+        ack = ack if isinstance(ack, dict) else {}
+        reason = str(ack.get("reason") or f"bridge_ack:{status}")
+        parts.append(f"{bridge_id}:{status}:{reason}")
+    return "bridge_ack_parts:" + ";".join(parts) if len(parts) > 1 else (parts[0] if parts else "bridge_ack_parts:empty")
+
+
+def _bridge_task_ack_metadata(bridge_ids: list[str], ack_states: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for bridge_id in bridge_ids:
+        ack_state = ack_states.get(bridge_id)
+        ack = getattr(ack_state, "ack", {}) if ack_state is not None else {}
+        ack = ack if isinstance(ack, dict) else {}
+        payload[bridge_id] = {
+            "bridge_id": bridge_id,
+            "status": str(getattr(ack_state, "status", "") or ""),
+            "reason": str(ack.get("reason") or ""),
+            "created_at": str(ack.get("created_at") or ""),
+        }
+    return payload
+
+
+def _task_message_id(task: dict[str, Any]) -> str:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    return str(task.get("external_id") or metadata.get("message_id") or "").strip()
+
+
+def _bridge_task_phase(final_status: str, reason: str, *, ack_status: str = "") -> str:
+    if final_status == "completed":
+        if "dry_run_not_delivered" in str(reason or ""):
+            return "send bridge dry-run completed"
+        if ack_status == "accepted" or "accepted" in str(reason or ""):
+            return "send bridge accepted, unverified"
+        return "send bridge delivered"
+    return "send bridge failed"
+
+
+def _entry_text(entry: dict[str, Any]) -> str:
+    blocks = entry.get("text_blocks") if isinstance(entry.get("text_blocks"), list) else []
+    return "\n".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict) and block.get("text"))
+
+
+def _repair_dry_run_send_task_phases(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    repaired: list[dict[str, Any]] = []
+    for task in tasks:
+        if (
+            str(task.get("kind") or "") == "send"
+            and str(task.get("status") or "") == "completed"
+            and "dry_run_not_delivered" in str(task.get("detail") or "")
+            and str(task.get("phase") or "") in {"发送完成", "非前台桥发送完成"}
+        ):
+            patched = dict(task)
+            patched["phase"] = "非前台桥演练完成，未投递微信"
             patched["priority_score"] = task_priority_score(patched)
             repaired.append(patched)
         else:
@@ -770,7 +1258,7 @@ def _channel_lanes(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ordered = sorted(items, key=task_priority_score, reverse=True)
         active = [item for item in ordered if item.get("status") in ACTIVE_STATUSES]
         terminal = [item for item in ordered if item.get("status") in TERMINAL_STATUSES]
-        current = active[0] if active else (ordered[0] if ordered else {})
+        current = active[0] if active else {}
         topics = _topic_history(items)
         lanes.append(
             {
@@ -779,7 +1267,7 @@ def _channel_lanes(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "topic_id": str(current.get("topic_id") or ""),
                     "title": str(current.get("topic_title") or current.get("title") or ""),
                     "priority": _int(current.get("priority"), 0),
-                    "status": str(current.get("status") or ""),
+                    "status": str(current.get("status") or "idle"),
                 },
                 "topic_history": topics[:12],
                 "counts": _counts(items),
@@ -831,7 +1319,7 @@ def _is_ephemeral_ui_task(task: dict[str, Any]) -> bool:
     scope = str(task.get("concurrency_key") or task.get("scope") or "")
     if metadata.get("ephemeral") is True:
         return True
-    if metadata.get("local_ui") is True and _is_non_lane_scope(scope):
+    if metadata.get("local_ui") is True:
         return True
     return False
 
@@ -872,6 +1360,15 @@ def _int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _float_first(*values: Any) -> float:
+    for value in values:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 
 def _percent(value: Any, default: int) -> int:

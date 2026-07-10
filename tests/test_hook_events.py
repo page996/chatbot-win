@@ -16,7 +16,6 @@ from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import Back
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter, hook_event_from_payload
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
-    normalize_wcf_callback,
     normalize_weflow_message,
     normalize_weflow_push_event,
 )
@@ -52,7 +51,7 @@ class HookEventsTest(unittest.TestCase):
         self.assertEqual(event.raw_id, "hook:message:wxid_page:1001:123456789")
         self.assertEqual(event.sort_key, "123456789")
 
-    def test_hook_payload_accepts_wcf_style_group_message(self) -> None:
+    def test_hook_payload_accepts_generic_group_message(self) -> None:
         event = hook_event_from_payload(
             {
                 "id": "1002",
@@ -96,7 +95,7 @@ class HookEventsTest(unittest.TestCase):
         self.assertEqual(event.attachments[0].path, "report.pdf")
         self.assertEqual(event.attachments[0].kind, "file")
 
-    def test_hook_source_bridge_normalizes_weflow_push_and_wcf_callback(self) -> None:
+    def test_hook_source_bridge_normalizes_weflow_push_and_raw_message(self) -> None:
         weflow = normalize_weflow_push_event(
             {
                 "event": "message.new",
@@ -109,23 +108,23 @@ class HookEventsTest(unittest.TestCase):
                 "timestamp": 1719900000,
             }
         )
-        wcf = normalize_wcf_callback(
+        raw = normalize_weflow_message(
             {
-                "id": "wcf-1",
-                "type": 1,
-                "sender": "wxid_member",
-                "roomid": "12345@chatroom",
-                "content": "from wcf",
-                "is_group": True,
-            }
+                "platformMessageId": "wf-raw-1",
+                "senderUsername": "wxid_member",
+                "accountName": "Member",
+                "content": "from raw",
+            },
+            session_id="12345@chatroom",
+            session_meta={"name": "Study Room", "type": "group"},
         )
 
         self.assertEqual(hook_event_from_payload(weflow).text, "from weflow")
         self.assertEqual(weflow["talker"], "12345@chatroom")
         self.assertEqual(weflow["sender_name"], "Member")
-        self.assertEqual(wcf["talker"], "12345@chatroom")
-        self.assertEqual(wcf["sender_id"], "wxid_member")
-        self.assertEqual(hook_event_from_payload(wcf).text, "from wcf")
+        self.assertEqual(raw["talker"], "12345@chatroom")
+        self.assertEqual(raw["sender_id"], "wxid_member")
+        self.assertEqual(hook_event_from_payload(raw).text, "from raw")
 
     def test_weflow_raw_event_preserves_ordering_voice_and_context_only(self) -> None:
         normalized = normalize_weflow_message(
@@ -354,7 +353,7 @@ class HookEventsTest(unittest.TestCase):
         entries = runtime.ledger_store.read_entries(message["conversation_id"])
 
         self.assertEqual(result["processed_count"], 1)
-        self.assertEqual(message["metadata"]["backend_event_source"], "wechat_hook_jsonl")
+        self.assertEqual(message["metadata"]["backend_event_source"], "wechat_native_jsonl")
         self.assertEqual(message["metadata"]["conversation_key"], "wxid_page")
         self.assertTrue(entries[0].text_blocks[1]["text"].startswith("hook file body"))
         self.assertIn("[file_index]", entries[0].text_blocks[1]["text"])

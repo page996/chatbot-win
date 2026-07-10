@@ -93,8 +93,8 @@ class ChannelStateStoreTest(unittest.TestCase):
         self.assertEqual(payload["file_states"][0]["file_id"], "file-1")
         self.assertEqual(payload["file_states"][0]["summary"], "这是一份项目报告。")
         self.assertEqual(payload["file_states"][0]["key_points"], ["预算变化", "时间线风险"])
-        self.assertEqual(payload["resource_audit"]["estimated_cost"], 6)
-        self.assertEqual(payload["resource_audit"]["actual_cost"], 3)
+        self.assertEqual(payload["resource_audit"]["estimated_cost"], 5)
+        self.assertEqual(payload["resource_audit"]["actual_cost"], 2)
         self.assertEqual(payload["resource_audit"]["resources"]["llm_interactive"]["active"], 1)
 
     def test_sqlite_replace_list_get_and_upsert(self) -> None:
@@ -177,6 +177,50 @@ class ChannelStateStoreTest(unittest.TestCase):
 
         self.assertEqual(active_snooze["effective_status"], "snoozed")
         self.assertEqual(expired_snooze["effective_status"], "queued")
+
+    def test_terminal_task_is_not_projected_as_current_topic(self) -> None:
+        record = build_channel_state_projection(
+            channel={"conversation_id": "conv-a", "chat_title": "A", "status": "active"},
+            tasks=[
+                {
+                    "task_id": "send-old",
+                    "title": "Send old reply",
+                    "status": "cancelled",
+                    "priority": 90,
+                    "topic_id": "reply-old",
+                    "topic_title": "Old reply",
+                    "updated_at": "2026-07-08T01:00:00Z",
+                }
+            ],
+            ledger_entries=[],
+        ).to_dict()
+
+        self.assertEqual(record["current_topic"]["status"], "idle")
+        self.assertEqual(record["current_topic"]["topic_id"], "")
+        self.assertEqual(record["effective_status"], "idle")
+        self.assertEqual(record["task_history"][0]["task_id"], "send-old")
+
+    def test_terminal_reply_status_does_not_make_idle_channel_failed(self) -> None:
+        record = build_channel_state_projection(
+            channel={"conversation_id": "conv-a", "chat_title": "A", "status": "active"},
+            tasks=[],
+            ledger_entries=[
+                {
+                    "entry_id": "entry-agent",
+                    "message_id": "reply-1",
+                    "role": "assistant",
+                    "received_at": "2026-07-08T01:03:00Z",
+                    "send": {"status": "failed", "reason": "manual_sidebar_failed:old_failure"},
+                }
+            ],
+        ).to_dict()
+
+        self.assertEqual(record["reply_state"]["status"], "failed")
+        self.assertEqual(record["reply_state"]["last_send_reason"], "manual_sidebar_failed:old_failure")
+        self.assertTrue(record["reply_state"]["historical"])
+        self.assertFalse(record["reply_state"]["problem"])
+        self.assertEqual(record["current_topic"]["status"], "idle")
+        self.assertEqual(record["effective_status"], "idle")
 
 
 if __name__ == "__main__":

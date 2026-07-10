@@ -16,6 +16,46 @@ class ProcessLockError(RuntimeError):
         self.holder = holder or {}
 
 
+def process_pid_alive(pid: int) -> bool:
+    """Return whether a recorded lock owner PID is still alive."""
+
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+        except ImportError:
+            return True
+        kernel32 = ctypes.windll.kernel32
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return int(exit_code.value) == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 class ProcessLock:
     """A long-held, heartbeat-based single-instance lock backed by one file.
 
@@ -37,10 +77,12 @@ class ProcessLock:
         *,
         label: str = "",
         stale_after_seconds: float = 60.0,
+        metadata: dict[str, Any] | None = None,
     ):
         self.path = Path(path)
         self.label = label
         self.stale_after_seconds = max(1.0, float(stale_after_seconds))
+        self.metadata = dict(metadata or {})
         self._fd: int | None = None
         self._acquired = False
 
@@ -93,6 +135,14 @@ class ProcessLock:
             return
         self._write_payload()
 
+    def update_metadata(self, metadata: dict[str, Any] | None) -> None:
+        """Merge metadata into future heartbeat payloads."""
+
+        if isinstance(metadata, dict):
+            self.metadata.update(metadata)
+        if self._acquired:
+            self._write_payload()
+
     def release(self) -> None:
         if self._fd is not None:
             try:
@@ -131,6 +181,7 @@ class ProcessLock:
             "acquired_at": getattr(self, "_acquired_at", None) or time.time(),
             "heartbeat_at": time.time(),
         }
+        payload.update(self.metadata)
         self._acquired_at = payload["acquired_at"]
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
@@ -157,10 +208,12 @@ class ProcessLock:
         if not isinstance(heartbeat, (int, float)):
             # Unparseable/legacy lock file: treat as stale so we can recover.
             return True
+        pid = holder.get("pid")
+        if isinstance(pid, int) and pid > 0 and not process_pid_alive(pid):
+            return True
         if time.time() - float(heartbeat) <= self.stale_after_seconds:
             return False
         # Heartbeat is old. If the recorded PID is our own, it is definitely safe.
-        pid = holder.get("pid")
         if isinstance(pid, int) and pid == os.getpid():
             return True
         return True
