@@ -10,6 +10,7 @@ from unittest import mock
 from app.personal_wechat_bot.config.loader import create_default_config, save_config
 from app.personal_wechat_bot.control.sidebar_api import build_sidebar_task_manager, sidebar_task_action
 from app.personal_wechat_bot.conversation.channel_state_store import ChannelStateStore
+from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.domain.models import ReplyCandidate
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
@@ -655,21 +656,15 @@ class TaskStatusStoreTest(unittest.TestCase):
                     "external_id": "msg-1",
                 }
             )
-            ledger = data_dir / "conversation_ledgers" / "conv-a" / "messages.jsonl"
-            ledger.parent.mkdir(parents=True, exist_ok=True)
-            ledger.write_text(
-                json.dumps(
-                    {
-                        "message_id": "msg-1",
-                        "role": "assistant",
-                        "updated_at": "2026-07-08T01:00:00Z",
-                        "text_blocks": [{"kind": "reply", "text": "hello"}],
-                        "send": {"status": "failed", "reason": "backend_missing"},
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n",
-                encoding="utf-8",
+            ConversationLedgerStore(data_dir).append_reply(
+                ReplyCandidate(
+                    message_id="msg-1",
+                    conversation_id="conv-a",
+                    text="hello",
+                    send_mode="confirm",
+                    model="test",
+                ),
+                chat_title="Alice",
             )
 
             task = TaskStatusStore(data_dir).state()["tasks"][0]
@@ -677,6 +672,42 @@ class TaskStatusStoreTest(unittest.TestCase):
             self.assertEqual(task["status"], "completed")
             self.assertEqual(task["progress"], 100)
             self.assertEqual(task["actual_cost"], 1)
+
+    def test_reply_task_repair_reads_sqlite_when_ledger_projection_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_reply(
+                ReplyCandidate(
+                    message_id="msg-db-only",
+                    conversation_id="conv-db-only",
+                    text="database-backed reply",
+                    send_mode="confirm",
+                    model="test",
+                ),
+                chat_title="DB Only",
+            )
+            projection_dir = ledger.conversation_markdown_path("conv-db-only").parent
+            (projection_dir / "messages.jsonl").unlink()
+            (projection_dir / "conversation.md").unlink()
+            store = TaskStatusStore(data_dir)
+            store.create(
+                {
+                    "task_id": "reply-msg-db-only",
+                    "title": "Reply",
+                    "kind": "reply",
+                    "status": "running",
+                    "conversation_id": "conv-db-only",
+                    "scope": "conversation:conv-db-only",
+                    "external_id": "msg-db-only",
+                }
+            )
+
+            task = TaskStatusStore(data_dir).state()["tasks"][0]
+
+            self.assertEqual(task["status"], "completed")
+            self.assertTrue((projection_dir / "messages.jsonl").exists())
+            self.assertTrue((projection_dir / "conversation.md").exists())
 
     def test_global_backend_tasks_do_not_create_channel_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

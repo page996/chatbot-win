@@ -1222,13 +1222,9 @@ def _sync_bridge_ack_to_ledgers(
     reason: str,
     external_message_id: str = "",
 ) -> list[str]:
-    root = Path(data_dir) / "conversation_ledgers"
-    if not root.exists():
-        return []
     changed: list[str] = []
     store = _ledger(data_dir)
-    for messages_path in root.glob("*/messages.jsonl"):
-        conversation_id = _conversation_id_from_messages(messages_path) or messages_path.parent.name
+    for conversation_id in store.list_conversation_ids():
         try:
             updated = store.update_bridge_send_result(
                 conversation_id,
@@ -1253,13 +1249,9 @@ def _requeue_bridge_send_result_in_ledgers(
     *,
     reason: str,
 ) -> list[str]:
-    root = Path(data_dir) / "conversation_ledgers"
-    if not root.exists():
-        return []
     changed: list[str] = []
     store = _ledger(data_dir)
-    for messages_path in root.glob("*/messages.jsonl"):
-        conversation_id = _conversation_id_from_messages(messages_path) or messages_path.parent.name
+    for conversation_id in store.list_conversation_ids():
         try:
             updated = store.requeue_bridge_send_result(
                 conversation_id,
@@ -1331,21 +1323,6 @@ def _requeue_send_tasks_for_bridge(
             continue
         updated.append(patched)
     return updated
-
-
-def _conversation_id_from_messages(messages_path: Path) -> str:
-    try:
-        with messages_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                payload = json.loads(line)
-                if isinstance(payload, dict):
-                    return str(payload.get("conversation_id", "") or "").strip()
-                return ""
-    except (OSError, json.JSONDecodeError):
-        return ""
-    return ""
 
 
 def _send_config_payload(config: Any) -> dict[str, Any]:

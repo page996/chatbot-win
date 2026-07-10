@@ -52,7 +52,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
 )
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
-from app.personal_wechat_bot.conversation.session_store import ConversationSessionStore
+from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID, ConversationSessionStore
 from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage, SendResult
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.domain.models import ReplyCandidate
@@ -384,7 +384,45 @@ class SidebarApiTest(unittest.TestCase):
             lock_before = lock_path.read_text(encoding="utf-8")
             synced_before = synced_path.read_text(encoding="utf-8")
             reverify_before = reverify_path.read_text(encoding="utf-8")
-            (data_dir / "conversation_ledgers").mkdir()
+            history_conversation_id = "history-private"
+            history_message = NormalizedMessage(
+                message_id="history-before-clear",
+                conversation_id=history_conversation_id,
+                conversation_type="private",
+                chat_title="History Friend",
+                sender_name="History Friend",
+                sender_wechat_id="wxid_history_friend",
+                text="history that must not return",
+                is_self=False,
+                received_at="2026-07-10T00:00:00+08:00",
+                metadata={
+                    "source": "backend_events_jsonl",
+                    "trusted_channel_source": True,
+                    "conversation_key": "wxid_history_friend",
+                    "is_friend": True,
+                },
+            )
+            history_config = load_config(data_dir)
+            history_channels = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(history_config.providers.get("chat", history_config.llm), data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            history_channels.ensure_channel(history_message)
+            ConversationLedgerStore(data_dir).append_message(history_message)
+            history_sessions = ConversationSessionStore(data_dir)
+            history_sessions.current_session_id_for_message(history_message)
+            history_sessions.reset_session(history_conversation_id, reason="history_clear_test")
+            authority_names = (
+                "conversation_channels.sqlite",
+                "conversation_ledger.sqlite",
+                "conversation_sessions.sqlite",
+            )
+            for name in authority_names:
+                self.assertTrue((data_dir / name).exists())
+                (data_dir / f"{name}-wal").write_bytes(b"stale-wal")
+                (data_dir / f"{name}-shm").write_bytes(b"stale-shm")
             (data_dir / "conversation_ledgers" / "old.md").write_text("history", encoding="utf-8")
             (data_dir / "backend_events.jsonl").write_text("{}\n", encoding="utf-8")
             (data_dir / "hook_events.jsonl").write_text("{}\n", encoding="utf-8")
@@ -407,11 +445,19 @@ class SidebarApiTest(unittest.TestCase):
             resource_audit_path.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
 
             result = clear_sidebar_history_data(data_dir)
-            state = build_sidebar_state(data_dir)
 
             self.assertEqual(result["status"], "ok")
             self.assertFalse((data_dir / "conversation_ledgers").exists())
             self.assertFalse((data_dir / "conversation_channels").exists())
+            removed_paths = {item["relative_path"] for item in result["removed"]}
+            expected_authority_paths = {
+                name
+                for authority in authority_names
+                for name in (authority, f"{authority}-wal", f"{authority}-shm")
+            }
+            self.assertTrue(expected_authority_paths.issubset(removed_paths))
+            for name in authority_names:
+                self.assertFalse((data_dir / name).exists())
             self.assertFalse((data_dir / "backend_events.jsonl").exists())
             self.assertFalse((data_dir / "hook_events.jsonl.raw_ids.json").exists())
             self.assertFalse((data_dir / "hook_events_state.json.consumer.lock").exists())
@@ -437,6 +483,25 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn(str(Path("send_bridge") / "synced_acks.json"), result["preserved_runtime"])
             self.assertIn(str(Path("send_bridge") / "accepted_reverify.json"), result["preserved_runtime"])
             self.assertIn(str(Path("send_bridge") / ".bridge_worker.lock"), result["preserved_runtime"])
+
+            reopened_config = load_config(data_dir)
+            reopened_channels = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(reopened_config.providers.get("chat", reopened_config.llm), data_dir),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            self.assertIsNone(reopened_channels.get_channel(history_conversation_id))
+            self.assertEqual(ConversationLedgerStore(data_dir).read_entries(history_conversation_id), [])
+            reopened_sessions = ConversationSessionStore(data_dir)
+            reopened_session_state = reopened_sessions.state_for_conversation(history_conversation_id)
+            self.assertEqual(reopened_session_state["current_session_id"], DEFAULT_SESSION_ID)
+            self.assertEqual(reopened_session_state["reset_count"], 0)
+            self.assertEqual(reopened_sessions.database.list_events(history_conversation_id), [])
+            for name in authority_names:
+                self.assertTrue((data_dir / name).exists())
+
+            state = build_sidebar_state(data_dir)
             self.assertEqual(state["config"]["mode"], "confirm")
             self.assertIn("survive history clear", "\n".join(RuntimeCardStore(data_dir).prompt_lines()))
 
@@ -2774,6 +2839,39 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(set(aggregation["pending_senders"]), {"Alice", "Bob"})
             self.assertTrue(any(item["resource_class"] == "llm_interactive" for item in dispatch))
             self.assertTrue(any(item["title"] for item in conversation["topic_candidates"]))
+
+    def test_agent_snapshot_discovers_sqlite_ledger_without_readable_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            conversation_id = "db-only-agent-conversation"
+            ledger = ConversationLedgerStore(data_dir)
+            ledger.append_message(
+                NormalizedMessage(
+                    message_id="db-only-user-1",
+                    conversation_id=conversation_id,
+                    conversation_type="private",
+                    chat_title="DB Only",
+                    sender_name="DB Only",
+                    sender_wechat_id="wxid_db_only",
+                    text="pending from sqlite",
+                    is_self=False,
+                    received_at="2026-07-10T00:00:00+08:00",
+                    metadata={"source": "test"},
+                )
+            )
+            projection_dir = ledger.conversation_markdown_path(conversation_id).parent
+            (projection_dir / "messages.jsonl").unlink()
+            (projection_dir / "conversation.md").unlink()
+            runtime = build_runtime(load_config(data_dir))
+
+            snapshot = sidebar_api._agent_session_snapshot(data_dir, runtime=runtime)
+
+            self.assertEqual(snapshot["conversation_count"], 1)
+            self.assertEqual(snapshot["conversations"][0]["conversation_id"], conversation_id)
+            self.assertEqual(snapshot["conversations"][0]["pending_user_count_since_last_assistant"], 1)
+            self.assertTrue((projection_dir / "messages.jsonl").exists())
+            self.assertTrue((projection_dir / "conversation.md").exists())
 
     def test_sidebar_agent_snapshot_excludes_group_owner_messages_from_pending_and_participants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

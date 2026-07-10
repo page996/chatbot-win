@@ -27,6 +27,45 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertIn("000001", markdown)
             self.assertIn("hello https://example.com/a", markdown)
 
+    def test_sqlite_ledger_remains_authoritative_without_readable_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationLedgerStore(root)
+            first = store.append_message(_message("m1", "first"))
+            second = store.append_message(_message("m2", "second"))
+            projection_dir = store.conversation_markdown_path("conv1").parent
+            (projection_dir / "messages.jsonl").unlink()
+            (projection_dir / "conversation.md").unlink()
+
+            reopened = ConversationLedgerStore(root)
+            entries = reopened.read_entries("conv1")
+
+            self.assertTrue((root / "conversation_ledger.sqlite").exists())
+            self.assertEqual([entry.entry_id for entry in entries], [first.entry_id, second.entry_id])
+            self.assertEqual([entry.sequence for entry in entries], [1, 2])
+            self.assertTrue((projection_dir / "messages.jsonl").exists())
+            self.assertTrue((projection_dir / "conversation.md").exists())
+            self.assertIn("first", (projection_dir / "conversation.md").read_text(encoding="utf-8"))
+
+    def test_legacy_jsonl_is_imported_into_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationLedgerStore(root)
+            expected = store.append_message(_message("m1", "legacy"))
+            database = root / "conversation_ledger.sqlite"
+            database.unlink()
+            for suffix in ("-shm", "-wal"):
+                companion = Path(str(database) + suffix)
+                if companion.exists():
+                    companion.unlink()
+
+            reopened = ConversationLedgerStore(root)
+            entries = reopened.read_entries("conv1")
+
+            self.assertEqual([entry.entry_id for entry in entries], [expected.entry_id])
+            self.assertEqual(entries[0].text_blocks[0]["text"], "legacy")
+            self.assertTrue(database.exists())
+
     def test_append_message_persists_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))

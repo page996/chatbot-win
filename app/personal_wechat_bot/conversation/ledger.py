@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.personal_wechat_bot.conversation.segment import chat_title_from_index, resolve_segment
+from app.personal_wechat_bot.conversation.ledger_database import ConversationLedgerDatabase
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, utc_now_iso
 from app.personal_wechat_bot.workspace.file_visibility import redact_file_internal_urls
@@ -62,6 +63,7 @@ class ConversationLedgerStore:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
         self.root = self.data_dir / "conversation_ledgers"
+        self.database = ConversationLedgerDatabase(self.data_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         # Cache conversation_id -> stable directory segment. Chat titles can
         # change; the directory carrying history must stay put.
@@ -523,9 +525,29 @@ class ConversationLedgerStore:
 
     def read_entries(self, conversation_id: str, *, include_removed: bool = False) -> list[LedgerEntry]:
         entries = self._read_entries(conversation_id)
+        self._restore_readable_projections(conversation_id, entries)
         if not include_removed:
             entries = [item for item in entries if item.get("status") == "active"]
         return [_entry_from_payload(item) for item in entries]
+
+    def list_conversation_ids(self) -> list[str]:
+        ids = set(self.database.list_conversation_ids())
+        # Compatibility only: a pre-SQLite projection may be imported lazily on
+        # first read. New runtime data is always discovered from the database.
+        for messages_path in self.root.glob("*/messages.jsonl"):
+            try:
+                with messages_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        payload = json.loads(line)
+                        conversation_id = str(payload.get("conversation_id") or "") if isinstance(payload, dict) else ""
+                        if conversation_id:
+                            ids.add(conversation_id)
+                        break
+            except (OSError, json.JSONDecodeError):
+                continue
+        return sorted(ids)
 
     def refresh_file_refs(self, conversation_id: str) -> bool:
         with self._conversation_lock(conversation_id):
@@ -586,6 +608,10 @@ class ConversationLedgerStore:
         cached_segment = self._segment_cache.get(conversation_id, "")
         if cached_segment:
             return self.root / cached_segment
+        database_segment = self.database.segment_for(conversation_id)
+        if database_segment:
+            self._segment_cache[conversation_id] = database_segment
+            return self.root / database_segment
         return self.root / resolve_segment(self.data_dir, conversation_id)
 
     def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
@@ -596,9 +622,11 @@ class ConversationLedgerStore:
             existing_dir = self._find_conversation_dir(conversation_id)
             if existing_dir.exists():
                 self._segment_cache[conversation_id] = existing_dir.name
+                self.database.set_segment(conversation_id, existing_dir.name)
                 return existing_dir.name
         segment = resolve_segment(self.data_dir, conversation_id, chat_title)
         self._segment_cache[conversation_id] = segment
+        self.database.set_segment(conversation_id, segment)
         return segment
 
     def _find_conversation_dir(self, conversation_id: str) -> Path:
@@ -629,6 +657,7 @@ class ConversationLedgerStore:
                             payload = json.loads(raw_line)
                             if isinstance(payload, dict) and payload.get("conversation_id") == conversation_id:
                                 self._segment_cache[conversation_id] = messages_jsonl.parent.name
+                                self.database.set_segment(conversation_id, messages_jsonl.parent.name)
                                 return messages_jsonl.parent
                             break  # only need the first entry for the id check
                 except (OSError, json.JSONDecodeError):
@@ -672,6 +701,9 @@ class ConversationLedgerStore:
                 pass
 
     def _read_entries(self, conversation_id: str) -> list[dict[str, Any]]:
+        database_entries = self.database.list_entries(conversation_id)
+        if database_entries:
+            return database_entries
         path = self._find_conversation_dir(conversation_id) / "messages.jsonl"
         if not path.exists():
             return []
@@ -686,21 +718,44 @@ class ConversationLedgerStore:
                     continue
                 if isinstance(payload, dict):
                     entries.append(payload)
+        if entries:
+            self.database.set_segment(conversation_id, path.parent.name)
+            self.database.replace_entries(conversation_id, entries)
         return entries
 
     def _append_entry(self, conversation_dir: Path, entry: LedgerEntry) -> None:
         conversation_dir.mkdir(parents=True, exist_ok=True)
-        with (conversation_dir / "messages.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+        payload = asdict(entry)
+        self.database.set_segment(entry.conversation_id, conversation_dir.name)
+        self.database.upsert_entry(payload)
+        self._write_entries_projection(
+            conversation_dir / "messages.jsonl",
+            self.database.list_entries(entry.conversation_id),
+        )
 
     def _rewrite_entries(self, conversation_id: str, entries: list[dict[str, Any]]) -> None:
         path = self._messages_path(conversation_id)
+        self.database.set_segment(conversation_id, path.parent.name)
+        self.database.replace_entries(conversation_id, entries)
+        self._write_entries_projection(path, entries)
+
+    def _write_entries_projection(self, path: Path, entries: list[dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             for item in entries:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         tmp.replace(path)
+
+    def _restore_readable_projections(self, conversation_id: str, entries: list[dict[str, Any]]) -> None:
+        if not entries:
+            return
+        messages_path = self._messages_path(conversation_id)
+        markdown_path = self.conversation_markdown_path(conversation_id)
+        if not messages_path.exists():
+            self._write_entries_projection(messages_path, entries)
+        if not markdown_path.exists():
+            self._render_conversation(conversation_id)
 
     def _next_sequence(self, entries: list[dict[str, Any]]) -> int:
         if not entries:

@@ -132,6 +132,15 @@ _HISTORY_RESET_FILES = (
     "channel_state.sqlite",
     "channel_state.sqlite-shm",
     "channel_state.sqlite-wal",
+    "conversation_channels.sqlite",
+    "conversation_channels.sqlite-shm",
+    "conversation_channels.sqlite-wal",
+    "conversation_ledger.sqlite",
+    "conversation_ledger.sqlite-shm",
+    "conversation_ledger.sqlite-wal",
+    "conversation_sessions.sqlite",
+    "conversation_sessions.sqlite-shm",
+    "conversation_sessions.sqlite-wal",
     "file_index.sqlite",
     "hook_events.jsonl",
     "hook_events.jsonl.raw_ids.json",
@@ -7276,23 +7285,10 @@ def _agent_conversation_ids(root: Path, *, runtime: Any, requested: list[str] | 
 
 
 def _agent_conversation_ids_from_ledgers(root: Path) -> list[str]:
-    ids: list[str] = []
-    ledger_root = root / "conversation_ledgers"
-    if not ledger_root.exists():
-        return ids
-    for messages_jsonl in ledger_root.glob("*/messages.jsonl"):
-        try:
-            with messages_jsonl.open("r", encoding="utf-8") as handle:
-                for raw_line in handle:
-                    if not raw_line.strip():
-                        continue
-                    payload = json.loads(raw_line)
-                    if isinstance(payload, dict) and payload.get("conversation_id"):
-                        ids.append(str(payload.get("conversation_id")))
-                    break
-        except (OSError, json.JSONDecodeError):
-            continue
-    return ids
+    try:
+        return ConversationLedgerStore(root).list_conversation_ids()
+    except Exception:
+        return []
 
 
 def _agent_conversation_snapshot(runtime: Any, conversation_id: str, *, limit: int) -> dict[str, Any]:
@@ -8581,10 +8577,15 @@ def _channel_state(data_dir: str | Path) -> dict[str, Any]:
     config = ensure_config(data_dir)
     root = Path(data_dir)
     channel_root = root / "conversation_channels"
-    channel_items = _channel_store(root).list_channels() if channel_root.exists() else []
+    channel_database = root / "conversation_channels.sqlite"
+    channel_items = _channel_store(root).list_channels() if channel_root.exists() or channel_database.exists() else []
     task_state = build_sidebar_task_manager(root)
     task_groups = _tasks_by_conversation(task_state.get("tasks", []))
-    ledger_store = ConversationLedgerStore(root) if channel_items and (root / "conversation_ledgers").exists() else None
+    ledger_store = (
+        ConversationLedgerStore(root)
+        if channel_items and ((root / "conversation_ledgers").exists() or (root / "conversation_ledger.sqlite").exists())
+        else None
+    )
     state_path = root / "channel_state.sqlite"
     state_store = ChannelStateStore(root) if channel_items or state_path.exists() else None
     if not channel_items:

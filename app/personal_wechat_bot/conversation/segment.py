@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 
 
@@ -48,6 +49,9 @@ def chat_title_from_index(data_dir: str | Path, conversation_id: str) -> str:
     Falls back to scanning channel.json files when the index is missing or
     stale. Returns "" when no matching channel exists.
     """
+    registered = _registry_payload(data_dir, conversation_id)
+    if registered:
+        return str(registered.get("chat_title", "") or "")
     root = Path(data_dir) / "conversation_channels"
     index_path = root / "index.json"
     if not index_path.exists():
@@ -72,6 +76,14 @@ def segment_from_index(data_dir: str | Path, conversation_id: str) -> str:
     ``chat_title``; in that case we reconstruct the historical segment from the
     title, then fall back to scanning channel directories.
     """
+    registered = _registry_payload(data_dir, conversation_id)
+    if registered:
+        segment = str(registered.get("segment", "") or "").strip()
+        if segment:
+            return segment
+        title = str(registered.get("chat_title", "") or "")
+        if title:
+            return conversation_segment(conversation_id, title)
     root = Path(data_dir) / "conversation_channels"
     index_path = root / "index.json"
     if index_path.exists():
@@ -118,6 +130,30 @@ def _scan_segment(root: Path, conversation_id: str) -> str:
             segment = str(payload.get("segment", "") or "").strip()
             return segment or channel_json.parent.name
     return ""
+
+
+def _registry_payload(data_dir: str | Path, conversation_id: str) -> dict[str, object]:
+    path = Path(data_dir) / "conversation_channels.sqlite"
+    if not path.exists():
+        return {}
+    try:
+        db = sqlite3.connect(path, timeout=1)
+        try:
+            row = db.execute(
+                "SELECT payload_json FROM conversation_channels WHERE conversation_id = ?",
+                (str(conversation_id or ""),),
+            ).fetchone()
+        finally:
+            db.close()
+    except (sqlite3.DatabaseError, OSError):
+        return {}
+    if row is None:
+        return {}
+    try:
+        payload = json.loads(str(row[0] or "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def resolve_segment(data_dir: str | Path, conversation_id: str, chat_title: str = "") -> str:

@@ -4,8 +4,10 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest import mock
 
 from app.personal_wechat_bot.config.loader import add_contact, add_group, create_default_config, load_config
+from app.personal_wechat_bot.domain.models import ToolCallResult
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 
 
@@ -96,12 +98,27 @@ class MinimumClosedLoopTest(unittest.TestCase):
         self.assertEqual(status["status"], "completed")
 
     def test_external_search_returns_url_summary_and_source_reference(self) -> None:
-        result = self.replay("tool_external_search.json")
+        output = self.data_dir / "tool_outputs" / "web_search" / "minimum-closed-loop.md"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("https://arxiv.org/abs/1234.5678\nResearch evidence.", encoding="utf-8")
+        tool_result = ToolCallResult(
+            call_id="minimum-search",
+            tool_name="web.search",
+            status="completed",
+            summary="web.search usable result: https://arxiv.org/abs/1234.5678",
+            output_refs=[str(output)],
+            payload={"result_count": 1, "filtered": [{"title": "Unrelated shopping"}]},
+        )
+        with mock.patch(
+            "app.personal_wechat_bot.agent.tool_orchestrator.ToolTaskOrchestrator.execute",
+            return_value=tool_result,
+        ):
+            result = self.replay("tool_external_search.json")
         tool = result["processed"][0]["reply"]["tool_result"]
         self.assertEqual(tool["status"], "completed")
-        self.assertIn("https://example.org/research/source", tool["summary"])
+        self.assertIn("https://arxiv.org/abs/1234.5678", tool["summary"])
         self.assertNotIn("Unrelated shopping", tool["summary"])
-        self.assertTrue(tool["output_refs"][0].endswith("_source.txt"))
+        self.assertTrue(tool["output_refs"][0].endswith(".md"))
 
 
 if __name__ == "__main__":

@@ -847,23 +847,22 @@ def _bridge_ack_states(data_dir: str | Path) -> dict[str, Any]:
 
 
 def _assistant_reply_messages(data_dir: str | Path) -> dict[str, dict[str, Any]]:
-    root = Path(data_dir) / "conversation_ledgers"
-    if not root.exists():
+    try:
+        from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
+
+        store = ConversationLedgerStore(data_dir)
+        conversation_ids = store.list_conversation_ids()
+    except Exception:
         return {}
     replies: dict[str, dict[str, Any]] = {}
-    for messages_path in root.glob("*/messages.jsonl"):
+    for conversation_id in conversation_ids:
         try:
-            lines = messages_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
+            entries = store.read_entries(conversation_id, include_removed=True)
+        except Exception:
             continue
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(item, dict) or str(item.get("role") or "") != "assistant":
+        for entry in entries:
+            item = asdict(entry)
+            if str(item.get("role") or "") != "assistant":
                 continue
             message_id = str(item.get("message_id") or "").strip()
             if message_id:

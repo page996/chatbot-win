@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 import uuid
 import zipfile
@@ -55,6 +56,8 @@ class StagedFile:
     derived_dir: str
     outputs_dir: str
     source: str = "backend_event_attachment"
+    blob_path: str = ""
+    storage_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,55 +112,73 @@ class FileWorkspace:
             child.mkdir(parents=True, exist_ok=True)
 
         manifest_path = workspace_dir / "manifest.json"
-        with _path_lock(workspace_dir / ".stage.lock"):
-            staged_path = original_dir / _safe_filename(display_name, source_file.suffix)
-            if not staged_path.exists() or _sha256_file(staged_path) != digest:
-                shutil.copy2(source_file, staged_path)
+        # Cleanup must never observe a blob before its manifest/index reference
+        # is durable. The digest calculation remains outside this short global
+        # critical section so staging different large files is still responsive.
+        with _path_lock(self.root / ".cleanup.lock", timeout_seconds=120.0):
+            with _path_lock(workspace_dir / ".stage.lock"):
+                staged_path = original_dir / _safe_filename(display_name, source_file.suffix)
+                blob_path = _ensure_content_blob(self.root, source_file, digest)
+                storage_mode = "existing"
+                if not staged_path.exists() or _sha256_file(staged_path) != digest:
+                    storage_mode = _materialize_content_blob(blob_path, staged_path)
+                elif _same_file(blob_path, staged_path):
+                    storage_mode = "hardlink"
+                    _set_read_only(staged_path)
+                else:
+                    storage_mode = "copy"
+                    _set_read_only(staged_path)
 
-            previous = _read_json(manifest_path, {})
-            source_record = {
-                "original_path": str(source_file),
-                "original_name": display_name,
-                "staged_path": str(staged_path),
-                "kind": kind,
-                "source": source,
-                "observed_at": utc_now_iso(),
-            }
-            sources = _merge_sources(previous.get("sources", []), source_record)
-            manifest = {
-                "file_id": file_id,
-                "conversation_id": conversation_id,
-                "session_id": session_id,
-                "original_name": display_name,
-                "kind": kind,
-                "source": source,
-                "sha256": digest,
-                "suffix": source_file.suffix.lower(),
-                "original_path": str(source_file),
-                "staged_path": str(staged_path),
-                "workspace_dir": str(workspace_dir),
-                "derived_dir": str(derived_dir),
-                "outputs_dir": str(outputs_dir),
-                "sources": sources,
-                "created_at": previous.get("created_at") or utc_now_iso(),
-                "updated_at": utc_now_iso(),
-            }
-            _write_json(manifest_path, manifest)
-            staged = StagedFile(
-                file_id=file_id,
-                conversation_id=conversation_id,
-                session_id=session_id,
-                original_name=display_name,
-                kind=kind,
-                sha256=digest,
-                workspace_dir=str(workspace_dir),
-                staged_path=str(staged_path),
-                manifest_path=str(manifest_path),
-                derived_dir=str(derived_dir),
-                outputs_dir=str(outputs_dir),
-                source=source,
-            )
-        self._update_session_index(staged, manifest)
+                previous = _read_json(manifest_path, {})
+                source_record = {
+                    "original_path": str(source_file),
+                    "original_name": display_name,
+                    "staged_path": str(staged_path),
+                    "blob_path": str(blob_path),
+                    "storage_mode": storage_mode,
+                    "kind": kind,
+                    "source": source,
+                    "observed_at": utc_now_iso(),
+                }
+                sources = _merge_sources(previous.get("sources", []), source_record)
+                manifest = {
+                    "file_id": file_id,
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "original_name": display_name,
+                    "kind": kind,
+                    "source": source,
+                    "sha256": digest,
+                    "suffix": source_file.suffix.lower(),
+                    "original_path": str(source_file),
+                    "staged_path": str(staged_path),
+                    "blob_path": str(blob_path),
+                    "storage_mode": storage_mode,
+                    "workspace_dir": str(workspace_dir),
+                    "derived_dir": str(derived_dir),
+                    "outputs_dir": str(outputs_dir),
+                    "sources": sources,
+                    "created_at": previous.get("created_at") or utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                }
+                _write_json(manifest_path, manifest)
+                staged = StagedFile(
+                    file_id=file_id,
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    original_name=display_name,
+                    kind=kind,
+                    sha256=digest,
+                    workspace_dir=str(workspace_dir),
+                    staged_path=str(staged_path),
+                    manifest_path=str(manifest_path),
+                    derived_dir=str(derived_dir),
+                    outputs_dir=str(outputs_dir),
+                    source=source,
+                    blob_path=str(blob_path),
+                    storage_mode=storage_mode,
+                )
+            self._update_session_index(staged, manifest)
         return staged
 
     def read_parse_result(self, staged: StagedFile) -> AttachmentParseResult | None:
@@ -411,10 +432,13 @@ class FileWorkspace:
         self._refresh_ledger_file_refs(staged)
 
     def _refresh_ledger_file_refs(self, staged: StagedFile) -> None:
+        data_dir = self._task_data_dir()
+        if data_dir is None:
+            return
         try:
             from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 
-            ConversationLedgerStore(self.root.parent).refresh_file_refs(staged.conversation_id)
+            ConversationLedgerStore(data_dir).refresh_file_refs(staged.conversation_id)
         except Exception:
             return
 
@@ -532,6 +556,8 @@ class FileWorkspace:
         staged_path = _ensure_within(Path(str(manifest["staged_path"])).resolve(), workspace_dir)
         derived_dir = _ensure_within(Path(str(manifest["derived_dir"])).resolve(), workspace_dir)
         outputs_dir = _ensure_within(Path(str(manifest["outputs_dir"])).resolve(), workspace_dir)
+        blob_value = str(manifest.get("blob_path", "")).strip()
+        blob_path = _ensure_within(Path(blob_value).resolve(), self.root / "_blobs") if blob_value else None
         return StagedFile(
             file_id=str(manifest["file_id"]),
             conversation_id=str(manifest["conversation_id"]),
@@ -545,6 +571,8 @@ class FileWorkspace:
             derived_dir=str(derived_dir),
             outputs_dir=str(outputs_dir),
             source=str(manifest.get("source", "backend_event_attachment")),
+            blob_path=str(blob_path) if blob_path is not None else "",
+            storage_mode=str(manifest.get("storage_mode", "")),
         )
 
     def parse_or_get_cached(
@@ -556,6 +584,7 @@ class FileWorkspace:
         embedded_media_asr: AsrEngine | None = None,
     ) -> AttachmentParseResult:
         with _path_lock(Path(staged.derived_dir) / ".parse.lock", timeout_seconds=120.0):
+            self._ensure_staged_content(staged)
             cached = self.read_parse_result(staged)
             if cached is not None:
                 if _needs_parse_refresh(staged, cached, embedded_media_ocr=embedded_media_ocr):
@@ -595,6 +624,20 @@ class FileWorkspace:
             )
             return result
 
+    def _ensure_staged_content(self, staged: StagedFile) -> None:
+        workspace_dir = _ensure_within(Path(staged.workspace_dir).resolve(), self.root)
+        staged_path = _ensure_within(Path(staged.staged_path).resolve(), workspace_dir)
+        if staged_path.is_file() and _sha256_file(staged_path) == staged.sha256:
+            _set_read_only(staged_path)
+            return
+        blob_value = str(staged.blob_path or "").strip()
+        if not blob_value:
+            raise PermissionError("staged file checksum mismatch and no content blob is registered")
+        blob_path = _ensure_within(Path(blob_value).resolve(), self.root / "_blobs")
+        if not blob_path.is_file() or _sha256_file(blob_path) != staged.sha256:
+            raise PermissionError("staged file and content blob checksum mismatch")
+        _materialize_content_blob(blob_path, staged_path)
+
     def _conversation_segment(self, conversation_id: str) -> str:
         # Fast path: in-session stable segment. On a miss (cold cache after
         # restart, or outgoing attachments without a chat title), recover from
@@ -633,35 +676,44 @@ class FileWorkspace:
         recent context is never dropped. Session ``index.json`` files are updated
         to drop pruned entries. Best-effort and idempotent.
         """
-        entries = self._all_file_dirs()
-        # Oldest first (by mtime); newest kept for keep_min / recency.
-        entries.sort(key=lambda item: item["mtime"])
-        now = time.time()
-        total_bytes = sum(item["bytes"] for item in entries)
-        removable_max = max(0, len(entries) - max(0, keep_min))
         removed: list[str] = []
-        freed = 0
+        removed_blobs = 0
         with _path_lock(self.root / ".cleanup.lock", timeout_seconds=120.0):
+            entries = self._all_file_dirs()
+            # Oldest first (by mtime); newest kept for keep_min / recency.
+            entries.sort(key=lambda item: item["mtime"])
+            now = time.time()
+            initial_total_bytes = _physical_tree_size(self.root)
+            current_total_bytes = initial_total_bytes
+            removable_max = max(0, len(entries) - max(0, keep_min))
             for item in entries[:removable_max]:
                 too_old = max_age_seconds is not None and (now - item["mtime"]) > max_age_seconds
-                over_size = max_total_bytes is not None and (total_bytes - freed) > max_total_bytes
+                over_size = max_total_bytes is not None and current_total_bytes > max_total_bytes
                 if not (too_old or over_size):
                     continue
                 if _has_active_lock(Path(item["path"])):
                     continue
                 try:
-                    shutil.rmtree(item["path"])
+                    _remove_tree(Path(item["path"]))
                 except OSError:
                     continue
                 removed.append(item["path"])
-                freed += item["bytes"]
                 self._drop_index_entry(item["conversation_id"], item["session_id"], item["file_id"])
+                if max_total_bytes is not None:
+                    blob_cleanup = self._prune_unreferenced_blobs()
+                    removed_blobs += int(blob_cleanup.get("removed", 0) or 0)
+                    current_total_bytes = _physical_tree_size(self.root)
+            blob_cleanup = self._prune_unreferenced_blobs()
+            removed_blobs += int(blob_cleanup.get("removed", 0) or 0)
+            remaining_bytes = _physical_tree_size(self.root)
         return {
             "status": "ok",
             "scanned": len(entries),
             "removed": len(removed),
-            "freed_bytes": freed,
-            "remaining_bytes": max(0, total_bytes - freed),
+            "freed_bytes": max(0, initial_total_bytes - remaining_bytes),
+            "remaining_bytes": remaining_bytes,
+            "removed_blobs": removed_blobs,
+            "size_basis": "unique_file_identity_bytes",
         }
 
     def _all_file_dirs(self) -> list[dict[str, Any]]:
@@ -693,6 +745,37 @@ class FileWorkspace:
                         }
                     )
         return results
+
+    def _prune_unreferenced_blobs(self) -> dict[str, int]:
+        blob_root = self.root / "_blobs"
+        if not blob_root.exists():
+            return {"removed": 0, "freed_bytes": 0}
+        referenced = {
+            str(item.get("sha256") or "")
+            for entry in self._all_file_dirs()
+            if isinstance((item := _read_json(Path(entry["path"]) / "manifest.json", {})), dict)
+        }
+        removed = 0
+        freed = 0
+        for blob in blob_root.glob("*/*"):
+            if not blob.is_file() or blob.name.endswith(".lock"):
+                continue
+            if blob.name in referenced:
+                _set_read_only(blob)
+                continue
+            try:
+                size = blob.stat().st_size
+                _unlink_file(blob)
+            except OSError:
+                continue
+            removed += 1
+            freed += size
+        for directory in sorted(blob_root.glob("*"), reverse=True):
+            try:
+                directory.rmdir()
+            except OSError:
+                continue
+        return {"removed": removed, "freed_bytes": freed}
 
     def _drop_index_entry(self, conversation_id: str, session_id: str, file_id: str) -> None:
         index_path = self.root / conversation_id / session_id / "index.json"
@@ -2594,6 +2677,116 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _ensure_content_blob(root: Path, source: Path, digest: str) -> Path:
+    blob = root / "_blobs" / digest[:2] / digest
+    with _path_lock(blob.with_name(f"{blob.name}.lock")):
+        if blob.exists() and _sha256_file(blob) == digest:
+            _set_read_only(blob)
+            return blob
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        tmp = blob.with_name(f"{blob.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            shutil.copy2(source, tmp)
+            if _sha256_file(tmp) != digest:
+                raise OSError("content blob checksum mismatch")
+            if blob.exists():
+                _unlink_file(blob)
+            tmp.replace(blob)
+            _set_read_only(blob)
+        finally:
+            if tmp.exists():
+                _unlink_file(tmp)
+    return blob
+
+
+def _materialize_content_blob(blob: Path, target: Path) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        _unlink_file(target)
+    try:
+        os.link(blob, target)
+        if _set_read_only(target):
+            return "hardlink"
+        _unlink_file(target)
+        _set_read_only(blob)
+    except OSError:
+        pass
+    shutil.copy2(blob, target)
+    _set_read_only(target)
+    return "copy"
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
+def _set_read_only(path: Path) -> bool:
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+        return not bool(path.stat().st_mode & stat.S_IWUSR)
+    except OSError:
+        return False
+
+
+def _set_writable(path: Path) -> None:
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IWUSR)
+    except OSError:
+        return
+
+
+def _unlink_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except PermissionError:
+        _set_writable(path)
+        path.unlink()
+
+
+def _remove_tree(path: Path) -> None:
+    # Read-only staged originals may be hardlinks to immutable blobs. Clear the
+    # directory entry attributes before removal; blob attributes are restored by
+    # _prune_unreferenced_blobs for every retained digest.
+    try:
+        children = list(path.rglob("*"))
+    except OSError:
+        children = []
+    for child in children:
+        if not child.is_symlink():
+            _set_writable(child)
+    _set_writable(path)
+    shutil.rmtree(path)
+
+
+def _physical_tree_size(path: Path) -> int:
+    """Count each hardlinked file identity once, excluding transient locks."""
+    total = 0
+    seen: set[tuple[Any, ...]] = set()
+    try:
+        children = path.rglob("*")
+        for child in children:
+            if child.name.endswith(".lock") or not child.is_file():
+                continue
+            try:
+                info = child.stat()
+            except OSError:
+                continue
+            inode = int(getattr(info, "st_ino", 0) or 0)
+            device = int(getattr(info, "st_dev", 0) or 0)
+            identity: tuple[Any, ...] = ("inode", device, inode) if inode else ("path", str(child.resolve()))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += info.st_size
+    except OSError:
+        return total
+    return total
 
 
 def _dir_size(path: Path) -> int:

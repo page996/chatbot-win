@@ -11,6 +11,7 @@ from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.control.send_commands import send_approved_confirm_item, set_send_controls
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.domain.models import ReplyCandidate
@@ -156,7 +157,11 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(state["sent_count"], 0)
             self.assertEqual(state["accepted_count"], 1)
             self.assertEqual(state["pending_count"], 0)
-            self.assertTrue(item["retryable"])
+            self.assertFalse(item["retryable"])
+            self.assertEqual(
+                item["retry_blocker"],
+                "accepted item may already be delivered; wait for verification and do not re-send",
+            )
 
     def test_worker_late_reverifies_accepted_file_without_redelivery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,6 +325,113 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(state["pending_count"], 1)
             self.assertEqual(state["items"][0]["status"], "queued")
 
+    def test_real_worker_rechecks_send_enabled_before_each_wire_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(
+                data_dir,
+                enabled=True,
+                driver="bridge_outbox",
+                backend="wechat_native_http",
+            )
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("filehelper", "only one wire attempt", receiver="filehelper")
+
+            class _DisableAfterFirstFailureBackend:
+                name = "wechat_native_http"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def health_check(self) -> bool:
+                    return True
+
+                def send_text(self, receiver: str, text: str) -> SendOutcome:
+                    self.calls += 1
+                    set_send_controls(data_dir, enabled=False)
+                    return SendOutcome.failure("wechat_native_http_unavailable")
+
+                def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                    raise AssertionError("unexpected file send")
+
+                def close(self) -> None:
+                    return None
+
+            backend = _DisableAfterFirstFailureBackend()
+            with mock.patch("app.personal_wechat_bot.runtime.send_bridge_worker.time.sleep"):
+                BridgeWorker(data_dir, backend, max_send_attempts=3).run_once()
+
+            self.assertEqual(backend.calls, 1)
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], BridgeAckStatus.RETRY)
+            self.assertEqual(item["ack"]["reason"], "send_enabled_false")
+            self.assertEqual(item["ack"]["payload"]["attempt"], 2)
+
+    def test_real_worker_rechecks_channel_authorization_before_each_wire_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(
+                data_dir,
+                enabled=True,
+                driver="bridge_outbox",
+                backend="wechat_native_http",
+            )
+            conversation_id = "authorized-private-dynamic"
+            channel = {
+                "conversation_id": conversation_id,
+                "conversation_type": "private",
+                "chat_title": "Alice",
+                "conversation_key": "wxid_real_alice",
+                "sender_wechat_ids": ["wxid_real_alice"],
+                "source_names": ["weflow_discovery"],
+                "trusted_channel_source": True,
+                "is_friend": True,
+                "contact_authorization": "explicit_friend",
+            }
+            _write_channel(data_dir, conversation_id, channel)
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue(conversation_id, "only one authorized attempt", receiver="wxid_real_alice")
+
+            class _RevokeAfterFirstFailureBackend:
+                name = "wechat_native_http"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def health_check(self) -> bool:
+                    return True
+
+                def send_text(self, receiver: str, text: str) -> SendOutcome:
+                    self.calls += 1
+                    ChannelRegistryStore(data_dir).upsert(
+                        {
+                            **channel,
+                            "is_friend": False,
+                            "contact_authorization": "unknown_or_unidentified",
+                        }
+                    )
+                    return SendOutcome.failure("wechat_native_http_unavailable")
+
+                def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                    raise AssertionError("unexpected file send")
+
+                def close(self) -> None:
+                    return None
+
+            backend = _RevokeAfterFirstFailureBackend()
+            with mock.patch("app.personal_wechat_bot.runtime.send_bridge_worker.time.sleep"):
+                BridgeWorker(data_dir, backend, max_send_attempts=3).run_once()
+
+            self.assertEqual(backend.calls, 1)
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], BridgeAckStatus.BLOCKED)
+            self.assertEqual(
+                item["ack"]["reason"],
+                "receiver_not_authorized:private_contact_unknown_or_unidentified",
+            )
+
     def test_real_worker_blocks_unidentified_legacy_private_channel_receiver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -369,6 +481,58 @@ class SendBridgeWorkerTest(unittest.TestCase):
             item = store.state(limit=10)["items"][0]
             self.assertEqual(item["status"], BridgeAckStatus.BLOCKED)
             self.assertEqual(item["ack"]["reason"], "receiver_not_authorized:private_contact_unknown_or_unidentified")
+
+    def test_real_worker_blocks_receiver_that_does_not_match_authorized_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(data_dir, enabled=True, backend="wechat_native_http")
+            conversation_id = "authorized-private"
+            _write_channel(
+                data_dir,
+                conversation_id,
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "Alice",
+                    "conversation_key": "wxid_real_alice",
+                    "sender_wechat_ids": ["wxid_real_alice"],
+                    "source_names": ["weflow_discovery"],
+                    "trusted_channel_source": True,
+                    "is_friend": True,
+                    "contact_authorization": "explicit_friend",
+                },
+            )
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue(conversation_id, "should not touch real backend", receiver="wxid_other_contact")
+
+            class _RealBackend:
+                name = "wechat_native_http"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def health_check(self) -> bool:
+                    return True
+
+                def send_text(self, receiver: str, text: str) -> SendOutcome:
+                    self.calls += 1
+                    return SendOutcome.success("should_not_send")
+
+                def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                    self.calls += 1
+                    return SendOutcome.success("should_not_send")
+
+                def close(self) -> None:
+                    return None
+
+            backend = _RealBackend()
+            BridgeWorker(data_dir, backend).run_once()
+
+            self.assertEqual(backend.calls, 0)
+            item = store.state(limit=10)["items"][0]
+            self.assertEqual(item["status"], BridgeAckStatus.BLOCKED)
+            self.assertEqual(item["ack"]["reason"], "receiver_not_authorized:receiver_channel_mismatch")
 
     def test_worker_is_restart_safe_and_does_not_resend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

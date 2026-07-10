@@ -1289,7 +1289,7 @@ async function inspectStorageStatus(helpers = {}) {
     const summary = storageStatusSummary(payload);
     if (box) {
       box.hidden = false;
-      box.textContent = JSON.stringify(compactPayload(payload, 9000), null, 2);
+      box.textContent = JSON.stringify(storageStatusDisplayPayload(payload), null, 2);
     }
     helpers.update?.(100, summary);
     setStatusMessage(summary);
@@ -1305,6 +1305,22 @@ async function inspectStorageStatus(helpers = {}) {
   }
 }
 
+function storageStatusDisplayPayload(payload) {
+  return {
+    schema: payload?.schema || "",
+    status: payload?.status || "unknown",
+    created_at: payload?.created_at || "",
+    data_dir: payload?.data_dir || "",
+    safe_default: payload?.safe_default || "",
+    summary: payload?.summary || {},
+    database_contract_summary: payload?.database_contract_summary || {},
+    database_contracts: Array.isArray(payload?.database_contracts) ? payload.database_contracts : [],
+    migration_boundaries: Array.isArray(payload?.migration_boundaries) ? payload.migration_boundaries : [],
+    recommended_sequence: Array.isArray(payload?.recommended_sequence) ? payload.recommended_sequence : [],
+    components: compactPayload(Array.isArray(payload?.items) ? payload.items : [], 5000),
+  };
+}
+
 function storageStatusSummary(payload) {
   const summary = payload?.summary || {};
   const db = Number(summary.database_backed_count || 0);
@@ -1313,7 +1329,7 @@ function storageStatusSummary(payload) {
   const reset = Number(summary.reset_component_count || 0);
   const truncated = Number(summary.truncated_component_count || 0);
   const suffix = truncated ? ` / ${truncated} 项尺寸已截断` : "";
-  return `存储边界：DB ${db} 项 / 文件真源 ${fileTruth} 项 / 清历史保留 ${preserved} 项 / 重置 ${reset} 项${suffix}`;
+  return `存储边界：DB ${db} 项 / 文件权威 ${fileTruth} 项 / 清历史保留 ${preserved} 项 / 重置 ${reset} 项${suffix}`;
 }
 
 function renderProbeJson() {
@@ -4783,7 +4799,7 @@ bindTaskButton("#clearAuditButton", {
   scope: "audit:clear",
 }, (helpers) => clearSendAudit(helpers));
 bindTaskButton("#storageStatusButton", {
-  label: "审查存储迁移边界",
+  label: "审查存储与数据库合同",
   category: "历史数据",
   scope: "history:storage-status",
 }, (helpers) => inspectStorageStatus(helpers));

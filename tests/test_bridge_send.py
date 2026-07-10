@@ -344,7 +344,7 @@ class BridgeSendTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.requeue_resolved(rec["bridge_id"], reason="should_not_retry")
 
-    def test_unverified_native_sent_ack_is_projected_as_accepted_and_retryable(self) -> None:
+    def test_unverified_native_sent_ack_is_projected_as_accepted_and_not_retryable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             store = BridgeOutboxStore(data_dir)
@@ -366,7 +366,10 @@ class BridgeSendTest(unittest.TestCase):
             self.assertEqual(state["accepted_count"], 1)
             self.assertEqual(state["items"][0]["status"], BridgeAckStatus.ACCEPTED)
             self.assertEqual(state["items"][0]["ack"]["original_status"], BridgeAckStatus.SENT)
-            self.assertTrue(state["items"][0]["retryable"])
+            self.assertFalse(state["items"][0]["retryable"])
+            self.assertIn("may already be delivered", state["items"][0]["retry_blocker"])
+            with self.assertRaises(ValueError):
+                store.requeue_resolved(rec["bridge_id"], reason="unsafe_duplicate_retry")
 
     def test_bridge_state_separates_legacy_hook_unverified_from_active_native_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -479,6 +482,27 @@ class BridgeSendTest(unittest.TestCase):
                 )
 
                 result = driver.send_message("wxid_unidentified", "do not send")
+                state = bridge_state(data_dir, limit=10)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.reason, "receiver_not_authorized:missing_channel")
+            self.assertEqual(state["count"], 0)
+
+    def test_real_bridge_send_blocks_raw_group_receiver_without_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            with mock.patch(
+                "app.personal_wechat_bot.wechat_driver.bridge_send.wechat_native_http_status",
+                return_value={"available": True, "reason": "", "health": {"IsLogin": 1}},
+            ):
+                driver = BridgeOutboxSendDriver(
+                    send_enabled=True,
+                    data_dir=data_dir,
+                    send_backend="wechat_native_http",
+                )
+
+                result = driver.send_message("12345678@chatroom", "do not send")
                 state = bridge_state(data_dir, limit=10)
 
             self.assertEqual(result.status, "failed")
@@ -623,8 +647,13 @@ class BridgeSendTest(unittest.TestCase):
             )
             # Confirm the dir is NOT the raw hash id (readable naming in effect).
             self.assertFalse((data_dir / "conversation_channels" / conversation_id).exists())
+            channel = store.get_channel(conversation_id)
+            self.assertIsNotNone(channel)
+            projection = data_dir / "conversation_channels" / channel.segment / "channel.json"
+            projection.unlink()
+            (data_dir / "conversation_channels" / "index.json").unlink()
 
-            # Fresh driver instance = no shared cache with the store.
+            # Fresh driver instance = no shared cache or file projection.
             driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
             result = driver.send_message(conversation_id, "hello from worker")
             state = bridge_state(data_dir, limit=10)

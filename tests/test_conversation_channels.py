@@ -64,6 +64,79 @@ class ConversationChannelStoreTest(unittest.TestCase):
             self.assertIn("Alice", first.context_dir)
             self.assertIn("Alice", first.file_workspace_dir)
 
+    def test_sqlite_registry_remains_authoritative_without_file_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            conversation_id = "private-sqlite-authority"
+            channel = store.ensure_channel(
+                _message(conversation_id=conversation_id, conversation_type="private", chat_title="Alice")
+            )
+            projection_dir = root / "conversation_channels" / channel.segment
+            (projection_dir / "channel.json").unlink()
+            (root / "conversation_channels" / "index.json").unlink()
+
+            reopened_store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            reopened = reopened_store.get_channel(conversation_id)
+            listed = reopened_store.list_channels()
+
+            self.assertTrue((root / "conversation_channels.sqlite").exists())
+            self.assertIsNotNone(reopened)
+            self.assertEqual(reopened.chat_title, "Alice")
+            self.assertEqual([item.conversation_id for item in listed], [conversation_id])
+            self.assertEqual(resolve_segment(root, conversation_id), channel.segment)
+            self.assertTrue((projection_dir / "channel.json").exists())
+            self.assertTrue((root / "conversation_channels" / "index.json").exists())
+
+    def test_legacy_file_registry_is_imported_into_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation_id = "private-legacy-import"
+            segment = conversation_segment(conversation_id, "Legacy Friend")
+            channel_path = root / "conversation_channels" / segment / "channel.json"
+            channel_path.parent.mkdir(parents=True, exist_ok=True)
+            channel_path.write_text(
+                json.dumps(
+                    {
+                        "conversation_id": conversation_id,
+                        "conversation_type": "private",
+                        "chat_title": "Legacy Friend",
+                        "segment": segment,
+                        "status": "active",
+                        "key_slots": 1,
+                        "api_key_refs": [],
+                        "sender_names": ["Legacy Friend"],
+                        "sender_wechat_ids": ["wxid_legacy_friend"],
+                        "source_names": ["weflow_discovery"],
+                        "trusted_channel_source": True,
+                        "is_friend": True,
+                        "contact_authorization": "explicit_friend",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+
+            self.assertIsNotNone(store.get_channel(conversation_id))
+            self.assertTrue((root / "conversation_channels.sqlite").exists())
+
     def test_group_channel_gets_two_key_slots_when_pool_allows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

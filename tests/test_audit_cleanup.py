@@ -12,6 +12,9 @@ from app.personal_wechat_bot.control.audit import (
     build_storage_migration_status,
 )
 from app.personal_wechat_bot.control.send_commands import set_send_controls
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
+from app.personal_wechat_bot.conversation.ledger_database import ConversationLedgerDatabase
+from app.personal_wechat_bot.conversation.session_database import ConversationSessionDatabase
 
 
 class AuditCleanupTest(unittest.TestCase):
@@ -171,7 +174,7 @@ class AuditCleanupTest(unittest.TestCase):
 
             self.assertEqual(report["schema"], "storage_migration_status_v1")
             self.assertEqual(items["confirm_queue"]["storage_state"], "database_backed")
-            self.assertEqual(items["conversation_ledgers"]["storage_state"], "file_truth_not_migrated")
+            self.assertEqual(items["conversation_ledgers"]["storage_state"], "database_backed")
             self.assertEqual(items["conversation_ledgers"]["clear_history"], "reset")
             self.assertEqual(items["file_workspace"]["storage_state"], "file_truth_not_migrated")
             self.assertEqual(items["send_bridge"]["clear_history"], "preserve")
@@ -180,6 +183,76 @@ class AuditCleanupTest(unittest.TestCase):
             self.assertGreaterEqual(report["summary"]["database_backed_count"], 1)
             self.assertGreaterEqual(report["summary"]["file_truth_not_migrated_count"], 1)
             self.assertGreaterEqual(report["summary"]["preserved_component_count"], 1)
+            self.assertEqual(report["database_contract_summary"]["existing_count"], 0)
+            self.assertFalse((data_dir / "conversation_ledger.sqlite").exists())
+
+    def test_storage_status_reports_sqlite_authority_schema_and_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            ChannelRegistryStore(data_dir).upsert(
+                {
+                    "conversation_id": "conv-db",
+                    "conversation_type": "private",
+                    "chat_title": "DB Friend",
+                    "segment": "DB_Friend_conv-db",
+                    "status": "active",
+                }
+            )
+            ConversationLedgerDatabase(data_dir).upsert_entry(
+                {
+                    "conversation_id": "conv-db",
+                    "entry_id": "entry-db-1",
+                    "sequence": 1,
+                    "session_id": "session_default",
+                    "status": "active",
+                    "role": "user",
+                    "created_at": "2026-07-10T00:00:00Z",
+                    "updated_at": "2026-07-10T00:00:00Z",
+                }
+            )
+            sessions = ConversationSessionDatabase(data_dir)
+            sessions.upsert_state(
+                "conv-db",
+                "DB_Friend_conv-db",
+                {
+                    "conversation_id": "conv-db",
+                    "current_session_id": "session_default",
+                    "reset_count": 0,
+                },
+            )
+            sessions.append_event(
+                {
+                    "type": "session.reset",
+                    "conversation_id": "conv-db",
+                    "session_id": "session-next",
+                    "created_at": "2026-07-10T00:01:00Z",
+                }
+            )
+
+            report = build_storage_migration_status(data_dir, include_sizes=False)
+            contracts = {item["component_id"]: item for item in report["database_contracts"]}
+
+            self.assertEqual(report["database_contract_summary"]["valid_count"], 3)
+            self.assertEqual(report["database_contract_summary"]["error_count"], 0)
+            for contract in contracts.values():
+                self.assertTrue(contract["valid"])
+                self.assertEqual(contract["status"], "ok")
+                self.assertEqual(contract["schema_version"], "1")
+                self.assertEqual(contract["integrity_check"], "ok")
+                self.assertEqual(contract["missing_tables"], [])
+            ledger_tables = {item["name"]: item for item in contracts["conversation_ledgers"]["tables"]}
+            channel_tables = {item["name"]: item for item in contracts["conversation_channels"]["tables"]}
+            session_tables = {item["name"]: item for item in contracts["conversation_sessions"]["tables"]}
+            self.assertEqual(ledger_tables["ledger_entries"]["row_count"], 1)
+            self.assertEqual(channel_tables["conversation_channels"]["row_count"], 1)
+            self.assertEqual(session_tables["conversation_session_states"]["row_count"], 1)
+            self.assertEqual(session_tables["conversation_session_events"]["row_count"], 1)
+            self.assertIn("idx_ledger_entries_order", {item["name"] for item in ledger_tables["ledger_entries"]["indexes"]})
+            unique_indexes = {
+                item["name"] for item in ledger_tables["ledger_entries"]["indexes"] if item["unique"]
+            }
+            self.assertIn("uq_ledger_entries_sequence", unique_indexes)
 
 
 if __name__ == "__main__":

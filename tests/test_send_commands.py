@@ -14,6 +14,7 @@ from unittest import mock
 
 from app.personal_wechat_bot.config.loader import create_default_config, load_config
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
+from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     clear_send_audit,
@@ -516,7 +517,8 @@ class SendCommandsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox", backend="dry_run")
+            _register_authorized_private_channel(data_dir)
             queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
             queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
             queue.approve(queue_id, reviewer="tester")
@@ -534,7 +536,8 @@ class SendCommandsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox", backend="dry_run")
+            _register_authorized_private_channel(data_dir)
             queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
             reply = _reply("message-bridge-task", "hello bridge")
             queue_id = queue.enqueue(reply)
@@ -557,7 +560,8 @@ class SendCommandsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox", backend="dry_run")
+            _register_authorized_private_channel(data_dir)
             file_path = Path(tmp) / "probe.txt"
             file_path.write_text("file payload", encoding="utf-8")
             reply = ReplyCandidate(
@@ -620,7 +624,8 @@ class SendCommandsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox", backend="dry_run")
+            _register_authorized_private_channel(data_dir)
             file_path = Path(tmp) / "probe.txt"
             file_path.write_text("file payload", encoding="utf-8")
             reply = ReplyCandidate(
@@ -681,7 +686,8 @@ class SendCommandsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox", backend="dry_run")
+            _register_authorized_private_channel(data_dir)
             reply = _reply("message-retry", "hello bridge")
             ledger = ConversationLedgerStore(data_dir)
             ledger.append_reply(reply, chat_title="Alice")
@@ -696,6 +702,9 @@ class SendCommandsTest(unittest.TestCase):
                 status=BridgeAckStatus.FAILED,
                 reason="wechat_native_http_send_text_error:ConnectionRefusedError:refused",
             )
+            projection_dir = ledger.conversation_markdown_path("private-1").parent
+            (projection_dir / "messages.jsonl").unlink()
+            (projection_dir / "conversation.md").unlink()
 
             retried = retry_bridge_item(data_dir, old_bridge_id, reviewer="tester", note="test_retry")
             new_bridge_id = retried["new_bridge_id"]
@@ -720,7 +729,8 @@ class SendCommandsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
-            set_send_controls(data_dir, enabled=True, driver="bridge_outbox")
+            set_send_controls(data_dir, enabled=True, driver="bridge_outbox", backend="dry_run")
+            _register_authorized_private_channel(data_dir)
             queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
             queue_id = queue.enqueue(_reply("message-1", "hello bridge"))
             queue.approve(queue_id, reviewer="tester")
@@ -876,6 +886,9 @@ class SendCommandsTest(unittest.TestCase):
                     "reason": f"queued_to_non_foreground_bridge:{bridge_id}",
                 },
             )
+            projection_dir = ledger.conversation_markdown_path("private-1").parent
+            (projection_dir / "messages.jsonl").unlink()
+            (projection_dir / "conversation.md").unlink()
 
             result = sync_bridge_ack_to_send_state(
                 data_dir,
@@ -890,6 +903,8 @@ class SendCommandsTest(unittest.TestCase):
             updated = ledger.read_entries("private-1")[0]
             self.assertEqual(updated.send["status"], "sent")
             self.assertEqual(updated.send["reason"], "native_sent")
+            self.assertTrue((projection_dir / "messages.jsonl").exists())
+            self.assertTrue((projection_dir / "conversation.md").exists())
 
     def test_probe_send_controls_reports_configured_driver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1158,6 +1173,34 @@ def _reply(message_id: str, text: str) -> ReplyCandidate:
         text=text,
         send_mode="confirm",
         model="fake",
+    )
+
+
+def _register_authorized_private_channel(
+    data_dir: Path,
+    *,
+    conversation_id: str = "private-1",
+    receiver: str = "wxid_test_friend",
+) -> None:
+    chat_title = "Test Friend"
+    segment = conversation_segment(conversation_id, chat_title)
+    channel_dir = data_dir / "conversation_channels" / segment
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "conversation_id": conversation_id,
+        "conversation_type": "private",
+        "chat_title": chat_title,
+        "conversation_key": receiver,
+        "sender_wechat_ids": [receiver],
+        "source_names": ["manual_backend_event"],
+        "trusted_channel_source": True,
+        "is_friend": True,
+        "contact_authorization": "explicit_friend",
+    }
+    (channel_dir / "channel.json").write_text(json.dumps(payload), encoding="utf-8")
+    (data_dir / "conversation_channels" / "index.json").write_text(
+        json.dumps({"channels": [{"conversation_id": conversation_id, "chat_title": chat_title}]}),
+        encoding="utf-8",
     )
 
 

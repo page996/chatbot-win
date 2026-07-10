@@ -8,8 +8,6 @@ from app.personal_wechat_bot.tools.document.translator import FakeDocumentTransl
 from app.personal_wechat_bot.tools.file_read import FileReadTool
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.tools.registry import ToolRegistry
-from app.personal_wechat_bot.tools.search.external_search import FakeExternalSearchTool
-from app.personal_wechat_bot.tools.search.model_relevance_filter import FakeModelRelevanceFilter
 from app.personal_wechat_bot.tools.vision.ocr_tool import OcrImageTool
 from app.personal_wechat_bot.tools.voice.asr_tool import LocalAsrTool
 from app.personal_wechat_bot.tools.web.fetch import WebFetchTool
@@ -29,7 +27,6 @@ def register_default_tools(
     file_workspace: FileWorkspace | None = None,
     attachment_parser: BackendAttachmentParser | None = None,
 ) -> None:
-    relevance_filter = FakeModelRelevanceFilter()
     input_roots = resolve_allowed_roots(data_root, config.file_read_roots)
     workspace_roots = [
         (data_root / "file_workspace").resolve(),
@@ -45,7 +42,6 @@ def register_default_tools(
             max_input_bytes=config.file_max_bytes,
         )
     )
-    registry.register(FakeExternalSearchTool(data_root / "tool_outputs", file_index, relevance_filter))
     registry.register(
         OcrImageTool(
             data_root / "tool_outputs" / "vision_ocr",

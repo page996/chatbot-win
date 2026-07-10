@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import os
+import stat
 import time
 import zipfile
 from pathlib import Path
@@ -36,6 +38,9 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertTrue(staged_path.exists())
             self.assertEqual(staged_path.read_text(encoding="utf-8"), "hello from wechat cache")
             self.assertEqual(manifest["original_path"], str(source.resolve()))
+            self.assertEqual(manifest["blob_path"], staged.blob_path)
+            self.assertEqual(manifest["storage_mode"], staged.storage_mode)
+            self.assertFalse(bool(staged_path.stat().st_mode & stat.S_IWUSR))
             # With human-readable naming and no chat_title, segment = hashPrefix only.
             # session_id segment is unchanged.
             self.assertIn("session-one", staged.workspace_dir)
@@ -44,6 +49,63 @@ class FileWorkspaceTest(unittest.TestCase):
 
             source.write_text("changed outside", encoding="utf-8")
             self.assertEqual(staged_path.read_text(encoding="utf-8"), "hello from wechat cache")
+
+    def test_duplicate_content_reuses_one_content_addressed_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_source = root / "wechat-a" / "note-a.txt"
+            second_source = root / "wechat-b" / "note-b.txt"
+            first_source.parent.mkdir()
+            second_source.parent.mkdir()
+            first_source.write_text("same attachment bytes", encoding="utf-8")
+            second_source.write_text("same attachment bytes", encoding="utf-8")
+            workspace = FileWorkspace(root / "data" / "file_workspace")
+
+            first = workspace.stage_file(first_source, conversation_id="conversation-a", session_id="session-one")
+            second = workspace.stage_file(second_source, conversation_id="conversation-b", session_id="session-two")
+
+            first_manifest = json.loads(Path(first.manifest_path).read_text(encoding="utf-8"))
+            second_manifest = json.loads(Path(second.manifest_path).read_text(encoding="utf-8"))
+            blobs = list((workspace.root / "_blobs").glob("*/*"))
+            self.assertEqual(first.sha256, second.sha256)
+            self.assertEqual(first_manifest["blob_path"], second_manifest["blob_path"])
+            self.assertEqual(len([path for path in blobs if path.is_file() and not path.name.endswith(".lock")]), 1)
+            self.assertIn(first.storage_mode, {"hardlink", "copy"})
+            self.assertIn(second.storage_mode, {"hardlink", "copy"})
+            if first.storage_mode == second.storage_mode == "hardlink":
+                self.assertTrue(os.path.samefile(first.staged_path, second.staged_path))
+
+    def test_hardlink_dedup_does_not_overstate_cleanup_size_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "large.bin"
+            payload_size = 1024 * 1024
+            source.write_bytes(b"x" * payload_size)
+            workspace = FileWorkspace(root / "data" / "file_workspace")
+            first = workspace.stage_file(source, conversation_id="conversation-a", session_id="session-one")
+            second = workspace.stage_file(source, conversation_id="conversation-b", session_id="session-two")
+            if first.storage_mode != "hardlink" or second.storage_mode != "hardlink":
+                self.skipTest("filesystem does not support hardlinks")
+
+            result = workspace.cleanup(max_total_bytes=payload_size + 256 * 1024, keep_min=0)
+
+            self.assertEqual(result["removed"], 0)
+            self.assertEqual(result["size_basis"], "unique_file_identity_bytes")
+
+    def test_workspace_cleanup_reclaims_unreferenced_content_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "wechat" / "note.txt"
+            source.parent.mkdir()
+            source.write_text("cleanup blob", encoding="utf-8")
+            workspace = FileWorkspace(root / "data" / "file_workspace")
+            staged = workspace.stage_file(source, conversation_id="conversation-a", session_id="session-one")
+
+            result = workspace.cleanup(max_age_seconds=-1, keep_min=0)
+
+            self.assertEqual(result["removed"], 1)
+            self.assertEqual(result["removed_blobs"], 1)
+            self.assertFalse(Path(staged.blob_path).exists())
 
     def test_stage_file_uses_stable_channel_segment_when_chat_title_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -561,6 +623,8 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertEqual(loaded.file_id, staged.file_id)
             self.assertEqual(loaded.staged_path, staged.staged_path)
             self.assertEqual(loaded.outputs_dir, staged.outputs_dir)
+            self.assertEqual(loaded.blob_path, staged.blob_path)
+            self.assertEqual(loaded.storage_mode, staged.storage_mode)
 
     def test_manifest_tracks_multiple_sources_for_same_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -618,6 +682,8 @@ class FileWorkspaceTest(unittest.TestCase):
                 derived_dir=staged.derived_dir,
                 outputs_dir=staged.outputs_dir,
                 source=staged.source,
+                blob_path=staged.blob_path,
+                storage_mode=staged.storage_mode,
             )
 
             workspace.parse_or_get_cached(changed, parser)

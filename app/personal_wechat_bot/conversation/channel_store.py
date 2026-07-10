@@ -12,6 +12,7 @@ from app.personal_wechat_bot.conversation.channel_admission import (
     private_contact_is_explicit_friend,
     private_contact_is_explicit_non_friend,
 )
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
@@ -71,16 +72,20 @@ class ConversationChannelStore:
         self.key_pool = key_pool
         self.file_workspace_root = Path(file_workspace_root)
         self.context_root = Path(context_root)
+        self.registry = ChannelRegistryStore(self.data_dir)
         self._lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         # Cache conversation_id -> stable directory segment. The display title
         # may change; the segment must not, or ledgers/sessions/workspaces split.
         self._segment_cache: dict[str, str] = {}
+        self._import_legacy_channels()
 
     def ensure_channel(self, message: NormalizedMessage) -> ConversationChannel:
         with self._lock, self._store_lock():
             existing_path = self._find_channel_path(message.conversation_id)
-            existing = self._read_channel_payload(existing_path) if existing_path else {}
+            existing = self.registry.get(message.conversation_id) or (
+                self._read_channel_payload(existing_path) if existing_path else {}
+            )
             segment = _payload_segment(existing, existing_path.parent.name if existing_path else "")
             if not segment:
                 segment = conversation_segment(message.conversation_id, message.chat_title)
@@ -148,15 +153,25 @@ class ConversationChannelStore:
                 "updated_at": now,
                 "next_key_index": int(existing.get("next_key_index", 0)) if existing else 0,
             }
+            self.registry.upsert(payload)
             self._write_json(path, payload)
             self._update_index(payload)
             return _channel_from_payload(payload)
 
     def get_channel(self, conversation_id: str) -> ConversationChannel | None:
+        payload = self.registry.get(conversation_id) or {}
+        if payload:
+            segment = _payload_segment(payload, "")
+            if segment:
+                self._segment_cache[conversation_id] = segment
+            self._restore_readable_projection(payload)
+            return _channel_from_payload(payload)
         path = self._find_channel_path(conversation_id)
         payload = self._read_channel_payload(path) if path else {}
         if payload and path:
             self._segment_cache[conversation_id] = _payload_segment(payload, path.parent.name)
+            payload.setdefault("segment", path.parent.name)
+            self.registry.insert_if_missing(payload)
         return _channel_from_payload(payload) if payload else None
 
     def _find_channel_path(self, conversation_id: str) -> Path | None:
@@ -168,6 +183,11 @@ class ConversationChannelStore:
         1. Try the cache (fast path for already-open sessions).
         2. Scan existing dirs (slow path for a fresh store instance after restart).
         """
+        registered = self.registry.get(conversation_id) or {}
+        registered_segment = _payload_segment(registered, "") if registered else ""
+        if registered_segment:
+            self._segment_cache[conversation_id] = registered_segment
+            return self.root / registered_segment / "channel.json"
         cached_segment = self._segment_cache.get(conversation_id, "")
         candidate = self.root / cached_segment / "channel.json" if cached_segment else self.root / resolve_segment(self.data_dir, conversation_id) / "channel.json"
         if candidate.exists():
@@ -206,17 +226,16 @@ class ConversationChannelStore:
             ref = available_refs[next_index % len(available_refs)]
             payload["next_key_index"] = (next_index + 1) % len(available_refs)
             payload["updated_at"] = utc_now_iso()
+            self.registry.upsert(payload)
             self._write_json(path, payload)
             self._update_index(payload)
             return ref
 
     def list_channels(self) -> list[ConversationChannel]:
-        channels: list[ConversationChannel] = []
-        for path in sorted(self.root.glob("*/channel.json")):
-            payload = self._read_channel_payload(path)
-            if payload:
-                channels.append(_channel_from_payload(payload))
-        return channels
+        payloads = self.registry.list_channels()
+        for payload in payloads:
+            self._restore_readable_projection(payload)
+        return [_channel_from_payload(payload) for payload in payloads]
 
     def delete_channel(self, conversation_id: str) -> bool:
         return self.delete_channel_with_cleanup(conversation_id)["deleted"]
@@ -224,7 +243,7 @@ class ConversationChannelStore:
     def delete_channel_with_cleanup(self, conversation_id: str) -> dict[str, Any]:
         with self._lock, self._store_lock():
             path = self._find_channel_path(conversation_id)
-            payload = self._read_channel_payload(path) if path else {}
+            payload = self.registry.get(conversation_id) or (self._read_channel_payload(path) if path else {})
             if not path or (not path.exists() and not payload):
                 return {
                     "deleted": False,
@@ -247,6 +266,7 @@ class ConversationChannelStore:
             if _remove_path(channel_dir):
                 removed.append(str(channel_dir))
             self._remove_from_index(conversation_id)
+            self.registry.delete(conversation_id)
             return {
                 "deleted": True,
                 "cleanup_policy": cleanup_policy,
@@ -288,11 +308,47 @@ class ConversationChannelStore:
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    def _import_legacy_channels(self) -> None:
+        for path in sorted(self.root.glob("*/channel.json")):
+            payload = self._read_channel_payload(path)
+            if not payload:
+                continue
+            payload.setdefault("segment", path.parent.name)
+            self.registry.insert_if_missing(payload)
+
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
+
+    def _restore_readable_projection(self, payload: dict[str, Any]) -> None:
+        conversation_id = str(payload.get("conversation_id") or "").strip()
+        if not conversation_id:
+            return
+        segment = _payload_segment(
+            payload,
+            resolve_segment(self.data_dir, conversation_id, str(payload.get("chat_title") or "")),
+        )
+        channel_path = self.root / segment / "channel.json"
+        index_path = self.root / "index.json"
+        index = self._read_channel_payload(index_path)
+        indexed = any(
+            isinstance(item, dict) and str(item.get("conversation_id") or "") == conversation_id
+            for item in (index.get("channels", []) if isinstance(index.get("channels"), list) else [])
+        )
+        if channel_path.exists() and indexed:
+            return
+        with self._lock, self._store_lock():
+            if not channel_path.exists():
+                self._write_json(channel_path, payload)
+            index = self._read_channel_payload(index_path)
+            indexed = any(
+                isinstance(item, dict) and str(item.get("conversation_id") or "") == conversation_id
+                for item in (index.get("channels", []) if isinstance(index.get("channels"), list) else [])
+            )
+            if not indexed:
+                self._update_index(payload)
 
     def _store_lock(self):
         return blocking_process_lock(

@@ -400,6 +400,33 @@ class BridgeWorker:
             # so a slow drain or a slow individual send can't let the lock go
             # stale and invite a second worker to take over and double-deliver.
             self._beat()
+            # Config and channel authorization are mutable while a backend is
+            # unavailable. Re-check them before *every* wire attempt so turning
+            # sending off or revoking a channel after attempt 1 prevents attempt 2.
+            runtime_blocker = _runtime_send_blocker(self.data_dir, str(getattr(self.backend, "name", "")))
+            if runtime_blocker:
+                self.stats.last_error = runtime_blocker
+                self._ack(
+                    bridge_id,
+                    BridgeAckStatus.RETRY,
+                    runtime_blocker,
+                    payload={"phase": "pre_wire_recheck", "attempt": attempt + 1},
+                )
+                logger.warning("bridge %s paused before wire retry: %s", bridge_id, runtime_blocker)
+                return
+            receiver = self._receiver_for(conversation_id, record)
+            if not receiver:
+                self._fail_or_retry(bridge_id, "missing_receiver")
+                return
+            receiver_blocker = _receiver_authorization_blocker(
+                self.data_dir,
+                conversation_id,
+                receiver,
+                backend_name=str(getattr(self.backend, "name", "")),
+            )
+            if receiver_blocker:
+                self._ack(bridge_id, BridgeAckStatus.BLOCKED, receiver_blocker)
+                return
             if kind == "file":
                 path = str(record.get("path", ""))
                 if not path or not Path(path).exists():

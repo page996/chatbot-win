@@ -6,7 +6,7 @@ from pathlib import Path
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config
-from app.personal_wechat_bot.conversation.context_store import CLEAR_CONTEXT_PHRASES, DEFAULT_SESSION_ID
+from app.personal_wechat_bot.conversation.session_store import CLEAR_CONTEXT_PHRASES, DEFAULT_SESSION_ID
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.domain.models import RawWeChatMessage
 from app.personal_wechat_bot.processor.message_processor import MessageProcessor

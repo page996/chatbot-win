@@ -163,6 +163,18 @@ class FileWorkspaceAnalysisTest(unittest.TestCase):
             self.assertEqual(manifest["parse"]["ai_summary"], "async summary")
             self.assertIn("async summary", content)
 
+    def test_ad_hoc_workspace_ledger_refresh_does_not_create_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "note.txt"
+            source.write_text("ad hoc workspace", encoding="utf-8")
+            workspace = FileWorkspace(root / "ws")
+            staged = workspace.stage_file(source, conversation_id="c1", session_id="s1", kind="file")
+
+            workspace._refresh_ledger_file_refs(staged)
+
+            self.assertFalse((root / "conversation_ledger.sqlite").exists())
+
     def test_async_analysis_refreshes_conversation_file_analysis_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"

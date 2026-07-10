@@ -9,6 +9,7 @@ from typing import Any
 
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.conversation.channel_admission import channel_allows_private_receiver
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import SendResult, utc_now_iso
 from app.personal_wechat_bot.runtime.process_lock import process_pid_alive
@@ -981,7 +982,7 @@ def bridge_item_retryable(status: str, reason: str) -> tuple[bool, str]:
     if status == BridgeAckStatus.SENT and "dry_run_not_delivered" in lowered:
         return True, ""
     if status == BridgeAckStatus.ACCEPTED:
-        return True, ""
+        return False, "accepted item may already be delivered; wait for verification and do not re-send"
     if status in {"queued", BridgeAckStatus.RETRY, BridgeAckStatus.INFLIGHT}:
         return False, "bridge item is still pending"
     if status == BridgeAckStatus.SENT:
@@ -1046,7 +1047,7 @@ def _receiver_authorization_blocker(
     receiver = str(receiver or "").strip()
     conversation_id = str(conversation_id or "").strip()
     if receiver.lower() == "filehelper":
-        return ""
+        return "" if conversation_id.lower() == "filehelper" else "receiver_not_authorized:receiver_channel_mismatch"
     payload = _channel_payload(data_dir, conversation_id)
     if not receiver:
         if _looks_like_private_wechat_receiver(conversation_id):
@@ -1054,11 +1055,25 @@ def _receiver_authorization_blocker(
         if isinstance(payload, dict) and str(payload.get("conversation_type", "") or "") == "private":
             return "receiver_not_authorized:private_contact_unknown_or_unidentified"
         return "missing_receiver"
+    if not _looks_like_wechat_receiver(receiver):
+        return "receiver_not_authorized:invalid_receiver"
+    if not payload:
+        return "receiver_not_authorized:missing_channel"
+
+    conversation_type = str(payload.get("conversation_type", "") or "").strip().lower()
+    if receiver.endswith("@chatroom") and conversation_type != "group":
+        return "receiver_not_authorized:receiver_channel_mismatch"
     if _looks_like_private_wechat_receiver(receiver):
-        if not payload:
-            return "receiver_not_authorized:missing_channel"
+        if conversation_type != "private":
+            return "receiver_not_authorized:receiver_channel_mismatch"
         if not channel_allows_private_receiver(payload, _load_config_or_none(data_dir)):
             return "receiver_not_authorized:private_contact_unknown_or_unidentified"
+
+    registered_receiver = _channel_receiver(data_dir, conversation_id)
+    if not registered_receiver:
+        return "receiver_not_authorized:missing_registered_receiver"
+    if receiver != registered_receiver:
+        return "receiver_not_authorized:receiver_channel_mismatch"
     return ""
 
 
@@ -1079,6 +1094,12 @@ def _looks_like_private_wechat_receiver(value: str) -> bool:
 
 
 def _channel_payload(data_dir: str | Path, conversation_id: str) -> dict[str, Any]:
+    try:
+        registered = ChannelRegistryStore(data_dir).get(conversation_id)
+    except Exception:
+        registered = None
+    if registered:
+        return registered
     # Channel dirs are named chat_title_hashPrefix, not the raw conversation_id,
     # so resolve the segment via the channel index. This is the ONLY reliable
     # path for the out-of-process send worker, which has no in-memory cache.
@@ -1090,7 +1111,14 @@ def _channel_payload(data_dir: str | Path, conversation_id: str) -> dict[str, An
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    payload.setdefault("segment", path.parent.name)
+    try:
+        ChannelRegistryStore(data_dir).insert_if_missing(payload)
+    except Exception:
+        pass
+    return payload
 
 
 def _looks_like_wechat_receiver(value: str) -> bool:

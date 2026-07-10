@@ -130,6 +130,51 @@ class ConversationSessionStoreTest(unittest.TestCase):
             self.assertFalse(hasattr(store, "record_message"))
             self.assertFalse(hasattr(store, "build_snapshot"))
 
+    def test_sqlite_session_state_survives_missing_file_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ConversationSessionStore(root)
+            new_session = store.maybe_reset_for_message(_message("m1", "@bot 清空上下文"))
+            segment = conversation_segment("conv1", "PAGE")
+            session_dir = root / "conversation_sessions" / segment
+            (session_dir / "state.json").unlink()
+            (session_dir / "events.jsonl").unlink()
+
+            reopened = ConversationSessionStore(root)
+            state = reopened.state_for_conversation("conv1")
+            events = reopened.database.list_events("conv1")
+
+            self.assertTrue((root / "conversation_sessions.sqlite").exists())
+            self.assertEqual(state["current_session_id"], new_session)
+            self.assertEqual(events[-1]["type"], "session.reset")
+            self.assertEqual(events[-1]["session_id"], new_session)
+            self.assertTrue((session_dir / "state.json").exists())
+            self.assertTrue((session_dir / "events.jsonl").exists())
+
+    def test_legacy_session_files_are_imported_into_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_dir = root / "conversation_sessions" / "conv1"
+            session_dir.mkdir(parents=True, exist_ok=True)
+            (session_dir / "state.json").write_text(
+                json.dumps({"conversation_id": "conv1", "current_session_id": "session_legacy"}),
+                encoding="utf-8",
+            )
+            legacy_event = {
+                "type": "session.reset",
+                "conversation_id": "conv1",
+                "session_id": "session_legacy",
+                "previous_session_id": DEFAULT_SESSION_ID,
+                "created_at": "2026-06-29T00:00:00+00:00",
+            }
+            (session_dir / "events.jsonl").write_text(json.dumps(legacy_event) + "\n", encoding="utf-8")
+
+            store = ConversationSessionStore(root)
+
+            self.assertEqual(store.current_session_id("conv1"), "session_legacy")
+            self.assertEqual(store.database.list_events("conv1"), [legacy_event])
+            self.assertTrue((root / "conversation_sessions.sqlite").exists())
+
     def test_reset_detector_accepts_chinese_and_english_variants(self) -> None:
         self.assertTrue(is_reset_command("@bot 清空当前对话上下文"))
         self.assertTrue(is_reset_command("please @agent reset context now"))

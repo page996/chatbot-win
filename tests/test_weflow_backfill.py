@@ -236,7 +236,13 @@ class _FakeWeFlowServer:
             for i in range(1, 6)
         ]
         sessions = [
-            {"username": "wxid_history", "displayName": "History Friend", "type": "private", "lastMessageAt": 50},
+            {
+                "username": "wxid_history",
+                "displayName": "History Friend",
+                "type": "private",
+                "isFriend": True,
+                "lastMessageAt": 50,
+            },
             {"sessionId": "room@chatroom", "name": "Room", "type": "group", "lastMessageAt": 0},
             {"id": "filehelper", "name": "File Helper", "type": "private"},
         ]

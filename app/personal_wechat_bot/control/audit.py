@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,27 @@ from app.personal_wechat_bot.domain.models import utc_now_iso
 
 
 PLAN_FILENAME = "\u6253\u9020\u8ba1\u5212.md"
+
+_SQLITE_AUTHORITY_CONTRACTS = (
+    {
+        "component_id": "conversation_channels",
+        "filename": "conversation_channels.sqlite",
+        "meta_table": "channel_registry_meta",
+        "expected_tables": ("channel_registry_meta", "conversation_channels"),
+    },
+    {
+        "component_id": "conversation_ledgers",
+        "filename": "conversation_ledger.sqlite",
+        "meta_table": "ledger_meta",
+        "expected_tables": ("ledger_meta", "ledger_conversations", "ledger_entries"),
+    },
+    {
+        "component_id": "conversation_sessions",
+        "filename": "conversation_sessions.sqlite",
+        "meta_table": "session_meta",
+        "expected_tables": ("session_meta", "conversation_session_states", "conversation_session_events"),
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -160,34 +182,34 @@ _STORAGE_COMPONENTS = [
     {
         "component_id": "conversation_ledgers",
         "kind": "conversation_truth",
-        "authority": "markdown_jsonl_file_truth",
-        "paths": ["conversation_ledgers"],
+        "authority": "sqlite_authority_with_jsonl_markdown_projection",
+        "paths": ["conversation_ledger.sqlite", "conversation_ledgers"],
         "clear_history": "reset",
-        "migration_action": "do not bulk migrate yet; linear conversation files are the source of truth until a lossless DB ledger exists",
+        "migration_action": "database-backed ordered entries; keep messages.jsonl and conversation.md as lossless readable projections",
     },
     {
         "component_id": "conversation_sessions",
         "kind": "session_state",
-        "authority": "file_truth_current_session",
-        "paths": ["conversation_sessions"],
+        "authority": "sqlite_authority_with_json_jsonl_projection",
+        "paths": ["conversation_sessions.sqlite", "conversation_sessions"],
         "clear_history": "reset",
-        "migration_action": "session reset must rebuild this store; DB migration requires explicit current-session schema first",
+        "migration_action": "database-backed current-session pointers and reset events; keep readable state/event projections",
     },
     {
         "component_id": "conversation_channels",
         "kind": "channel_registry",
-        "authority": "file_registry_with_readable_segments",
-        "paths": ["conversation_channels"],
+        "authority": "sqlite_authority_with_readable_file_projection",
+        "paths": ["conversation_channels.sqlite", "conversation_channels"],
         "clear_history": "reset",
-        "migration_action": "candidate for future SQLite registry; keep file truth until segment/path compatibility is replaced",
+        "migration_action": "database-backed; keep channel.json/index.json as readable path-resolution projections",
     },
     {
         "component_id": "file_workspace",
         "kind": "file_artifact_store",
-        "authority": "file_workspace_truth",
+        "authority": "content_addressed_blob_store_with_manifest_projection",
         "paths": ["file_workspace"],
         "clear_history": "reset",
-        "migration_action": "do not auto-migrate binary artifacts into SQLite; prune with workspace cleanup or add content-addressed storage first",
+        "migration_action": "deduplicate originals by SHA-256 blob and hardlink; keep derived artifacts and manifests beside each conversation",
     },
     {
         "component_id": "confirm_queue",
@@ -217,7 +239,7 @@ _STORAGE_COMPONENTS = [
             "send_bridge/.bridge_worker.lock",
         ],
         "clear_history": "preserve",
-        "migration_action": "never delete during history reset; migrate only after an append-only evidence export/import plan exists",
+        "migration_action": "never delete during history reset; preserve as an intact evidence chain and never replay it as new work",
     },
     {
         "component_id": "task_manager",
@@ -241,7 +263,7 @@ _STORAGE_COMPONENTS = [
         "authority": "sqlite_projection_from_channel_registry",
         "paths": ["channel_state.sqlite"],
         "clear_history": "reset",
-        "migration_action": "projection only; source remains conversation_channels until registry migration",
+        "migration_action": "operational projection only; source is the SQLite conversation channel registry",
     },
     {
         "component_id": "dedupe_and_indexes",
@@ -443,13 +465,13 @@ def build_storage_migration_status(
     include_sizes: bool = True,
     max_entries_per_component: int = 5000,
 ) -> dict[str, Any]:
-    """Report storage ownership and migration boundaries without mutating data.
+    """Report storage ownership and fresh-start boundaries without mutating data.
 
-    This is intentionally a status contract, not a migration command. The current
-    system already mixes SQLite authorities, JSONL evidence streams, readable
-    file truth stores, and compatibility projections. Bulk-moving everything to
-    SQLite would be risky until the conversation/file semantics are modelled
-    losslessly, so this report makes those boundaries explicit.
+    Conversation channels, ledgers, and sessions use SQLite authorities with
+    readable file projections. Binary artifacts and send-bridge evidence remain
+    file-based by design. A deployment may clear conversation history and let the
+    three databases initialize empty; this report inspects that contract without
+    creating a missing database or importing legacy projections.
     """
 
     data_root = Path(data_dir).resolve()
@@ -479,6 +501,7 @@ def build_storage_migration_status(
                 item["truncated"] = bool(item.get("truncated")) or bool(sidecar_report.get("truncated"))
 
     summary = _storage_summary(items)
+    database_contracts = [_sqlite_authority_contract(data_root, spec) for spec in _SQLITE_AUTHORITY_CONTRACTS]
     return {
         "schema": "storage_migration_status_v1",
         "status": "ok",
@@ -488,39 +511,125 @@ def build_storage_migration_status(
         "safe_default": "report_only_no_mutation",
         "summary": summary,
         "items": items,
+        "database_contracts": database_contracts,
+        "database_contract_summary": {
+            "configured_count": len(database_contracts),
+            "existing_count": sum(1 for item in database_contracts if item.get("exists")),
+            "valid_count": sum(1 for item in database_contracts if item.get("valid")),
+            "error_count": sum(1 for item in database_contracts if item.get("status") == "error"),
+        },
         "migration_boundaries": [
-            {
-                "component_id": "conversation_ledgers",
-                "boundary": "linear_dialogue_truth",
-                "reason": "ledger files must exactly mirror the real chronological conversation; no DB migration should discard markdown/jsonl order or session reset semantics",
-                "allowed_next_step": "design a lossless ledger DB plus export/import tests before applying",
-            },
             {
                 "component_id": "file_workspace",
                 "boundary": "binary_artifact_store",
-                "reason": "large originals and derived artifacts are better pruned or content-addressed than embedded into SQLite",
-                "allowed_next_step": "operator-run workspace cleanup or future blob-store manifest migration",
+                "reason": "large originals and derived artifacts should remain content-addressed files instead of SQLite BLOBs",
+                "allowed_next_step": "run bounded workspace cleanup; unreferenced content blobs are reclaimed automatically",
             },
             {
                 "component_id": "send_bridge",
                 "boundary": "delivery_evidence_chain",
                 "reason": "outbox and ack files are the non-foreground send evidence trail and survive history reset",
-                "allowed_next_step": "export/import evidence chain first; never delete via general cleanup",
-            },
-            {
-                "component_id": "conversation_channels",
-                "boundary": "readable_segment_registry",
-                "reason": "current paths use human-readable segments; the legacy id-only migrator is not compatible with this layout",
-                "allowed_next_step": "add a SQLite channel registry and keep a path resolver projection during transition",
+                "allowed_next_step": "preserve the evidence chain intact; never delete or replay it via general cleanup",
             },
         ],
         "recommended_sequence": [
-            "keep history clear scoped to resettable runtime stores only",
+            "stop history-writing workers and use the guarded history-clear path",
+            "preserve configuration, runtime cards, and the complete send-bridge evidence chain",
+            "start conversation channels, ledgers, and sessions from empty SQLite authorities instead of importing old projections",
+            "verify integrity, schema version, tables, indexes, row counts, and regenerated readable projections",
             "continue using cleanup-artifacts as dry-run first for disposable diagnostics/cache",
-            "migrate small mutable projections first (channel registry), not ledger/file blobs",
-            "add export/import tests before applying any destructive storage migration",
         ],
     }
+
+
+def _sqlite_authority_contract(data_root: Path, spec: dict[str, Any]) -> dict[str, Any]:
+    path = (data_root / str(spec.get("filename") or "")).resolve()
+    expected_tables = [str(item) for item in spec.get("expected_tables", ()) if str(item)]
+    report: dict[str, Any] = {
+        "component_id": str(spec.get("component_id") or ""),
+        "path": str(path),
+        "relative_path": path.name,
+        "exists": path.is_file(),
+        "status": "missing",
+        "valid": False,
+        "schema_version": "",
+        "integrity_check": "not_run",
+        "expected_tables": expected_tables,
+        "missing_tables": expected_tables,
+        "tables": [],
+        "error": "",
+    }
+    if not path.is_file():
+        return report
+    try:
+        db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        db.row_factory = sqlite3.Row
+        try:
+            integrity_row = db.execute("PRAGMA integrity_check(1)").fetchone()
+            integrity = str(integrity_row[0] if integrity_row is not None else "")
+            table_names = [
+                str(row["name"] or "")
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()
+                if str(row["name"] or "")
+            ]
+            tables: list[dict[str, Any]] = []
+            for table_name in table_names:
+                quoted = table_name.replace('"', '""')
+                columns = [
+                    {
+                        "name": str(row["name"] or ""),
+                        "type": str(row["type"] or ""),
+                        "not_null": bool(row["notnull"]),
+                        "primary_key_position": int(row["pk"] or 0),
+                    }
+                    for row in db.execute(f'PRAGMA table_info("{quoted}")').fetchall()
+                ]
+                indexes = [
+                    {
+                        "name": str(row["name"] or ""),
+                        "unique": bool(row["unique"]),
+                        "origin": str(row["origin"] or ""),
+                    }
+                    for row in db.execute(f'PRAGMA index_list("{quoted}")').fetchall()
+                ]
+                row_count = int(db.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0])
+                tables.append(
+                    {
+                        "name": table_name,
+                        "row_count": row_count,
+                        "columns": columns,
+                        "indexes": indexes,
+                    }
+                )
+            meta_table = str(spec.get("meta_table") or "")
+            schema_version = ""
+            if meta_table and meta_table in table_names:
+                quoted_meta = meta_table.replace('"', '""')
+                row = db.execute(
+                    f'SELECT value FROM "{quoted_meta}" WHERE key = ?',
+                    ("schema_version",),
+                ).fetchone()
+                schema_version = str(row[0] or "") if row is not None else ""
+        finally:
+            db.close()
+    except (OSError, sqlite3.Error) as exc:
+        report.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+        return report
+    missing_tables = [name for name in expected_tables if name not in table_names]
+    valid = integrity.lower() == "ok" and not missing_tables and bool(schema_version)
+    report.update(
+        {
+            "status": "ok" if valid else "invalid",
+            "valid": valid,
+            "schema_version": schema_version,
+            "integrity_check": integrity,
+            "missing_tables": missing_tables,
+            "tables": tables,
+        }
+    )
+    return report
 
 
 def _storage_component_item(

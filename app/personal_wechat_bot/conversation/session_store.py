@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.personal_wechat_bot.conversation.segment import resolve_segment
+from app.personal_wechat_bot.conversation.session_database import ConversationSessionDatabase
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 
 
@@ -44,10 +45,12 @@ class ConversationSessionStore:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
         self.root = self.data_dir / "conversation_sessions"
+        self.database = ConversationSessionDatabase(self.data_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         # conversation_id -> stable directory segment. A message title is only
         # used to choose the first segment before a channel exists.
         self._segment_cache: dict[str, str] = {}
+        self._import_legacy_sessions()
 
     def current_session_id(self, conversation_id: str) -> str:
         with self._conversation_lock(conversation_id):
@@ -142,6 +145,10 @@ class ConversationSessionStore:
         cached_segment = self._segment_cache.get(conversation_id, "")
         if cached_segment:
             return self.root / cached_segment
+        database_segment = self.database.segment_for(conversation_id)
+        if database_segment:
+            self._segment_cache[conversation_id] = database_segment
+            return self.root / database_segment
         return self.root / resolve_segment(self.data_dir, conversation_id)
 
     def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
@@ -152,9 +159,15 @@ class ConversationSessionStore:
             existing_dir = self._find_conversation_dir(conversation_id)
             if existing_dir.exists():
                 self._segment_cache[conversation_id] = existing_dir.name
+                state = self.database.get_state(conversation_id) or {}
+                if state:
+                    self.database.upsert_state(conversation_id, existing_dir.name, state)
                 return existing_dir.name
         segment = resolve_segment(self.data_dir, conversation_id, chat_title)
         self._segment_cache[conversation_id] = segment
+        state = self.database.get_state(conversation_id) or {}
+        if state:
+            self.database.upsert_state(conversation_id, segment, state)
         return segment
 
     def _find_conversation_dir(self, conversation_id: str) -> Path:
@@ -178,6 +191,10 @@ class ConversationSessionStore:
         return self._find_conversation_dir(conversation_id) / "events.jsonl"
 
     def _read_state(self, conversation_id: str) -> dict[str, Any]:
+        registered = self.database.get_state(conversation_id)
+        if registered:
+            self._restore_readable_projection(conversation_id, registered)
+            return registered
         path = self._find_conversation_dir(conversation_id) / "state.json"
         if not path.exists():
             return {}
@@ -185,13 +202,35 @@ class ConversationSessionStore:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
-        return payload if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict):
+            return {}
+        self.database.insert_state_if_missing(conversation_id, path.parent.name, payload)
+        return payload
+
+    def _restore_readable_projection(self, conversation_id: str, state: dict[str, Any]) -> None:
+        conversation_dir = self._conversation_dir(conversation_id)
+        state_path = conversation_dir / "state.json"
+        events_path = conversation_dir / "events.jsonl"
+        if state_path.exists() and events_path.exists():
+            return
+        conversation_dir.mkdir(parents=True, exist_ok=True)
+        if not state_path.exists():
+            tmp = state_path.with_name(f"{state_path.name}.{uuid.uuid4().hex}.tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(state_path)
+        if not events_path.exists():
+            tmp = events_path.with_name(f"{events_path.name}.{uuid.uuid4().hex}.tmp")
+            with tmp.open("w", encoding="utf-8") as handle:
+                for event in self.database.list_events(conversation_id):
+                    handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            tmp.replace(events_path)
 
     def _write_state(self, conversation_id: str, payload: dict[str, Any]) -> None:
         path = self._state_path(conversation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         previous = self._read_state(conversation_id)
         merged = {**previous, **payload, "updated_at": utc_now_iso()}
+        self.database.upsert_state(conversation_id, path.parent.name, merged)
         tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
@@ -199,8 +238,36 @@ class ConversationSessionStore:
     def _append_event(self, conversation_id: str, payload: dict[str, Any]) -> None:
         path = self._events_path(conversation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.database.append_event(payload)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _import_legacy_sessions(self) -> None:
+        for state_path in sorted(self.root.glob("*/state.json")):
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            conversation_id = str(payload.get("conversation_id") or "").strip()
+            if not conversation_id:
+                continue
+            self.database.insert_state_if_missing(conversation_id, state_path.parent.name, payload)
+            events_path = state_path.parent / "events.jsonl"
+            if not events_path.exists():
+                continue
+            events: list[dict[str, Any]] = []
+            try:
+                for line in events_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        events.append(event)
+            except (OSError, json.JSONDecodeError):
+                continue
+            self.database.import_events_if_empty(conversation_id, events)
 
     @contextmanager
     def _conversation_lock(self, conversation_id: str) -> Iterator[None]:

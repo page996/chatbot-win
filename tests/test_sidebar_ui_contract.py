@@ -48,6 +48,21 @@ class SidebarUiContractTest(unittest.TestCase):
 
         self.assertEqual(unbound, [])
 
+    def test_storage_status_prioritizes_database_contracts_before_component_compaction(self) -> None:
+        js = (SIDEBAR_DIR / "app.js").read_text(encoding="utf-8")
+        helper = re.search(
+            r"function storageStatusDisplayPayload\(payload\) \{(?P<body>.*?)\n\}",
+            js,
+            flags=re.DOTALL,
+        )
+
+        self.assertIsNotNone(helper)
+        body = helper.group("body")
+        self.assertIn("database_contract_summary: payload?.database_contract_summary", body)
+        self.assertIn("database_contracts: Array.isArray(payload?.database_contracts)", body)
+        self.assertIn("components: compactPayload", body)
+        self.assertNotIn("database_contracts: compactPayload", body)
+
 
 if __name__ == "__main__":
     unittest.main()
