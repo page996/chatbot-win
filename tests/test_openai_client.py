@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
+
+from app.personal_wechat_bot.llm import openai_client as openai_client_module
 
 from app.personal_wechat_bot.config.schema import ProviderConfig
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.llm.openai_client import (
     RelayOpenAIClient,
+    UnsafeRelayRedirectError,
+    _RelayRedirectHandler,
+    _open_relay_request,
     normalize_openai_base_url,
     validate_endpoint_url,
 )
@@ -49,6 +61,114 @@ class EndpointUrlValidationTest(unittest.TestCase):
 
     def test_rejects_missing_host(self) -> None:
         self.assertEqual(validate_endpoint_url("https:///v1"), "missing_url_host")
+
+    def test_rejects_url_credentials(self) -> None:
+        self.assertEqual(
+            validate_endpoint_url("https://user:secret@relay.example/v1"),
+            "url_credentials_not_allowed",
+        )
+
+    def test_relay_redirect_rejects_cross_authority_and_https_downgrade(self) -> None:
+        handler = _RelayRedirectHandler()
+        request = urllib.request.Request(
+            "https://relay.example/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+        )
+        for target, reason in (
+            ("https://evil.example/collect", "cross_authority"),
+            ("http://relay.example/collect", "https_downgrade"),
+        ):
+            response = mock.Mock()
+            with self.subTest(target=target), self.assertRaisesRegex(UnsafeRelayRedirectError, reason):
+                handler.redirect_request(request, response, 302, "Found", {}, target)
+            response.close.assert_called_once_with()
+
+    def test_relay_redirect_allows_same_origin_path_change(self) -> None:
+        handler = _RelayRedirectHandler()
+        request = urllib.request.Request(
+            "https://relay.example/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+        redirected = handler.redirect_request(
+            request,
+            mock.Mock(),
+            302,
+            "Found",
+            {},
+            "https://relay.example/v2/chat/completions",
+        )
+
+        self.assertEqual(redirected.full_url, "https://relay.example/v2/chat/completions")
+
+    def test_relay_open_enforces_total_deadline_and_closes_late_response(self) -> None:
+        release = threading.Event()
+        closed = threading.Event()
+
+        class _LateResponse:
+            def close(self) -> None:
+                closed.set()
+
+        class _BlockingOpener:
+            def open(self, _request, timeout=None):
+                release.wait(1.0)
+                return _LateResponse()
+
+        request = urllib.request.Request("https://relay.example/v1/chat/completions")
+        started = time.monotonic()
+        try:
+            with mock.patch("urllib.request.build_opener", return_value=_BlockingOpener()):
+                with self.assertRaisesRegex(TimeoutError, "openai_request_deadline"):
+                    _open_relay_request(request, timeout=0.2)
+        finally:
+            release.set()
+
+        self.assertLess(time.monotonic() - started, 0.4)
+        self.assertTrue(closed.wait(0.5))
+
+    def test_relay_open_ignores_environment_proxy_before_attaching_bearer_key(self) -> None:
+        proxy_requests: list[tuple[str, str]] = []
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                proxy_requests.append((self.path, self.headers.get("Authorization", "")))
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        proxy.daemon_threads = True
+        thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+        thread.start()
+        try:
+            proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+            request = urllib.request.Request(
+                "http://relay.invalid/v1/models",
+                headers={"Authorization": "Bearer secret"},
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HTTP_PROXY": proxy_url,
+                    "http_proxy": proxy_url,
+                    "NO_PROXY": "",
+                    "no_proxy": "",
+                },
+                clear=False,
+            ):
+                with self.assertRaises((urllib.error.URLError, TimeoutError)):
+                    _open_relay_request(request, timeout=1.0)
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(proxy_requests, [])
 
     def test_chat_completion_rejects_bad_base_url_before_key_use(self) -> None:
         # A non-http(s) base_url must fail fast with a validation error, never
@@ -102,7 +222,10 @@ class KeyFailoverTest(unittest.TestCase):
                 def __exit__(self, *a):
                     return False
 
-                def read(self):
+                def read(self, _size=-1):
+                    if getattr(self, "_read_done", False):
+                        return b""
+                    self._read_done = True
                     return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
 
             def fake_urlopen(req, timeout=None):
@@ -112,17 +235,43 @@ class KeyFailoverTest(unittest.TestCase):
                     raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, None)
                 return _FakeResp()
 
-            orig = urllib.request.urlopen
-            urllib.request.urlopen = fake_urlopen
+            orig = openai_client_module._open_relay_request
+            openai_client_module._open_relay_request = fake_urlopen
             try:
                 data = client._chat_completion([{"role": "user", "content": "hi"}])
             finally:
-                urllib.request.urlopen = orig
+                openai_client_module._open_relay_request = orig
 
             self.assertEqual(client._extract_content(data), "ok")
             # Tried the bad key, then failed over to the good one.
             self.assertTrue(any("bad-key" in k for k in used_keys))
             self.assertTrue(any("good-key" in k for k in used_keys))
+
+    def test_chat_completion_rejects_oversize_response_before_read(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client, _ = self._client_with_two_keys(tmp)
+
+            class _OversizeResponse:
+                headers = {"Content-Length": str(16 * 1024 * 1024 + 1)}
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def read(self, _size=-1):
+                    raise AssertionError("oversize response must be rejected before body read")
+
+            with mock.patch.object(
+                openai_client_module,
+                "_open_relay_request",
+                return_value=_OversizeResponse(),
+            ):
+                with self.assertRaisesRegex(ValueError, "http_response_too_large"):
+                    client._chat_completion([{"role": "user", "content": "hi"}])
 
     def test_all_keys_rejected_raises_after_bounded_attempts(self) -> None:
         import tempfile
@@ -137,13 +286,13 @@ class KeyFailoverTest(unittest.TestCase):
                 calls.append(req.headers["Authorization"])
                 raise urllib.error.HTTPError(req.full_url, 429, "rate", {}, None)
 
-            orig = urllib.request.urlopen
-            urllib.request.urlopen = fake_urlopen
+            orig = openai_client_module._open_relay_request
+            openai_client_module._open_relay_request = fake_urlopen
             try:
                 with self.assertRaises(RuntimeError) as ctx:
                     client._chat_completion([{"role": "user", "content": "hi"}])
             finally:
-                urllib.request.urlopen = orig
+                openai_client_module._open_relay_request = orig
 
             self.assertIn("exhausted", str(ctx.exception))
             # Bounded: each of the 2 keys tried exactly once, no infinite loop.
@@ -162,13 +311,13 @@ class KeyFailoverTest(unittest.TestCase):
                 calls.append(req.headers["Authorization"])
                 raise urllib.error.HTTPError(req.full_url, 500, "server error", {}, None)
 
-            orig = urllib.request.urlopen
-            urllib.request.urlopen = fake_urlopen
+            orig = openai_client_module._open_relay_request
+            openai_client_module._open_relay_request = fake_urlopen
             try:
                 with self.assertRaises(urllib.error.HTTPError):
                     client._chat_completion([{"role": "user", "content": "hi"}])
             finally:
-                urllib.request.urlopen = orig
+                openai_client_module._open_relay_request = orig
 
             # A 5xx is not a key problem: fail fast on the first key, no failover.
             self.assertEqual(len(calls), 1)
@@ -215,7 +364,10 @@ class KeyFailoverTest(unittest.TestCase):
                 def __exit__(self, *a):
                     return False
 
-                def read(self):
+                def read(self, _size=-1):
+                    if getattr(self, "_read_done", False):
+                        return b""
+                    self._read_done = True
                     return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
 
             def fake_urlopen(req, timeout=None):
@@ -223,14 +375,14 @@ class KeyFailoverTest(unittest.TestCase):
                 seen.append((req.full_url, body["model"], req.headers["Authorization"]))
                 return _FakeResp()
 
-            orig = urllib.request.urlopen
-            urllib.request.urlopen = fake_urlopen
+            orig = openai_client_module._open_relay_request
+            openai_client_module._open_relay_request = fake_urlopen
             try:
                 client._chat_completion([{"role": "user", "content": "hi"}], conversation_id="conversation-a")
                 client._retire_key(refs[0])
                 client._chat_completion([{"role": "user", "content": "hi"}], conversation_id="conversation-a")
             finally:
-                urllib.request.urlopen = orig
+                openai_client_module._open_relay_request = orig
 
             self.assertEqual(seen[0][0], "https://one.example/v1/chat/completions")
             self.assertEqual(seen[0][1], "model-one")
@@ -261,13 +413,13 @@ class KeyFailoverTest(unittest.TestCase):
                 calls["n"] += 1
                 raise AssertionError("cooling key must not be retried")
 
-            orig = urllib.request.urlopen
-            urllib.request.urlopen = fake_urlopen
+            orig = openai_client_module._open_relay_request
+            openai_client_module._open_relay_request = fake_urlopen
             try:
                 with self.assertRaises(RuntimeError) as ctx:
                     client._chat_completion([{"role": "user", "content": "hi"}])
             finally:
-                urllib.request.urlopen = orig
+                openai_client_module._open_relay_request = orig
 
             self.assertIn("cooling down", str(ctx.exception))
             self.assertEqual(calls["n"], 0)
@@ -302,7 +454,10 @@ class LlmResourceGateTest(unittest.TestCase):
                 def __exit__(self, *a):
                     return False
 
-                def read(self):
+                def read(self, _size=-1):
+                    if getattr(self, "_read_done", False):
+                        return b""
+                    self._read_done = True
                     return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
 
             def fake_urlopen(req, timeout=None):
@@ -329,13 +484,13 @@ class LlmResourceGateTest(unittest.TestCase):
                 leases.append((workload, int(max_parallel or 0), int(total_max_parallel or 0), reason))
                 return _Lease()
 
-            orig = urllib.request.urlopen
-            urllib.request.urlopen = fake_urlopen
+            orig = openai_client_module._open_relay_request
+            openai_client_module._open_relay_request = fake_urlopen
             try:
                 with mock.patch("app.personal_wechat_bot.llm.openai_client.acquire_llm", side_effect=fake_acquire_llm):
                     client._chat_completion([{"role": "user", "content": "hi"}], workload="background", conversation_id="c1")
             finally:
-                urllib.request.urlopen = orig
+                openai_client_module._open_relay_request = orig
 
             self.assertEqual(scheduler.workloads, ["background"])
             self.assertEqual(leases, [("background", 3, 10, "llm:background:c1")])

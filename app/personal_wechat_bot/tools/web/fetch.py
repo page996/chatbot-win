@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
@@ -12,6 +13,11 @@ from app.personal_wechat_bot.domain.models import ToolCallRequest, ToolCallResul
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.base import ToolManifest
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
+from app.personal_wechat_bot.tools.web.http_safety import (
+    PublicHttpUrlError,
+    guarded_urlopen,
+    read_response_with_deadline,
+)
 from app.personal_wechat_bot.tools.web.search import fetched_text_block_reason
 
 
@@ -31,6 +37,7 @@ class WebFetchTool:
         max_bytes: int = 2 * 1024 * 1024,
         file_workspace: Any | None = None,
         attachment_parser: Any | None = None,
+        allow_private_network: bool = False,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -39,11 +46,15 @@ class WebFetchTool:
         self.max_bytes = max_bytes
         self.file_workspace = file_workspace
         self.attachment_parser = attachment_parser
+        self.allow_private_network = allow_private_network
 
     def run(self, request: ToolCallRequest) -> ToolCallResult:
         url = str(request.arguments.get("url") or request.arguments.get("input_url") or "").strip()
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return ToolCallResult(
                 call_id=request.call_id,
                 tool_name=self.manifest.name,
@@ -54,9 +65,27 @@ class WebFetchTool:
 
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "wechat-agent-local/0.1"})
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
-                raw = response.read(self.max_bytes + 1)
+            deadline = time.monotonic() + max(0.2, float(self.timeout_seconds))
+            with guarded_urlopen(
+                req,
+                timeout_seconds=self.timeout_seconds,
+                allow_private_network=self.allow_private_network,
+            ) as response:
+                raw = read_response_with_deadline(
+                    response,
+                    max_bytes=self.max_bytes + 1,
+                    deadline=deadline,
+                    truncate=True,
+                )
                 content_type = response.headers.get("content-type", "")
+        except PublicHttpUrlError as exc:
+            return ToolCallResult(
+                call_id=request.call_id,
+                tool_name=self.manifest.name,
+                status="blocked",
+                summary="web.fetch only allows public HTTP(S) URLs",
+                error=str(exc),
+            )
         except Exception as exc:
             return ToolCallResult(
                 call_id=request.call_id,

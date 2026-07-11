@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from app.personal_wechat_bot.conversation.session_database import ConversationSe
 from app.personal_wechat_bot.config.schema import ProviderConfig
 from app.personal_wechat_bot.domain.models import NormalizedMessage
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
+from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path, short_process_lock
 
 
 class ConversationChannelStoreTest(unittest.TestCase):
@@ -395,6 +397,129 @@ class ConversationChannelStoreTest(unittest.TestCase):
             self.assertFalse(session_file.parent.exists())
             self.assertNotIn(conversation_id, ledger_database.list_conversation_ids())
             self.assertIsNone(session_database.get_state(conversation_id))
+
+    def test_delete_waits_for_external_conversation_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            conversation_id = "delete-serialized"
+            store.ensure_channel(_message(conversation_id=conversation_id))
+            lock_path = scoped_process_lock_path(
+                root,
+                "conversation-lifecycle",
+                conversation_id,
+            )
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with short_process_lock(
+                    lock_path,
+                    timeout_seconds=1.0,
+                    stale_after_seconds=60.0,
+                ):
+                    future = executor.submit(
+                        store.delete_channel_with_cleanup,
+                        conversation_id,
+                    )
+                    self.assertFalse(future.done())
+                    self.assertIsNotNone(store.get_channel(conversation_id))
+                self.assertTrue(future.result(timeout=5.0)["deleted"])
+            self.assertIsNone(store.get_channel(conversation_id))
+
+    def test_stale_reader_does_not_restore_channel_after_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+            conversation_id = "delete-stale-reader"
+            channel = store.ensure_channel(_message(conversation_id=conversation_id))
+            restore_started = threading.Event()
+            allow_restore = threading.Event()
+            original_restore = store._restore_readable_projection
+
+            def delayed_restore(payload: dict[str, object]):
+                restore_started.set()
+                self.assertTrue(allow_restore.wait(5.0))
+                return original_restore(payload)
+
+            store._restore_readable_projection = delayed_restore  # type: ignore[method-assign]
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                reader = executor.submit(store.get_channel, conversation_id)
+                self.assertTrue(restore_started.wait(5.0))
+                self.assertTrue(store.delete_channel_with_cleanup(conversation_id)["deleted"])
+                allow_restore.set()
+                self.assertIsNone(reader.result(timeout=5.0))
+
+            self.assertIsNone(store.registry.get(conversation_id))
+            self.assertFalse((store.root / channel.segment / "channel.json").exists())
+            index = json.loads((store.root / "index.json").read_text(encoding="utf-8"))
+            self.assertFalse(
+                any(item.get("conversation_id") == conversation_id for item in index["channels"])
+            )
+
+    def test_store_lock_lives_outside_deletable_channel_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            store = ConversationChannelStore(
+                root,
+                ApiKeyPool(provider),
+                file_workspace_root=root / "file_workspace",
+                context_root=root / "conversation_ledgers",
+            )
+
+            with store._store_lock():
+                lock_path = scoped_process_lock_path(
+                    root,
+                    "conversation-channel-store",
+                    "global",
+                )
+                self.assertTrue(lock_path.exists())
+
+            self.assertFalse(lock_path.exists())
+            self.assertTrue(Path(f"{lock_path}.guard").exists())
+
+    def test_delete_rejects_registry_segment_that_escapes_storage_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "keep.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+            provider = ProviderConfig(api_key_env="", api_key_env_pool=["KEY_A"])
+            store = ConversationChannelStore(
+                data_dir,
+                ApiKeyPool(provider),
+                file_workspace_root=data_dir / "file_workspace",
+                context_root=data_dir / "conversation_ledgers",
+            )
+            conversation_id = "malicious-segment"
+            store.registry.upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "segment": "../outside",
+                    "trusted_channel_source": False,
+                    "source_names": [],
+                }
+            )
+
+            with self.assertRaises(ValueError):
+                store.delete_channel_with_cleanup(conversation_id)
+
+            self.assertTrue(sentinel.exists())
+            self.assertIsNotNone(store.registry.get(conversation_id))
 
 
 def _message(

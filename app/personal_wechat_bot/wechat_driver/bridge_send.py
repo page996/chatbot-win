@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +15,7 @@ from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.conversation.channel_admission import channel_allows_private_receiver
 from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.domain.models import SendResult, utc_now_iso
-from app.personal_wechat_bot.runtime.process_lock import process_pid_alive
+from app.personal_wechat_bot.runtime.process_lock import process_pid_alive, process_start_marker
 from app.personal_wechat_bot.wechat_driver.send_backends import (
     wechat_native_file_send_blocker,
     wechat_native_http_status,
@@ -19,9 +23,14 @@ from app.personal_wechat_bot.wechat_driver.send_backends import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 BRIDGE_OUTBOX_SEND_DRIVER = "bridge_outbox"
 BRIDGE_WORKER_LOCK_STALE_SECONDS = 60.0
 REAL_BRIDGE_SEND_BACKENDS = frozenset({"weflow_http", "wechat_native_http"})
+STAGED_RECORD_OWNER_EXITED = "staged_record_owner_exited_before_activation"
+STAGED_RECORD_ABANDON_SECONDS = 300.0
 
 
 class BridgeAckStatus:
@@ -62,6 +71,24 @@ _BRIDGE_TERMINAL_ACK_PRIORITY = {
 _NON_RETRYABLE_FAILED_REASON_MARKERS = (
     "possible_duplicate",
     "unknown_delivery_state",
+    "connectionreseterror",
+    "connectionabortederror",
+    "brokenpipeerror",
+    "econnreset",
+    "econnaborted",
+    "epipe",
+    "winerror 10053",
+    "winerror 10054",
+    "remotedisconnected",
+    "remote end closed connection without response",
+    "badstatusline",
+    "incompleteread",
+    "connectionerror",
+    "ssleoferror",
+    "ssl eof",
+    "response ended",
+    "remote protocol error",
+    "http_5",
     "timeout",
     "timed_out",
     "manual_sidebar_failed",
@@ -71,6 +98,16 @@ _NON_RETRYABLE_FAILED_REASON_MARKERS = (
     "unsupported",
     "http_404",
     "not_found",
+)
+
+_RETRYABLE_PRE_CONNECT_FAILED_REASON_MARKERS = (
+    "connectionrefusederror",
+    "econnrefused",
+    "winerror 10061",
+    "connect_failed",
+    "connection refused",
+    "errno 111",
+    "actively refused",
 )
 
 
@@ -228,6 +265,121 @@ def effective_bridge_ack_states(records: list[dict[str, Any]]) -> dict[str, Brid
     }
 
 
+def bridge_ack_fingerprint(ack: dict[str, Any]) -> str:
+    """Return a stable semantic version for one effective terminal ack."""
+
+    if not isinstance(ack, dict) or not is_terminal_bridge_ack_status(str(ack.get("status", ""))):
+        return ""
+    canonical = {
+        str(key): value
+        for key, value in ack.items()
+        if str(key) != "created_at"
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "bridge-ack-v1:" + hashlib.sha256(encoded).hexdigest()
+
+
+def bridge_sync_fingerprint(
+    ack: dict[str, Any],
+    outbox_record: dict[str, Any] | None,
+) -> str:
+    """Bind terminal-ack sync proof to the projection contract it satisfied.
+
+    ``sync_complete`` depends on more than the ack itself: staged records can
+    declare which queue/ledger/task projections must exist.  A marker written
+    for an empty or absent contract must therefore become stale if a producer
+    later publishes a stronger contract after racing terminal recovery.
+    """
+
+    ack_fingerprint = bridge_ack_fingerprint(ack)
+    if not ack_fingerprint:
+        return ""
+    record_present = isinstance(outbox_record, dict)
+    contract_present = bool(record_present and "expected_projections" in outbox_record)
+    targets = (
+        sorted(_normalized_projection_targets(outbox_record.get("expected_projections")))
+        if contract_present and isinstance(outbox_record, dict)
+        else []
+    )
+    canonical = {
+        "ack": ack_fingerprint,
+        "outbox_record_present": record_present,
+        "staged": bool(record_present and outbox_record.get("ready_for_delivery") is False),
+        "projection_contract_present": contract_present,
+        "expected_projections": targets,
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "bridge-sync-v1:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _retry_descendants(
+    outbox: list[dict[str, Any]],
+    bridge_id: str,
+) -> list[dict[str, Any]]:
+    return _retry_descendants_by_ancestor(outbox).get(str(bridge_id or ""), [])
+
+
+def _retry_descendants_by_ancestor(
+    outbox: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Map every retry ancestor to all of its transitive descendants."""
+
+    records_by_id = {
+        str(item.get("bridge_id", "")): item
+        for item in outbox
+        if isinstance(item, dict) and str(item.get("bridge_id", ""))
+    }
+    descendants_by_ancestor: dict[str, list[dict[str, Any]]] = {}
+    for item in outbox:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("bridge_id", ""))
+        if not item_id:
+            continue
+        ancestor_id = str(item.get("retry_of", ""))
+        visited = {item_id}
+        while ancestor_id and ancestor_id not in visited:
+            descendants_by_ancestor.setdefault(ancestor_id, []).append(item)
+            visited.add(ancestor_id)
+            ancestor = records_by_id.get(ancestor_id)
+            if ancestor is None:
+                break
+            ancestor_id = str(ancestor.get("retry_of", ""))
+    return descendants_by_ancestor
+
+
+def _retry_ancestor_ids(outbox: list[dict[str, Any]], bridge_id: str) -> list[str]:
+    """Return direct parent first, followed by older retry ancestors."""
+
+    records_by_id = {
+        str(item.get("bridge_id", "")): item
+        for item in outbox
+        if isinstance(item, dict) and str(item.get("bridge_id", ""))
+    }
+    current = records_by_id.get(str(bridge_id or ""))
+    ancestor_ids: list[str] = []
+    visited = {str(bridge_id or "")}
+    while current is not None:
+        ancestor_id = str(current.get("retry_of", ""))
+        if not ancestor_id or ancestor_id in visited:
+            break
+        ancestor_ids.append(ancestor_id)
+        visited.add(ancestor_id)
+        current = records_by_id.get(ancestor_id)
+    return ancestor_ids
+
+
 def _bridge_ack_backend(ack: dict[str, Any]) -> str:
     payload = ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
     backend = str(payload.get("backend") or "").strip()
@@ -282,8 +434,10 @@ class BridgeOutboxStore:
         # Touch outbox/ack files on init so they exist for sidebar/state queries
         # even before the first send. The worker and state() expect readable files.
         for path in (self.outbox_path, self.ack_path):
-            if not path.exists():
-                path.write_text("", encoding="utf-8")
+            # Append mode is deliberately non-truncating. An exists()+write_text()
+            # check can erase a record appended by a concurrent first-time store.
+            with path.open("ab"):
+                pass
 
     def enqueue(
         self,
@@ -291,6 +445,7 @@ class BridgeOutboxStore:
         text: str,
         *,
         receiver: str = "",
+        staged: bool = False,
     ) -> dict[str, Any]:
         bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
         record = {
@@ -303,6 +458,9 @@ class BridgeOutboxStore:
             "created_at": utc_now_iso(),
             "transport": "send_bridge",
         }
+        if staged:
+            record["ready_for_delivery"] = False
+            record["staging_owner"] = _staging_owner_metadata()
         self._append(self.outbox_path, record)
         return record
 
@@ -314,6 +472,7 @@ class BridgeOutboxStore:
         name: str = "",
         caption: str = "",
         receiver: str = "",
+        staged: bool = False,
     ) -> dict[str, Any]:
         bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
         resolved_path = str(Path(path).expanduser().resolve())
@@ -329,6 +488,9 @@ class BridgeOutboxStore:
             "created_at": utc_now_iso(),
             "transport": "send_bridge",
         }
+        if staged:
+            record["ready_for_delivery"] = False
+            record["staging_owner"] = _staging_owner_metadata()
         self._append(self.outbox_path, record)
         return record
 
@@ -354,7 +516,82 @@ class BridgeOutboxStore:
         self._append(self.ack_path, record)
         return record
 
-    def requeue_resolved(self, bridge_id: str, *, reason: str = "manual_bridge_retry") -> dict[str, Any]:
+    def append_terminal_ack_if_queued(
+        self,
+        bridge_id: str,
+        *,
+        status: str,
+        reason: str = "",
+        external_message_id: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically apply a manual terminal ack only to a queued item.
+
+        The outbox existence check, effective-state check, and append share the
+        same lock used by worker ack writes. Therefore a manual stop either wins
+        before the worker's inflight marker, or observes inflight and is refused.
+        """
+
+        target_id = str(bridge_id or "").strip()
+        if not target_id:
+            raise ValueError("bridge_id is required")
+        if not is_terminal_bridge_ack_status(status):
+            raise ValueError("status must be sent, accepted, failed, or blocked")
+        with self._store_lock():
+            outbox = self._read_all(self.outbox_path)
+            target = next(
+                (item for item in outbox if str(item.get("bridge_id", "")) == target_id),
+                None,
+            )
+            if target is None:
+                return {
+                    "applied": False,
+                    "reason": "bridge_item_not_found",
+                    "effective_status": "missing",
+                    "ack": {},
+                }
+            if target.get("ready_for_delivery") is False and "expected_projections" not in target:
+                return {
+                    "applied": False,
+                    "reason": "bridge_item_staged_without_projection_contract",
+                    "effective_status": "staged",
+                    "ack": {},
+                }
+            ack_state = resolve_bridge_ack_state(
+                self._read_all(self.ack_path),
+                bridge_id=target_id,
+                default_status="queued",
+            )
+            if ack_state.status != "queued" or ack_state.ack_count:
+                return {
+                    "applied": False,
+                    "reason": f"bridge_item_not_queued:{ack_state.status}",
+                    "effective_status": ack_state.status,
+                    "ack": ack_state.ack,
+                }
+            record = {
+                "bridge_id": target_id,
+                "status": status,
+                "reason": reason,
+                "external_message_id": external_message_id,
+                "payload": payload or {},
+                "created_at": utc_now_iso(),
+            }
+            self._append_unlocked(self.ack_path, record)
+            return {
+                "applied": True,
+                "reason": "",
+                "effective_status": status,
+                "ack": record,
+            }
+
+    def requeue_resolved(
+        self,
+        bridge_id: str,
+        *,
+        reason: str = "manual_bridge_retry",
+        staged: bool = False,
+    ) -> dict[str, Any]:
         """Create a fresh outbox record for a resolved item that never landed.
 
         A terminal ack normally makes a record restart-safe and non-retryable.
@@ -367,61 +604,357 @@ class BridgeOutboxStore:
         original_id = str(bridge_id or "").strip()
         if not original_id:
             raise ValueError("bridge_id is required")
-        outbox = self._read_all(self.outbox_path)
-        acks = self._read_all(self.ack_path)
-        original = next((item for item in outbox if str(item.get("bridge_id", "")) == original_id), None)
-        if original is None:
-            raise KeyError(f"bridge_id not found: {original_id}")
-        ack_state = effective_bridge_ack_states(acks).get(original_id)
-        if ack_state is None or not ack_state.terminal:
-            raise ValueError("bridge item is not terminal; wait for the current attempt to finish")
-        retryable, retry_reason = bridge_item_retryable(ack_state.status, str(ack_state.ack.get("reason", "")))
-        if not retryable:
-            raise ValueError(retry_reason or f"bridge item is not retryable from status {ack_state.status}")
-
-        conversation_id = str(original.get("conversation_id", ""))
-        kind = str(original.get("kind", "text") or "text")
-        receiver = str(original.get("receiver") or "").strip() or _channel_receiver(self.data_dir, conversation_id)
-        retry_metadata = {
-            "retry_of": original_id,
-            "retry_reason": str(reason or "manual_bridge_retry"),
-            "previous_status": ack_state.status,
-            "previous_reason": str(ack_state.ack.get("reason", "")),
-        }
-        if kind == "file":
-            record = self.enqueue_file(
-                conversation_id,
-                str(original.get("path", "")),
-                name=str(original.get("name", "")),
-                caption=str(original.get("caption", "")),
-                receiver=receiver,
-            )
-        else:
-            record = self.enqueue(conversation_id, str(original.get("text", "")), receiver=receiver)
-        record = {**record, **retry_metadata}
-        # The append above wrote the minimal record. Rewrite only the last line's
-        # metadata by appending a sidecar ack-like marker would complicate state,
-        # so store retry metadata in the outbox record through a small rewrite.
-        self._patch_outbox_record(str(record["bridge_id"]), retry_metadata)
-        return record
-
-    def _patch_outbox_record(self, bridge_id: str, patch: dict[str, Any]) -> None:
+        # Validation, active-descendant detection, and append form one transaction.
+        # Without this shared lock, two retry requests can both observe the same
+        # failed item and enqueue separate live successors.
         with self._store_lock():
-            records = self._read_all(self.outbox_path)
-            changed = False
-            for index, item in enumerate(records):
-                if str(item.get("bridge_id", "")) != bridge_id:
+            outbox = self._read_all(self.outbox_path)
+            acks = self._read_all(self.ack_path)
+            ack_states = effective_bridge_ack_states(acks)
+            original = next((item for item in outbox if str(item.get("bridge_id", "")) == original_id), None)
+            if original is None:
+                raise KeyError(f"bridge_id not found: {original_id}")
+            ack_state = ack_states.get(original_id)
+            if ack_state is None or not ack_state.terminal:
+                raise ValueError("bridge item is not terminal; wait for the current attempt to finish")
+            retryable, retry_reason = bridge_item_retryable(
+                ack_state.status,
+                str(ack_state.ack.get("reason", "")),
+            )
+            if not retryable:
+                raise ValueError(retry_reason or f"bridge item is not retryable from status {ack_state.status}")
+
+            descendants = _retry_descendants(outbox, original_id)
+            for descendant in descendants:
+                descendant_id = str(descendant.get("bridge_id", ""))
+                descendant_state = ack_states.get(descendant_id)
+                if descendant_state is None or not descendant_state.terminal:
                     continue
-                records[index] = {**item, **patch}
+                descendant_retryable, descendant_blocker = bridge_item_retryable(
+                    descendant_state.status,
+                    str(descendant_state.ack.get("reason", "")),
+                )
+                if not descendant_retryable:
+                    raise ValueError(
+                        descendant_blocker
+                        or f"retry lineage already resolved by {descendant_id}:{descendant_state.status}"
+                    )
+
+            active_descendants = [
+                item
+                for item in descendants
+                if not ack_states.get(
+                    str(item.get("bridge_id", "")),
+                    BridgeAckState("", "queued", {}, False, 0, 0),
+                ).terminal
+            ]
+            if active_descendants:
+                # The newest live leaf is the only authoritative successor. A
+                # replay from any ancestor repairs projections to this leaf and
+                # never creates a sibling delivery attempt.
+                existing = dict(active_descendants[-1])
+                existing_id = str(existing.get("bridge_id", ""))
+                return {
+                    **existing,
+                    "_reused_existing": True,
+                    "_retry_parent_id": str(existing.get("retry_of", "")),
+                    "_projection_bridge_ids": _retry_ancestor_ids(outbox, existing_id),
+                }
+
+            retry_parent = descendants[-1] if descendants else original
+            retry_parent_id = str(retry_parent.get("bridge_id", ""))
+            retry_parent_state = ack_states.get(retry_parent_id)
+            if retry_parent_state is None or not retry_parent_state.terminal:
+                raise ValueError("retry lineage leaf is not terminal; wait for the current attempt to finish")
+            retryable, retry_reason = bridge_item_retryable(
+                retry_parent_state.status,
+                str(retry_parent_state.ack.get("reason", "")),
+            )
+            if not retryable:
+                raise ValueError(
+                    retry_reason
+                    or f"bridge item is not retryable from status {retry_parent_state.status}"
+                )
+
+            conversation_id = str(retry_parent.get("conversation_id", ""))
+            kind = str(retry_parent.get("kind", "text") or "text")
+            receiver = str(retry_parent.get("receiver") or "").strip() or _channel_receiver(
+                self.data_dir,
+                conversation_id,
+            )
+            bridge_id = f"bridge:{conversation_id}:{uuid.uuid4().hex[:12]}"
+            retry_metadata = {
+                "retry_of": retry_parent_id,
+                "retry_reason": str(reason or "manual_bridge_retry"),
+                "previous_status": retry_parent_state.status,
+                "previous_reason": str(retry_parent_state.ack.get("reason", "")),
+            }
+            inherited_projections = _normalized_projection_targets(
+                retry_parent.get("expected_projections")
+                if isinstance(retry_parent.get("expected_projections"), list)
+                else None
+            )
+            if inherited_projections:
+                retry_metadata["expected_projections"] = inherited_projections
+            if kind == "file":
+                resolved_path = str(Path(str(retry_parent.get("path", ""))).expanduser().resolve())
+                record = {
+                    "bridge_id": bridge_id,
+                    "conversation_id": conversation_id,
+                    "receiver": receiver,
+                    "kind": "file",
+                    "path": resolved_path,
+                    "name": str(retry_parent.get("name", "")) or Path(resolved_path).name,
+                    "caption": str(retry_parent.get("caption", "")),
+                    "status": "queued",
+                    "created_at": utc_now_iso(),
+                    "transport": "send_bridge",
+                    **retry_metadata,
+                }
+            else:
+                record = {
+                    "bridge_id": bridge_id,
+                    "conversation_id": conversation_id,
+                    "receiver": receiver,
+                    "kind": "text",
+                    "text": str(retry_parent.get("text", "")),
+                    "status": "queued",
+                    "created_at": utc_now_iso(),
+                    "transport": "send_bridge",
+                    **retry_metadata,
+                }
+            if staged:
+                # retry_bridge_item publishes queue/ledger/task projections before
+                # activating this record. A running worker skips staged records.
+                record["ready_for_delivery"] = False
+                record["staging_owner"] = _staging_owner_metadata()
+            self._append_unlocked(self.outbox_path, record)
+            lineage_outbox = [*outbox, record]
+            return {
+                **record,
+                "_reused_existing": False,
+                "_retry_parent_id": retry_parent_id,
+                "_projection_bridge_ids": _retry_ancestor_ids(lineage_outbox, bridge_id),
+            }
+
+    def activate_retry_successor(
+        self,
+        bridge_id: str,
+        *,
+        expected_projections: list[str] | None = None,
+    ) -> dict[str, Any]:
+        successor_id = str(bridge_id or "").strip()
+        if not successor_id:
+            raise ValueError("bridge_id is required")
+        projection_targets = _normalized_projection_targets(expected_projections)
+        with self._store_lock():
+            outbox = self._read_all(self.outbox_path)
+            ack_states = effective_bridge_ack_states(self._read_all(self.ack_path))
+            for index, item in enumerate(outbox):
+                if str(item.get("bridge_id", "")) != successor_id:
+                    continue
+                if not str(item.get("retry_of", "")):
+                    raise ValueError("bridge item is not a retry successor")
+                if item.get("ready_for_delivery") is not False:
+                    return {"record": item, "activated": False}
+                ack_state = ack_states.get(successor_id)
+                if ack_state is not None and ack_state.terminal:
+                    # Persist the contract even though activation lost a race to
+                    # terminal recovery.  Its changed sync fingerprint forces the
+                    # worker to project that terminal ack onto any state the
+                    # producer published immediately before this conflict.
+                    updated = {**item, "expected_projections": projection_targets}
+                    if updated != item:
+                        outbox[index] = updated
+                        self._rewrite(self.outbox_path, outbox)
+                    raise ValueError(
+                        f"bridge item already terminal: {successor_id}:{ack_state.status}"
+                    )
+                activated = {
+                    **item,
+                    "ready_for_delivery": True,
+                    "expected_projections": projection_targets,
+                }
+                activated.pop("staging_owner", None)
+                outbox[index] = activated
+                self._rewrite(self.outbox_path, outbox)
+                return {"record": activated, "activated": True}
+        raise KeyError(f"bridge_id not found: {successor_id}")
+
+    def activate_staged_record(
+        self,
+        bridge_id: str,
+        *,
+        expected_projections: list[str] | None = None,
+    ) -> dict[str, Any]:
+        result = self.activate_staged_records(
+            [bridge_id],
+            expected_projections=expected_projections,
+        )
+        return {
+            "record": result["records"][0],
+            "activated": bool(result.get("activated_ids")),
+        }
+
+    def activate_staged_records(
+        self,
+        bridge_ids: list[str],
+        *,
+        expected_projections: list[str] | None = None,
+    ) -> dict[str, Any]:
+        target_ids = list(dict.fromkeys(str(item or "").strip() for item in bridge_ids if str(item or "").strip()))
+        if not target_ids:
+            return {"records": [], "activated_ids": []}
+        projection_targets = _normalized_projection_targets(expected_projections)
+        with self._store_lock():
+            outbox = self._read_all(self.outbox_path)
+            ack_states = effective_bridge_ack_states(self._read_all(self.ack_path))
+            indexes = {
+                str(item.get("bridge_id") or ""): index
+                for index, item in enumerate(outbox)
+                if isinstance(item, dict) and str(item.get("bridge_id") or "")
+            }
+            missing = [bridge_id for bridge_id in target_ids if bridge_id not in indexes]
+            if missing:
+                raise KeyError(f"bridge_id not found: {missing[0]}")
+            resolved = [
+                bridge_id
+                for bridge_id in target_ids
+                if bridge_id in ack_states and ack_states[bridge_id].terminal
+            ]
+            if resolved:
+                contract_changed = False
+                for bridge_id in target_ids:
+                    index = indexes[bridge_id]
+                    if outbox[index].get("expected_projections") == projection_targets:
+                        continue
+                    outbox[index] = {
+                        **outbox[index],
+                        "expected_projections": projection_targets,
+                    }
+                    contract_changed = True
+                if contract_changed:
+                    self._rewrite(self.outbox_path, outbox)
+                raise ValueError(f"bridge item already terminal: {resolved[0]}:{ack_states[resolved[0]].status}")
+            activated_ids: list[str] = []
+            for bridge_id in target_ids:
+                index = indexes[bridge_id]
+                item = outbox[index]
+                if item.get("ready_for_delivery") is not False:
+                    continue
+                outbox[index] = {
+                    **item,
+                    "ready_for_delivery": True,
+                    "expected_projections": projection_targets,
+                }
+                outbox[index].pop("staging_owner", None)
+                activated_ids.append(bridge_id)
+            if activated_ids:
+                self._rewrite(self.outbox_path, outbox)
+            return {
+                "records": [outbox[indexes[bridge_id]] for bridge_id in target_ids],
+                "activated_ids": activated_ids,
+            }
+
+    def quarantine_abandoned_staged_records(self) -> list[dict[str, Any]]:
+        """Fail staged records whose creating process exited before activation.
+
+        No wire send can happen while ``ready_for_delivery`` is false. A dead
+        staging owner therefore proves delivery was never attempted, so these
+        records are safe to terminate and later requeue explicitly. Legacy
+        staged records without owner metadata use an age-based compatibility
+        grace period because their creator cannot be identified reliably.
+        """
+
+        quarantined: list[dict[str, Any]] = []
+        with self._store_lock():
+            outbox = self._read_all(self.outbox_path)
+            ack_states = effective_bridge_ack_states(self._read_all(self.ack_path))
+            abandoned: list[tuple[str, dict[str, Any]]] = []
+            outbox_changed = False
+            for index, item in enumerate(outbox):
+                bridge_id = str(item.get("bridge_id") or "").strip()
+                if not bridge_id or item.get("ready_for_delivery") is not False:
+                    continue
+                ack_state = ack_states.get(bridge_id)
+                if ack_state is not None and ack_state.terminal:
+                    continue
+                owner = item.get("staging_owner") if isinstance(item.get("staging_owner"), dict) else {}
+                if not _staged_record_is_abandoned(item, owner):
+                    continue
+                updated = {
+                    **item,
+                    # An explicit empty contract makes downstream ack sync
+                    # complete even when the producer crashed before it could
+                    # declare which optional projections it intended to write.
+                    "expected_projections": (
+                        _normalized_projection_targets(item.get("expected_projections"))
+                        if isinstance(item.get("expected_projections"), list)
+                        else []
+                    ),
+                    "staging_abandoned_at": utc_now_iso(),
+                }
+                outbox[index] = updated
+                outbox_changed = True
+                abandoned.append((bridge_id, owner))
+            # Write the recoverable contract first. If the process crashes before
+            # the ack append, the next tick sees the staged record and retries.
+            if outbox_changed:
+                self._rewrite(self.outbox_path, outbox)
+            for bridge_id, owner in abandoned:
+                record = {
+                    "bridge_id": bridge_id,
+                    "status": BridgeAckStatus.FAILED,
+                    "reason": STAGED_RECORD_OWNER_EXITED,
+                    "external_message_id": "",
+                    "payload": {
+                        "phase": "staged_projection_publish",
+                        "delivery_attempted": False,
+                        "staging_owner": owner,
+                    },
+                    "created_at": utc_now_iso(),
+                }
+                self._append_unlocked(self.ack_path, record)
+                quarantined.append(record)
+        return quarantined
+
+    def set_staged_projection_contract(
+        self,
+        bridge_ids: list[str],
+        *,
+        expected_projections: list[str],
+    ) -> None:
+        target_ids = list(
+            dict.fromkeys(str(item or "").strip() for item in bridge_ids if str(item or "").strip())
+        )
+        if not target_ids:
+            return
+        targets = _normalized_projection_targets(expected_projections)
+        with self._store_lock():
+            outbox = self._read_all(self.outbox_path)
+            indexes = {
+                str(item.get("bridge_id") or ""): index
+                for index, item in enumerate(outbox)
+                if isinstance(item, dict) and str(item.get("bridge_id") or "")
+            }
+            missing = [bridge_id for bridge_id in target_ids if bridge_id not in indexes]
+            if missing:
+                raise KeyError(f"bridge_id not found: {missing[0]}")
+            changed = False
+            for bridge_id in target_ids:
+                index = indexes[bridge_id]
+                if outbox[index].get("expected_projections") == targets:
+                    continue
+                outbox[index] = {**outbox[index], "expected_projections": targets}
                 changed = True
-                break
             if changed:
-                self._rewrite(self.outbox_path, records)
+                self._rewrite(self.outbox_path, outbox)
 
     def state(self, *, limit: int = 30) -> dict[str, Any]:
-        outbox = self._read_all(self.outbox_path)
-        acks = self._read_all(self.ack_path)
+        outbox, invalid_outbox_lines = self._read_all_with_invalid(self.outbox_path)
+        acks, invalid_ack_lines = self._read_all_with_invalid(self.ack_path)
         ack_states = effective_bridge_ack_states(acks)
+        retry_descendants = _retry_descendants_by_ancestor(outbox)
         effective_status_counts = {
             BridgeAckStatus.SENT: 0,
             BridgeAckStatus.ACCEPTED: 0,
@@ -440,6 +973,19 @@ class BridgeOutboxStore:
             ack = ack_state.ack if ack_state is not None else {}
             status = ack_state.status if ack_state is not None else str(item.get("status", "queued"))
             retryable, retry_reason = bridge_item_retryable(status, str(ack.get("reason", "")))
+            descendant_items = retry_descendants.get(bridge_id, [])
+            latest_descendant = descendant_items[-1] if descendant_items else None
+            latest_descendant_id = str(latest_descendant.get("bridge_id", "")) if latest_descendant else ""
+            latest_descendant_state = ack_states.get(latest_descendant_id) if latest_descendant_id else None
+            if latest_descendant is not None:
+                retryable = False
+                if latest_descendant_state is not None and latest_descendant_state.terminal:
+                    retry_reason = (
+                        f"retry lineage already resolved by "
+                        f"{latest_descendant_id}:{latest_descendant_state.status}"
+                    )
+                else:
+                    retry_reason = f"active retry already pending: {latest_descendant_id}"
             effective_status_counts[status] = effective_status_counts.get(status, 0) + 1
             ack_backend = _bridge_ack_backend(ack)
             backend_counts = status_counts_by_backend.setdefault(ack_backend, {})
@@ -452,8 +998,16 @@ class BridgeOutboxStore:
                     "ack_backend": ack_backend,
                     "delivery_verified": _bridge_ack_delivery_verified(ack),
                     "accepted_unverified": _bridge_ack_accepted_unverified(ack),
+                    "delivery_ready": item.get("ready_for_delivery") is not False,
                     "retryable": retryable,
                     "retry_blocker": "" if retryable else retry_reason,
+                    "active_retry_bridge_id": (
+                        latest_descendant_id
+                        if latest_descendant is not None
+                        and (latest_descendant_state is None or not latest_descendant_state.terminal)
+                        else ""
+                    ),
+                    "retry_successor_bridge_id": latest_descendant_id,
                 }
             )
         items = resolved_items[-max(1, limit) :]
@@ -495,6 +1049,8 @@ class BridgeOutboxStore:
             "pending_count": pending_count,
             "ack_count": len(acks),
             "ack_line_count": len(acks),
+            "invalid_outbox_line_count": len(invalid_outbox_lines),
+            "invalid_ack_line_count": len(invalid_ack_lines),
             "terminal_count": sum(
                 effective_status_counts.get(status, 0)
                 for status in BRIDGE_TERMINAL_ACK_STATUSES
@@ -530,8 +1086,25 @@ class BridgeOutboxStore:
         # compaction's read-modify-rewrite window (which would drop this record
         # when compaction replaces the file with its pre-append snapshot).
         with self._store_lock():
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._append_unlocked(path, record)
+
+    @staticmethod
+    def _append_unlocked(path: Path, record: dict[str, Any]) -> None:
+        encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        with path.open("a+b") as f:
+            f.seek(0, os.SEEK_END)
+            length = f.tell()
+            if length:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    # Preserve a crash-truncated tail as its own malformed line;
+                    # never concatenate it with the next durable record.
+                    f.seek(0, os.SEEK_END)
+                    f.write(b"\n")
+            f.seek(0, os.SEEK_END)
+            f.write(encoded)
+            f.flush()
+            os.fsync(f.fileno())
 
     def _store_lock(self):
         """Cross-process lock serializing append vs compaction of the jsonl files.
@@ -551,7 +1124,12 @@ class BridgeOutboxStore:
             wait_timeout_seconds=15.0,
         )
 
-    def compact(self, *, keep_resolved: int = 500) -> dict[str, int]:
+    def compact(
+        self,
+        *,
+        keep_resolved: int = 500,
+        synced_ack_fingerprints: dict[str, str] | None = None,
+    ) -> dict[str, int]:
         """Drop old terminally-resolved records from outbox.jsonl + acks.jsonl.
 
         The bridge worker re-reads both files in full on every tick, so without
@@ -559,8 +1137,14 @@ class BridgeOutboxStore:
         "resolved" once its latest ack is terminal (sent/failed/blocked); such
         records will never be delivered again, so dropping the oldest ones is
         restart-safe. The most recent ``keep_resolved`` resolved records are
-        retained for history/audit, plus every not-yet-resolved (pending/retry)
-        record and all acks referencing a retained bridge_id.
+        retained for history/audit, plus every not-yet-resolved (pending/retry),
+        accepted/unverified, or not-yet-synced record, its complete retry
+        ancestry, and all acks referencing a retained bridge_id. A terminal
+        record is eligible for deletion only when its current effective ack and
+        projection-contract fingerprint is confirmed in
+        ``synced_ack_fingerprints``. Keeping pending ancestry is required so a
+        staged retry can be recovered by replaying any
+        older bridge id after compaction.
 
         Returns counts of removed outbox/ack lines. A no-op-safe rewrite: if
         nothing is droppable it leaves the files untouched.
@@ -570,31 +1154,96 @@ class BridgeOutboxStore:
         # after our replace) and can never be dropped. _rewrite does not re-lock,
         # so there is no reentrancy.
         with self._store_lock():
-            outbox = self._read_all(self.outbox_path)
-            acks = self._read_all(self.ack_path)
+            outbox, invalid_outbox_lines = self._read_all_with_invalid(self.outbox_path)
+            acks, invalid_ack_lines = self._read_all_with_invalid(self.ack_path)
+            if invalid_outbox_lines or invalid_ack_lines:
+                logger.error(
+                    "bridge compaction refused: invalid_outbox_lines=%d invalid_ack_lines=%d",
+                    len(invalid_outbox_lines),
+                    len(invalid_ack_lines),
+                )
+                return {
+                    "removed_outbox": 0,
+                    "removed_acks": 0,
+                    "invalid_outbox_lines": len(invalid_outbox_lines),
+                    "invalid_ack_lines": len(invalid_ack_lines),
+                }
             ack_states = effective_bridge_ack_states(acks)
+            synced_fingerprints = {
+                str(bridge_id): str(fingerprint)
+                for bridge_id, fingerprint in (synced_ack_fingerprints or {}).items()
+                if str(bridge_id) and str(fingerprint)
+            }
 
             resolved_order: list[str] = []
             pending_ids: set[str] = set()
+            records_by_id = {
+                str(item.get("bridge_id", "")): item
+                for item in outbox
+                if isinstance(item, dict) and str(item.get("bridge_id", ""))
+            }
             for item in outbox:
                 bridge_id = str(item.get("bridge_id", ""))
                 if not bridge_id:
                     continue
                 ack_state = ack_states.get(bridge_id)
-                if ack_state is not None and ack_state.terminal:
+                if (
+                    ack_state is not None
+                    and ack_state.terminal
+                    and ack_state.status != BridgeAckStatus.ACCEPTED
+                    and synced_fingerprints.get(bridge_id)
+                    == bridge_sync_fingerprint(ack_state.ack, item)
+                ):
                     resolved_order.append(bridge_id)
                 else:
                     pending_ids.add(bridge_id)
 
-            if len(resolved_order) <= max(0, keep_resolved):
-                return {"removed_outbox": 0, "removed_acks": 0}
-
             # Keep the most-recent resolved ids (outbox is FIFO, so tail = newest).
             keep_resolved_ids = set(resolved_order[-keep_resolved:]) if keep_resolved > 0 else set()
             keep_ids = pending_ids | keep_resolved_ids
+            ancestry_frontier = list(keep_ids)
+            while ancestry_frontier:
+                retained_id = ancestry_frontier.pop()
+                retained = records_by_id.get(retained_id)
+                if retained is None:
+                    continue
+                parent_id = str(retained.get("retry_of", ""))
+                if not parent_id or parent_id in keep_ids:
+                    continue
+                keep_ids.add(parent_id)
+                ancestry_frontier.append(parent_id)
 
-            new_outbox = [item for item in outbox if str(item.get("bridge_id", "")) in keep_ids]
-            new_acks = [ack for ack in acks if str(ack.get("bridge_id", "")) in keep_ids]
+            outbox_ids = set(records_by_id)
+            removable_ack_only_ids = {
+                bridge_id
+                for bridge_id, ack_state in ack_states.items()
+                if bridge_id not in outbox_ids
+                and ack_state.terminal
+                and ack_state.status != BridgeAckStatus.ACCEPTED
+                and synced_fingerprints.get(bridge_id)
+                == bridge_sync_fingerprint(ack_state.ack, None)
+            }
+            # Missing ids and ack-only ids without current sync proof are
+            # evidence, not garbage.  In particular, a terminal upgrade may be
+            # appended after its original outbox record was compacted.
+            new_outbox = [
+                item
+                for item in outbox
+                if not str(item.get("bridge_id", ""))
+                or str(item.get("bridge_id", "")) in keep_ids
+            ]
+            new_acks = [
+                ack
+                for ack in acks
+                if (
+                    not str(ack.get("bridge_id", ""))
+                    or str(ack.get("bridge_id", "")) in keep_ids
+                    or (
+                        str(ack.get("bridge_id", "")) not in outbox_ids
+                        and str(ack.get("bridge_id", "")) not in removable_ack_only_ids
+                    )
+                )
+            ]
             removed_outbox = len(outbox) - len(new_outbox)
             removed_acks = len(acks) - len(new_acks)
             if removed_outbox <= 0 and removed_acks <= 0:
@@ -606,27 +1255,50 @@ class BridgeOutboxStore:
 
     def _rewrite(self, path: Path, records: list[dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _existing, invalid_lines = self._read_all_with_invalid(path)
+        if invalid_lines:
+            raise ValueError(
+                f"bridge_jsonl_corruption_prevents_rewrite:{path.name}:invalid_lines={len(invalid_lines)}"
+            )
         tmp = path.with_suffix(path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(path)
 
     def _read_all(self, path: Path) -> list[dict[str, Any]]:
+        records, _invalid_lines = self._read_all_with_invalid(path)
+        return records
+
+    @staticmethod
+    def _read_all_with_invalid(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, int]]]:
         if not path.exists():
-            return []
+            return [], []
         records: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
+        invalid_lines: list[dict[str, int]] = []
+        offset = 0
+        with path.open("rb") as f:
+            for line_number, raw_line in enumerate(f, start=1):
+                line_offset = offset
+                offset += len(raw_line)
+                if not raw_line.strip():
                     continue
                 try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
+                    payload = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError):
+                    invalid_lines.append(
+                        {"line_number": line_number, "offset": line_offset, "bytes": len(raw_line)}
+                    )
                     continue
                 if isinstance(payload, dict):
                     records.append(payload)
-        return records
+                else:
+                    invalid_lines.append(
+                        {"line_number": line_number, "offset": line_offset, "bytes": len(raw_line)}
+                    )
+        return records, invalid_lines
 
 
 class BridgeOutboxSendDriver:
@@ -677,7 +1349,7 @@ class BridgeOutboxSendDriver:
     def health_check(self) -> bool:
         return self.store.root.exists()
 
-    def probe(self) -> BridgeSendProbe:
+    def probe(self, *, active_backend_probe: bool = True) -> BridgeSendProbe:
         state = self.store.state(limit=1)
         blockers = [] if self.send_enabled else ["send_enabled_false"]
         backend = {
@@ -693,13 +1365,14 @@ class BridgeOutboxSendDriver:
             "wechat_native_send_image_path": self.wechat_native_send_image_path,
             "wechat_native_send_file_path": self.wechat_native_send_file_path,
             "wechat_native_status_path": self.wechat_native_status_path,
+            "active_backend_probe": bool(active_backend_probe),
         }
         worker_config = self._worker_lock_config_status()
         backend["worker_config"] = worker_config
         worker_blocker = self._worker_config_blocker(worker_config)
         if self.send_enabled and worker_blocker:
             blockers.append(worker_blocker)
-        if self.send_backend == "weflow_http":
+        if active_backend_probe and self.send_backend == "weflow_http":
             backend["weflow_http"] = weflow_http_status(
                 self.weflow_base_url,
                 token_env=self.weflow_token_env,
@@ -713,7 +1386,7 @@ class BridgeOutboxSendDriver:
                 capability_blocker = _weflow_capability_blocker(backend["weflow_http"], kind="text")
                 if capability_blocker:
                     blockers.append(capability_blocker)
-        if self.send_backend == "wechat_native_http":
+        if active_backend_probe and self.send_backend == "wechat_native_http":
             backend["wechat_native_http"] = wechat_native_http_status(
                 self.wechat_native_base_url,
                 text_path=self.wechat_native_send_text_path,
@@ -755,7 +1428,7 @@ class BridgeOutboxSendDriver:
         )
         if receiver_blocker:
             return SendResult("bridge-outbox-send", conversation_id, "failed", receiver_blocker)
-        record = self.store.enqueue(conversation_id, text, receiver=receiver)
+        record = self.store.enqueue(conversation_id, text, receiver=receiver, staged=True)
         return SendResult(
             message_id=str(record["bridge_id"]),
             conversation_id=conversation_id,
@@ -780,13 +1453,58 @@ class BridgeOutboxSendDriver:
         )
         if receiver_blocker:
             return SendResult("bridge-outbox-send", conversation_id, "failed", receiver_blocker)
-        record = self.store.enqueue_file(conversation_id, path, caption=caption, receiver=receiver)
+        record = self.store.enqueue_file(conversation_id, path, caption=caption, receiver=receiver, staged=True)
         return SendResult(
             message_id=str(record["bridge_id"]),
             conversation_id=conversation_id,
             status="queued_to_bridge",
             reason=f"queued_file_to_non_foreground_bridge:{record['bridge_id']}",
         )
+
+    def activate_send_result(
+        self,
+        result: SendResult,
+        *,
+        expected_projections: list[str] | None = None,
+    ) -> dict[str, Any]:
+        bridge_ids = _queued_bridge_ids_from_send_result(result)
+        activation = self.store.activate_staged_records(
+            bridge_ids,
+            expected_projections=expected_projections,
+        )
+        return {"status": "ok", "bridge_ids": bridge_ids, **activation}
+
+    def fail_staged_send_result(
+        self,
+        result: SendResult,
+        *,
+        reason: str,
+        expected_projections: list[str] | None = None,
+    ) -> dict[str, Any]:
+        bridge_ids = _queued_bridge_ids_from_send_result(result)
+        self.store.set_staged_projection_contract(
+            bridge_ids,
+            expected_projections=expected_projections or [],
+        )
+        applied: list[str] = []
+        conflicts: list[dict[str, Any]] = []
+        for bridge_id in bridge_ids:
+            outcome = self.store.append_terminal_ack_if_queued(
+                bridge_id,
+                status=BridgeAckStatus.FAILED,
+                reason=reason or "staged_projection_failed",
+                payload={"phase": "projection_publish", "delivery_attempted": False},
+            )
+            if outcome.get("applied"):
+                applied.append(bridge_id)
+            else:
+                conflicts.append({"bridge_id": bridge_id, **outcome})
+        return {
+            "status": "failed" if applied else "conflict",
+            "bridge_ids": bridge_ids,
+            "applied_ids": applied,
+            "conflicts": conflicts,
+        }
 
     def _receiver_for(self, conversation_id: str) -> str:
         receiver = _channel_receiver(self.data_dir, conversation_id)
@@ -885,6 +1603,16 @@ class BridgeOutboxSendDriver:
                 "pid": pid,
                 "pid_alive": False,
             }
+        recorded_start = str(payload.get("process_start") or "")
+        current_start = process_start_marker(pid) if pid > 0 and recorded_start else ""
+        if recorded_start and current_start and recorded_start != current_start:
+            return {
+                "running": False,
+                "config_status": "not_running",
+                "pid": pid,
+                "pid_alive": False,
+                "process_start_mismatch": True,
+            }
         expected = self._worker_expected_config_signature()
         actual = payload.get("config_signature") if isinstance(payload.get("config_signature"), dict) else {}
         if actual:
@@ -929,14 +1657,54 @@ def bridge_state(data_dir: str | Path, *, limit: int = 30) -> dict[str, Any]:
     return BridgeOutboxStore(data_dir).state(limit=limit)
 
 
-def bridge_requeue_resolved(data_dir: str | Path, bridge_id: str, *, reason: str = "manual_bridge_retry") -> dict[str, Any]:
+def bridge_requeue_resolved(
+    data_dir: str | Path,
+    bridge_id: str,
+    *,
+    reason: str = "manual_bridge_retry",
+    staged: bool = False,
+) -> dict[str, Any]:
     store = BridgeOutboxStore(data_dir)
-    record = store.requeue_resolved(bridge_id, reason=reason)
+    record = store.requeue_resolved(bridge_id, reason=reason, staged=staged)
+    reused_existing = bool(record.pop("_reused_existing", False))
+    retry_parent_id = str(record.pop("_retry_parent_id", "") or "")
+    projection_bridge_ids = [
+        str(value)
+        for value in record.pop("_projection_bridge_ids", [])
+        if str(value or "").strip().startswith("bridge:")
+    ]
+    expected_projections = record.get("expected_projections")
     return {
         "status": "ok",
         "old_bridge_id": str(bridge_id or "").strip(),
         "new_bridge_id": str(record.get("bridge_id", "")),
+        "created": not reused_existing,
+        "reused_existing": reused_existing,
+        "retry_parent_id": retry_parent_id,
+        "projection_bridge_ids": projection_bridge_ids,
+        "expected_projections": (
+            list(expected_projections) if isinstance(expected_projections, list) else []
+        ),
         "record": record,
+        "state": store.state(limit=30),
+    }
+
+
+def bridge_activate_retry_successor(
+    data_dir: str | Path,
+    bridge_id: str,
+    *,
+    expected_projections: list[str] | None = None,
+) -> dict[str, Any]:
+    store = BridgeOutboxStore(data_dir)
+    result = store.activate_retry_successor(
+        bridge_id,
+        expected_projections=expected_projections,
+    )
+    return {
+        "status": "ok",
+        "bridge_id": str(bridge_id or "").strip(),
+        **result,
         "state": store.state(limit=30),
     }
 
@@ -946,6 +1714,8 @@ def bridge_item_retryable(status: str, reason: str) -> tuple[bool, str]:
     reason = str(reason or "")
     lowered = reason.lower()
     if status == BridgeAckStatus.FAILED:
+        if any(marker in lowered for marker in _RETRYABLE_PRE_CONNECT_FAILED_REASON_MARKERS):
+            return True, ""
         if any(marker in lowered for marker in _NON_RETRYABLE_FAILED_REASON_MARKERS):
             return False, "failed item may have unknown delivery state or needs operator review"
         return True, ""
@@ -970,6 +1740,84 @@ def _weflow_capability_blocker(status: dict[str, Any], *, kind: str) -> str:
         backend = str(capabilities.get("backend") or "unknown")
         return f"weflow_backend_unavailable:weflow_{key}_send_not_supported:{backend}"
     return ""
+
+
+def _queued_bridge_ids_from_send_result(result: SendResult) -> list[str]:
+    bridge_ids: list[str] = []
+    details = result.details if isinstance(result.details, dict) else {}
+    text = details.get("text") if isinstance(details.get("text"), dict) else {}
+    if str(text.get("status") or "") == "queued_to_bridge":
+        bridge_ids.append(str(text.get("message_id") or ""))
+    files = details.get("files") if isinstance(details.get("files"), list) else []
+    for item in files:
+        if isinstance(item, dict) and str(item.get("status") or "") == "queued_to_bridge":
+            bridge_ids.append(str(item.get("message_id") or ""))
+    if not details and result.status == "queued_to_bridge":
+        bridge_ids.append(str(result.message_id or ""))
+    return list(
+        dict.fromkeys(
+            item.strip()
+            for item in bridge_ids
+            if item.strip().startswith("bridge:")
+        )
+    )
+
+
+def _normalized_projection_targets(values: list[str] | None) -> list[str]:
+    allowed = {"queue", "ledger", "task"}
+    return list(
+        dict.fromkeys(
+            str(item or "").strip().lower()
+            for item in (values or [])
+            if str(item or "").strip().lower() in allowed
+        )
+    )
+
+
+def _staging_owner_metadata() -> dict[str, Any]:
+    pid = os.getpid()
+    return {
+        "pid": pid,
+        "process_start": process_start_marker(pid),
+        "created_at": utc_now_iso(),
+    }
+
+
+def _staging_owner_is_alive(owner: dict[str, Any]) -> bool:
+    try:
+        pid = int(owner.get("pid") or 0)
+    except (TypeError, ValueError):
+        return True
+    # Malformed metadata cannot prove that staging was abandoned. Keep it
+    # staged so no worker can accidentally deliver it.
+    if pid <= 0:
+        return True
+    if not process_pid_alive(pid):
+        return False
+    recorded_start = str(owner.get("process_start") or "")
+    current_start = process_start_marker(pid) if recorded_start else ""
+    if recorded_start and current_start and recorded_start != current_start:
+        return False
+    return True
+
+
+def _staged_record_is_abandoned(item: dict[str, Any], owner: dict[str, Any]) -> bool:
+    if owner:
+        # Wall-clock age cannot fence a live producer: sleep/resume or a slow
+        # projection write can legitimately exceed the timeout and race the
+        # worker.  Process identity is the durable ownership proof available for
+        # current records, so only a dead/reused owner is abandoned.
+        return not _staging_owner_is_alive(owner)
+    # Legacy records written before staging-owner metadata existed have no live
+    # identity to protect. They remain ineligible for delivery and may be
+    # quarantined conservatively after the compatibility grace period.
+    raw_created = str(owner.get("created_at") or item.get("created_at") or "")
+    try:
+        created_at = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+        age_seconds = time.time() - created_at.timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return False
+    return age_seconds >= STAGED_RECORD_ABANDON_SECONDS
 
 
 def _channel_receiver(data_dir: str | Path, conversation_id: str) -> str:
@@ -1103,6 +1951,29 @@ def bridge_ack(
         "ack": record,
         "effective_status": effective.status,
         "effective_ack": effective.ack,
+    }
+
+
+def bridge_ack_if_queued(
+    data_dir: str | Path,
+    bridge_id: str,
+    *,
+    status: str,
+    reason: str = "",
+    external_message_id: str = "",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = BridgeOutboxStore(data_dir).append_terminal_ack_if_queued(
+        bridge_id,
+        status=status,
+        reason=reason,
+        external_message_id=external_message_id,
+        payload=payload,
+    )
+    return {
+        "status": "ok" if result.get("applied") else "conflict",
+        "bridge_id": str(bridge_id or "").strip(),
+        **result,
     }
 
 

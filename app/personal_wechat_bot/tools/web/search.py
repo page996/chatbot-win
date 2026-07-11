@@ -16,6 +16,11 @@ from typing import Any, Protocol
 from app.personal_wechat_bot.domain.models import ToolCallRequest, ToolCallResult
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.base import ToolManifest
+from app.personal_wechat_bot.tools.web.http_safety import (
+    PublicHttpUrlError,
+    guarded_urlopen,
+    read_response_with_deadline,
+)
 
 
 SEARCH_LEVELS: dict[str, dict[str, Any]] = {
@@ -206,8 +211,14 @@ class DuckDuckGoHtmlSearchProvider:
                 "Accept": "text/html,application/xhtml+xml",
             },
         )
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            raw = response.read(1024 * 1024)
+        deadline = time.monotonic() + max(0.2, float(timeout_seconds))
+        with guarded_urlopen(request, timeout_seconds=timeout_seconds) as response:
+            raw = read_response_with_deadline(
+                response,
+                max_bytes=1024 * 1024,
+                deadline=deadline,
+                truncate=True,
+            )
             charset = _charset(response.headers.get("content-type", "")) or "utf-8"
         parser = _DuckDuckGoParser()
         parser.feed(raw.decode(charset, errors="replace"))
@@ -215,20 +226,41 @@ class DuckDuckGoHtmlSearchProvider:
 
 
 class SimplePageFetcher:
+    def __init__(self, *, allow_private_network: bool = False) -> None:
+        self.allow_private_network = allow_private_network
+
     def fetch(self, url: str, *, timeout_seconds: float, max_bytes: int) -> dict[str, Any]:
-        parsed = urllib.parse.urlparse(url)
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            return {"status": "blocked", "error": "invalid_url"}
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return {"status": "blocked", "error": "invalid_url"}
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "wechat-agent-local/0.1",
-                "Accept": "text/html,text/plain,application/xhtml+xml,application/json",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            content_type = response.headers.get("content-type", "")
-            raw = response.read(max_bytes + 1)
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "wechat-agent-local/0.1",
+                    "Accept": "text/html,text/plain,application/xhtml+xml,application/json",
+                },
+            )
+            deadline = time.monotonic() + max(0.2, float(timeout_seconds))
+            with guarded_urlopen(
+                request,
+                timeout_seconds=timeout_seconds,
+                allow_private_network=self.allow_private_network,
+            ) as response:
+                content_type = response.headers.get("content-type", "")
+                raw = read_response_with_deadline(
+                    response,
+                    max_bytes=max_bytes + 1,
+                    deadline=deadline,
+                    truncate=True,
+                )
+        except PublicHttpUrlError as exc:
+            return {"status": "blocked", "error": str(exc)}
+        except (UnicodeError, ValueError):
+            return {"status": "blocked", "error": "invalid_url"}
         truncated = len(raw) > max_bytes
         raw = raw[:max_bytes]
         if _binary_content(content_type, raw):
@@ -397,7 +429,10 @@ def _quality_adjustment(domain: str, title: str, snippet: str, url: str) -> tupl
 
 
 def _filter_reason(*, title: str, url: str, domain: str, snippet: str, blocklist: list[str]) -> str:
-    parsed = urllib.parse.urlparse(url)
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return "invalid_or_non_http_url"
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return "invalid_or_non_http_url"
     if _domain_blocked(domain, blocklist):
@@ -563,7 +598,10 @@ def _normalize_result_url(url: str) -> str:
     text = html.unescape(str(url or "").strip())
     if not text:
         return ""
-    parsed = urllib.parse.urlparse(text)
+    try:
+        parsed = urllib.parse.urlparse(text)
+    except ValueError:
+        return ""
     if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
         query = urllib.parse.parse_qs(parsed.query)
         target = query.get("uddg", [""])[0]
@@ -575,7 +613,10 @@ def _normalize_result_url(url: str) -> str:
 
 
 def _domain(url: str) -> str:
-    host = urllib.parse.urlparse(url).netloc.lower().split("@")[-1]
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower().split("@")[-1]
+    except ValueError:
+        return ""
     host = host.split(":", 1)[0]
     return host[4:] if host.startswith("www.") else host
 

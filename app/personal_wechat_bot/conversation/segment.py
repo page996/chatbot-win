@@ -38,6 +38,45 @@ def conversation_segment(conversation_id: str, chat_title: str = "") -> str:
     return f"{sanitized}_{hash_prefix}"
 
 
+def validate_conversation_segment(value: str, *, label: str = "conversation segment") -> str:
+    """Return one safe, portable directory segment or fail closed."""
+
+    segment = str(value or "").strip()
+    if (
+        not segment
+        or segment in {".", ".."}
+        or "/" in segment
+        or "\\" in segment
+        or ":" in segment
+        or Path(segment).is_absolute()
+        or len(Path(segment).parts) != 1
+        or Path(segment).name != segment
+    ):
+        raise ValueError(f"invalid {label}: {value!r}")
+    return segment
+
+
+def conversation_projection_dir(
+    root: str | Path,
+    segment: str,
+    *,
+    label: str = "conversation segment",
+) -> Path:
+    """Resolve and contain a conversation directory beneath its projection root."""
+
+    safe_segment = validate_conversation_segment(segment, label=label)
+    root_path = Path(root).resolve()
+    candidate = root_path / safe_segment
+    resolved = candidate.resolve()
+    try:
+        relative = resolved.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes projection root: {segment!r}") from exc
+    if not relative.parts:
+        raise ValueError(f"{label} must identify a child directory")
+    return candidate
+
+
 def chat_title_from_registry(data_dir: str | Path, conversation_id: str) -> str:
     """Look up a conversation title from the SQLite channel registry."""
 
@@ -52,10 +91,13 @@ def segment_from_registry(data_dir: str | Path, conversation_id: str) -> str:
     if registered:
         segment = str(registered.get("segment", "") or "").strip()
         if segment:
-            return segment
+            return validate_conversation_segment(segment, label="registry conversation segment")
         title = str(registered.get("chat_title", "") or "")
         if title:
-            return conversation_segment(conversation_id, title)
+            return validate_conversation_segment(
+                conversation_segment(conversation_id, title),
+                label="derived registry conversation segment",
+            )
     return ""
 
 
@@ -95,4 +137,7 @@ def resolve_segment(data_dir: str | Path, conversation_id: str, chat_title: str 
     segment = segment_from_registry(data_dir, conversation_id)
     if segment:
         return segment
-    return conversation_segment(conversation_id, chat_title)
+    return validate_conversation_segment(
+        conversation_segment(conversation_id, chat_title),
+        label="derived conversation segment",
+    )

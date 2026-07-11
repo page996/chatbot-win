@@ -19,10 +19,14 @@ from app.personal_wechat_bot.wechat_driver.send_backends import (
 )
 
 
-def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]:
+def build_send_readiness_report(
+    data_dir: str | Path = "data",
+    *,
+    active_backend_probe: bool = True,
+) -> dict[str, Any]:
     config = load_config(data_dir)
     preflight = build_preflight_report(config, show_accepted=True, include_tool_health=False)
-    checks = _checks(preflight, config)
+    checks = _checks(preflight, config, active_backend_probe=active_backend_probe)
     blockers = [item for item in checks if item["status"] == "blocker"]
     warnings = [item for item in checks if item["status"] == "warn"]
     passed = [item for item in checks if item["status"] == "pass"]
@@ -30,6 +34,7 @@ def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]
         "status": "blocked" if blockers else ("warn" if warnings else "ready"),
         "data_dir": str(Path(data_dir).resolve()),
         "mode": preflight["mode"],
+        "active_backend_probe": bool(active_backend_probe),
         "summary": {
             "passed": len(passed),
             "warnings": len(warnings),
@@ -51,7 +56,12 @@ def build_send_readiness_report(data_dir: str | Path = "data") -> dict[str, Any]
     }
 
 
-def _checks(preflight: dict[str, Any], config: Any) -> list[dict[str, str]]:
+def _checks(
+    preflight: dict[str, Any],
+    config: Any,
+    *,
+    active_backend_probe: bool,
+) -> list[dict[str, str]]:
     send_policy = preflight.get("send_policy", {})
     wechat_access = preflight.get("wechat_access", {})
     model = preflight.get("model", {})
@@ -96,7 +106,7 @@ def _checks(preflight: dict[str, Any], config: Any) -> list[dict[str, str]]:
             f"send backend is '{send_backend}', not a real delivery backend; queued replies are acked as sent but NOT delivered",
         )
     )
-    if send_backend == "weflow_http":
+    if send_backend == "weflow_http" and active_backend_probe:
         weflow_status = weflow_http_status(
             str(getattr(config, "weflow_base_url", "http://127.0.0.1:5031") or "http://127.0.0.1:5031"),
             token_env=str(getattr(config, "weflow_token_env", "WEFLOW_API_TOKEN") or "WEFLOW_API_TOKEN"),
@@ -140,6 +150,15 @@ def _checks(preflight: dict[str, Any], config: Any) -> list[dict[str, str]]:
                     "WeFlow HTTP bridge does not expose file sending",
                 )
             )
+    elif send_backend == "weflow_http":
+        checks.append(
+            _check(
+                "weflow_http_send_bridge",
+                "warn" if intends_real_send else "pass",
+                "WeFlow HTTP health is deferred during passive state refresh",
+                "WeFlow HTTP health is deferred; run the explicit send probe before enabling delivery",
+            )
+        )
     else:
         checks.append(
             _check(
@@ -149,7 +168,7 @@ def _checks(preflight: dict[str, Any], config: Any) -> list[dict[str, str]]:
                 "WeFlow HTTP send bridge is not selected",
             )
         )
-    if send_backend == "wechat_native_http":
+    if send_backend == "wechat_native_http" and active_backend_probe:
         hook_status = wechat_native_http_status(
             str(getattr(config, "wechat_native_base_url", "http://127.0.0.1:30001") or "http://127.0.0.1:30001"),
             text_path=str(getattr(config, "wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
@@ -208,6 +227,23 @@ def _checks(preflight: dict[str, Any], config: Any) -> list[dict[str, str]]:
                     "WeChat Native ordinary-file endpoint accepts requests, but delivery remains unverified until readback or operator confirmation",
                 )
             )
+    elif send_backend == "wechat_native_http":
+        checks.append(
+            _check(
+                "wechat_native_http_send_bridge",
+                "warn" if intends_real_send else "pass",
+                "WeChat Native HTTP health is deferred during passive state refresh",
+                "WeChat Native HTTP health is deferred; run the explicit send probe before enabling delivery",
+            )
+        )
+        checks.append(
+            _check(
+                "wechat_native_text_delivery_verification",
+                "warn",
+                "WeChat Native HTTP delivery verification is deferred during passive state refresh",
+                "Delivery verification is deferred; run the explicit send probe to check WeFlow readback availability",
+            )
+        )
     else:
         checks.append(
             _check(

@@ -8,7 +8,12 @@ from pathlib import Path
 
 from app.personal_wechat_bot.domain.models import ToolCallRequest
 from app.personal_wechat_bot.memory.file_index import FileIndex
-from app.personal_wechat_bot.tools.web.search import WebSearchTool, fetched_text_block_reason, score_and_filter_candidates
+from app.personal_wechat_bot.tools.web.search import (
+    SimplePageFetcher,
+    WebSearchTool,
+    fetched_text_block_reason,
+    score_and_filter_candidates,
+)
 
 
 class WebSearchToolTest(unittest.TestCase):
@@ -131,6 +136,21 @@ class WebSearchToolTest(unittest.TestCase):
         self.assertEqual(fetched_text_block_reason("请登录后查看全文"), "login_or_paywall_detected")
         self.assertEqual(fetched_text_block_reason("请完成验证，验证你是真人"), "anti_bot_or_verification_wall")
         self.assertEqual(fetched_text_block_reason("现金网 博彩 广告推广"), "unsafe_or_spam_content")
+
+
+    def test_malformed_search_result_is_filtered_without_raising(self) -> None:
+        scored, filtered = score_and_filter_candidates(
+            "release notes",
+            [{"title": "Release notes", "url": "http://[::1", "snippet": "current release notes"}],
+        )
+
+        self.assertEqual(scored, [])
+        self.assertEqual(filtered[0]["reason"], "invalid_or_non_http_url")
+
+    def test_page_fetcher_blocks_malformed_url(self) -> None:
+        result = SimplePageFetcher().fetch("http://[::1", timeout_seconds=1.0, max_bytes=1024)
+
+        self.assertEqual(result, {"status": "blocked", "error": "invalid_url"})
 
 
 class _FakeSearchProvider:

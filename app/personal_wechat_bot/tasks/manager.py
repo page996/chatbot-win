@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from app.personal_wechat_bot.conversation.channel_control import normalize_control_mode, parse_bool, snooze_is_active
 from app.personal_wechat_bot.conversation.channel_state_store import ChannelStateStore
+from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path, short_process_lock
 from app.personal_wechat_bot.tasks.scheduler_store import SchedulerStore
 
 
@@ -115,57 +116,65 @@ class TaskStatusStore:
 
     def create(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            tasks = self._read_tasks()
             task_id = _clean_id(payload.get("task_id") or payload.get("id") or "")
             if not task_id:
                 task_id = f"task-{uuid4().hex[:12]}"
-            existing = next((item for item in tasks if item.get("task_id") == task_id), None)
-            if existing is not None:
-                updated = _merge_task(existing, payload)
-                _replace(tasks, task_id, updated)
-                self._write_tasks(tasks)
-                self._write_event(task_id, "updated", updated)
-                return updated
-            task = TaskRecord(
-                task_id=task_id,
-                title=str(payload.get("title") or payload.get("label") or "operation").strip() or "operation",
-                conversation_id=str(payload.get("conversation_id") or payload.get("conversationId") or ""),
-                session_id=str(payload.get("session_id") or payload.get("sessionId") or "session_default"),
-                kind=str(payload.get("kind") or payload.get("category") or "operation"),
-                status=_status(payload.get("status"), "queued"),
-                priority=_int(payload.get("priority"), 50),
-                progress=_percent(payload.get("progress"), 0),
-                phase=str(payload.get("phase") or ""),
-                detail=str(payload.get("detail") or ""),
-                blocker=str(payload.get("blocker") or ""),
-                assigned_worker=str(payload.get("assigned_worker") or payload.get("assignedWorker") or ""),
-                parent_task_id=str(payload.get("parent_task_id") or payload.get("parentTaskId") or ""),
-                dependencies=_string_list(payload.get("dependencies")),
-                concurrency_key=str(payload.get("concurrency_key") or payload.get("scope") or "global"),
-                topic_id=str(payload.get("topic_id") or payload.get("topicId") or ""),
-                topic_title=str(payload.get("topic_title") or payload.get("topicTitle") or ""),
-                resource_class=str(payload.get("resource_class") or payload.get("resourceClass") or "cpu_io"),
-                estimated_cost=max(0, _int(payload.get("estimated_cost") or payload.get("estimatedCost"), 1)),
-                actual_cost=max(0, _int(payload.get("actual_cost") or payload.get("actualCost"), 0)),
-                stop_and_wait=bool(payload.get("stop_and_wait") or payload.get("stopAndWait")),
-                external_id=str(payload.get("external_id") or payload.get("externalId") or ""),
-                metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
-            ).to_dict()
-            tasks.append(task)
-            self._write_tasks(tasks)
-            self._write_event(task_id, "created", task)
-            return task
+
+            def mutate(tasks: list[dict[str, Any]]):
+                tasks, _, _ = self._repair_tasks_atomically(tasks)
+                existing = next((item for item in tasks if item.get("task_id") == task_id), None)
+                if existing is not None:
+                    result = _merge_task(existing, payload)
+                    _replace(tasks, task_id, result)
+                    event = "updated"
+                else:
+                    result = TaskRecord(
+                        task_id=task_id,
+                        title=str(payload.get("title") or payload.get("label") or "operation").strip()
+                        or "operation",
+                        conversation_id=str(payload.get("conversation_id") or payload.get("conversationId") or ""),
+                        session_id=str(payload.get("session_id") or payload.get("sessionId") or "session_default"),
+                        kind=str(payload.get("kind") or payload.get("category") or "operation"),
+                        status=_status(payload.get("status"), "queued"),
+                        priority=_int(payload.get("priority"), 50),
+                        progress=_percent(payload.get("progress"), 0),
+                        phase=str(payload.get("phase") or ""),
+                        detail=str(payload.get("detail") or ""),
+                        blocker=str(payload.get("blocker") or ""),
+                        assigned_worker=str(payload.get("assigned_worker") or payload.get("assignedWorker") or ""),
+                        parent_task_id=str(payload.get("parent_task_id") or payload.get("parentTaskId") or ""),
+                        dependencies=_string_list(payload.get("dependencies")),
+                        concurrency_key=str(payload.get("concurrency_key") or payload.get("scope") or "global"),
+                        topic_id=str(payload.get("topic_id") or payload.get("topicId") or ""),
+                        topic_title=str(payload.get("topic_title") or payload.get("topicTitle") or ""),
+                        resource_class=str(payload.get("resource_class") or payload.get("resourceClass") or "cpu_io"),
+                        estimated_cost=max(0, _int(payload.get("estimated_cost") or payload.get("estimatedCost"), 1)),
+                        actual_cost=max(0, _int(payload.get("actual_cost") or payload.get("actualCost"), 0)),
+                        stop_and_wait=bool(payload.get("stop_and_wait") or payload.get("stopAndWait")),
+                        external_id=str(payload.get("external_id") or payload.get("externalId") or ""),
+                        metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+                    ).to_dict()
+                    tasks.append(result)
+                    event = "created"
+                return _bounded_task_records(tasks), result, [(task_id, event, result)]
+
+            result = self.scheduler_store.update_tasks_atomically(mutate)
+            self._write_projection_from_sqlite()
+            return result
 
     def update(self, task_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            tasks = self._read_tasks()
-            current = next((item for item in tasks if item.get("task_id") == task_id), None)
-            if current is None:
-                raise KeyError(f"task not found: {task_id}")
-            updated = _merge_task(current, patch)
-            _replace(tasks, task_id, updated)
-            self._write_tasks(tasks)
-            self._write_event(task_id, "updated", updated)
+            def mutate(tasks: list[dict[str, Any]]):
+                tasks, _, _ = self._repair_tasks_atomically(tasks)
+                current = next((item for item in tasks if item.get("task_id") == task_id), None)
+                if current is None:
+                    raise KeyError(f"task not found: {task_id}")
+                updated = _merge_task(current, patch)
+                _replace(tasks, task_id, updated)
+                return _bounded_task_records(tasks), updated, [(task_id, "updated", updated)]
+
+            updated = self.scheduler_store.update_tasks_atomically(mutate)
+            self._write_projection_from_sqlite()
             return updated
 
     def transition(self, task_id: str, action: str, patch: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -193,20 +202,23 @@ class TaskStatusStore:
         if not external_id:
             return []
         with self._lock:
-            tasks = self._read_tasks()
-            updated_tasks: list[dict[str, Any]] = []
-            for index, task in enumerate(tasks):
-                if str(task.get("external_id") or "") != external_id:
-                    continue
-                if str(task.get("status") or "") not in ACTIVE_STATUSES:
-                    continue
-                updated = _merge_task(task, patch or {})
-                tasks[index] = updated
-                updated_tasks.append(updated)
-            if updated_tasks:
-                self._write_tasks(tasks)
-                for task in updated_tasks:
-                    self._write_event(str(task.get("task_id") or ""), "finish_external", task)
+            def mutate(tasks: list[dict[str, Any]]):
+                tasks, _, _ = self._repair_tasks_atomically(tasks)
+                updated_tasks: list[dict[str, Any]] = []
+                events: list[tuple[str, str, dict[str, Any]]] = []
+                for index, task in enumerate(tasks):
+                    if str(task.get("external_id") or "") != external_id:
+                        continue
+                    if str(task.get("status") or "") not in ACTIVE_STATUSES:
+                        continue
+                    updated = _merge_task(task, patch or {})
+                    tasks[index] = updated
+                    updated_tasks.append(updated)
+                    events.append((str(updated.get("task_id") or ""), "finish_external", updated))
+                return _bounded_task_records(tasks), updated_tasks, events
+
+            updated_tasks = self.scheduler_store.update_tasks_atomically(mutate)
+            self._write_projection_from_sqlite()
             return updated_tasks
 
     def claim_next(
@@ -326,9 +338,6 @@ class TaskStatusStore:
             return repaired
         return []
 
-    def _write_tasks(self, tasks: list[dict[str, Any]]) -> None:
-        self._persist_tasks(tasks)
-
     def _repair_tasks_atomically(
         self, tasks: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[str, str, dict[str, Any]]]]:
@@ -336,13 +345,21 @@ class TaskStatusStore:
         repaired = _repair_stale_external_tasks(filtered, data_dir=self.data_dir)
         return repaired, repaired, []
 
-    def _persist_tasks(self, tasks: list[dict[str, Any]]) -> None:
-        tasks = sorted(tasks, key=lambda item: str(item.get("updated_at", "")), reverse=True)[:500]
-        self.scheduler_store.replace_tasks(tasks)
-        self._write_projection(tasks)
-
     def _write_projection_from_sqlite(self) -> None:
-        self._write_projection(self.scheduler_store.list_tasks())
+        lock_path = scoped_process_lock_path(
+            self.data_dir,
+            "task-manager-projection",
+            "global",
+        )
+        with short_process_lock(
+            lock_path,
+            timeout_seconds=30.0,
+            stale_after_seconds=60.0,
+            timeout_label="task manager projection lock",
+        ):
+            # Read after acquiring the projection lock. A caller that committed
+            # earlier must not overwrite a newer caller with its older snapshot.
+            self._write_projection(self.scheduler_store.list_tasks())
 
     def _write_projection(self, tasks: list[dict[str, Any]]) -> None:
         tasks = sorted(tasks, key=lambda item: str(item.get("updated_at", "")), reverse=True)[:500]
@@ -445,6 +462,14 @@ def _replace(tasks: list[dict[str, Any]], task_id: str, updated: dict[str, Any])
             tasks[index] = updated
             return
     tasks.append(updated)
+
+
+def _bounded_task_records(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        tasks,
+        key=lambda item: str(item.get("updated_at", "")),
+        reverse=True,
+    )[:500]
 
 
 def _counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
@@ -794,18 +819,22 @@ def _approved_queue_message_ids(data_dir: str | Path) -> set[str]:
 def _bridge_worker_config_is_matched(data_dir: str | Path) -> bool:
     try:
         from app.personal_wechat_bot.config.loader import load_config
-        from app.personal_wechat_bot.wechat_driver.send_driver_factory import build_send_driver
+        from app.personal_wechat_bot.runtime.send_bridge_worker import (
+            bridge_worker_config_signature,
+            bridge_worker_lock_alive,
+            bridge_worker_lock_path,
+        )
 
-        driver = build_send_driver(load_config(data_dir))
-        probe = getattr(driver, "probe", None)
-        if not callable(probe):
+        root = Path(data_dir)
+        if not bridge_worker_lock_alive(root):
             return False
-        result = probe()
-        backend = getattr(result, "backend", {}) if result is not None else {}
-        if not isinstance(backend, dict):
+        payload = json.loads(bridge_worker_lock_path(root).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
             return False
-        worker = backend.get("worker_config") if isinstance(backend.get("worker_config"), dict) else {}
-        return bool(worker.get("config_match") is True and worker.get("config_status") == "matched")
+        actual = payload.get("config_signature")
+        if not isinstance(actual, dict) or not actual:
+            return False
+        return actual == bridge_worker_config_signature(load_config(root))
     except Exception:
         return False
 
@@ -865,7 +894,11 @@ def _task_bridge_ids(task: dict[str, Any]) -> list[str]:
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     ids: list[str] = []
     raw_bridge_ids = metadata.get("bridge_ids") if isinstance(metadata.get("bridge_ids"), list) else []
-    ids.extend(str(item).strip() for item in raw_bridge_ids if str(item).strip())
+    ids.extend(
+        str(item).strip()
+        for item in raw_bridge_ids
+        if str(item).strip().startswith("bridge:")
+    )
     for value in (
         task.get("external_id"),
         metadata.get("bridge_id"),
@@ -877,7 +910,7 @@ def _task_bridge_ids(task: dict[str, Any]) -> list[str]:
         if text.startswith("bridge:"):
             ids.append(text.strip("，,.;；"))
         ids.extend(match.group("id").strip("，,.;；") for match in _BRIDGE_ID_RE.finditer(text))
-    return _dedupe_nonempty(ids)
+    return _dedupe_nonempty([item for item in ids if str(item).startswith("bridge:")])
 
 
 def _dedupe_nonempty(values: list[str]) -> list[str]:

@@ -33,8 +33,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import quote
+from urllib.request import Request
+
+from app.personal_wechat_bot.tools.web.http_safety import (
+    guarded_local_urlopen,
+    read_response_with_deadline,
+    validate_local_http_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,8 @@ _DEFAULT_WECHAT_NATIVE_VERIFY_POLL_SECONDS = 0.75
 _MAX_EVIDENCE_STRING_LENGTH = 500
 _MAX_EVIDENCE_LIST_ITEMS = 20
 _MAX_EVIDENCE_DICT_ITEMS = 50
+_MAX_HTTP_JSON_RESPONSE_BYTES = 1024 * 1024
+_HTTP_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 _SYNTHETIC_PRIVATE_WECHAT_SUFFIXES = frozenset(
     {
         "a",
@@ -198,11 +206,12 @@ def _local_endpoint_url(base_url: str, endpoint_path: str, *, default_base_url: 
 
 
 def _require_local_http_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme != "http":
-        raise ValueError("local send backend only allows http endpoints")
-    if (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("local send backend only allows localhost endpoints")
+    try:
+        validate_local_http_url(url)
+    except ValueError as exc:
+        if "local_http_required" in str(exc):
+            raise ValueError("local send backend only allows http endpoints") from exc
+        raise ValueError("local send backend only allows localhost endpoints") from exc
 
 
 def _http_json(
@@ -214,6 +223,8 @@ def _http_json(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     _require_local_http_url(url)
+    timeout = max(0.2, float(timeout_seconds))
+    deadline = time.monotonic() + timeout
     body = None
     headers = {"Accept": "application/json"}
     if payload is not None:
@@ -223,11 +234,11 @@ def _http_json(
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, data=body, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=max(0.2, float(timeout_seconds))) as response:
-            raw = response.read().decode("utf-8", errors="replace")
+        with guarded_local_urlopen(request, timeout_seconds=timeout, deadline=deadline) as response:
+            raw = _read_http_response_body(response, deadline=deadline).decode("utf-8", errors="replace")
     except HTTPError as exc:
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            detail = _read_http_response_body(exc, deadline=deadline).decode("utf-8", errors="replace")[:500]
         finally:
             exc.close()
         raise ValueError(f"http_{exc.code}:{detail}") from exc
@@ -241,20 +252,44 @@ def _http_json(
     return parsed
 
 
+def _read_http_response_body(
+    response: Any,
+    *,
+    deadline: float,
+    max_bytes: int = _MAX_HTTP_JSON_RESPONSE_BYTES,
+) -> bytes:
+    try:
+        return read_response_with_deadline(
+            response,
+            max_bytes=max_bytes,
+            deadline=deadline,
+            chunk_bytes=_HTTP_RESPONSE_READ_CHUNK_BYTES,
+        )
+    except ValueError as exc:
+        if "http_response_too_large" in str(exc):
+            raise ValueError(str(exc)) from exc
+        raise
+
+
 def _weflow_payload_success(payload: dict[str, Any]) -> bool:
     if not payload:
         return True
     if payload.get("success") is False or payload.get("ok") is False:
         return False
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {"error", "failed", "fail"}:
+        return False
+    if "code" in payload and payload.get("code") not in (0, "0"):
+        return False
+    if status and status not in {"ok", "success", "sent"}:
+        # Unknown/business-progress statuses are not proof of delivery.
+        return False
     if payload.get("success") is True or payload.get("ok") is True:
         return True
     if payload.get("code") in (0, "0"):
         return True
-    status = str(payload.get("status") or "").strip().lower()
     if status in {"ok", "success", "sent"}:
         return True
-    if status in {"error", "failed", "fail"}:
-        return False
     return True
 
 
@@ -1087,20 +1122,27 @@ class WeChatNativeHttpSendBackend:
             "verify_base_url": self.verify_base_url,
             "verify_token_env": self.verify_token_env,
             "before": {},
+            "baseline_status": "pending",
         }
-        if self.file_verify_timeout_seconds <= 0:
+        if self.verify_timeout_seconds <= 0:
             probe["disabled"] = True
+            probe["baseline_status"] = "disabled"
             return probe
         token = _token_from_env(self.verify_token_env)
         if not token:
             probe["disabled"] = True
             probe["reason"] = "weflow_token_missing"
+            probe["baseline_status"] = "disabled"
             return probe
         try:
             before = self._read_weflow_messages(receiver, limit=10, timeout_seconds=min(2.0, self.verify_timeout_seconds))
             probe["before"] = _wechat_native_delivery_watermark(before)
+            probe["baseline_status"] = "ready"
         except Exception as exc:
             probe["before_error"] = f"{type(exc).__name__}:{exc}"
+            probe["baseline_status"] = "failed"
+            probe["disabled"] = True
+            probe["reason"] = "baseline_readback_failed"
         return probe
 
     def _file_delivery_probe(self, receiver: str, path: str) -> dict[str, Any]:
@@ -1115,20 +1157,27 @@ class WeChatNativeHttpSendBackend:
             "verify_base_url": self.verify_base_url,
             "verify_token_env": self.verify_token_env,
             "before": {},
+            "baseline_status": "pending",
         }
-        if self.verify_timeout_seconds <= 0:
+        if self.file_verify_timeout_seconds <= 0:
             probe["disabled"] = True
+            probe["baseline_status"] = "disabled"
             return probe
         token = _token_from_env(self.verify_token_env)
         if not token:
             probe["disabled"] = True
             probe["reason"] = "weflow_token_missing"
+            probe["baseline_status"] = "disabled"
             return probe
         try:
             before = self._read_weflow_messages(receiver, limit=20, timeout_seconds=min(2.0, self.file_verify_timeout_seconds))
             probe["before"] = _wechat_native_delivery_watermark(before)
+            probe["baseline_status"] = "ready"
         except Exception as exc:
             probe["before_error"] = f"{type(exc).__name__}:{exc}"
+            probe["baseline_status"] = "failed"
+            probe["disabled"] = True
+            probe["reason"] = "baseline_readback_failed"
         return probe
 
     def verify_accepted_bridge_record(self, record: dict[str, Any], ack: dict[str, Any]) -> SendOutcome | None:
@@ -1191,6 +1240,7 @@ class WeChatNativeHttpSendBackend:
             "timeout_seconds": self.verify_timeout_seconds,
             "before": probe.get("before") if isinstance(probe.get("before"), dict) else {},
             "token_present": bool(probe.get("token_present")),
+            "baseline_status": str(probe.get("baseline_status") or ""),
         }
         if probe.get("disabled"):
             result["reason"] = str(probe.get("reason") or "disabled")
@@ -1245,6 +1295,7 @@ class WeChatNativeHttpSendBackend:
             "timeout_seconds": timeout_seconds,
             "before": probe.get("before") if isinstance(probe.get("before"), dict) else {},
             "token_present": bool(probe.get("token_present")),
+            "baseline_status": str(probe.get("baseline_status") or ""),
         }
         if probe.get("disabled"):
             result["reason"] = str(probe.get("reason") or "disabled")
@@ -1311,7 +1362,11 @@ class WeChatNativeHttpSendBackend:
             "timeout_seconds": 0.0,
             "before": before,
             "token_present": bool(_token_from_env(self.verify_token_env)),
+            "baseline_status": str(prior.get("baseline_status") or ""),
         }
+        if result["baseline_status"] == "failed" or str(prior.get("reason") or "") == "baseline_readback_failed":
+            result["reason"] = "baseline_readback_failed"
+            return result
         if not receiver:
             result["reason"] = "missing_receiver"
             return result

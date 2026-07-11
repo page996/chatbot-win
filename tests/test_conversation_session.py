@@ -15,9 +15,61 @@ from app.personal_wechat_bot.conversation.session_store import (
     is_reset_command,
 )
 from app.personal_wechat_bot.domain.models import NormalizedMessage
+from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path
 
 
 class ConversationSessionStoreTest(unittest.TestCase):
+    def test_tampered_registry_segment_cannot_escape_session_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            conversation_id = "registry-escape"
+            ChannelRegistryStore(data_dir).upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "Unsafe",
+                    "segment": "../../escaped",
+                    "status": "active",
+                }
+            )
+
+            with self.assertRaises(ValueError):
+                ConversationSessionStore(data_dir).current_session_id_for_conversation(
+                    conversation_id,
+                    "Unsafe",
+                )
+
+            self.assertFalse((root / "escaped").exists())
+
+    def test_tampered_segment_cache_cannot_escape_session_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            store = ConversationSessionStore(data_dir)
+            store._segment_cache["conv1"] = "../../escaped"
+
+            with self.assertRaises(ValueError):
+                store.current_session_id("conv1")
+
+            self.assertFalse((root / "escaped").exists())
+
+    def test_conversation_lock_lives_outside_deletable_session_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = ConversationSessionStore(data_dir)
+
+            with store._conversation_lock("conv1"):
+                lock_path = scoped_process_lock_path(
+                    data_dir,
+                    "conversation-lifecycle",
+                    "conv1",
+                )
+                self.assertTrue(lock_path.exists())
+
+            self.assertFalse(lock_path.exists())
+            self.assertTrue(Path(f"{lock_path}.guard").exists())
+
     def test_current_session_defaults_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationSessionStore(Path(tmp))

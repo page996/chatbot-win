@@ -26,3 +26,31 @@ class ReplyGate:
         if self.auto_executor is None:
             return SendResult(reply.message_id, reply.conversation_id, "failed", "auto_send_executor_missing")
         return self.auto_executor.execute_auto(reply)
+
+    def activate_staged(
+        self,
+        result: SendResult,
+        *,
+        expected_projections: list[str] | None = None,
+    ) -> dict:
+        if self.auto_executor is None:
+            return {"status": "not_supported", "bridge_ids": []}
+        return self.auto_executor.activate_staged(
+            result,
+            expected_projections=expected_projections,
+        )
+
+    def fail_staged(
+        self,
+        result: SendResult,
+        *,
+        reason: str,
+        expected_projections: list[str] | None = None,
+    ) -> dict:
+        if self.auto_executor is None:
+            return {"status": "not_supported", "bridge_ids": []}
+        return self.auto_executor.fail_staged(
+            result,
+            reason=reason,
+            expected_projections=expected_projections,
+        )

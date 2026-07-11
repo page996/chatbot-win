@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 
 SCHEMA_VERSION = 1
+_SQLITE_BUSY_TIMEOUT_MS = 30000
 
 
 class SchedulerStore:
@@ -182,19 +184,18 @@ class SchedulerStore:
 
     def _connect(self) -> sqlite3.Connection:
         self.root.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.path, timeout=30)
+        db = sqlite3.connect(self.path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000.0)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA busy_timeout=30000")
+        db.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         db.execute("PRAGMA foreign_keys=ON")
         return db
 
     def _ensure_schema(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.path, timeout=30)
+        db = sqlite3.connect(self.path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000.0)
         try:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA busy_timeout=30000")
+            db.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+            _ensure_wal_mode(db)
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scheduler_meta(
@@ -298,3 +299,25 @@ def _int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _ensure_wal_mode(db: sqlite3.Connection) -> None:
+    current = db.execute("PRAGMA journal_mode").fetchone()
+    if current and str(current[0] or "").lower() == "wal":
+        return
+
+    deadline = time.monotonic() + (_SQLITE_BUSY_TIMEOUT_MS / 1000.0)
+    while True:
+        try:
+            result = db.execute("PRAGMA journal_mode=WAL").fetchone()
+            if result and str(result[0] or "").lower() == "wal":
+                return
+            raise sqlite3.OperationalError("failed to enable WAL journal mode")
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.05, remaining))

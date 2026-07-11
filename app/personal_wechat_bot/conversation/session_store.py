@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.personal_wechat_bot.conversation.segment import resolve_segment
+from app.personal_wechat_bot.conversation.segment import (
+    conversation_projection_dir,
+    resolve_segment,
+    validate_conversation_segment,
+)
 from app.personal_wechat_bot.conversation.session_database import ConversationSessionDatabase
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
+from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path, short_process_lock
 
 
 DEFAULT_SESSION_ID = "session_default"
@@ -143,22 +146,63 @@ class ConversationSessionStore:
     def _conversation_dir(self, conversation_id: str) -> Path:
         cached_segment = self._segment_cache.get(conversation_id, "")
         if cached_segment:
-            return self.root / cached_segment
+            return conversation_projection_dir(
+                self.root,
+                cached_segment,
+                label="cached session conversation segment",
+            )
         database_segment = self.database.segment_for(conversation_id)
         if database_segment:
+            database_segment = validate_conversation_segment(
+                database_segment,
+                label="session database conversation segment",
+            )
+            conversation_dir = conversation_projection_dir(
+                self.root,
+                database_segment,
+                label="session database conversation segment",
+            )
             self._segment_cache[conversation_id] = database_segment
-            return self.root / database_segment
-        return self.root / resolve_segment(self.data_dir, conversation_id)
+            return conversation_dir
+        segment = resolve_segment(self.data_dir, conversation_id)
+        return conversation_projection_dir(
+            self.root,
+            segment,
+            label="resolved session conversation segment",
+        )
 
     def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
         cached_segment = self._segment_cache.get(conversation_id, "")
         if cached_segment:
+            cached_segment = validate_conversation_segment(
+                cached_segment,
+                label="cached session conversation segment",
+            )
+            conversation_projection_dir(
+                self.root,
+                cached_segment,
+                label="cached session conversation segment",
+            )
             return cached_segment
         database_segment = self.database.segment_for(conversation_id)
         if database_segment:
+            database_segment = validate_conversation_segment(
+                database_segment,
+                label="session database conversation segment",
+            )
+            conversation_projection_dir(
+                self.root,
+                database_segment,
+                label="session database conversation segment",
+            )
             self._segment_cache[conversation_id] = database_segment
             return database_segment
         segment = resolve_segment(self.data_dir, conversation_id, chat_title)
+        conversation_projection_dir(
+            self.root,
+            segment,
+            label="resolved session conversation segment",
+        )
         self._segment_cache[conversation_id] = segment
         state = self.database.get_state(conversation_id) or {}
         if state:
@@ -218,33 +262,18 @@ class ConversationSessionStore:
 
     @contextmanager
     def _conversation_lock(self, conversation_id: str) -> Iterator[None]:
-        lock_path = self._find_conversation_dir(conversation_id) / ".session.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + 30.0
-        fd: int | None = None
-        while fd is None:
-            try:
-                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except (FileExistsError, PermissionError):
-                if _stale_lock(lock_path):
-                    try:
-                        lock_path.unlink()
-                        continue
-                    except OSError:
-                        pass
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for conversation session lock: {lock_path}")
-                time.sleep(0.025)
-        try:
-            os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+        lock_path = scoped_process_lock_path(
+            self.data_dir,
+            "conversation-lifecycle",
+            conversation_id,
+        )
+        with short_process_lock(
+            lock_path,
+            timeout_seconds=30.0,
+            stale_after_seconds=60.0,
+            timeout_label="conversation session lock",
+        ):
             yield
-        finally:
-            if fd is not None:
-                os.close(fd)
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
 
 
 def is_reset_command(text: str, *, metadata: dict[str, Any] | None = None) -> bool:
@@ -300,13 +329,6 @@ def _new_session_id() -> str:
 
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", text).lower()
-
-
-def _stale_lock(path: Path, *, max_age_seconds: float = 60.0) -> bool:
-    try:
-        return time.time() - path.stat().st_mtime > max_age_seconds
-    except OSError:
-        return False
 
 
 def _safe_int(value: Any, default: int = 0) -> int:

@@ -19,6 +19,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -46,9 +47,13 @@ from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandid
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
-from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
+from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue, ConfirmQueueClaimConflict
 from app.personal_wechat_bot.reply_gate.send_audit import SendAuditLog
-from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
+from app.personal_wechat_bot.reply_gate.send_executor import (
+    GuardedSendExecutor,
+    send_result_bridge_ids,
+    send_result_non_bridge_part_statuses,
+)
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.runtime.process_lock import (
@@ -56,6 +61,7 @@ from app.personal_wechat_bot.runtime.process_lock import (
     ProcessLockError,
     blocking_process_lock,
     process_pid_alive,
+    process_start_marker,
 )
 from app.personal_wechat_bot.runtime.resource_governor import audit_local_resources
 from app.personal_wechat_bot.runtime.resource_gate import gpu_gate_snapshot, llm_gate_snapshot
@@ -91,7 +97,11 @@ from app.personal_wechat_bot.wechat_driver.window_introspection import build_wec
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
-from app.personal_wechat_bot.wechat_driver.bridge_send import bridge_ack, bridge_state, is_terminal_bridge_ack_status
+from app.personal_wechat_bot.wechat_driver.bridge_send import (
+    bridge_ack_if_queued,
+    bridge_state,
+    is_terminal_bridge_ack_status,
+)
 from app.personal_wechat_bot.wechat_driver.send_backends import (
     wechat_native_http_status,
     weflow_http_status,
@@ -111,6 +121,7 @@ from app.personal_wechat_bot.voice.asr import LocalAsrSubprocessEngine
 QUEUE_STATUSES = ("pending", "approved", "queued_to_bridge", "accepted", "rejected", "sent", "failed")
 AUDIT_PHASES = QUEUE_STATUSES + ("blocked", "resolved", "other")
 BRIDGE_ITEM_STATUSES = ("queued", "inflight", "accepted", "sent", "failed", "blocked", "retry")
+_WEFLOW_HEALTH_TTL_SECONDS = 60.0
 _HISTORY_RESET_DIRS = (
     "agent_workspace",
     "conversation_channels",
@@ -245,7 +256,12 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
             "supports_multi_conversation": True,
             "send_driver_boundary": "bridge_outbox queues replies for the configured non-foreground send backend (delivered by wxid/roomid); backend events can receive multiple conversations without page OCR",
             "input_pipeline": "POST /api/backend-events or append-backend-event -> backend_events.jsonl -> run-agent/poll-backend-events -> conversation_ledgers",
-            "background_send_status": _background_send_status(config, send_bridge, data_dir),
+            "background_send_status": _background_send_status(
+                config,
+                send_bridge,
+                data_dir,
+                active_backend_probe=False,
+            ),
         },
         "config": {
             "mode": config.mode,
@@ -286,12 +302,12 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "resource_audit": _last_resource_audit(data_dir),
         "resource_scheduler": _resource_scheduler_snapshot(data_dir),
         "queues": queues,
-        "readiness": build_send_readiness_report(data_dir),
-        "driver_probe": probe_send_controls(data_dir)["probe"],
+        "readiness": build_send_readiness_report(data_dir, active_backend_probe=False),
+        "driver_probe": probe_send_controls(data_dir, active_backend_probe=False)["probe"],
         "send_bridge": send_bridge,
         "weflow": build_sidebar_weflow_state(data_dir),
         "native_migration": build_sidebar_native_migration_state(data_dir),
-        "wechat_window_probe": _safe_wechat_window_probe(max_children=0, max_controls=0),
+        "wechat_window_probe": _passive_wechat_window_probe(),
         "audit": audit,
     }
 
@@ -572,20 +588,16 @@ def _audit_item_conversation_id(item: dict[str, Any], queue_lookup: dict[str, di
 def _audit_item_phase(item: dict[str, Any]) -> str:
     if bool(item.get("resolved")):
         return "resolved"
-    status = str(item.get("status") or "").strip()
-    if status in AUDIT_PHASES:
-        return status
     action = str(item.get("action") or "").strip()
-    if action == "confirm_approve":
-        return "approved"
-    if action == "confirm_reject":
-        return "rejected"
-    if action == "confirm_send_blocked":
-        return "blocked"
-    if action == "ledger_sync_recovered":
-        return "resolved"
+    # Projection errors describe the audit event, while ``status`` records the
+    # business state that failed to project. Count the event as a failure rather
+    # than a second approved/sent transition in the sidebar summary.
     if action == "ledger_sync_failed":
         return "failed"
+    if action == "ledger_sync_recovered":
+        return "resolved"
+    if action == "confirm_send_blocked":
+        return "blocked"
     if action == "bridge_ack_sync":
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         ack_status = str(payload.get("ack_status") or "").strip()
@@ -595,6 +607,13 @@ def _audit_item_phase(item: dict[str, Any]) -> str:
             return "sent"
         if ack_status in {"failed", "blocked"}:
             return "failed"
+    status = str(item.get("status") or "").strip()
+    if status in AUDIT_PHASES:
+        return status
+    if action == "confirm_approve":
+        return "approved"
+    if action == "confirm_reject":
+        return "rejected"
     return "other"
 
 
@@ -2265,6 +2284,26 @@ def _safe_wechat_window_probe(
     }
 
 
+def _passive_wechat_window_probe() -> dict[str, Any]:
+    """Return the polling-safe window schema without enumerating OS windows."""
+
+    return {
+        "status": "unchecked",
+        "reason": "explicit_probe_required",
+        "endpoint": "/api/wechat-probe",
+        "active": {
+            "status": "unchecked",
+            "source": "passive_state",
+            "hwnd": 0,
+            "title": "",
+        },
+        "windows": [],
+        "ignored_windows": [],
+        "ui_automation": {"available": False, "reason": "explicit_probe_required"},
+        "raw_probe": {},
+    }
+
+
 def delete_sidebar_channel(data_dir: str | Path, conversation_id: str) -> dict[str, Any]:
     channel_id = str(conversation_id or "").strip()
     if not channel_id:
@@ -2739,7 +2778,8 @@ def _dispatch_sidebar_test_reply(root: Path, reply: ReplyCandidate, ledger_entry
             "message": "测试发送已进入发送审核",
         }
     _start_bridge_worker(root, {"source": "sidebar_channel_test_auto"})
-    send_result = GuardedSendExecutor(config, build_send_driver(config)).execute_auto(reply)
+    executor = GuardedSendExecutor(config, build_send_driver(config))
+    send_result = executor.execute_auto(reply)
     ledger_updated = ConversationLedgerStore(root).update_reply_send_result(
         reply.conversation_id,
         ledger_entry_id,
@@ -2758,11 +2798,30 @@ def _dispatch_sidebar_test_reply(root: Path, reply: ReplyCandidate, ledger_entry
             "ledger_updated": ledger_updated,
         },
     )
+    if ledger_updated:
+        try:
+            activation = executor.activate_staged(
+                send_result,
+                expected_projections=["ledger"],
+            )
+        except Exception as exc:
+            activation = executor.fail_staged(
+                send_result,
+                reason=f"staged_activation_failed:{type(exc).__name__}:{exc}",
+                expected_projections=["ledger"],
+            )
+    else:
+        activation = executor.fail_staged(
+            send_result,
+            reason="staged_projection_failed:ledger_projection_not_updated",
+            expected_projections=["ledger"],
+        )
     return {
         "dispatch_mode": "auto",
         "queue_id": "",
         "item": {},
         "send_result": asdict(send_result),
+        "activation": activation,
         "message": f"测试发送已自动投递：{send_result.status}",
     }
 
@@ -3716,11 +3775,12 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
     persisted = _read_weflow_sidebar_state(root)
     worker = _weflow_worker_state(root)
     token_env = str(persisted.get("token_env") or "WEFLOW_API_TOKEN") if isinstance(persisted, dict) else "WEFLOW_API_TOKEN"
-    token_present = bool(persisted.get("token_present")) if isinstance(persisted, dict) else False
     env_token_present = bool(_env_value(token_env) or _env_value("WEFLOW_API_TOKEN"))
-    if env_token_present:
-        token_present = True
-    token_source = "environment" if env_token_present else ("payload_or_state" if token_present else "missing")
+    # A direct token is deliberately never persisted. The historical boolean
+    # only says that an earlier request supplied credentials; it is not proof
+    # that this process can authenticate now.
+    token_present = env_token_present
+    token_source = "environment" if env_token_present else "missing"
     cached_sessions = _weflow_cached_sessions(root, limit=200)
     readiness = _weflow_readiness_snapshot(persisted if isinstance(persisted, dict) else {}, worker, token_present, token_source)
     pull_job = _weflow_pull_job_state(root, persisted)
@@ -3731,6 +3791,15 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
     last_backfill = persisted.get("last_backfill", {}) if isinstance(persisted, dict) else {}
     if isinstance(backfill_job.get("result"), dict) and backfill_job.get("result"):
         last_backfill = backfill_job["result"]
+    last_health = persisted.get("last_health", {}) if isinstance(persisted, dict) else {}
+    if isinstance(last_health, dict) and last_health:
+        health_fresh, health_age = _weflow_health_freshness(last_health)
+        last_health = {
+            **last_health,
+            "fresh": health_fresh,
+            "age_seconds": health_age,
+            "ttl_seconds": _WEFLOW_HEALTH_TTL_SECONDS,
+        }
     return {
         "status": "ok",
         "base_url": str(persisted.get("base_url") or "http://127.0.0.1:5031"),
@@ -3754,7 +3823,7 @@ def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "pull_job": pull_job,
         "backfill_job": backfill_job,
         "bridge_state": summarize_weflow_bridge_state(root / "weflow_bridge_state.json"),
-        "last_health": persisted.get("last_health", {}) if isinstance(persisted, dict) else {},
+        "last_health": last_health,
         "last_discover": persisted.get("last_discover", {}) if isinstance(persisted, dict) else {},
         "discovered_sessions": {
             "status": "ok",
@@ -3779,7 +3848,12 @@ def sidebar_weflow_health(data_dir: str | Path, payload: dict[str, Any]) -> dict
         require_token=False,
         require_fork=True,
     )
-    result = {**result, "token_source": params["token_source"]}
+    result = {
+        **result,
+        "token_source": params["token_source"],
+        "checked_at": utc_now_iso(),
+        "ttl_seconds": _WEFLOW_HEALTH_TTL_SECONDS,
+    }
     _record_weflow_state_safely(data_dir, {"last_health": result, **_weflow_public_params(params)}, action="health", result=result)
     return result
 
@@ -4479,7 +4553,7 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
     reason = str(payload.get("reason", "")).strip()
     external_message_id = str(payload.get("external_message_id") or payload.get("externalMessageId") or "").strip()
     extra = payload.get("payload")
-    result = bridge_ack(
+    result = bridge_ack_if_queued(
         data_dir,
         bridge_id,
         status=status,
@@ -4487,7 +4561,9 @@ def ack_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> di
         external_message_id=external_message_id,
         payload=extra if isinstance(extra, dict) else {},
     )
-    effective_ack = result.get("effective_ack") if isinstance(result.get("effective_ack"), dict) else {}
+    if not bool(result.get("applied")):
+        return result
+    effective_ack = result.get("ack") if isinstance(result.get("ack"), dict) else {}
     result["send_sync"] = sync_bridge_ack_to_send_state(
         data_dir,
         bridge_id,
@@ -4504,19 +4580,33 @@ def retry_sidebar_bridge_item(data_dir: str | Path, payload: dict[str, Any]) -> 
         raise ValueError("bridge_id is required")
     reviewer = str(payload.get("reviewer") or "sidebar").strip() or "sidebar"
     note = str(payload.get("note") or "").strip()
+    result = retry_bridge_item(data_dir, bridge_id, reviewer=reviewer, note=note)
+    # Publish queue/ledger/task projections before a newly-started worker can
+    # drain the successor and race its terminal ack against those projections.
     _start_bridge_worker(Path(data_dir).resolve(), dict(payload))
-    return retry_bridge_item(data_dir, bridge_id, reviewer=reviewer, note=note)
+    return result
 
 
 def sidebar_queue_action(data_dir: str | Path, action: str, queue_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     reviewer = str(payload.get("reviewer", "sidebar"))
     note = str(payload.get("note", ""))
-    if action == "approve":
-        return approve_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
-    if action == "reject":
-        return reject_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
-    if action in {"remove", "delete"}:
-        return remove_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
+    try:
+        if action == "approve":
+            return approve_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
+        if action == "reject":
+            return reject_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
+        if action in {"remove", "delete"}:
+            return remove_confirm_item(data_dir, queue_id, reviewer=reviewer, note=note)
+    except ConfirmQueueClaimConflict as exc:
+        item = ConfirmQueue(Path(data_dir) / "confirm_queue.jsonl").get(queue_id) or {}
+        return {
+            "status": "blocked",
+            "reason": str(exc) or "send_claim_conflict",
+            "queue_id": queue_id,
+            "queue_status": str(item.get("status") or ""),
+            "claim_conflict": True,
+            "item": item,
+        }
     if action == "send-approved":
         _start_bridge_worker(Path(data_dir).resolve(), dict(payload))
         return send_approved_confirm_item(data_dir, queue_id)
@@ -4934,6 +5024,9 @@ def _bridge_worker_lock_snapshot(root: Path) -> dict[str, Any]:
         "heartbeat_age_seconds": heartbeat_age,
         "pid": pid,
         "pid_alive": _pid_exists(pid) if pid else False,
+        "process_start": str(payload.get("process_start") or ""),
+        "process_instance": str(payload.get("process_instance") or ""),
+        "owner_token": str(payload.get("owner_token") or ""),
         "label": str(payload.get("label") or ""),
         "acquired_at": payload.get("acquired_at"),
         "heartbeat_at": heartbeat,
@@ -5163,48 +5256,37 @@ def _repair_stale_external_bridge_worker(root: Path, expected_signature: dict[st
         return False
     if pid <= 0 or pid == os.getpid():
         return False
+    recorded_start = str(lock.get("process_start") or "")
     if not bool(lock.get("pid_alive")):
-        _unlink_bridge_worker_lock_if_owner_matches(root, pid)
         return not bridge_worker_lock_alive(root)
-    if not _terminate_process_tree(pid):
+    current_start = process_start_marker(pid)
+    if not recorded_start or not current_start or current_start != recorded_start:
+        return False
+    if not _terminate_process_tree(pid, expected_process_start=recorded_start):
         return False
     deadline = time.monotonic() + 6.0
     while time.monotonic() < deadline and _pid_exists(pid):
         time.sleep(0.1)
     if _pid_exists(pid):
-        if not _terminate_process_tree(pid, force=True):
+        if not _terminate_process_tree(pid, force=True, expected_process_start=recorded_start):
             return False
         deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline and _pid_exists(pid):
             time.sleep(0.1)
     if _pid_exists(pid):
         return False
-    _unlink_bridge_worker_lock_if_owner_matches(root, pid)
     return not bridge_worker_lock_alive(root)
 
 
-def _unlink_bridge_worker_lock_if_owner_matches(root: Path, pid: int) -> None:
-    path = bridge_worker_lock_path(root)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (OSError, json.JSONDecodeError):
-        payload = {}
-    try:
-        owner_pid = int(payload.get("pid") or 0) if isinstance(payload, dict) else 0
-    except (TypeError, ValueError):
-        owner_pid = 0
-    if owner_pid and owner_pid != pid:
-        return
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        logger.warning("bridge stale lock unlink failed: %s", exc)
-
-
-def _terminate_process_tree(pid: int, *, force: bool = False) -> bool:
+def _terminate_process_tree(
+    pid: int,
+    *,
+    force: bool = False,
+    expected_process_start: str = "",
+) -> bool:
     if pid <= 0 or pid == os.getpid():
+        return False
+    if expected_process_start and process_start_marker(pid) != expected_process_start:
         return False
     if os.name == "nt":
         command = ["taskkill", "/PID", str(pid), "/T"]
@@ -6390,8 +6472,9 @@ def _weflow_readiness_snapshot(
     token_source: str,
 ) -> dict[str, Any]:
     last_health = persisted.get("last_health") if isinstance(persisted.get("last_health"), dict) else {}
-    health_ok = str(last_health.get("status") or "") == "ok"
-    fork_ok = bool(last_health.get("fork_ok"))
+    health_fresh, health_age = _weflow_health_freshness(last_health)
+    health_ok = health_fresh and str(last_health.get("status") or "") == "ok"
+    fork_ok = health_fresh and bool(last_health.get("fork_ok"))
     service_reachable = health_ok
     running = bool(worker.get("running"))
     if running and not service_reachable:
@@ -6402,6 +6485,8 @@ def _weflow_readiness_snapshot(
         status = "token_missing"
     elif health_ok and not fork_ok:
         status = "fork_marker_missing"
+    elif last_health and not health_fresh:
+        status = "health_stale"
     elif last_health:
         status = "error"
     else:
@@ -6414,9 +6499,34 @@ def _weflow_readiness_snapshot(
         "fork_ok": fork_ok,
         "worker_running": running,
         "last_health_status": str(last_health.get("status") or ""),
+        "last_health_checked_at": str(last_health.get("checked_at") or ""),
+        "health_fresh": health_fresh,
+        "health_age_seconds": health_age,
+        "health_ttl_seconds": _WEFLOW_HEALTH_TTL_SECONDS,
         "message": str(last_health.get("message") or last_health.get("error") or ""),
         "updated_at": persisted.get("updated_at", ""),
     }
+
+
+def _weflow_health_freshness(last_health: dict[str, Any], *, now: datetime | None = None) -> tuple[bool, float | None]:
+    checked_at = str(last_health.get("checked_at") or "").strip()
+    if not checked_at:
+        return False, None
+    try:
+        checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False, None
+    if checked.tzinfo is None:
+        checked = checked.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    raw_age = (current.astimezone(timezone.utc) - checked.astimezone(timezone.utc)).total_seconds()
+    age = max(0.0, raw_age)
+    # Small negative values can occur around clock synchronization, but a state
+    # file dated materially in the future must not remain fresh indefinitely.
+    fresh = raw_age >= -5.0 and age <= _WEFLOW_HEALTH_TTL_SECONDS
+    return fresh, round(age, 3)
 
 
 def _read_weflow_sidebar_state(data_dir: str | Path) -> dict[str, Any]:
@@ -7057,7 +7167,13 @@ def _bridge_worker_alive(data_dir: str | Path) -> bool:
     return bridge_worker_lock_alive(data_dir)
 
 
-def _background_send_status(config: Any, bridge: dict[str, Any], data_dir: str | Path | None = None) -> str:
+def _background_send_status(
+    config: Any,
+    bridge: dict[str, Any],
+    data_dir: str | Path | None = None,
+    *,
+    active_backend_probe: bool = True,
+) -> str:
     if str(getattr(config, "send_driver", "")) == "bridge_outbox":
         if not bool(getattr(config, "send_enabled", False)):
             return "bridge_outbox_configured_disabled"
@@ -7071,7 +7187,7 @@ def _background_send_status(config: Any, bridge: dict[str, Any], data_dir: str |
             return "bridge_outbox_worker_stale_config"
         if isinstance(worker, dict) and str(worker.get("config_status") or "") == "unknown_legacy_lock":
             return "bridge_outbox_worker_config_unknown"
-        if send_backend == "weflow_http":
+        if active_backend_probe and send_backend == "weflow_http":
             weflow_status = weflow_http_status(
                 str(getattr(config, "weflow_base_url", "http://127.0.0.1:5031") or "http://127.0.0.1:5031"),
                 token_env=str(getattr(config, "weflow_token_env", "WEFLOW_API_TOKEN") or "WEFLOW_API_TOKEN"),
@@ -7089,7 +7205,7 @@ def _background_send_status(config: Any, bridge: dict[str, Any], data_dir: str |
             text_capability = capabilities.get("text") if isinstance(capabilities.get("text"), dict) else {}
             if text_capability.get("supports") is False:
                 return "bridge_outbox_weflow_send_not_supported"
-        if send_backend == "wechat_native_http":
+        if active_backend_probe and send_backend == "wechat_native_http":
             hook_status = wechat_native_http_status(
                 str(getattr(config, "wechat_native_base_url", "http://127.0.0.1:30001") or "http://127.0.0.1:30001"),
                 text_path=str(getattr(config, "wechat_native_send_text_path", "/SendTextMsg") or "/SendTextMsg"),
@@ -7115,6 +7231,9 @@ def _background_send_status(config: Any, bridge: dict[str, Any], data_dir: str |
             ) if isinstance(bridge, dict) else 0
             if active_unverified > 0:
                 return "bridge_outbox_wechat_native_accepted_unverified"
+        if not active_backend_probe:
+            return "bridge_outbox_backend_probe_deferred"
+        if send_backend == "wechat_native_http":
             return "bridge_outbox_ready"
         return "bridge_outbox_ready"
     return "bridge_outbox_available"
@@ -7589,7 +7708,7 @@ def _agent_generate_one_proactive_reply(root: Path, *, runtime: Any, candidate: 
             "source_watermark": int(candidate.get("source_watermark") or 0),
         }
     send = runtime.reply_gate.handle(reply)
-    runtime.ledger_store.update_reply_send_result(conversation_id, entry.entry_id, send)
+    ledger_updated = runtime.ledger_store.update_reply_send_result(conversation_id, entry.entry_id, send)
     try:
         runtime.event_logger.log(
             "agent.proactive_reply",
@@ -7603,7 +7722,32 @@ def _agent_generate_one_proactive_reply(root: Path, *, runtime: Any, candidate: 
         )
     except Exception:
         pass
-    _record_agent_proactive_tasks(root, conversation=conversation, reply=reply, send=send, kind=kind)
+    task_projection_error = _record_agent_proactive_tasks(
+        root,
+        conversation=conversation,
+        reply=reply,
+        send=send,
+        kind=kind,
+    )
+    if not ledger_updated or task_projection_error:
+        projection_error = task_projection_error or "ledger_projection_not_updated"
+        runtime.reply_gate.fail_staged(
+            send,
+            reason=f"staged_projection_failed:{projection_error}",
+            expected_projections=["ledger", "task"],
+        )
+    else:
+        try:
+            runtime.reply_gate.activate_staged(
+                send,
+                expected_projections=["ledger", "task"],
+            )
+        except Exception as exc:
+            runtime.reply_gate.fail_staged(
+                send,
+                reason=f"staged_activation_failed:{type(exc).__name__}:{exc}",
+                expected_projections=["ledger", "task"],
+            )
     return {
         "status": "ok",
         "kind": kind,
@@ -7830,7 +7974,7 @@ def _record_agent_proactive_tasks(
     reply: ReplyCandidate,
     send: Any,
     kind: str,
-) -> None:
+) -> str:
     try:
         store = TaskStatusStore(root)
         fragment = _agent_safe_id(reply.message_id)
@@ -7859,7 +8003,10 @@ def _record_agent_proactive_tasks(
         )
         status = str(getattr(send, "status", "") or "")
         reason = str(getattr(send, "reason", "") or "")
-        bridge_id = _agent_bridge_id_from_reason(reason)
+        bridge_ids = send_result_bridge_ids(send)
+        bridge_id = bridge_ids[0] if bridge_ids else _agent_bridge_id_from_reason(reason)
+        if bridge_id and bridge_id not in bridge_ids:
+            bridge_ids.append(bridge_id)
         send_task_id = f"agent-proactive-send-{fragment}"
         store.create(
             {
@@ -7875,7 +8022,14 @@ def _record_agent_proactive_tasks(
                 "priority": 85,
                 "estimated_cost": 1,
                 "external_id": bridge_id,
-                "metadata": {"message_id": reply.message_id, "send_status": status, "send_reason": reason, "bridge_id": bridge_id},
+                "metadata": {
+                    "message_id": reply.message_id,
+                    "send_status": status,
+                    "send_reason": reason,
+                    "bridge_id": bridge_id,
+                    "bridge_ids": bridge_ids,
+                    "non_bridge_part_statuses": send_result_non_bridge_part_statuses(send),
+                },
             }
         )
         if status == "queued_to_bridge":
@@ -7886,8 +8040,9 @@ def _record_agent_proactive_tasks(
             store.transition(send_task_id, "wait", {"progress": 45, "phase": "等待人工审核", "detail": reason})
         else:
             store.transition(send_task_id, "fail", {"progress": 100, "phase": "发送失败", "detail": reason, "last_error": reason})
-    except Exception:
-        return
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
 
 
 def _agent_safe_id(value: str) -> str:
@@ -8605,7 +8760,10 @@ def probe_model_fetch(data_dir: str | Path, payload: dict[str, Any]) -> dict[str
             # or misbehaving endpoint stream an unbounded body into memory.
             body = response.read(2_000_000).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        return {"status": "error", "reachable": True, "http_status": exc.code, "error": f"http_{exc.code}", "url": url}
+        try:
+            return {"status": "error", "reachable": True, "http_status": exc.code, "error": f"http_{exc.code}", "url": url}
+        finally:
+            exc.close()
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return {"status": "error", "reachable": False, "error": f"{type(exc).__name__}: {exc}", "url": url}
     try:

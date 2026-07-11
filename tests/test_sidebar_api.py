@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -66,6 +67,114 @@ from app.personal_wechat_bot.reply_gate.send_audit import SendAuditLog
 
 
 class SidebarApiTest(unittest.TestCase):
+    def test_sidebar_state_poll_is_local_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            with (
+                mock.patch(
+                    "app.personal_wechat_bot.control.send_readiness.wechat_native_http_status",
+                    side_effect=AssertionError("state poll must not probe native HTTP"),
+                ) as readiness_native,
+                mock.patch(
+                    "app.personal_wechat_bot.control.send_readiness.weflow_http_status",
+                    side_effect=AssertionError("state poll must not probe WeFlow HTTP"),
+                ) as readiness_weflow,
+                mock.patch(
+                    "app.personal_wechat_bot.wechat_driver.bridge_send.wechat_native_http_status",
+                    side_effect=AssertionError("state poll must not probe driver backend"),
+                ) as driver_native,
+                mock.patch.object(
+                    sidebar_api,
+                    "build_wechat_window_probe",
+                    side_effect=AssertionError("state poll must not enumerate OS windows"),
+                ) as window_probe,
+            ):
+                state = build_sidebar_state(data_dir)
+
+            readiness_native.assert_not_called()
+            readiness_weflow.assert_not_called()
+            driver_native.assert_not_called()
+            window_probe.assert_not_called()
+            self.assertFalse(state["readiness"]["active_backend_probe"])
+            self.assertFalse(state["driver_probe"]["driver_probe"]["backend"]["active_backend_probe"])
+            self.assertEqual(state["wechat_window_probe"]["status"], "unchecked")
+
+    def test_weflow_health_freshness_has_a_sixty_second_boundary(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
+
+        fresh, fresh_age = sidebar_api._weflow_health_freshness(
+            {"checked_at": (now - timedelta(seconds=60)).isoformat()},
+            now=now,
+        )
+        stale, stale_age = sidebar_api._weflow_health_freshness(
+            {"checked_at": (now - timedelta(seconds=60, milliseconds=1)).isoformat()},
+            now=now,
+        )
+        future, future_age = sidebar_api._weflow_health_freshness(
+            {"checked_at": (now + timedelta(minutes=5)).isoformat()},
+            now=now,
+        )
+
+        self.assertTrue(fresh)
+        self.assertEqual(fresh_age, 60.0)
+        self.assertFalse(stale)
+        self.assertEqual(stale_age, 60.001)
+        self.assertFalse(future)
+        self.assertEqual(future_age, 0.0)
+
+    def test_weflow_state_does_not_treat_historical_direct_token_as_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sidebar_api, "_env_value", return_value=None):
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            with mock.patch.object(
+                sidebar_api,
+                "weflow_health_status",
+                return_value={"status": "ok", "fork_ok": True, "message": "reachable"},
+            ):
+                health = sidebar_api.sidebar_weflow_health(
+                    data_dir,
+                    {"token": "request-only-secret", "token_env": "MISSING_WEFLOW_TOKEN"},
+                )
+
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+
+            self.assertTrue(health["checked_at"])
+            self.assertEqual(health["ttl_seconds"], 60.0)
+            self.assertFalse(state["token_present"])
+            self.assertEqual(state["token_source"], "missing")
+            self.assertFalse(state["readiness"]["token_present"])
+            self.assertTrue(state["readiness"]["service_reachable"])
+            self.assertTrue(state["readiness"]["health_fresh"])
+            self.assertEqual(state["readiness"]["status"], "token_missing")
+            self.assertTrue(state["last_health"]["fresh"])
+
+    def test_weflow_expired_success_is_not_reported_reachable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sidebar_api, "_env_value", return_value="token"):
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            sidebar_api._write_weflow_sidebar_state(
+                data_dir,
+                {
+                    "token_present": True,
+                    "last_health": {
+                        "status": "ok",
+                        "fork_ok": True,
+                        "checked_at": "2000-01-01T00:00:00+00:00",
+                    },
+                },
+            )
+
+            state = sidebar_api.build_sidebar_weflow_state(data_dir)
+
+            self.assertTrue(state["token_present"])
+            self.assertFalse(state["readiness"]["service_reachable"])
+            self.assertFalse(state["readiness"]["fork_ok"])
+            self.assertFalse(state["readiness"]["health_fresh"])
+            self.assertEqual(state["readiness"]["status"], "health_stale")
+            self.assertFalse(state["last_health"]["fresh"])
+
     def test_weflow_session_normalization_prefers_display_name_over_wxid(self) -> None:
         session = sidebar_api._normalize_weflow_session(
             {
@@ -304,10 +413,14 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(grouped["private-1"]["phases"]["pending"]["items"][0]["phase"], "pending")
             self.assertEqual(grouped["private-2"]["display_name"], "Bob")
             self.assertEqual(grouped["private-2"]["phase_counts"]["approved"], 1)
+            self.assertEqual(grouped["private-2"]["phase_counts"]["failed"], 1)
             self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["queue_id"], bob_id)
             self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["conversation_id"], "private-2")
             self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["channel_display_name"], "Bob")
             self.assertEqual(grouped["private-2"]["phases"]["approved"]["items"][0]["phase"], "approved")
+            failed_item = grouped["private-2"]["phases"]["failed"]["items"][0]
+            self.assertEqual(failed_item["action"], "ledger_sync_failed")
+            self.assertEqual(failed_item["conversation_id"], "private-2")
 
     def test_sidebar_state_restores_config_from_persistent_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3510,6 +3623,24 @@ class SidebarApiTest(unittest.TestCase):
             self.assertTrue(removed["removed"])
             self.assertIsNone(queue.get(queue_id))
 
+    def test_sidebar_queue_mutation_returns_structured_conflict_during_send_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            queue = ConfirmQueue(data_dir / "confirm_queue.jsonl")
+            queue_id = queue.enqueue(_reply())
+            queue.approve(queue_id, reviewer="test")
+            claim = queue.claim_approved_for_send(queue_id, owner="sidebar-race-test")
+
+            rejected = sidebar_queue_action(data_dir, "reject", queue_id, {"reviewer": "test"})
+            removed = sidebar_queue_action(data_dir, "remove", queue_id, {"reviewer": "test"})
+
+            self.assertEqual(rejected["status"], "blocked")
+            self.assertTrue(rejected["claim_conflict"])
+            self.assertEqual(removed["status"], "blocked")
+            self.assertTrue(removed["claim_conflict"])
+            self.assertEqual(queue.get(queue_id)["send_claim"]["token"], claim["token"])
+
     def test_channel_test_reply_creates_pending_review_item(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -3794,19 +3925,49 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(send_task["phase"], "非前台桥演练完成，未投递微信")
 
     def test_sidebar_bridge_state_and_ack_are_available(self) -> None:
+        from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxStore
+
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
+            record = BridgeOutboxStore(data_dir).enqueue("wxid_a", "manual ack")
 
             ack = ack_sidebar_bridge_item(
                 data_dir,
-                {"bridge_id": "bridge:test", "status": "sent", "reason": "manual"},
+                {"bridge_id": record["bridge_id"], "status": "sent", "reason": "manual"},
             )
             state = build_sidebar_bridge_state(data_dir)
 
             self.assertEqual(ack["status"], "ok")
             self.assertEqual(state["status"], "ok")
             self.assertEqual(state["ack_count"], 1)
+
+    def test_sidebar_manual_ack_conflict_does_not_sync_inflight_item(self) -> None:
+        from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "already claimed")
+            store.append_ack(
+                record["bridge_id"],
+                status=BridgeAckStatus.INFLIGHT,
+                reason="worker_claimed",
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.sync_bridge_ack_to_send_state"
+            ) as sync:
+                result = ack_sidebar_bridge_item(
+                    data_dir,
+                    {"bridge_id": record["bridge_id"], "status": "blocked", "reason": "manual"},
+                )
+
+            self.assertEqual(result["status"], "conflict")
+            self.assertFalse(result["applied"])
+            self.assertEqual(result["effective_status"], BridgeAckStatus.INFLIGHT)
+            sync.assert_not_called()
 
     def test_sidebar_bridge_retry_requeues_failed_item(self) -> None:
         from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
@@ -3824,13 +3985,19 @@ class SidebarApiTest(unittest.TestCase):
 
             with mock.patch("app.personal_wechat_bot.control.sidebar_api._start_bridge_worker") as start_worker:
                 result = retry_sidebar_bridge_item(data_dir, {"bridge_id": rec["bridge_id"], "reviewer": "tester"})
+                replay = retry_sidebar_bridge_item(data_dir, {"bridge_id": rec["bridge_id"], "reviewer": "tester"})
             state = build_sidebar_bridge_state(data_dir)
             retry = next(item for item in state["items"] if item["bridge_id"] == result["new_bridge_id"])
 
             self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["created"])
+            self.assertTrue(replay["reused_existing"])
+            self.assertEqual(replay["new_bridge_id"], result["new_bridge_id"])
             self.assertEqual(retry["status"], "queued")
             self.assertEqual(retry["retry_of"], rec["bridge_id"])
-            start_worker.assert_called_once()
+            self.assertEqual(state["count"], 2)
+            self.assertEqual(state["pending_count"], 1)
+            self.assertEqual(start_worker.call_count, 2)
 
     def test_sidebar_manual_ack_rejects_nonterminal_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4511,6 +4678,8 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
                 json.dumps(
                     {
                         "pid": 123456,
+                        "process_start": "start-123456",
+                        "owner_token": "worker-owner",
                         "label": "send_bridge_worker",
                         "heartbeat_at": time.time(),
                         "data_dir": str(root),
@@ -4531,6 +4700,8 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
             try:
                 with mock.patch("app.personal_wechat_bot.control.sidebar_api.bridge_worker_lock_alive", side_effect=[True, True, False]), mock.patch.object(
                     sidebar_api, "_pid_exists", side_effect=[True, False, False, False]
+                ), mock.patch.object(
+                    sidebar_api, "process_start_marker", return_value="start-123456"
                 ), mock.patch.object(sidebar_api, "_terminate_process_tree", return_value=True) as terminate, mock.patch(
                     "app.personal_wechat_bot.runtime.send_bridge_worker.run_bridge_worker",
                     side_effect=fake_run,
@@ -4538,10 +4709,44 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
                     sidebar_api._start_bridge_worker(root, {"bridge_interval_seconds": 0.1})
                     self.assertTrue(started.wait(1), "bridge worker was not restarted after stale external repair")
 
-                terminate.assert_called_once_with(123456)
+                terminate.assert_called_once_with(123456, expected_process_start="start-123456")
                 self.assertTrue(sidebar_api._bridge_worker_state(root)["running"])
             finally:
                 sidebar_api._stop_bridge_worker(root)
+
+    def test_stale_external_worker_repair_refuses_reused_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = (Path(tmp) / "data").resolve()
+            config = create_default_config(root)
+            signature = sidebar_api._bridge_worker_config_signature(config)
+            lock_path = root / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 123456,
+                        "process_start": "old-process-start",
+                        "owner_token": "old-worker-owner",
+                        "label": "send_bridge_worker",
+                        "heartbeat_at": time.time(),
+                        "data_dir": str(root),
+                        "config_signature": {**signature, "send_backend": "old-backend"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(sidebar_api, "bridge_worker_lock_alive", return_value=True),
+                mock.patch.object(sidebar_api, "_pid_exists", return_value=True),
+                mock.patch.object(sidebar_api, "process_start_marker", return_value="reused-pid-start"),
+                mock.patch.object(sidebar_api, "_terminate_process_tree") as terminate,
+            ):
+                repaired = sidebar_api._repair_stale_external_bridge_worker(root, signature)
+
+            self.assertFalse(repaired)
+            terminate.assert_not_called()
+            self.assertTrue(lock_path.exists())
 
     def test_start_bridge_worker_restarts_when_backend_config_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4627,6 +4832,32 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
             ):
                 status = sidebar_api._background_send_status(config, {"pending_count": 3}, data_dir)
             self.assertEqual(status, "bridge_outbox_worker_down_backlog")
+
+    def test_background_send_status_passive_snapshot_does_not_probe_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(
+                data_dir,
+                mode="confirm",
+                enabled=True,
+                driver="bridge_outbox",
+                backend="wechat_native_http",
+            )
+            config = load_config(data_dir)
+
+            with mock.patch(
+                "app.personal_wechat_bot.control.sidebar_api.wechat_native_http_status",
+                side_effect=AssertionError("passive sidebar snapshot must stay local"),
+            ) as backend_status:
+                status = sidebar_api._background_send_status(
+                    config,
+                    {"worker": {"config_status": "matched"}, "pending_count": 0},
+                    active_backend_probe=False,
+                )
+
+            backend_status.assert_not_called()
+            self.assertEqual(status, "bridge_outbox_backend_probe_deferred")
 
     def test_background_send_status_reports_wechat_native_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

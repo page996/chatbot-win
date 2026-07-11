@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from app.personal_wechat_bot.config.loader import create_default_config
 from app.personal_wechat_bot.config.loader import load_config
+from app.personal_wechat_bot.control import sidebar_server
 from app.personal_wechat_bot.control.sidebar_server import _handler_factory
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
 from app.personal_wechat_bot.domain.models import ReplyCandidate
@@ -39,6 +42,177 @@ def _edge_executable() -> Path | None:
 
 
 class SidebarServerTest(unittest.TestCase):
+    def test_sidebar_server_rejects_oversized_post_before_reading_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                connection.putrequest("POST", "/api/controls")
+                connection.putheader("Content-Type", "application/json")
+                connection.putheader("Content-Length", str(sidebar_server._MAX_POST_BODY_BYTES + 1))
+                connection.endheaders()
+
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(response.status, 413)
+                self.assertEqual(payload["error"], "request_body_too_large")
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_sidebar_server_post_body_total_deadline_blocks_slow_drip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            sidebar_server,
+            "_POST_BODY_READ_TIMEOUT_SECONDS",
+            0.12,
+        ):
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=5)
+            drip_errors: list[Exception] = []
+            try:
+                body = b'{"slow":true}'
+                connection.putrequest("POST", "/api/controls")
+                connection.putheader("Content-Type", "application/json")
+                connection.putheader("Content-Length", str(len(body)))
+                connection.endheaders()
+
+                def drip() -> None:
+                    for value in body:
+                        time.sleep(0.04)
+                        try:
+                            connection.send(bytes((value,)))
+                        except OSError as exc:
+                            drip_errors.append(exc)
+                            return
+
+                drip_thread = threading.Thread(target=drip, daemon=True)
+                started = time.monotonic()
+                drip_thread.start()
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                elapsed = time.monotonic() - started
+                drip_thread.join(timeout=1)
+
+                self.assertEqual(response.status, 408)
+                self.assertEqual(payload["error"], "request_body_read_timeout")
+                self.assertLess(elapsed, 0.8)
+                self.assertFalse(drip_thread.is_alive())
+                self.assertLessEqual(len(drip_errors), 1)
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_sidebar_server_driver_probe_is_explicit_and_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                with mock.patch(
+                    "app.personal_wechat_bot.wechat_driver.bridge_send.wechat_native_http_status",
+                    return_value={"available": False, "reason": "test_unavailable"},
+                ) as backend_probe:
+                    request = Request(
+                        f"http://{host}:{port}/api/driver-probe",
+                        data=b"{}",
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    payload = json.loads(
+                        urlopen(request, timeout=5).read().decode("utf-8")
+                    )
+
+                self.assertEqual(payload["status"], "ok")
+                self.assertTrue(payload["probe"]["driver_probe"]["backend"]["active_backend_probe"])
+                backend_probe.assert_called_once()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_active_probe_get_routes_do_not_execute_probe(self) -> None:
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                with (
+                    mock.patch(
+                        "app.personal_wechat_bot.control.send_commands.probe_send_controls"
+                    ) as driver_probe,
+                    mock.patch.object(sidebar_server, "build_sidebar_wechat_probe") as wechat_probe,
+                ):
+                    for path in ("/api/driver-probe", "/api/wechat-probe"):
+                        with self.subTest(path=path), self.assertRaises(HTTPError) as ctx:
+                            urlopen(f"http://{host}:{port}{path}", timeout=5)
+                        self.assertEqual(ctx.exception.code, 405)
+                        body = json.loads(ctx.exception.read().decode("utf-8"))
+                        ctx.exception.close()
+                        self.assertEqual(body["error"], "method_not_allowed")
+                    driver_probe.assert_not_called()
+                    wechat_probe.assert_not_called()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_sidebar_server_ignores_client_disconnect_while_writing_response(self) -> None:
+        handler_type = _handler_factory(Path("data"))
+        for error in (
+            BrokenPipeError(32, "broken pipe"),
+            ConnectionResetError(104, "connection reset"),
+            ConnectionAbortedError(10053, "connection aborted"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                handler = object.__new__(handler_type)
+                handler.send_response = mock.Mock()
+                handler.send_header = mock.Mock()
+                handler.end_headers = mock.Mock()
+                handler.wfile = mock.Mock()
+                handler.wfile.write.side_effect = error
+
+                handler._json({"status": "ok"})
+
+                handler.wfile.write.assert_called_once()
+
+    def test_sidebar_server_ignores_client_disconnect_while_flushing_headers(self) -> None:
+        handler_type = _handler_factory(Path("data"))
+        handler = object.__new__(handler_type)
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock(
+            side_effect=ConnectionResetError(10054, "connection reset while flushing headers")
+        )
+        handler.wfile = mock.Mock()
+
+        handler._json({"status": "ok"})
+
+        handler.end_headers.assert_called_once_with()
+        handler.wfile.write.assert_not_called()
+
     def test_sidebar_server_serves_state_and_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -126,7 +300,7 @@ class SidebarServerTest(unittest.TestCase):
             self.assertIn("MODEL_QUICK_OPTIONS", script)
             self.assertIn("setModelSuggestions", script)
             self.assertIn("modelQuickSelect", script)
-            self.assertIn("await loadKeyPool()", script)
+            self.assertIn("await loadKeyPool({ force: true })", script)
             self.assertNotIn("#refreshKeys", script)
             self.assertIn("savePersonaCard", script)
             self.assertIn("queued_to_bridge", script)
@@ -218,7 +392,13 @@ class SidebarServerTest(unittest.TestCase):
             thread.start()
             try:
                 host, port = server.server_address
-                payload = json.loads(urlopen(f"http://{host}:{port}/api/wechat-probe", timeout=5).read().decode("utf-8"))
+                request = Request(
+                    f"http://{host}:{port}/api/wechat-probe",
+                    data=b"{}",
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -921,7 +1101,74 @@ class SidebarServerTest(unittest.TestCase):
                     urlopen(request, timeout=5)
                 self.assertEqual(ctx.exception.code, 403)
                 body = json.loads(ctx.exception.read().decode("utf-8"))
+                ctx.exception.close()
                 self.assertEqual(body["error"], "cross_origin_forbidden")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_dns_rebinding_host_is_rejected_for_get_and_post(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            sidebar_server,
+            "set_model_config",
+        ) as set_model_config:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                get_connection = http.client.HTTPConnection(host, port, timeout=5)
+                get_connection.putrequest("GET", "/api/state", skip_host=True)
+                get_connection.putheader("Host", f"attacker.example:{port}")
+                get_connection.endheaders()
+                get_response = get_connection.getresponse()
+                get_payload = json.loads(get_response.read().decode("utf-8"))
+                get_connection.close()
+
+                post_body = json.dumps({"provider": "relay"}).encode("utf-8")
+                post_connection = http.client.HTTPConnection(host, port, timeout=5)
+                post_connection.putrequest("POST", "/api/model-config", skip_host=True)
+                post_connection.putheader("Host", f"attacker.example:{port}")
+                post_connection.putheader("Origin", f"http://attacker.example:{port}")
+                post_connection.putheader("Content-Type", "application/json")
+                post_connection.putheader("Content-Length", str(len(post_body)))
+                post_connection.endheaders(post_body)
+                post_response = post_connection.getresponse()
+                post_payload = json.loads(post_response.read().decode("utf-8"))
+                post_connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertEqual(get_response.status, 403)
+            self.assertEqual(get_payload["error"], "untrusted_host")
+            self.assertEqual(post_response.status, 403)
+            self.assertEqual(post_payload["error"], "untrusted_host")
+            set_model_config.assert_not_called()
+
+    def test_sidebar_responses_deny_framing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                for path, expected_status in (("/", 200), ("/missing-static-file", 404)):
+                    with self.subTest(path=path):
+                        connection = http.client.HTTPConnection(host, port, timeout=5)
+                        connection.request("GET", path)
+                        response = connection.getresponse()
+                        response.read()
+                        self.assertEqual(response.status, expected_status)
+                        self.assertEqual(response.getheader("Content-Security-Policy"), "frame-ancestors 'none'")
+                        self.assertEqual(response.getheader("X-Frame-Options"), "DENY")
+                        connection.close()
             finally:
                 server.shutdown()
                 server.server_close()
@@ -950,6 +1197,7 @@ class SidebarServerTest(unittest.TestCase):
                     urlopen(request, timeout=5)
                 self.assertEqual(ctx.exception.code, 403)
                 body = json.loads(ctx.exception.read().decode("utf-8"))
+                ctx.exception.close()
                 self.assertEqual(body["error"], "unsupported_content_type")
             finally:
                 server.shutdown()

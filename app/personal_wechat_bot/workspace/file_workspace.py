@@ -17,6 +17,11 @@ from typing import Any, Iterator
 
 from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.runtime.process_lock import (
+    pid_lock_file_is_stale,
+    scoped_process_lock_path,
+    short_process_lock,
+)
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.tools.document.libreoffice import LibreOfficeRuntime
 from app.personal_wechat_bot.vision.ocr import OcrEngine, OcrItem, ocr_rows_payload
@@ -88,6 +93,40 @@ class FileWorkspace:
         # only a bootstrap hint before channel metadata exists.
         self._segment_cache: dict[str, str] = {}
 
+    def _root_lifecycle_lock(self, *, timeout_seconds: float = 120.0):
+        return short_process_lock(
+            scoped_process_lock_path(
+                self.root.parent,
+                "file-workspace-root",
+                str(self.root),
+            ),
+            timeout_seconds=timeout_seconds,
+            stale_after_seconds=120.0,
+            timeout_label="file workspace root lifecycle lock",
+        )
+
+    def _conversation_lifecycle_lock(
+        self,
+        workspace_path: str | Path,
+        *,
+        timeout_seconds: float = 120.0,
+    ):
+        resolved = _ensure_within(Path(workspace_path).resolve(), self.root)
+        relative = resolved.relative_to(self.root)
+        if not relative.parts:
+            raise ValueError("file workspace conversation path is required")
+        conversation_dir = self.root / relative.parts[0]
+        return short_process_lock(
+            scoped_process_lock_path(
+                self.root.parent,
+                "file-workspace-conversation",
+                str(conversation_dir),
+            ),
+            timeout_seconds=timeout_seconds,
+            stale_after_seconds=120.0,
+            timeout_label="file workspace conversation lifecycle lock",
+        )
+
     def stage_file(
         self,
         source_path: str | Path,
@@ -108,15 +147,14 @@ class FileWorkspace:
         original_dir = workspace_dir / "original"
         derived_dir = workspace_dir / "derived"
         outputs_dir = workspace_dir / "outputs"
-        for child in [original_dir, derived_dir, outputs_dir]:
-            child.mkdir(parents=True, exist_ok=True)
-
         manifest_path = workspace_dir / "manifest.json"
-        # Cleanup must never observe a blob before its manifest/index reference
-        # is durable. The digest calculation remains outside this short global
-        # critical section so staging different large files is still responsive.
-        with _path_lock(self.root / ".cleanup.lock", timeout_seconds=120.0):
-            with _path_lock(workspace_dir / ".stage.lock"):
+        # Cleanup or channel deletion must never remove a workspace while its
+        # blob, manifest, and session-index projection are being committed.
+        # These locks live beside runtime state, outside the deletable tree.
+        with self._root_lifecycle_lock():
+            with self._conversation_lifecycle_lock(workspace_dir):
+                for child in [original_dir, derived_dir, outputs_dir]:
+                    child.mkdir(parents=True, exist_ok=True)
                 staged_path = original_dir / _safe_filename(display_name, source_file.suffix)
                 blob_path = _ensure_content_blob(self.root, source_file, digest)
                 storage_mode = "existing"
@@ -202,6 +240,23 @@ class FileWorkspace:
         )
 
     def write_parse_result(
+        self,
+        staged: StagedFile,
+        result: AttachmentParseResult,
+        *,
+        embedded_media_ocr: OcrEngine | None = None,
+        embedded_media_asr: AsrEngine | None = None,
+    ) -> None:
+        with self._conversation_lifecycle_lock(staged.workspace_dir):
+            self._require_staged_manifest(staged)
+            self._write_parse_result_unlocked(
+                staged,
+                result,
+                embedded_media_ocr=embedded_media_ocr,
+                embedded_media_asr=embedded_media_asr,
+            )
+
+    def _write_parse_result_unlocked(
         self,
         staged: StagedFile,
         result: AttachmentParseResult,
@@ -376,25 +431,27 @@ class FileWorkspace:
         ai_analysis = self._run_file_analysis(staged, result, media_artifacts)
         analysis = _analysis_payload(staged, result, chunks, table_artifacts, media_artifacts, ai_analysis, ocr_table_artifacts)
         try:
-            _write_json(analysis_path, analysis)
-            content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
-            parse_payload = _read_json(Path(staged.derived_dir) / "parse_result.json", {})
-            if isinstance(parse_payload, dict):
-                parse_payload["ai_analysis"] = ai_analysis
-                parse_payload["updated_at"] = utc_now_iso()
-                _write_json(Path(staged.derived_dir) / "parse_result.json", parse_payload)
-            self._update_manifest_parse_artifacts(
-                staged,
-                result,
-                content_path,
-                Path(staged.derived_dir) / "full_text.md",
-                analysis_path,
-                chunks,
-                table_artifacts,
-                media_artifacts,
-                ocr_table_artifacts,
-                analysis=analysis,
-            )
+            with self._conversation_lifecycle_lock(staged.workspace_dir):
+                self._require_staged_manifest(staged)
+                _write_json(analysis_path, analysis)
+                content_path.write_text(_content_markdown(staged, result, analysis), encoding="utf-8")
+                parse_payload = _read_json(Path(staged.derived_dir) / "parse_result.json", {})
+                if isinstance(parse_payload, dict):
+                    parse_payload["ai_analysis"] = ai_analysis
+                    parse_payload["updated_at"] = utc_now_iso()
+                    _write_json(Path(staged.derived_dir) / "parse_result.json", parse_payload)
+                self._update_manifest_parse_artifacts(
+                    staged,
+                    result,
+                    content_path,
+                    Path(staged.derived_dir) / "full_text.md",
+                    analysis_path,
+                    chunks,
+                    table_artifacts,
+                    media_artifacts,
+                    ocr_table_artifacts,
+                    analysis=analysis,
+                )
         except Exception as exc:
             self._transition_file_task(
                 task_id,
@@ -575,6 +632,26 @@ class FileWorkspace:
             storage_mode=str(manifest.get("storage_mode", "")),
         )
 
+    def _require_staged_manifest(self, staged: StagedFile) -> None:
+        workspace_dir = _ensure_within(Path(staged.workspace_dir).resolve(), self.root)
+        manifest_path = _ensure_within(Path(staged.manifest_path).resolve(), workspace_dir)
+        _ensure_within(Path(staged.staged_path).resolve(), workspace_dir)
+        _ensure_within(Path(staged.derived_dir).resolve(), workspace_dir)
+        _ensure_within(Path(staged.outputs_dir).resolve(), workspace_dir)
+        manifest = _read_json(manifest_path, None)
+        if not isinstance(manifest, dict):
+            raise FileNotFoundError(f"staged file manifest was removed: {manifest_path}")
+        registered_workspace = _ensure_within(
+            Path(str(manifest.get("workspace_dir") or "")).resolve(),
+            self.root,
+        )
+        if (
+            registered_workspace != workspace_dir
+            or str(manifest.get("file_id") or "") != staged.file_id
+            or str(manifest.get("sha256") or "") != staged.sha256
+        ):
+            raise FileNotFoundError(f"staged file manifest no longer matches: {manifest_path}")
+
     def parse_or_get_cached(
         self,
         staged: StagedFile,
@@ -583,13 +660,14 @@ class FileWorkspace:
         embedded_media_ocr: OcrEngine | None = None,
         embedded_media_asr: AsrEngine | None = None,
     ) -> AttachmentParseResult:
-        with _path_lock(Path(staged.derived_dir) / ".parse.lock", timeout_seconds=120.0):
+        with self._conversation_lifecycle_lock(staged.workspace_dir):
+            self._require_staged_manifest(staged)
             self._ensure_staged_content(staged)
             cached = self.read_parse_result(staged)
             if cached is not None:
                 if _needs_parse_refresh(staged, cached, embedded_media_ocr=embedded_media_ocr):
                     result = parser.parse(staged.staged_path)
-                    self.write_parse_result(
+                    self._write_parse_result_unlocked(
                         staged,
                         result,
                         embedded_media_ocr=embedded_media_ocr,
@@ -607,7 +685,7 @@ class FileWorkspace:
                     or _needs_ocr_table_artifact_refresh(staged, cached)
                     or _needs_ai_analysis_refresh(staged, analyzer_available=self.analyzer is not None)
                 ):
-                    self.write_parse_result(
+                    self._write_parse_result_unlocked(
                         staged,
                         cached,
                         embedded_media_ocr=embedded_media_ocr,
@@ -616,7 +694,7 @@ class FileWorkspace:
                     return self.read_parse_result(staged) or cached
                 return cached
             result = parser.parse(staged.staged_path)
-            self.write_parse_result(
+            self._write_parse_result_unlocked(
                 staged,
                 result,
                 embedded_media_ocr=embedded_media_ocr,
@@ -678,7 +756,7 @@ class FileWorkspace:
         """
         removed: list[str] = []
         removed_blobs = 0
-        with _path_lock(self.root / ".cleanup.lock", timeout_seconds=120.0):
+        with self._root_lifecycle_lock():
             entries = self._all_file_dirs()
             # Oldest first (by mtime); newest kept for keep_min / recency.
             entries.sort(key=lambda item: item["mtime"])
@@ -691,10 +769,14 @@ class FileWorkspace:
                 over_size = max_total_bytes is not None and current_total_bytes > max_total_bytes
                 if not (too_old or over_size):
                     continue
-                if _has_active_lock(Path(item["path"])):
-                    continue
                 try:
-                    _remove_tree(Path(item["path"]))
+                    with self._conversation_lifecycle_lock(
+                        Path(item["path"]),
+                        timeout_seconds=0.1,
+                    ):
+                        if _has_active_lock(Path(item["path"])):
+                            continue
+                        _remove_tree(Path(item["path"]))
                 except OSError:
                     continue
                 removed.append(item["path"])
@@ -758,7 +840,7 @@ class FileWorkspace:
         removed = 0
         freed = 0
         for blob in blob_root.glob("*/*"):
-            if not blob.is_file() or blob.name.endswith(".lock"):
+            if not blob.is_file() or _is_lock_metadata_path(blob):
                 continue
             if blob.name in referenced:
                 _set_read_only(blob)
@@ -2771,7 +2853,7 @@ def _physical_tree_size(path: Path) -> int:
     try:
         children = path.rglob("*")
         for child in children:
-            if child.name.endswith(".lock") or not child.is_file():
+            if _is_lock_metadata_path(child) or not child.is_file():
                 continue
             try:
                 info = child.stat()
@@ -2793,7 +2875,7 @@ def _dir_size(path: Path) -> int:
     total = 0
     try:
         for child in path.rglob("*"):
-            if child.is_file():
+            if child.is_file() and not _is_lock_metadata_path(child):
                 try:
                     total += child.stat().st_size
                 except OSError:
@@ -2801,6 +2883,11 @@ def _dir_size(path: Path) -> int:
     except OSError:
         return total
     return total
+
+
+def _is_lock_metadata_path(path: Path) -> bool:
+    name = path.name
+    return name.endswith(".lock") or name.endswith(".lock.guard")
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -2823,45 +2910,17 @@ def _write_json(path: Path, payload: Any) -> None:
 
 @contextmanager
 def _path_lock(path: Path, *, timeout_seconds: float = 30.0) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + max(0.1, timeout_seconds)
-    fd: int | None = None
-    while fd is None:
-        try:
-            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError) as exc:
-            if isinstance(exc, PermissionError) and not path.exists():
-                raise
-            if _stale_lock(path):
-                try:
-                    path.unlink()
-                    continue
-                except OSError:
-                    pass
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for file workspace lock: {path}")
-            time.sleep(0.025)
-    try:
-        os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+    with short_process_lock(
+        path,
+        timeout_seconds=timeout_seconds,
+        stale_after_seconds=120.0,
+        timeout_label="file workspace lock",
+    ):
         yield
-    finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _has_active_lock(path: Path) -> bool:
     for lock_path in path.rglob("*.lock"):
-        if not _stale_lock(lock_path):
+        if not pid_lock_file_is_stale(lock_path, max_age_seconds=120.0):
             return True
     return False
-
-
-def _stale_lock(path: Path, *, max_age_seconds: float = 120.0) -> bool:
-    try:
-        return time.time() - path.stat().st_mtime > max_age_seconds
-    except OSError:
-        return False

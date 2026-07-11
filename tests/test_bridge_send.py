@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import tempfile
@@ -15,9 +16,12 @@ from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BridgeAckStatus,
     BridgeOutboxSendDriver,
     BridgeOutboxStore,
+    bridge_sync_fingerprint,
     bridge_ack,
+    bridge_ack_if_queued,
     bridge_requeue_resolved,
     bridge_state,
+    effective_bridge_ack_states,
 )
 
 
@@ -35,6 +39,19 @@ def _write_channel(data_dir: Path, conversation_id: str, payload: dict) -> None:
         json.dumps({"channels": [{"conversation_id": conversation_id, "chat_title": chat_title}]}),
         encoding="utf-8",
     )
+
+
+def _synced_ack_fingerprints(store: BridgeOutboxStore) -> dict[str, str]:
+    outbox_by_id = {
+        str(record.get("bridge_id", "")): record
+        for record in store._read_all(store.outbox_path)
+        if str(record.get("bridge_id", ""))
+    }
+    return {
+        bridge_id: bridge_sync_fingerprint(state.ack, outbox_by_id.get(bridge_id))
+        for bridge_id, state in effective_bridge_ack_states(store._read_all(store.ack_path)).items()
+        if state.terminal
+    }
 
 
 class BridgeSendTest(unittest.TestCase):
@@ -295,6 +312,237 @@ class BridgeSendTest(unittest.TestCase):
             self.assertEqual(items[new_bridge_id]["retry_reason"], "test_retry")
             self.assertEqual(after["pending_count"], 1)
             self.assertEqual(after["historical_failed_count"], 1)
+
+    def test_concurrent_requeue_reuses_one_active_successor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "retry once")
+            store.append_ack(
+                rec["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="wechat_native_http_send_text_error:ConnectionRefusedError:refused",
+            )
+
+            def requeue(index: int) -> dict:
+                return bridge_requeue_resolved(data_dir, rec["bridge_id"], reason=f"retry-{index}")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(requeue, range(16)))
+
+            successor_ids = {str(item["new_bridge_id"]) for item in results}
+            state = store.state(limit=30)
+            original = next(item for item in state["items"] if item["bridge_id"] == rec["bridge_id"])
+
+            self.assertEqual(len(successor_ids), 1)
+            self.assertEqual(sum(1 for item in results if item["created"]), 1)
+            self.assertEqual(sum(1 for item in results if item["reused_existing"]), 15)
+            self.assertEqual(state["count"], 2)
+            self.assertEqual(state["pending_count"], 1)
+            self.assertFalse(original["retryable"])
+            self.assertEqual(original["active_retry_bridge_id"], next(iter(successor_ids)))
+
+    def test_requeue_of_ancestor_reuses_active_transitive_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            original = store.enqueue("wxid_a", "retry chain")
+            failure_reason = "wechat_native_http_send_text_error:ConnectionRefusedError:refused"
+            store.append_ack(original["bridge_id"], status=BridgeAckStatus.FAILED, reason=failure_reason)
+            first = bridge_requeue_resolved(data_dir, original["bridge_id"], reason="first")
+            store.append_ack(first["new_bridge_id"], status=BridgeAckStatus.FAILED, reason=failure_reason)
+            second = bridge_requeue_resolved(data_dir, original["bridge_id"], reason="second-from-stale-ancestor")
+
+            replay = bridge_requeue_resolved(data_dir, original["bridge_id"], reason="ancestor-replay")
+            state = store.state(limit=20)
+
+            self.assertEqual(second["retry_parent_id"], first["new_bridge_id"])
+            self.assertEqual(second["record"]["retry_of"], first["new_bridge_id"])
+            self.assertTrue(replay["reused_existing"])
+            self.assertFalse(replay["created"])
+            self.assertEqual(replay["new_bridge_id"], second["new_bridge_id"])
+            self.assertEqual(state["count"], 3)
+            self.assertEqual(state["pending_count"], 1)
+
+    def test_terminal_retry_descendant_permanently_blocks_ancestor_requeue(self) -> None:
+        cases = [
+            (BridgeAckStatus.SENT, "native_sent"),
+            (BridgeAckStatus.ACCEPTED, "native_accepted_unverified"),
+            (BridgeAckStatus.FAILED, "unknown_delivery_state:ConnectionResetError:reset"),
+        ]
+        for descendant_status, descendant_reason in cases:
+            with self.subTest(status=descendant_status), tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                store = BridgeOutboxStore(data_dir)
+                original = store.enqueue("wxid_a", "retry lineage")
+                store.append_ack(
+                    original["bridge_id"],
+                    status=BridgeAckStatus.FAILED,
+                    reason="wechat_native_http_send_text_error:ConnectionRefusedError:refused",
+                )
+                successor = bridge_requeue_resolved(data_dir, original["bridge_id"], reason="first")
+                store.append_ack(
+                    successor["new_bridge_id"],
+                    status=descendant_status,
+                    reason=descendant_reason,
+                )
+
+                with self.assertRaises(ValueError):
+                    bridge_requeue_resolved(data_dir, original["bridge_id"], reason="must-not-fork")
+
+                self.assertEqual(store.state(limit=20)["count"], 2)
+
+    def test_manual_terminal_ack_is_atomic_and_only_applies_while_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            queued = store.enqueue("wxid_a", "stop before send")
+
+            applied = bridge_ack_if_queued(
+                data_dir,
+                queued["bridge_id"],
+                status=BridgeAckStatus.BLOCKED,
+                reason="manual_block",
+            )
+            replay = bridge_ack_if_queued(
+                data_dir,
+                queued["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="late_manual_failure",
+            )
+            missing = bridge_ack_if_queued(
+                data_dir,
+                "bridge:missing",
+                status=BridgeAckStatus.BLOCKED,
+                reason="missing",
+            )
+
+            self.assertTrue(applied["applied"])
+            self.assertEqual(applied["status"], "ok")
+            self.assertFalse(replay["applied"])
+            self.assertEqual(replay["effective_status"], BridgeAckStatus.BLOCKED)
+            self.assertFalse(missing["applied"])
+            self.assertEqual(missing["effective_status"], "missing")
+
+    def test_manual_terminal_ack_rejects_staged_item_until_contract_is_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            staged = store.enqueue("wxid_a", "projection pending", staged=True)
+
+            refused = bridge_ack_if_queued(
+                data_dir,
+                staged["bridge_id"],
+                status=BridgeAckStatus.BLOCKED,
+                reason="manual_block",
+            )
+            store.set_staged_projection_contract(
+                [staged["bridge_id"]],
+                expected_projections=[],
+            )
+            applied = bridge_ack_if_queued(
+                data_dir,
+                staged["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="projection_publish_failed",
+            )
+
+            self.assertEqual(refused["status"], "conflict")
+            self.assertEqual(refused["reason"], "bridge_item_staged_without_projection_contract")
+            self.assertEqual(store._read_all(store.ack_path)[0]["status"], BridgeAckStatus.FAILED)
+            self.assertTrue(applied["applied"])
+
+    def test_abandoned_staged_record_is_quarantined_without_becoming_deliverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "never activate", staged=True)
+
+            with mock.patch(
+                "app.personal_wechat_bot.wechat_driver.bridge_send.process_pid_alive",
+                return_value=False,
+            ):
+                quarantined = store.quarantine_abandoned_staged_records()
+
+            state = store.state(limit=10)
+            item = next(value for value in state["items"] if value["bridge_id"] == record["bridge_id"])
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual(item["status"], BridgeAckStatus.FAILED)
+            self.assertFalse(item["delivery_ready"])
+            self.assertEqual(item["expected_projections"], [])
+            self.assertFalse(item["ack"]["payload"]["delivery_attempted"])
+            with self.assertRaisesRegex(ValueError, "already terminal"):
+                store.activate_staged_record(
+                    record["bridge_id"],
+                    expected_projections=["queue", "ledger"],
+                )
+            conflicted = next(
+                value
+                for value in store._read_all(store.outbox_path)
+                if value["bridge_id"] == record["bridge_id"]
+            )
+            self.assertEqual(conflicted["expected_projections"], ["queue", "ledger"])
+
+    def test_live_fresh_staged_record_is_not_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            record = store.enqueue("wxid_a", "still projecting", staged=True)
+
+            quarantined = store.quarantine_abandoned_staged_records()
+
+            self.assertEqual(quarantined, [])
+            item = next(value for value in store.state(limit=10)["items"] if value["bridge_id"] == record["bridge_id"])
+            self.assertEqual(item["status"], "queued")
+            self.assertFalse(item["delivery_ready"])
+
+    def test_live_old_staged_owner_is_not_fenced_by_wall_clock_age(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            record = store.enqueue("wxid_a", "slow projection", staged=True)
+            outbox = store._read_all(store.outbox_path)
+            outbox[0]["staging_owner"]["created_at"] = "2000-01-01T00:00:00+00:00"
+            store._rewrite(store.outbox_path, outbox)
+
+            quarantined = store.quarantine_abandoned_staged_records()
+
+            self.assertEqual(quarantined, [])
+            item = next(value for value in store.state(limit=10)["items"] if value["bridge_id"] == record["bridge_id"])
+            self.assertEqual(item["status"], "queued")
+            self.assertFalse(item["delivery_ready"])
+
+    def test_old_legacy_staged_record_without_owner_is_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            record = store.enqueue("wxid_a", "legacy staged", staged=True)
+            outbox = store._read_all(store.outbox_path)
+            outbox[0].pop("staging_owner", None)
+            outbox[0]["created_at"] = "2000-01-01T00:00:00+00:00"
+            store._rewrite(store.outbox_path, outbox)
+
+            quarantined = store.quarantine_abandoned_staged_records()
+
+            self.assertEqual([item["bridge_id"] for item in quarantined], [record["bridge_id"]])
+            self.assertEqual(store.state(limit=10)["items"][0]["status"], BridgeAckStatus.FAILED)
+
+    def test_abandoned_staged_record_preserves_durable_projection_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            record = store.enqueue("wxid_a", "contract written before crash", staged=True)
+            store.set_staged_projection_contract(
+                [record["bridge_id"]],
+                expected_projections=["ledger", "task"],
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.wechat_driver.bridge_send.process_pid_alive",
+                return_value=False,
+            ):
+                quarantined = store.quarantine_abandoned_staged_records()
+
+            item = next(value for value in store.state(limit=10)["items"] if value["bridge_id"] == record["bridge_id"])
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual(item["expected_projections"], ["ledger", "task"])
+            self.assertEqual(item["status"], BridgeAckStatus.FAILED)
 
     def test_permanent_native_media_failures_are_not_retryable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -760,6 +1008,26 @@ class BridgeSendTest(unittest.TestCase):
 
 
 class BridgeOutboxCompactionTest(unittest.TestCase):
+    def test_append_isolates_partial_tail_and_compaction_preserves_corruption_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            partial = b'{"bridge_id":"crash-truncated"'
+            store.outbox_path.write_bytes(partial)
+
+            appended = store.enqueue("wxid_a", "after crash")
+            before_compaction = store.outbox_path.read_bytes()
+            state = store.state(limit=10)
+            compacted = store.compact(keep_resolved=0)
+
+            self.assertTrue(before_compaction.startswith(partial + b"\n"))
+            self.assertEqual(state["count"], 1)
+            self.assertEqual(state["items"][0]["bridge_id"], appended["bridge_id"])
+            self.assertEqual(state["invalid_outbox_line_count"], 1)
+            self.assertEqual(compacted["invalid_outbox_lines"], 1)
+            self.assertEqual(compacted["removed_outbox"], 0)
+            self.assertEqual(store.outbox_path.read_bytes(), before_compaction)
+
     def test_compact_drops_old_resolved_keeps_pending_and_recent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -773,7 +1041,10 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
             pending = store.enqueue("wxid_b", "still pending")
 
             # keep only the 2 most recent resolved records.
-            result = store.compact(keep_resolved=2)
+            result = store.compact(
+                keep_resolved=2,
+                synced_ack_fingerprints=_synced_ack_fingerprints(store),
+            )
 
             self.assertEqual(result["removed_outbox"], 3)
             state = store.state(limit=50)
@@ -786,6 +1057,114 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
             self.assertNotIn(resolved_ids[0], remaining)
             self.assertEqual(state["pending_count"], 1)
 
+    def test_compact_preserves_terminal_records_without_current_sync_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            for index in range(3):
+                record = store.enqueue("wxid_a", f"unsynced {index}")
+                store.append_ack(record["bridge_id"], status=BridgeAckStatus.FAILED, reason="not projected")
+            before_outbox = store.outbox_path.read_bytes()
+            before_acks = store.ack_path.read_bytes()
+
+            result = store.compact(keep_resolved=0)
+
+            self.assertEqual(result, {"removed_outbox": 0, "removed_acks": 0})
+            self.assertEqual(store.outbox_path.read_bytes(), before_outbox)
+            self.assertEqual(store.ack_path.read_bytes(), before_acks)
+
+    def test_compact_preserves_record_when_sync_fingerprint_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            record = store.enqueue("wxid_a", "terminal upgraded")
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.FAILED, reason="first terminal")
+            stale_fingerprint = _synced_ack_fingerprints(store)[record["bridge_id"]]
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.SENT, reason="verified sent")
+
+            preserved = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints={record["bridge_id"]: stale_fingerprint},
+            )
+            removed = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints=_synced_ack_fingerprints(store),
+            )
+
+            self.assertEqual(preserved, {"removed_outbox": 0, "removed_acks": 0})
+            self.assertEqual(removed, {"removed_outbox": 1, "removed_acks": 2})
+
+    def test_compact_preserves_ack_only_terminal_upgrade_until_current_sync_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            record = store.enqueue("wxid_a", "failed then verified")
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.FAILED, reason="initial failure")
+            old_proof = _synced_ack_fingerprints(store)[record["bridge_id"]]
+            store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints={record["bridge_id"]: old_proof},
+            )
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.SENT, reason="verified later")
+
+            preserved = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints={record["bridge_id"]: old_proof},
+            )
+            ack_state = effective_bridge_ack_states(store._read_all(store.ack_path))[record["bridge_id"]]
+            current_proof = bridge_sync_fingerprint(ack_state.ack, None)
+            removed = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints={record["bridge_id"]: current_proof},
+            )
+
+            self.assertEqual(preserved, {"removed_outbox": 0, "removed_acks": 0})
+            self.assertEqual(ack_state.status, BridgeAckStatus.SENT)
+            self.assertEqual(removed, {"removed_outbox": 0, "removed_acks": 1})
+
+    def test_ack_upgrade_appended_during_compaction_is_not_lost(self) -> None:
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BridgeOutboxStore(Path(tmp) / "data")
+            upgraded = store.enqueue("wxid_a", "late verification")
+            store.append_ack(upgraded["bridge_id"], status=BridgeAckStatus.FAILED, reason="initial failure")
+            old_proof = _synced_ack_fingerprints(store)[upgraded["bridge_id"]]
+            store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints={upgraded["bridge_id"]: old_proof},
+            )
+            noise = store.enqueue("wxid_b", "compaction trigger")
+            store.append_ack(noise["bridge_id"], status=BridgeAckStatus.SENT, reason="done")
+            sync_proofs = _synced_ack_fingerprints(store)
+            sync_proofs[upgraded["bridge_id"]] = old_proof
+            compaction_inside_rewrite = threading.Event()
+            append_started = threading.Event()
+            original_rewrite = store._rewrite
+
+            def paused_rewrite(path: Path, records: list[dict]) -> None:
+                if path == store.outbox_path and not compaction_inside_rewrite.is_set():
+                    compaction_inside_rewrite.set()
+                    self.assertTrue(append_started.wait(2.0))
+                    time.sleep(0.05)
+                original_rewrite(path, records)
+
+            def append_upgrade() -> None:
+                self.assertTrue(compaction_inside_rewrite.wait(2.0))
+                append_started.set()
+                store.append_ack(
+                    upgraded["bridge_id"],
+                    status=BridgeAckStatus.SENT,
+                    reason="verified while compacting",
+                )
+
+            with mock.patch.object(store, "_rewrite", side_effect=paused_rewrite):
+                thread = threading.Thread(target=append_upgrade)
+                thread.start()
+                store.compact(keep_resolved=0, synced_ack_fingerprints=sync_proofs)
+                thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            ack_state = effective_bridge_ack_states(store._read_all(store.ack_path))[upgraded["bridge_id"]]
+            self.assertEqual(ack_state.status, BridgeAckStatus.SENT)
+
     def test_compact_treats_terminal_ack_with_stale_retry_as_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -794,10 +1173,45 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
             store.append_ack(rec["bridge_id"], status=BridgeAckStatus.SENT, reason="ok")
             store.append_ack(rec["bridge_id"], status=BridgeAckStatus.RETRY, reason="stale_retry")
 
-            result = store.compact(keep_resolved=0)
+            result = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints=_synced_ack_fingerprints(store),
+            )
 
             self.assertEqual(result["removed_outbox"], 1)
             self.assertEqual(store.state(limit=10)["items"], [])
+
+    def test_compact_keeps_complete_ancestry_for_staged_retry_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            noise = store.enqueue("wxid_a", "old noise")
+            store.append_ack(noise["bridge_id"], status=BridgeAckStatus.SENT, reason="done")
+            original = store.enqueue("wxid_a", "retry chain")
+            safe_failure = "wechat_native_http_send_text_error:ConnectionRefusedError:refused"
+            store.append_ack(original["bridge_id"], status=BridgeAckStatus.FAILED, reason=safe_failure)
+            first = store.requeue_resolved(original["bridge_id"])
+            store.append_ack(first["bridge_id"], status=BridgeAckStatus.FAILED, reason=safe_failure)
+            staged = store.requeue_resolved(original["bridge_id"], staged=True)
+
+            compacted = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints=_synced_ack_fingerprints(store),
+            )
+            retained_ids = {
+                str(item.get("bridge_id", ""))
+                for item in store._read_all(store.outbox_path)
+            }
+            replay = store.requeue_resolved(original["bridge_id"], staged=True)
+
+            self.assertGreater(compacted["removed_outbox"], 0)
+            self.assertNotIn(noise["bridge_id"], retained_ids)
+            self.assertEqual(
+                retained_ids,
+                {original["bridge_id"], first["bridge_id"], staged["bridge_id"]},
+            )
+            self.assertTrue(replay["_reused_existing"])
+            self.assertEqual(replay["bridge_id"], staged["bridge_id"])
 
     def test_concurrent_append_during_compaction_is_not_lost(self) -> None:
         import threading
@@ -827,7 +1241,11 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
                 try:
                     barrier.wait()
                     for _ in range(20):
-                        BridgeOutboxStore(data_dir).compact(keep_resolved=1)
+                        current_store = BridgeOutboxStore(data_dir)
+                        current_store.compact(
+                            keep_resolved=1,
+                            synced_ack_fingerprints=_synced_ack_fingerprints(current_store),
+                        )
                 except Exception as exc:  # pragma: no cover - surfaced via errors
                     errors.append(exc)
 
@@ -855,7 +1273,10 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
             rec = store.enqueue("wxid_a", "one")
             store.append_ack(rec["bridge_id"], status="sent", reason="ok")
 
-            result = store.compact(keep_resolved=500)
+            result = store.compact(
+                keep_resolved=500,
+                synced_ack_fingerprints=_synced_ack_fingerprints(store),
+            )
 
             self.assertEqual(result, {"removed_outbox": 0, "removed_acks": 0})
 
@@ -872,7 +1293,10 @@ class BridgeOutboxCompactionTest(unittest.TestCase):
             for i in range(4):
                 rec = store.enqueue("wxid_a", f"done {i}")
                 store.append_ack(rec["bridge_id"], status="sent", reason="ok")
-            store.compact(keep_resolved=1)
+            store.compact(
+                keep_resolved=1,
+                synced_ack_fingerprints=_synced_ack_fingerprints(store),
+            )
 
             backend = DryRunSendBackend()
             processed = BridgeWorker(data_dir, backend).run_once()

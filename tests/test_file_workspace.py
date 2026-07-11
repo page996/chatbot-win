@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 import json
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
+from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path, short_process_lock
 from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
@@ -68,9 +70,12 @@ class FileWorkspaceTest(unittest.TestCase):
             first_manifest = json.loads(Path(first.manifest_path).read_text(encoding="utf-8"))
             second_manifest = json.loads(Path(second.manifest_path).read_text(encoding="utf-8"))
             blobs = list((workspace.root / "_blobs").glob("*/*"))
+            content_blobs = [path for path in blobs if path.is_file() and path.name == first.sha256]
+            guard_files = [path for path in blobs if path.is_file() and path.name.endswith(".lock.guard")]
             self.assertEqual(first.sha256, second.sha256)
             self.assertEqual(first_manifest["blob_path"], second_manifest["blob_path"])
-            self.assertEqual(len([path for path in blobs if path.is_file() and not path.name.endswith(".lock")]), 1)
+            self.assertEqual(len(content_blobs), 1)
+            self.assertEqual(len(guard_files), 1)
             self.assertIn(first.storage_mode, {"hardlink", "copy"})
             self.assertIn(second.storage_mode, {"hardlink", "copy"})
             if first.storage_mode == second.storage_mode == "hardlink":
@@ -107,6 +112,7 @@ class FileWorkspaceTest(unittest.TestCase):
             self.assertEqual(result["removed"], 1)
             self.assertEqual(result["removed_blobs"], 1)
             self.assertFalse(Path(staged.blob_path).exists())
+            self.assertTrue(Path(f"{staged.blob_path}.lock.guard").exists())
 
     def test_stage_file_uses_stable_channel_segment_when_chat_title_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -881,6 +887,84 @@ class FileWorkspaceCleanupTest(unittest.TestCase):
             self.assertGreaterEqual(result["removed"], 1)
             # The very newest must survive (keep_min + recency).
             self.assertTrue(ws.file_dir("c1", "s1", ids[-1]).exists())
+
+    def test_cleanup_skips_external_conversation_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws = FileWorkspace(root / "ws")
+            file_id = self._stage(ws, root, "held.txt")
+            file_dir = ws.file_dir("c1", "s1", file_id)
+            old = time.time() - 10_000
+            os.utime(file_dir, (old, old))
+            lock_path = scoped_process_lock_path(
+                ws.root.parent,
+                "file-workspace-conversation",
+                str(file_dir.parents[1]),
+            )
+            with short_process_lock(
+                lock_path,
+                timeout_seconds=1.0,
+                stale_after_seconds=120.0,
+            ):
+                result = ws.cleanup(max_age_seconds=1, keep_min=0)
+                self.assertEqual(result["removed"], 0)
+                self.assertTrue(file_dir.exists())
+
+            result = ws.cleanup(max_age_seconds=1, keep_min=0)
+            self.assertEqual(result["removed"], 1)
+            self.assertFalse(file_dir.exists())
+
+    def test_stale_parse_handle_does_not_recreate_cleaned_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "stale.txt"
+            source.write_text("stale", encoding="utf-8")
+            ws = FileWorkspace(root / "ws")
+            staged = ws.stage_file(source, conversation_id="c1", session_id="s1")
+            file_dir = Path(staged.workspace_dir)
+            old = time.time() - 10_000
+            os.utime(file_dir, (old, old))
+            cleanup = ws.cleanup(max_age_seconds=1, keep_min=0)
+
+            self.assertEqual(cleanup["removed"], 1)
+            with self.assertRaises(FileNotFoundError):
+                ws.parse_or_get_cached(staged, _CountingParser())
+            self.assertFalse(file_dir.exists())
+
+    def test_stage_waits_for_external_root_lifecycle_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "held-stage.txt"
+            source.write_text("held", encoding="utf-8")
+            ws = FileWorkspace(root / "ws")
+            lock_path = scoped_process_lock_path(
+                ws.root.parent,
+                "file-workspace-root",
+                str(ws.root),
+            )
+            finished = threading.Event()
+            staged_result: dict[str, object] = {}
+
+            def stage() -> None:
+                staged_result["value"] = ws.stage_file(
+                    source,
+                    conversation_id="c1",
+                    session_id="s1",
+                )
+                finished.set()
+
+            with short_process_lock(
+                lock_path,
+                timeout_seconds=1.0,
+                stale_after_seconds=120.0,
+            ):
+                worker = threading.Thread(target=stage)
+                worker.start()
+                self.assertFalse(finished.wait(0.1))
+
+            worker.join(timeout=5.0)
+            self.assertFalse(worker.is_alive())
+            self.assertIn("value", staged_result)
 
 
 if __name__ == "__main__":

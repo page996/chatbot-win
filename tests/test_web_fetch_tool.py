@@ -24,7 +24,11 @@ class WebFetchToolTest(unittest.TestCase):
             server = _LocalServer(root)
             server.start()
             try:
-                tool = WebFetchTool(root / "outputs", FileIndex(root / "files.sqlite"))
+                tool = WebFetchTool(
+                    root / "outputs",
+                    FileIndex(root / "files.sqlite"),
+                    allow_private_network=True,
+                )
                 result = tool.run(
                     ToolCallRequest(
                         tool_name="web.fetch",
@@ -54,7 +58,11 @@ class WebFetchToolTest(unittest.TestCase):
             server = _LocalServer(root)
             server.start()
             try:
-                tool = WebFetchTool(root / "outputs", FileIndex(root / "files.sqlite"))
+                tool = WebFetchTool(
+                    root / "outputs",
+                    FileIndex(root / "files.sqlite"),
+                    allow_private_network=True,
+                )
                 result = tool.run(
                     ToolCallRequest(
                         tool_name="web.fetch",
@@ -84,6 +92,7 @@ class WebFetchToolTest(unittest.TestCase):
                     FileIndex(root / "files.sqlite"),
                     file_workspace=workspace,
                     attachment_parser=BackendAttachmentParser(),
+                    allow_private_network=True,
                 )
                 result = tool.run(
                     ToolCallRequest(
@@ -118,6 +127,42 @@ class WebFetchToolTest(unittest.TestCase):
                     conversation_id="conv1",
                     requested_by="test",
                     arguments={"url": "file:///tmp/a.txt"},
+                )
+            )
+
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.error, "invalid_url")
+
+    def test_blocks_private_network_url_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = WebFetchTool(root / "outputs", FileIndex(root / "files.sqlite"))
+
+            result = tool.run(
+                ToolCallRequest(
+                    tool_name="web.fetch",
+                    call_id="private-url",
+                    conversation_id="conv1",
+                    requested_by="test",
+                    arguments={"url": "http://127.0.0.1:30001/QueryDB/status"},
+                )
+            )
+
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.error, "non_public_url")
+
+    def test_blocks_malformed_ipv6_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = WebFetchTool(root / "outputs", FileIndex(root / "files.sqlite"))
+
+            result = tool.run(
+                ToolCallRequest(
+                    tool_name="web.fetch",
+                    call_id="malformed-url",
+                    conversation_id="conv1",
+                    requested_by="test",
+                    arguments={"url": "http://[::1"},
                 )
             )
 

@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -12,7 +11,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.runtime.process_lock import short_process_lock
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_record
+
+
+_SOURCE_CHECKPOINT_VERSION = 1
+_SOURCE_CHECKPOINT_WINDOW_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -112,30 +116,93 @@ class HookEventJsonlImporter:
         skipped = 0
         errors: list[dict[str, Any]] = []
         appended_raw_ids: list[str] = []
+        appended_sequences: list[int] = []
         backend_event_count = _state_int(state, "_backend_event_count")
         if backend_event_count <= 0:
             backend_event_count = _jsonl_line_count(self.backend_event_path)
         import_sequence = int(state.get("_import_sequence", 0) or 0)
-        first_import_sequence = import_sequence + 1
+        durable_offset = offset
+        source_checkpoint: dict[str, Any] = {}
         with self.source_path.open("r", encoding="utf-8") as f:
+            try:
+                opened_size = int(os.fstat(f.fileno()).st_size)
+            except OSError:
+                opened_size = size
+            if offset > opened_size or (
+                offset > 0
+                and not _source_checkpoint_matches(
+                    state.get(_source_checkpoint_state_key(self.source_path)),
+                    _source_checkpoint_from_open_file(f, offset),
+                    offset,
+                )
+            ):
+                offset = 0
+                durable_offset = 0
+                state.pop(_source_line_state_key(self.source_path), None)
             f.seek(offset)
             line_no = _state_int(state, _source_line_state_key(self.source_path))
             if line_no <= 0 and offset > 0:
                 line_no = _jsonl_line_count_until(self.source_path, offset)
+            durable_line_no = line_no
             while True:
                 line_offset = f.tell()
                 line = f.readline()
                 if line == "":
                     break
-                line_no += 1
+                candidate_line_no = line_no + 1
                 if not line.strip():
+                    line_no = candidate_line_no
+                    durable_line_no = line_no
+                    durable_offset = f.tell()
                     continue
                 scanned += 1
                 try:
                     payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    if not line.endswith("\n"):
+                        scanned -= 1
+                        f.seek(line_offset)
+                        break
+                    skipped += 1
+                    errors.append(
+                        {
+                            "line": candidate_line_no,
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "phase": "parse",
+                            "disposition": "skip_poison",
+                        }
+                    )
+                    line_no = candidate_line_no
+                    durable_line_no = line_no
+                    durable_offset = f.tell()
+                    continue
+                try:
                     events = _hook_events_from_payload(payload)
-                    for batch_index, event in enumerate(events):
-                        import_sequence += 1
+                except Exception as exc:
+                    # A complete JSON value that cannot be normalized is a
+                    # deterministic poison record. Record and advance past it
+                    # so one bad collector payload cannot block the stream.
+                    skipped += 1
+                    errors.append(
+                        {
+                            "line": candidate_line_no,
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "phase": "normalize",
+                            "disposition": "skip_poison",
+                        }
+                    )
+                    line_no = candidate_line_no
+                    durable_line_no = line_no
+                    durable_offset = f.tell()
+                    continue
+
+                persist_failed = False
+                line_appended_before = appended
+                for batch_index, event in enumerate(events):
+                    import_sequence += 1
+                    try:
                         raw_id, was_appended = append_backend_event_record(
                             self.backend_event_path,
                             chat_title=event.chat_title,
@@ -154,7 +221,7 @@ class HookEventJsonlImporter:
                             source_payload=_source_payload(
                                 event,
                                 source_path=self.source_path,
-                                source_line_no=line_no,
+                                source_line_no=candidate_line_no,
                                 source_offset=line_offset,
                                 batch_index=batch_index,
                                 batch_count=len(events),
@@ -165,22 +232,48 @@ class HookEventJsonlImporter:
                             appended += 1
                             backend_event_count += 1
                             appended_raw_ids.append(raw_id)
+                            appended_sequences.append(import_sequence)
                         else:
                             skipped += 1
-                except json.JSONDecodeError as exc:
-                    if not line.endswith("\n"):
-                        scanned -= 1
+                    except Exception as exc:
+                        # The source line is not durable until every expanded
+                        # event is present in the backend bus. Keep its offset
+                        # pending; already-appended siblings are deduplicated on
+                        # retry by raw_id.
+                        persist_failed = True
+                        skipped += 1
+                        errors.append(
+                            {
+                                "line": candidate_line_no,
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                                "phase": "append",
+                                "disposition": "retry",
+                                "batch_index": batch_index,
+                                "batch_count": len(events),
+                                "partial_appended_count": appended - line_appended_before,
+                            }
+                        )
                         f.seek(line_offset)
                         break
-                    skipped += 1
-                    errors.append({"line": line_no, "type": type(exc).__name__, "message": str(exc)})
-                except Exception as exc:
-                    skipped += 1
-                    errors.append({"line": line_no, "type": type(exc).__name__, "message": str(exc)})
-            new_offset = f.tell()
+                if persist_failed:
+                    break
+                line_no = candidate_line_no
+                durable_line_no = line_no
+                durable_offset = f.tell()
+            source_checkpoint = _source_checkpoint_from_open_file(f, durable_offset)
 
-        state[str(self.source_path)] = new_offset
-        state[_source_line_state_key(self.source_path)] = line_no
+        if errors and errors[-1].get("disposition") == "retry":
+            # The append helper may have written the JSONL line before a
+            # sidecar/index error surfaced. Reconcile the diagnostic counter
+            # from the durable bus while leaving the source offset pending.
+            backend_event_count = _jsonl_line_count(self.backend_event_path)
+        state[str(self.source_path)] = durable_offset
+        state[_source_line_state_key(self.source_path)] = durable_line_no
+        if source_checkpoint:
+            state[_source_checkpoint_state_key(self.source_path)] = source_checkpoint
+        else:
+            state.pop(_source_checkpoint_state_key(self.source_path), None)
         state["_import_sequence"] = import_sequence
         state["_backend_event_count"] = backend_event_count
         _write_state(self.state_path, state)
@@ -194,10 +287,10 @@ class HookEventJsonlImporter:
             error_count=len(errors),
             appended_raw_ids=tuple(appended_raw_ids),
             errors=tuple(errors[:20]),
-            source_offset=new_offset,
+            source_offset=durable_offset,
             backend_event_count=backend_event_count,
-            imported_sequence_start=first_import_sequence if appended else import_sequence,
-            imported_sequence_end=import_sequence,
+            imported_sequence_start=appended_sequences[0] if appended_sequences else import_sequence,
+            imported_sequence_end=appended_sequences[-1] if appended_sequences else import_sequence,
         )
 
 
@@ -791,6 +884,87 @@ def _source_line_state_key(source_path: Path) -> str:
     return f"{source_path}:line_no"
 
 
+def _source_checkpoint_state_key(source_path: Path) -> str:
+    return f"{source_path}:checkpoint"
+
+
+def _source_checkpoint_from_open_file(source: Any, offset: int) -> dict[str, Any]:
+    try:
+        stat = os.fstat(source.fileno())
+    except (AttributeError, OSError):
+        return {}
+    consumed = int(offset)
+    if consumed < 0 or consumed > int(stat.st_size):
+        return {}
+    duplicate = -1
+    try:
+        duplicate = os.dup(source.fileno())
+        with os.fdopen(duplicate, "rb", closefd=True) as raw:
+            duplicate = -1
+            fingerprint = _source_prefix_fingerprint(raw, consumed)
+    except OSError:
+        return {}
+    finally:
+        if duplicate >= 0:
+            try:
+                os.close(duplicate)
+            except OSError:
+                pass
+    if not fingerprint:
+        return {}
+    return {
+        "version": _SOURCE_CHECKPOINT_VERSION,
+        "offset": consumed,
+        "source_device": int(getattr(stat, "st_dev", 0) or 0),
+        "source_file_id": int(getattr(stat, "st_ino", 0) or 0),
+        "source_size": int(stat.st_size),
+        "consumed_fingerprint": fingerprint,
+    }
+
+
+def _source_checkpoint_matches(value: Any, current: dict[str, Any], offset: int) -> bool:
+    if not isinstance(value, dict) or not current:
+        return False
+    try:
+        if int(value.get("version", 0) or 0) != _SOURCE_CHECKPOINT_VERSION:
+            return False
+        if int(value.get("offset", -1)) != int(offset):
+            return False
+        stored_device = int(value.get("source_device", 0) or 0)
+        stored_file_id = int(value.get("source_file_id", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    current_device = int(current.get("source_device", 0) or 0)
+    current_file_id = int(current.get("source_file_id", 0) or 0)
+    if stored_file_id and current_file_id and (
+        stored_device != current_device or stored_file_id != current_file_id
+    ):
+        return False
+    return str(value.get("consumed_fingerprint") or "") == str(current.get("consumed_fingerprint") or "")
+
+
+def _source_prefix_fingerprint(source: Any, offset: int) -> str:
+    consumed = max(0, int(offset))
+    digest = hashlib.sha256()
+    digest.update(f"hook-source-v{_SOURCE_CHECKPOINT_VERSION}:{consumed}:".encode("ascii"))
+    try:
+        source.seek(0)
+        head = source.read(min(consumed, _SOURCE_CHECKPOINT_WINDOW_BYTES))
+        if len(head) != min(consumed, _SOURCE_CHECKPOINT_WINDOW_BYTES):
+            return ""
+        digest.update(head)
+        if consumed > _SOURCE_CHECKPOINT_WINDOW_BYTES:
+            source.seek(max(0, consumed - _SOURCE_CHECKPOINT_WINDOW_BYTES))
+            tail = source.read(_SOURCE_CHECKPOINT_WINDOW_BYTES)
+            if len(tail) != _SOURCE_CHECKPOINT_WINDOW_BYTES:
+                return ""
+            digest.update(b"\0tail\0")
+            digest.update(tail)
+    except (AttributeError, OSError):
+        return ""
+    return digest.hexdigest()
+
+
 def _state_int(state: dict[str, Any], key: str) -> int:
     try:
         return int(state.get(key, 0) or 0)
@@ -800,39 +974,13 @@ def _state_int(state: dict[str, Any], key: str) -> int:
 
 @contextmanager
 def _state_file_lock(path: Path, *, timeout_seconds: float = 30.0) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + max(0.1, timeout_seconds)
-    fd: int | None = None
-    while fd is None:
-        try:
-            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            if _stale_lock(path):
-                try:
-                    path.unlink()
-                    continue
-                except OSError:
-                    pass
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for hook import state lock: {path}")
-            time.sleep(0.025)
-    try:
-        os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+    with short_process_lock(
+        path,
+        timeout_seconds=timeout_seconds,
+        stale_after_seconds=60.0,
+        timeout_label="hook import state lock",
+    ):
         yield
-    finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _stale_lock(path: Path, *, max_age_seconds: float = 60.0) -> bool:
-    try:
-        return time.time() - path.stat().st_mtime > max_age_seconds
-    except OSError:
-        return False
 
 
 def _jsonl_line_count(path: Path) -> int:

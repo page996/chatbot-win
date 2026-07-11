@@ -11,6 +11,10 @@
   historyResetPending: false,
   statusMessage: "",
   probeExpanded: false,
+  wechatProbeOverlay: null,
+  wechatProbeRequestEpoch: 0,
+  driverProbeOverlay: null,
+  driverProbeRequestEpoch: 0,
   activePage: "overview",
   activePanel: "queue",
   weflowStatusMode: "live",
@@ -25,12 +29,20 @@
   taskEvents: new Map(),
   taskEventsLoading: new Set(),
   channelLaneOpenState: new Map(),
+  channelLaneDrafts: new Map(),
+  channelLaneComposing: new Set(),
+  channelLaneMissingRefreshes: new Map(),
+  channelLaneDraftPruneRevision: 0,
+  successfulRefreshRevision: 0,
+  personaCardRevision: 0,
+  taskCardRevision: 0,
   renderingChannelLanes: false,
 };
 
 const BACKFILL_POLL_INTERVAL_MS = 1000;
 const BACKFILL_STALE_TIMEOUT_MS = 15 * 60 * 1000;
 const BACKFILL_MAX_WAIT_MS = 60 * 60 * 1000;
+const DRIVER_PROBE_TTL_MS = 60 * 1000;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -39,37 +51,36 @@ async function api(path, options = {}) {
   const { timeoutMs = 120000, headers = {}, ...fetchOptions } = options;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 120000));
-  let response;
   try {
-    response = await fetch(path, {
+    const response = await fetch(path, {
       headers: { "content-type": "application/json", ...headers },
       ...fetchOptions,
       signal: controller.signal,
     });
+    const raw = await response.text();
+    let payload = {};
+    if (raw) {
+      try {
+        payload = JSON.parse(raw);
+      } catch (error) {
+        const invalid = new Error(`服务返回了无效 JSON：HTTP ${response.status}`);
+        invalid.httpStatus = response.status;
+        throw invalid;
+      }
+    }
+    if (!response.ok || payload.status === "error") {
+      const error = new Error(payload.error || payload.message || `HTTP ${response.status}`);
+      error.payload = payload;
+      error.httpStatus = response.status;
+      throw error;
+    }
+    return payload;
   } catch (error) {
     if (error?.name === "AbortError") throw new Error(`请求超时：${path}`);
     throw error;
   } finally {
     clearTimeout(timeout);
   }
-  const raw = await response.text();
-  let payload = {};
-  if (raw) {
-    try {
-      payload = JSON.parse(raw);
-    } catch (error) {
-      const invalid = new Error(`服务返回了无效 JSON：HTTP ${response.status}`);
-      invalid.httpStatus = response.status;
-      throw invalid;
-    }
-  }
-  if (!response.ok || payload.status === "error") {
-    const error = new Error(payload.error || payload.message || `HTTP ${response.status}`);
-    error.payload = payload;
-    error.httpStatus = response.status;
-    throw error;
-  }
-  return payload;
 }
 
 async function refresh({ forceControls = false, force = false } = {}) {
@@ -89,10 +100,11 @@ async function refresh({ forceControls = false, force = false } = {}) {
 }
 
 function queueRefresh({ forceControls = false, force = false } = {}) {
-  const pending = state.pendingRefresh || { forceControls: false, force: false };
+  const pending = state.pendingRefresh || { forceControls: false, force: false, forceControlsRevision: null };
   state.pendingRefresh = {
     forceControls: pending.forceControls || forceControls,
     force: pending.force || force,
+    forceControlsRevision: forceControls ? state.controlsRevision : pending.forceControlsRevision,
   };
 }
 
@@ -108,7 +120,10 @@ async function drainRefreshQueue() {
         const payload = await api("/api/state");
         if (epoch === state.dataEpoch && !state.historyResetPending) {
           state.data = payload;
-          render({ forceControls: request.forceControls });
+          state.successfulRefreshRevision += 1;
+          render({
+            forceControls: request.forceControls && request.forceControlsRevision === state.controlsRevision,
+          });
         }
         result = payload;
       } catch (error) {
@@ -133,7 +148,7 @@ function render({ forceControls = false } = {}) {
   renderReadiness(data);
   renderCapture(data);
   renderChannels(data);
-  renderWechatProbe(data.wechat_window_probe || {});
+  renderWechatProbe(effectiveWechatProbe(data));
   renderCounts(data);
   renderQueue();
   renderBridge(data.send_bridge || {});
@@ -143,6 +158,7 @@ function render({ forceControls = false } = {}) {
   renderTaskQueue();
   renderProbeJson();
   syncTaskButtonLocks();
+  syncDriverProbeAvailability();
 }
 
 function renderReadiness(data) {
@@ -227,6 +243,77 @@ function selectedSendBackend(configured) {
   return ["dry_run", "weflow_http", "wechat_native_http"].includes(backend) ? backend : "wechat_native_http";
 }
 
+function driverProbeConfigFingerprint(data = state.data) {
+  const config = data?.config;
+  if (!config || typeof config !== "object") return "";
+  return JSON.stringify([
+    String(config.send_driver || ""),
+    configBoolean(config.send_enabled, false),
+    selectedSendBackend(config.send_backend),
+    String(config.weflow_base_url || ""),
+    String(config.weflow_token_env || ""),
+    String(config.weflow_send_text_path || ""),
+    String(config.weflow_send_file_path || ""),
+    Number(config.weflow_send_timeout_seconds ?? 35),
+    String(config.wechat_native_base_url || ""),
+    String(config.wechat_native_send_text_path || ""),
+    String(config.wechat_native_send_image_path || ""),
+    String(config.wechat_native_send_file_path || ""),
+    String(config.wechat_native_status_path || ""),
+    Number(config.wechat_native_timeout_seconds ?? 15),
+    Number(config.wechat_native_verify_timeout_seconds ?? 10),
+    Number(config.wechat_native_file_verify_timeout_seconds ?? 45),
+  ]);
+}
+
+function driverProbePayloadFingerprint(payload) {
+  const probe = payload?.probe;
+  if (!probe || typeof probe !== "object" || !("configured_driver" in probe)) return "";
+  return JSON.stringify([
+    String(probe.configured_driver || ""),
+    configBoolean(probe.send_enabled, false),
+    selectedSendBackend(probe.send_backend),
+    String(probe.weflow_base_url || ""),
+    String(probe.weflow_token_env || ""),
+    String(probe.weflow_send_text_path || ""),
+    String(probe.weflow_send_file_path || ""),
+    Number(probe.weflow_send_timeout_seconds ?? 35),
+    String(probe.wechat_native_base_url || ""),
+    String(probe.wechat_native_send_text_path || ""),
+    String(probe.wechat_native_send_image_path || ""),
+    String(probe.wechat_native_send_file_path || ""),
+    String(probe.wechat_native_status_path || ""),
+    Number(probe.wechat_native_timeout_seconds ?? 15),
+    Number(probe.wechat_native_verify_timeout_seconds ?? 10),
+    Number(probe.wechat_native_file_verify_timeout_seconds ?? 45),
+  ]);
+}
+
+function currentDriverProbeOverlay(data = state.data, now = Date.now()) {
+  const overlay = state.driverProbeOverlay;
+  if (!overlay || state.controlsDirty || state.controlsSaving) return null;
+  if (overlay.requestEpoch !== state.driverProbeRequestEpoch) return null;
+  if (overlay.expiresAt <= now) return null;
+  if (overlay.configFingerprint !== driverProbeConfigFingerprint(data)) return null;
+  return overlay;
+}
+
+function invalidateDriverProbeOverlay() {
+  state.driverProbeRequestEpoch += 1;
+  state.driverProbeOverlay = null;
+}
+
+function invalidateWechatProbeOverlay() {
+  state.wechatProbeRequestEpoch += 1;
+  state.wechatProbeOverlay = null;
+}
+
+function effectiveWechatProbe(data = state.data) {
+  const overlay = state.wechatProbeOverlay;
+  if (overlay && overlay.requestEpoch === state.wechatProbeRequestEpoch) return overlay.payload || {};
+  return data?.wechat_window_probe || {};
+}
+
 function driverNames(data) {
   const registered = data.driver_probe?.registered_send_drivers || [];
   const names = registered.map((item) => item.name).filter(Boolean);
@@ -257,8 +344,36 @@ function renderSendControlSummary(data = state.data) {
     setSendStatusPill("#sendBridgeSummary", "非前台桥：保存后审查", "warn");
     return;
   }
+  const explicitProbe = currentDriverProbeOverlay(data);
+  if (explicitProbe) {
+    const summary = driverProbeSummary(explicitProbe.payload);
+    setSendStatusPill("#sendBridgeSummary", summary.text, summary.tone);
+    return;
+  }
   const bridgeStatus = data?.capture?.background_send_status || "bridge_outbox_available";
   setSendStatusPill("#sendBridgeSummary", `非前台桥：${backgroundSendText(bridgeStatus)}`, bridgeStatusTone(bridgeStatus));
+}
+
+function driverProbeSummary(payload) {
+  const probe = payload?.probe?.driver_probe || {};
+  const blockers = Array.isArray(probe.blockers) ? probe.blockers.map((item) => String(item || "")).filter(Boolean) : [];
+  if (String(probe.health || "") === "ready" && !blockers.length) {
+    return { text: "后端探测：已就绪（60 秒内）", tone: "ok" };
+  }
+  if (!Object.keys(probe).length) {
+    return { text: "后端探测：驱动未提供探测结果", tone: "warn" };
+  }
+  const labels = {
+    send_enabled_false: "真实发送未启用",
+    weflow_http_unavailable: "WeFlow HTTP 不可达",
+    weflow_http_token_missing: "WeFlow token 缺失",
+    wechat_native_http_unavailable: "Native HTTP 不可达",
+    bridge_worker_config_stale: "worker 配置已过期",
+    bridge_worker_config_unknown: "worker 配置未知",
+  };
+  const detail = blockers.map((item) => labels[item] || item).join("、") || String(probe.health || "未就绪");
+  const onlyDisabled = blockers.length === 1 && blockers[0] === "send_enabled_false";
+  return { text: `后端探测：${detail}`, tone: onlyDisabled ? "muted" : "danger" };
 }
 
 function setSendStatusPill(selector, text, tone) {
@@ -323,6 +438,7 @@ function bridgeStatusTone(status) {
     bridge_outbox_ready: "ok",
     bridge_outbox_worker_down: "warn",
     bridge_outbox_worker_down_backlog: "danger",
+    bridge_outbox_backend_probe_deferred: "warn",
     bridge_outbox_worker_config_unknown: "warn",
     bridge_outbox_worker_stale_config: "danger",
   }[status] || "muted";
@@ -332,18 +448,20 @@ function renderWechatProbe(probe) {
   const active = probe.active || {};
   const windows = probe.windows || [];
   const first = windows[0] || {};
+  const status = active.status || probe.status || "unknown";
+  const unchecked = status === "unchecked";
   $("#diagnosticDetail").textContent = [
-    active.title || first.title || "未发现可用微信聊天窗口",
-    probeStatusText(active.status || probe.status || "unknown"),
+    active.title || first.title || (unchecked ? "尚未主动探测" : "未发现可用微信聊天窗口"),
+    probeStatusText(status),
     first.process_name || "",
-    first.hwnd ? `hwnd ${first.hwnd}` : "仅诊断",
-    probe.ui_automation?.available ? "UIA 可用" : (probe.ui_automation?.reason || "UIA 未知"),
+    first.hwnd ? `hwnd ${first.hwnd}` : (unchecked ? "" : "仅诊断"),
+    unchecked ? "" : (probe.ui_automation?.available ? "UIA 可用" : (probe.ui_automation?.reason || "UIA 未知")),
   ].filter(Boolean).join(" / ");
 
   const list = $("#handleList");
   list.innerHTML = "";
   if (!windows.length) {
-    list.append(emptyNode("没有发现可用的微信窗口句柄"));
+    list.append(emptyNode(unchecked ? "尚未主动探测微信窗口" : "没有发现可用的微信窗口句柄"));
     return;
   }
   for (const windowInfo of windows.slice(0, 2)) {
@@ -718,7 +836,7 @@ function renderBridgeItem(item) {
     actions.append(actionButton("重投", "primary", () => retryBridge(item.bridge_id), {
       label: `重投桥接项：${item.conversation_id || item.bridge_id}`,
       category: "非前台桥",
-      scope: `send-review:bridge-retry:${item.bridge_id || item.conversation_id}`,
+      scope: `send-review:bridge:${item.bridge_id || item.conversation_id}`,
       scopeLabel: "非前台桥重投",
       target: item.conversation_id || "",
     }));
@@ -904,12 +1022,13 @@ function renderWeFlow(weflow) {
   const selectedTalkers = talkerIds();
   $("#weflowStatus").textContent = worker.running
     ? `后台运行中 / ${worker.loops || 0} 轮`
-    : (readiness.status || weflow.last_pull?.status || weflow.last_health?.status || "未检查");
+    : weflowReadinessText(readiness.status || weflow.last_pull?.status || weflow.last_health?.status || "unchecked");
   $("#weflowDetail").textContent = [
     selectedTalkers.length ? `前端选中 ${selectedTalkers.length} talker` : "",
     requestedTalkers.length ? `后端最近请求 ${requestedTalkers.length} talker` : "",
     readiness.token_present ? `token ${readiness.token_source === "environment" ? "存在（环境变量）" : "存在"}` : "token 缺失",
     readiness.service_reachable ? "WeFlow 可达" : "",
+    readiness.status === "health_stale" ? "Health 已过期，请重新检查" : "",
     readiness.fork_ok ? "fork marker 正常" : "",
     weflow.security?.primary_source || "weflow_local_fork",
     weflow.security?.requires_token_for_pull ? "正式拉取需要 token" : "",
@@ -1301,6 +1420,9 @@ function auditDetailText(item, resolved = false) {
 }
 
 async function clearSendAudit(helpers = {}) {
+  if (!window.confirm("确定清空发送审计吗？\n\n该操作会删除控制台中的发送审计记录，但不会删除 send_bridge 证据链。")) {
+    return { status: "cancelled_by_user", message: "用户取消清空发送审计" };
+  }
   helpers.update?.(30, "正在清空发送审计");
   const payload = await api("/api/audit/clear", {
     method: "POST",
@@ -1308,6 +1430,30 @@ async function clearSendAudit(helpers = {}) {
   });
   helpers.update?.(78, "发送审计已清空，正在刷新页面状态");
   setStatusMessage("发送审计已清空");
+  await refresh({ force: true });
+  return payload;
+}
+
+function weflowReadinessText(value) {
+  return {
+    ready: "已就绪",
+    token_missing: "token 缺失",
+    fork_marker_missing: "fork marker 缺失",
+    health_stale: "Health 已过期",
+    worker_running_unchecked: "后台运行中，尚未确认健康",
+    error: "Health 检查失败",
+    unchecked: "尚未检查",
+  }[String(value || "")] || String(value || "未检查");
+}
+
+async function clearWeFlowHistory(helpers = {}) {
+  if (!window.confirm("确定清空 WeFlow 操作历史吗？\n\n该操作只清除控制台操作记录，不会删除对话或 send_bridge 证据链。")) {
+    return { status: "cancelled_by_user", message: "用户取消清空 WeFlow 操作历史" };
+  }
+  helpers.update?.(30, "正在清空 WeFlow 操作历史");
+  const payload = await api("/api/weflow/clear-history", { method: "POST", body: JSON.stringify({}) });
+  showWeFlowStatusPayload(payload);
+  setStatusMessage("操作历史已清空");
   await refresh({ force: true });
   return payload;
 }
@@ -1320,6 +1466,8 @@ async function clearHistoryData(helpers = {}) {
     return { status: "cancelled_by_user", message: "用户取消清空历史数据" };
   }
   state.historyResetPending = true;
+  invalidateWechatProbeOverlay();
+  invalidateDriverProbeOverlay();
   state.dataEpoch += 1;
   syncTaskButtonLocks();
   helpers.update?.(18, "已确认，正在调度关闭清空");
@@ -1423,10 +1571,18 @@ function storageStatusSummary(payload) {
 function renderProbeJson() {
   $("#probeBox").hidden = !state.probeExpanded;
   if (!state.probeExpanded) return;
+  const driverOverlay = currentDriverProbeOverlay();
   $("#probeBox").textContent = JSON.stringify(
     {
-      driver_probe: state.data?.driver_probe,
-      wechat_window_probe: state.data?.wechat_window_probe,
+      driver_probe: driverOverlay?.payload?.probe || state.data?.driver_probe,
+      driver_probe_overlay: driverOverlay
+        ? {
+          checked_at: driverOverlay.checkedAt,
+          expires_at: new Date(driverOverlay.expiresAt).toISOString(),
+          config_fingerprint: driverOverlay.configFingerprint,
+        }
+        : null,
+      wechat_window_probe: effectiveWechatProbe(),
       runtime_probe: state.data?.runtime_probe,
     },
     null,
@@ -1544,6 +1700,7 @@ async function executeTask(task, worker) {
     renderAgentStatus();
     if (state.data?.weflow) renderWeFlow(state.data.weflow);
     syncTaskButtonLocks();
+    syncDriverProbeAvailability();
   }
 }
 
@@ -1686,7 +1843,15 @@ function positionButtonTaskProgress(button, node) {
   const maxLeft = shellRect.right - nodeRect.width - padding;
   const idealLeft = buttonRect.left + buttonRect.width / 2 - nodeRect.width / 2;
   const left = Math.max(minLeft, Math.min(maxLeft, idealLeft));
-  const top = buttonRect.bottom + gap;
+  let top = buttonRect.bottom + gap;
+  const tabs = $(".page-tabs");
+  const tabsRect = tabs?.offsetParent === null ? null : tabs?.getBoundingClientRect();
+  if (tabsRect && top < tabsRect.bottom + gap && top + nodeRect.height > tabsRect.top - gap) {
+    top = tabsRect.bottom + gap;
+  }
+  if (top + nodeRect.height > window.innerHeight - padding) {
+    top = Math.max(padding, buttonRect.top - nodeRect.height - gap);
+  }
   const arrowX = buttonRect.left + buttonRect.width / 2 - left;
   node.style.left = `${Math.round(left)}px`;
   node.style.top = `${Math.round(top)}px`;
@@ -2048,9 +2213,18 @@ function renderChannelTaskLanes() {
     state.renderingChannelLanes = false;
     return;
   }
+  // Replacing the active input during an IME composition discards the
+  // unfinished text. Other panels may refresh, but this lane DOM stays put.
+  if (channelLaneCompositionActive()) return;
   rememberRenderedChannelLaneOpenState(list);
+  rememberRenderedChannelLaneDrafts(list);
+  const focusedControl = channelLaneFocusedControl(list);
   const lanes = channelLaneViewModels();
   const items = Array.isArray(lanes) ? lanes : [];
+  pruneMissingChannelLaneDrafts(items);
+  const currentLaneIds = new Set(items.map((lane, index) => String(
+    lane.conversation_id || lane.display_name || lane.current_topic?.topic_id || `lane-${index}`,
+  )));
   count.textContent = items.length;
   state.renderingChannelLanes = true;
   list.innerHTML = "";
@@ -2059,12 +2233,10 @@ function renderChannelTaskLanes() {
     state.renderingChannelLanes = false;
     return;
   }
-  const visibleLaneIds = new Set();
   let laneIndex = 0;
   for (const lane of items.slice(0, 16)) {
     const fallbackLaneId = `lane-${laneIndex++}`;
     const laneId = String(lane.conversation_id || lane.display_name || lane.current_topic?.topic_id || fallbackLaneId);
-    visibleLaneIds.add(laneId);
     const tasks = orderedTasks(lane.tasks || []);
     const visibleTasks = laneVisibleTasks(tasks);
     const activeTasks = visibleTasks.filter((task) => taskIsActive(task));
@@ -2155,9 +2327,12 @@ function renderChannelTaskLanes() {
     });
   }
   for (const laneId of state.channelLaneOpenState.keys()) {
-    if (!visibleLaneIds.has(laneId)) state.channelLaneOpenState.delete(laneId);
+    if (!currentLaneIds.has(laneId) && !state.channelLaneDrafts.has(laneId)) {
+      state.channelLaneOpenState.delete(laneId);
+    }
   }
   state.renderingChannelLanes = false;
+  restoreChannelLaneFocus(list, focusedControl);
 }
 
 function renderLaneTask(task) {
@@ -2186,6 +2361,141 @@ function rememberRenderedChannelLaneOpenState(list) {
     const laneId = String(node.dataset.laneId || "").trim();
     if (!laneId) continue;
     state.channelLaneOpenState.set(laneId, Boolean(node.open));
+  }
+}
+
+const CHANNEL_LANE_DRAFT_FIELDS = {
+  pinned: ".lane-pin-input",
+  priority: ".lane-priority-input",
+  snoozedUntil: ".lane-snooze-input",
+  waitReason: ".lane-wait-input",
+  operatorNote: ".lane-note-input",
+};
+
+function setChannelLaneComposition(conversationId, active) {
+  const id = String(conversationId || "").trim();
+  if (!id) return;
+  if (active) {
+    state.channelLaneComposing.add(id);
+  } else {
+    state.channelLaneComposing.delete(id);
+  }
+}
+
+function channelLaneCompositionActive() {
+  return state.channelLaneComposing.size > 0;
+}
+
+function pruneMissingChannelLaneDrafts(items) {
+  const refreshRevision = Number(state.successfulRefreshRevision || 0);
+  if (!refreshRevision || refreshRevision === state.channelLaneDraftPruneRevision) return;
+  state.channelLaneDraftPruneRevision = refreshRevision;
+  const present = new Set(
+    (Array.isArray(items) ? items : [])
+      .map((lane) => String(lane?.conversation_id || "").trim())
+      .filter(Boolean),
+  );
+  for (const conversationId of present) {
+    state.channelLaneMissingRefreshes.delete(conversationId);
+  }
+  for (const conversationId of Array.from(state.channelLaneDrafts.keys())) {
+    if (present.has(conversationId)) continue;
+    const missingCount = Number(state.channelLaneMissingRefreshes.get(conversationId) || 0) + 1;
+    if (missingCount < 3) {
+      state.channelLaneMissingRefreshes.set(conversationId, missingCount);
+      continue;
+    }
+    state.channelLaneDrafts.delete(conversationId);
+    state.channelLaneOpenState.delete(conversationId);
+    state.channelLaneComposing.delete(conversationId);
+    state.channelLaneMissingRefreshes.delete(conversationId);
+  }
+  for (const conversationId of Array.from(state.channelLaneMissingRefreshes.keys())) {
+    if (!state.channelLaneDrafts.has(conversationId)) {
+      state.channelLaneMissingRefreshes.delete(conversationId);
+    }
+  }
+}
+
+function channelLaneControlValues(root) {
+  return {
+    pinned: Boolean(root.querySelector(CHANNEL_LANE_DRAFT_FIELDS.pinned)?.checked),
+    priority: String(root.querySelector(CHANNEL_LANE_DRAFT_FIELDS.priority)?.value || "50"),
+    snoozedUntil: String(root.querySelector(CHANNEL_LANE_DRAFT_FIELDS.snoozedUntil)?.value || ""),
+    waitReason: String(root.querySelector(CHANNEL_LANE_DRAFT_FIELDS.waitReason)?.value || ""),
+    operatorNote: String(root.querySelector(CHANNEL_LANE_DRAFT_FIELDS.operatorNote)?.value || ""),
+  };
+}
+
+function channelLaneControlDisplayValues(control = {}, draft = null) {
+  const values = {
+    pinned: control.pinned,
+    priority: String(control.priority),
+    snoozedUntil: datetimeLocalValue(control.snoozed_until),
+    waitReason: control.wait_reason,
+    operatorNote: control.operator_note,
+  };
+  const dirtyFields = new Set(draft?.dirtyFields || []);
+  const draftValues = draft?.values || {};
+  for (const field of Object.keys(values)) {
+    if (dirtyFields.has(field) && Object.prototype.hasOwnProperty.call(draftValues, field)) {
+      values[field] = draftValues[field];
+    }
+  }
+  return values;
+}
+
+function rememberChannelLaneDraft(conversationId, root, { increment = true, field = "" } = {}) {
+  const id = String(conversationId || "").trim();
+  if (!id || !root) return null;
+  const previous = state.channelLaneDrafts.get(id) || { revision: 0, dirtyFields: [], fieldRevisions: {} };
+  const dirtyFields = new Set(previous.dirtyFields || []);
+  if (field) dirtyFields.add(field);
+  const revision = Number(previous.revision || 0) + (increment ? 1 : 0);
+  const fieldRevisions = { ...(previous.fieldRevisions || {}) };
+  if (field) fieldRevisions[field] = revision;
+  const draft = {
+    revision,
+    values: channelLaneControlValues(root),
+    dirtyFields: Array.from(dirtyFields),
+    fieldRevisions,
+  };
+  state.channelLaneDrafts.set(id, draft);
+  root.dataset.draftDirty = "1";
+  return draft;
+}
+
+function rememberRenderedChannelLaneDrafts(list) {
+  for (const lane of list.querySelectorAll(".channel-lane[data-lane-id]")) {
+    const panel = lane.querySelector(".lane-control-panel[data-conversation-id]");
+    if (!panel || panel.dataset.draftDirty !== "1") continue;
+    rememberChannelLaneDraft(panel.dataset.conversationId, panel, { increment: false });
+  }
+}
+
+function channelLaneFocusedControl(list) {
+  const active = document.activeElement;
+  if (!active || !list.contains(active)) return null;
+  const lane = active.closest(".channel-lane[data-lane-id]");
+  const field = String(active.dataset?.draftField || "");
+  if (!lane || !field) return null;
+  return {
+    laneId: String(lane.dataset.laneId || ""),
+    field,
+    selectionStart: Number.isInteger(active.selectionStart) ? active.selectionStart : null,
+    selectionEnd: Number.isInteger(active.selectionEnd) ? active.selectionEnd : null,
+  };
+}
+
+function restoreChannelLaneFocus(list, snapshot) {
+  if (!snapshot?.laneId || !snapshot.field) return;
+  const lane = Array.from(list.querySelectorAll(".channel-lane[data-lane-id]"))
+    .find((item) => item.dataset.laneId === snapshot.laneId);
+  const input = lane?.querySelector(`[data-draft-field="${snapshot.field}"]`);
+  if (!input) return;
+  input.focus({ preventScroll: true });
+  if (snapshot.selectionStart !== null && typeof input.setSelectionRange === "function") {
+    input.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd ?? snapshot.selectionStart);
   }
 }
 
@@ -2295,8 +2605,12 @@ async function toggleTaskEvents(taskId) {
 
 function renderLaneControl(lane, control) {
   const conversationId = String(lane.conversation_id || "").trim();
+  const draft = state.channelLaneDrafts.get(conversationId) || null;
+  const values = channelLaneControlDisplayValues(control, draft);
   const node = document.createElement("section");
   node.className = `lane-control-panel mode-${control.mode}${control.pinned ? " is-pinned" : ""}`;
+  node.dataset.conversationId = conversationId;
+  if (draft) node.dataset.draftDirty = "1";
   node.innerHTML = `
     <div class="lane-state-head">
       <strong>通道控制</strong>
@@ -2306,26 +2620,39 @@ function renderLaneControl(lane, control) {
     <div class="lane-control-grid">
       <label class="lane-pin-row">
         <span>置顶</span>
-        <input class="lane-pin-input" type="checkbox" ${control.pinned ? "checked" : ""} />
+        <input class="lane-pin-input" data-draft-field="pinned" type="checkbox" ${values.pinned ? "checked" : ""} />
       </label>
       <label>
         <span>优先级</span>
-        <input class="compact-input lane-priority-input" type="number" min="0" max="100" step="1" value="${escapeHtml(control.priority)}" />
+        <input class="compact-input lane-priority-input" data-draft-field="priority" type="number" min="0" max="100" step="1" value="${escapeHtml(values.priority)}" />
       </label>
       <label>
         <span>稍后到</span>
-        <input class="compact-input lane-snooze-input" type="datetime-local" value="${escapeHtml(datetimeLocalValue(control.snoozed_until))}" />
+        <input class="compact-input lane-snooze-input" data-draft-field="snoozedUntil" type="datetime-local" value="${escapeHtml(values.snoozedUntil)}" />
       </label>
       <label>
         <span>等待原因</span>
-        <input class="compact-input lane-wait-input" type="text" value="${escapeHtml(control.wait_reason)}" />
+        <input class="compact-input lane-wait-input" data-draft-field="waitReason" type="text" value="${escapeHtml(values.waitReason)}" />
       </label>
       <label>
         <span>备注</span>
-        <input class="compact-input lane-note-input" type="text" value="${escapeHtml(control.operator_note)}" />
+        <input class="compact-input lane-note-input" data-draft-field="operatorNote" type="text" value="${escapeHtml(values.operatorNote)}" />
       </label>
     </div>
   `;
+  node.querySelectorAll("[data-draft-field]").forEach((input) => {
+    const eventName = input.type === "checkbox" ? "change" : "input";
+    input.addEventListener(eventName, () => rememberChannelLaneDraft(conversationId, node, {
+      field: String(input.dataset.draftField || ""),
+    }));
+    input.addEventListener("compositionstart", () => setChannelLaneComposition(conversationId, true));
+    input.addEventListener("compositionend", () => {
+      rememberChannelLaneDraft(conversationId, node, {
+        field: String(input.dataset.draftField || ""),
+      });
+      setChannelLaneComposition(conversationId, false);
+    });
+  });
   const actions = node.querySelector(".lane-control-actions");
   const meta = {
     category: "通道",
@@ -2374,16 +2701,12 @@ function renderLaneControl(lane, control) {
       snoozed_until: datetimeLocalToIso(raw),
     });
   }, { ...meta, label: `稍后处理通道：${lane.display_name || conversationId}` }));
-  actions.append(actionButton("保存", "primary mini", () => updateChannelControl(conversationId, {
-    action: "update_control",
-    patch: {
-      pinned: Boolean(node.querySelector(".lane-pin-input")?.checked),
-      priority: Number(node.querySelector(".lane-priority-input")?.value || 50),
-      wait_reason: String(node.querySelector(".lane-wait-input")?.value || ""),
-      operator_note: String(node.querySelector(".lane-note-input")?.value || ""),
-      snoozed_until: datetimeLocalToIso(String(node.querySelector(".lane-snooze-input")?.value || "")),
-    },
-  }), { ...meta, label: `保存通道控制：${lane.display_name || conversationId}` }));
+  actions.append(actionButton(
+    "保存",
+    "primary mini",
+    () => saveChannelLaneControl(conversationId, node),
+    { ...meta, label: `保存通道控制：${lane.display_name || conversationId}` },
+  ));
   return node;
 }
 
@@ -2877,7 +3200,7 @@ function normalizeBackendTask(task) {
 
 function taskResultFailed(result) {
   if (!result || typeof result !== "object") return false;
-  return ["error", "failed", "partial_error", "blocked"].includes(String(result.status || ""));
+  return ["error", "failed", "partial_error", "blocked", "conflict"].includes(String(result.status || ""));
 }
 
 function taskStatusText(status) {
@@ -3012,6 +3335,8 @@ function sleep(ms) {
 async function saveControls() {
   if (state.controlsSaving) return { status: "blocked", message: "controls_save_in_progress" };
   state.controlsSaving = true;
+  invalidateDriverProbeOverlay();
+  syncDriverProbeAvailability();
   const savedRevision = state.controlsRevision;
   setDirtyIndicator("saving");
   renderSendControlSummary();
@@ -3046,6 +3371,7 @@ async function saveControls() {
     state.controlsSaving = false;
     setDirtyIndicator(state.controlsDirty ? "dirty" : "clean");
     renderSendControlSummary();
+    syncDriverProbeAvailability();
   }
 }
 
@@ -3098,6 +3424,11 @@ async function deleteChannel(conversationId) {
 
 async function updateChannelControl(conversationId, payload = {}) {
   if (!conversationId) return null;
+  const actionFields = channelControlActionDraftFields(payload.action);
+  const expectedFieldRevisions = Object.fromEntries(actionFields.map((field) => [
+    field,
+    Number(state.channelLaneDrafts.get(conversationId)?.fieldRevisions?.[field] ?? -1),
+  ]));
   const response = await api("/api/channel-state", {
     method: "POST",
     body: JSON.stringify({
@@ -3107,8 +3438,88 @@ async function updateChannelControl(conversationId, payload = {}) {
     }),
   });
   const control = response.channel_state?.control || {};
+  reconcileChannelLaneActionDrafts(conversationId, actionFields, expectedFieldRevisions, control);
   setStatusMessage(`通道控制已更新：${channelControlModeText(control.mode || "active")}`);
   await refresh({ force: true });
+  return response;
+}
+
+function channelControlActionDraftFields(action) {
+  const normalized = String(action || "");
+  if (["pin", "unpin"].includes(normalized)) return ["pinned"];
+  if (normalized === "snooze") return ["snoozedUntil"];
+  if (normalized === "pause") return ["waitReason"];
+  if (normalized === "resume") return ["waitReason", "snoozedUntil"];
+  return [];
+}
+
+function reconcileChannelLaneActionDrafts(conversationId, fields, expectedFieldRevisions, control = {}) {
+  for (const field of fields || []) {
+    reconcileChannelLaneActionDraft(
+      conversationId,
+      field,
+      Number(expectedFieldRevisions?.[field] ?? -1),
+      control,
+    );
+  }
+}
+
+function reconcileChannelLaneActionDraft(conversationId, field, expectedFieldRevision, control = {}) {
+  if (!field) return;
+  const draft = state.channelLaneDrafts.get(conversationId);
+  if (!draft) return;
+  if (Number(draft.fieldRevisions?.[field] ?? -1) !== expectedFieldRevision) return;
+  const values = { ...(draft.values || {}) };
+  if (field === "pinned") values.pinned = configBoolean(control.pinned, false);
+  if (field === "priority") values.priority = String(control.priority ?? 50);
+  if (field === "snoozedUntil") values.snoozedUntil = datetimeLocalValue(control.snoozed_until);
+  if (field === "waitReason") values.waitReason = String(control.wait_reason || "");
+  if (field === "operatorNote") values.operatorNote = String(control.operator_note || "");
+  const dirtyFields = (draft.dirtyFields || []).filter((item) => item !== field);
+  if (!dirtyFields.length) {
+    state.channelLaneDrafts.delete(conversationId);
+    return;
+  }
+  const fieldRevisions = { ...(draft.fieldRevisions || {}) };
+  delete fieldRevisions[field];
+  state.channelLaneDrafts.set(conversationId, { ...draft, values, dirtyFields, fieldRevisions });
+}
+
+async function saveChannelLaneControl(conversationId, root) {
+  const submitted = state.channelLaneDrafts.get(conversationId) || rememberChannelLaneDraft(
+    conversationId,
+    root,
+    { increment: false },
+  );
+  const submittedValues = channelLaneControlValues(root);
+  const submittedFields = Array.from(new Set(submitted?.dirtyFields || []));
+  const expectedFieldRevisions = Object.fromEntries(submittedFields.map((field) => [
+    field,
+    Number(submitted?.fieldRevisions?.[field] ?? -1),
+  ]));
+  const patch = {};
+  if (submittedFields.includes("pinned")) patch.pinned = submittedValues.pinned;
+  if (submittedFields.includes("priority")) patch.priority = Number(submittedValues.priority || 50);
+  if (submittedFields.includes("waitReason")) patch.wait_reason = submittedValues.waitReason;
+  if (submittedFields.includes("operatorNote")) patch.operator_note = submittedValues.operatorNote;
+  if (submittedFields.includes("snoozedUntil")) {
+    patch.snoozed_until = datetimeLocalToIso(submittedValues.snoozedUntil);
+  }
+  if (!Object.keys(patch).length) {
+    state.channelLaneDrafts.delete(conversationId);
+    return { status: "ok", message: "no_channel_control_changes" };
+  }
+  const response = await updateChannelControl(conversationId, {
+    action: "update_control",
+    patch,
+  });
+  reconcileChannelLaneActionDrafts(
+    conversationId,
+    submittedFields,
+    expectedFieldRevisions,
+    response.channel_state?.control || {},
+  );
+  renderChannelTaskLanes();
   return response;
 }
 
@@ -3249,6 +3660,13 @@ async function cleanupHiddenChannels() {
 
 async function ackBridge(bridgeId, status) {
   if (!bridgeId) return;
+  const markingSent = status === "sent";
+  const confirmed = window.confirm(
+    markingSent
+      ? "确认将该桥接项标记为已发送吗？\n\n仅处理仍处于待桥接（queued）的项，并且仅在微信侧已经核实送达时执行。worker 一旦开始发送（inflight）便无法取消，陈旧请求会被拒绝。"
+      : "确认将该桥接项标记为失败吗？\n\n仅处理仍处于待桥接（queued）的项。worker 一旦开始发送（inflight）便无法取消，陈旧请求会被拒绝；人工失败是终态，系统不会自动重发。",
+  );
+  if (!confirmed) return { status: "cancelled_by_user", message: "用户取消桥接回执标记" };
   const payload = await api("/api/bridge/ack", {
     method: "POST",
     body: JSON.stringify({
@@ -3257,6 +3675,13 @@ async function ackBridge(bridgeId, status) {
       reason: status === "sent" ? "manual_sidebar_ack" : "manual_sidebar_failed",
     }),
   });
+  if (payload.applied === false || payload.status === "conflict") {
+    const effectiveStatus = bridgeStatusText(payload.effective_status || "") || "已变化";
+    const message = `桥接项当前为${effectiveStatus}，人工标记未执行；已经开始的发送无法取消`;
+    setStatusMessage(message);
+    await refresh({ force: true });
+    return { ...payload, status: "conflict", message };
+  }
   setStatusMessage(status === "sent" ? "桥接项已标记为已发" : "桥接项已标记为失败");
   await refresh({ force: true });
   return payload;
@@ -3264,6 +3689,9 @@ async function ackBridge(bridgeId, status) {
 
 async function retryBridge(bridgeId) {
   if (!bridgeId) return;
+  if (!window.confirm("确认重投该桥接项吗？\n\n重投可能造成重复发送；请先核对微信侧没有实际送达。")) {
+    return { status: "cancelled_by_user", message: "用户取消桥接重投" };
+  }
   const payload = await api("/api/bridge/retry", {
     method: "POST",
     body: JSON.stringify({
@@ -3288,8 +3716,19 @@ async function runtimeCardAction(action, payload) {
   return result;
 }
 
+const PERSONA_CARD_FIELDS = [
+  "#personaCardName",
+  "#personaCardDescription",
+  "#personaCardPersonality",
+  "#personaCardScenario",
+  "#personaCardMesExample",
+  "#personaCardContent",
+];
+const TASK_CARD_FIELDS = ["#taskCardName", "#taskCardContent"];
+
 async function savePersonaCard(event) {
   event.preventDefault();
+  const submittedRevision = state.personaCardRevision;
   const name = $("#personaCardName").value.trim();
   const payload = {
     name,
@@ -3306,22 +3745,18 @@ async function savePersonaCard(event) {
     return { status: "error", message: "人物卡内容不能为空" };
   }
   const result = await runtimeCardAction("save-persona", payload);
-  [
-    "#personaCardName",
-    "#personaCardDescription",
-    "#personaCardPersonality",
-    "#personaCardScenario",
-    "#personaCardMesExample",
-    "#personaCardContent",
-  ].forEach((selector) => {
-    const node = $(selector);
-    if (node) node.value = "";
-  });
+  if (state.personaCardRevision === submittedRevision) {
+    PERSONA_CARD_FIELDS.forEach((selector) => {
+      const node = $(selector);
+      if (node) node.value = "";
+    });
+  }
   return result;
 }
 
 async function saveTaskCard(event) {
   event.preventDefault();
+  const submittedRevision = state.taskCardRevision;
   const name = $("#taskCardName").value.trim();
   const content = $("#taskCardContent").value.trim();
   if (!content) {
@@ -3329,8 +3764,12 @@ async function saveTaskCard(event) {
     return { status: "error", message: "任务卡内容不能为空" };
   }
   const result = await runtimeCardAction("save-task", { name, content });
-  $("#taskCardName").value = "";
-  $("#taskCardContent").value = "";
+  if (state.taskCardRevision === submittedRevision) {
+    TASK_CARD_FIELDS.forEach((selector) => {
+      const node = $(selector);
+      if (node) node.value = "";
+    });
+  }
   return result;
 }
 
@@ -3362,6 +3801,9 @@ async function clearChannelPersonaOverride() {
     setStatusMessage("请先填写 conversation_id");
     return { status: "error", message: "conversation_id required" };
   }
+  if (!window.confirm(`确定清除通道 ${conversationId} 的人物卡覆盖吗？`)) {
+    return { status: "cancelled_by_user", message: "用户取消清除通道人物卡覆盖" };
+  }
   const result = await runtimeCardAction("clear-channel-persona", { conversation_id: conversationId });
   setStatusMessage(`通道人物卡已恢复全局：${conversationId}`);
   return result;
@@ -3373,16 +3815,71 @@ async function clearChannelSkillsOverride() {
     setStatusMessage("请先填写 conversation_id");
     return { status: "error", message: "conversation_id required" };
   }
+  if (!window.confirm(`确定清除通道 ${conversationId} 的技能覆盖吗？`)) {
+    return { status: "cancelled_by_user", message: "用户取消清除通道技能覆盖" };
+  }
   const result = await runtimeCardAction("clear-channel-skills", { conversation_id: conversationId });
   setStatusMessage(`通道技能已恢复全局：${conversationId}`);
   return result;
 }
 
 async function probeNow() {
-  const payload = await api("/api/wechat-probe");
-  state.data = { ...(state.data || {}), wechat_window_probe: payload };
+  invalidateWechatProbeOverlay();
+  const requestEpoch = state.wechatProbeRequestEpoch;
+  renderWechatProbe(effectiveWechatProbe());
+  renderProbeJson();
+  const payload = await api("/api/wechat-probe", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  if (requestEpoch !== state.wechatProbeRequestEpoch) {
+    return { ...payload, ignored: true, ignore_reason: "stale_probe_response" };
+  }
+  state.wechatProbeOverlay = { payload, requestEpoch, checkedAt: new Date().toISOString() };
   renderWechatProbe(payload);
   renderProbeJson();
+  return payload;
+}
+
+async function probeDriverNow() {
+  if (state.controlsDirty || state.controlsSaving) {
+    setStatusMessage("请先保存发送控制，再探测后端");
+    return { status: "blocked", reason: "unsaved_send_controls" };
+  }
+  const configFingerprint = driverProbeConfigFingerprint();
+  if (!configFingerprint) {
+    return { status: "blocked", reason: "send_config_unavailable" };
+  }
+  invalidateDriverProbeOverlay();
+  const requestEpoch = state.driverProbeRequestEpoch;
+  renderSendControlSummary();
+  renderProbeJson();
+  const payload = await api("/api/driver-probe", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 10000,
+  });
+  const responseFingerprint = driverProbePayloadFingerprint(payload);
+  if (
+    requestEpoch !== state.driverProbeRequestEpoch
+    || state.controlsDirty
+    || configFingerprint !== driverProbeConfigFingerprint()
+    || (responseFingerprint && responseFingerprint !== configFingerprint)
+  ) {
+    return { ...payload, ignored: true, ignore_reason: "stale_probe_response" };
+  }
+  const checkedAt = Date.now();
+  state.driverProbeOverlay = {
+    payload,
+    requestEpoch,
+    configFingerprint,
+    checkedAt: new Date(checkedAt).toISOString(),
+    expiresAt: checkedAt + DRIVER_PROBE_TTL_MS,
+  };
+  renderSendControlSummary();
+  renderProbeJson();
+  const summary = driverProbeSummary(payload);
+  setStatusMessage(summary.text);
   return payload;
 }
 
@@ -4251,10 +4748,18 @@ function currentMode(fallback = "dry_run") {
 }
 
 function markControlsDirty() {
+  invalidateDriverProbeOverlay();
   state.controlsRevision += 1;
   state.controlsDirty = true;
   setDirtyIndicator("dirty");
   renderSendControlSummary();
+  syncDriverProbeAvailability();
+}
+
+function syncDriverProbeAvailability() {
+  const button = $("#driverProbeButton");
+  if (!button || button.dataset.taskLocked || button.dataset.taskScopeLocked) return;
+  button.disabled = state.controlsDirty || state.controlsSaving || state.historyResetPending;
 }
 
 function setDirtyIndicator(status) {
@@ -4392,6 +4897,7 @@ function backgroundSendText(value) {
     bridge_outbox_ready: "bridge_outbox 已启用（投递中）",
     bridge_outbox_worker_down: "bridge_outbox 已启用，但投递进程未运行",
     bridge_outbox_worker_down_backlog: "bridge_outbox 投递进程未运行，有待发消息积压",
+    bridge_outbox_backend_probe_deferred: "worker 运行中；后端健康等待主动探测",
     bridge_outbox_worker_config_unknown: "bridge_outbox 投递进程运行中，但配置签名未知",
     bridge_outbox_worker_stale_config: "bridge_outbox 投递进程运行中，但启动配置已过期",
   }[value] || value;
@@ -4433,6 +4939,7 @@ function probeStatusText(value) {
     matched_foreground: "匹配当前前台",
     foreground_wechat_child_or_popup: "前台是微信子窗口",
     not_wechat_foreground: "前台不是微信",
+    unchecked: "尚未主动探测",
     unknown: "未知",
   }[value] || value;
 }
@@ -4527,7 +5034,15 @@ function reasonSummary(reasons) {
     .join("，");
 }
 
-const keyPoolState = { keys: [], keyFile: "", writable: false, loading: false };
+const keyPoolState = {
+  keys: [],
+  keyFile: "",
+  writable: false,
+  loading: false,
+  requestEpoch: 0,
+  loadPromise: null,
+  inputRevision: 0,
+};
 
 const MODEL_QUICK_OPTIONS = [
   { value: "gpt-5.4", label: "gpt 5.4" },
@@ -4537,7 +5052,15 @@ const MODEL_QUICK_OPTIONS = [
   { value: "deepseek-v4-pro", label: "deepseek v4 pro" },
 ];
 
-const modelConfigState = { loading: false, loaded: false, probeModels: [], revision: 0, loadPromise: null };
+const modelConfigState = {
+  loading: false,
+  loaded: false,
+  probeModels: [],
+  revision: 0,
+  requestEpoch: 0,
+  probeRequestEpoch: 0,
+  loadPromise: null,
+};
 
 function syncModelQuickSelect(value) {
   $$("#modelQuickSelect [data-model-value]").forEach((button) => {
@@ -4548,6 +5071,7 @@ function syncModelQuickSelect(value) {
 function setModelSuggestions(extraModels = []) {
   const datalist = $("#modelNameOptions");
   if (!datalist) return;
+  datalist.replaceChildren();
   const seen = new Set();
   const appendOption = (value, label = "") => {
     const model = String(value || "").trim();
@@ -4577,33 +5101,51 @@ function chooseModelName(model) {
 }
 
 async function loadModelConfig({ force = false } = {}) {
-  if (modelConfigState.loadPromise) return modelConfigState.loadPromise;
   const requestedRevision = modelConfigState.revision;
+  if (modelConfigState.loadPromise) {
+    if (!force) return modelConfigState.loadPromise;
+    modelConfigState.requestEpoch += 1;
+    await modelConfigState.loadPromise;
+  }
+  const requestEpoch = ++modelConfigState.requestEpoch;
   modelConfigState.loading = true;
-  modelConfigState.loadPromise = (async () => {
+  let loadPromise;
+  loadPromise = (async () => {
     try {
       const payload = await api("/api/model-config");
+      if (requestEpoch !== modelConfigState.requestEpoch) return payload;
       applyModelConfig(payload, { force: force && modelConfigState.revision === requestedRevision });
       modelConfigState.loaded = true;
       return payload;
     } catch (error) {
+      if (requestEpoch !== modelConfigState.requestEpoch) {
+        return { status: "superseded", message: error.message };
+      }
       setModelConfigMessage(`加载模型配置失败：${error.message}`, true);
       return { status: "error", message: error.message };
     } finally {
-      modelConfigState.loading = false;
-      modelConfigState.loadPromise = null;
+      if (modelConfigState.loadPromise === loadPromise) {
+        modelConfigState.loading = false;
+        modelConfigState.loadPromise = null;
+      }
     }
   })();
-  return modelConfigState.loadPromise;
+  modelConfigState.loadPromise = loadPromise;
+  return loadPromise;
 }
 
 function applyModelConfig(payload, { force = false } = {}) {
   setModelSuggestions([payload.model, ...modelConfigState.probeModels]);
   const providerSelect = $("#modelProvider");
   if (providerSelect) {
-    const formats = Array.isArray(payload.provider_formats) && payload.provider_formats.length
+    const localProvider = providerSelect.value;
+    const providerTouched = Boolean(providerSelect.dataset.touched);
+    const serverFormats = Array.isArray(payload.provider_formats) && payload.provider_formats.length
       ? payload.provider_formats
       : ["deepseek", "relay"];
+    const formats = providerTouched && localProvider && !serverFormats.includes(localProvider)
+      ? [...serverFormats, localProvider]
+      : serverFormats;
     providerSelect.innerHTML = "";
     for (const format of formats) {
       const option = document.createElement("option");
@@ -4613,8 +5155,10 @@ function applyModelConfig(payload, { force = false } = {}) {
     }
     // Don't clobber an in-progress edit on tab re-entry; only set when the user
     // hasn't touched the field (or when forced, e.g. right after a save).
-    if (force || !providerSelect.dataset.touched) {
+    if (force || !providerTouched) {
       providerSelect.value = payload.provider || formats[0];
+    } else if (formats.includes(localProvider)) {
+      providerSelect.value = localProvider;
     }
   }
   const nameInput = $("#modelName");
@@ -4664,8 +5208,14 @@ async function saveModelConfig(helpers = {}) {
     return { status: "error" };
   }
   helpers.update?.(30, "正在保存模型配置");
+  // Any GET already in flight describes state from before this save. Its
+  // response may still complete, but it must not be applied afterward.
+  modelConfigState.requestEpoch += 1;
   try {
     const result = await api("/api/model-config", { method: "POST", body: JSON.stringify(payload) });
+    // A GET may have started while the POST was pending and can still contain
+    // the pre-save snapshot. Advance again before applying the committed value.
+    modelConfigState.requestEpoch += 1;
     const unchanged = modelConfigState.revision === savedRevision;
     applyModelConfig(result.model_config || {}, { force: unchanged });
     setModelConfigMessage(unchanged ? "模型配置已保存" : "模型配置已保存；还有新的修改待保存", false);
@@ -4683,9 +5233,26 @@ async function probeModelFetch(helpers = {}) {
     setModelConfigMessage("请先填写请求地址 base_url", true);
     return { status: "error" };
   }
+  const submittedRevision = modelConfigState.revision;
+  const submittedFingerprint = JSON.stringify(payload);
+  const requestEpoch = ++modelConfigState.probeRequestEpoch;
+  const box = $("#modelProbeResult");
+  if (box) {
+    box.hidden = true;
+    box.textContent = "";
+  }
   helpers.update?.(30, "正在试拉取模型列表");
   try {
     const result = await api("/api/model-config/probe", { method: "POST", body: JSON.stringify(payload) });
+    if (
+      requestEpoch !== modelConfigState.probeRequestEpoch
+      || submittedRevision !== modelConfigState.revision
+      || submittedFingerprint !== JSON.stringify(modelConfigPayload())
+    ) {
+      const ignored = { ...result, ignored: true, ignore_reason: "stale_model_probe_response" };
+      setModelConfigMessage("模型配置已变化，旧探测结果已忽略", false);
+      return ignored;
+    }
     renderModelProbe(result);
     if (result.status === "ok") {
       setModelConfigMessage(`试拉取成功，返回 ${result.model_count} 个模型`, false);
@@ -4694,6 +5261,13 @@ async function probeModelFetch(helpers = {}) {
     }
     return result;
   } catch (error) {
+    if (
+      requestEpoch !== modelConfigState.probeRequestEpoch
+      || submittedRevision !== modelConfigState.revision
+      || submittedFingerprint !== JSON.stringify(modelConfigPayload())
+    ) {
+      return { status: "superseded", ignored: true, ignore_reason: "stale_model_probe_response" };
+    }
     renderModelProbe({ status: "error", error: error.message });
     setModelConfigMessage(`试拉取失败：${error.message}`, true);
     return { status: "error", message: error.message };
@@ -4749,17 +5323,61 @@ function setModelConfigMessage(message, isError) {
   }
 }
 
-async function loadKeyPool() {
-  if (keyPoolState.loading) return;
-  keyPoolState.loading = true;
-  try {
-    const payload = await api("/api/keys");
-    applyKeyPoolPayload(payload);
-  } catch (error) {
-    setKeyPoolMessage(`加载密钥池失败：${error.message}`, true);
-  } finally {
-    keyPoolState.loading = false;
+async function loadKeyPool({ force = false } = {}) {
+  if (keyPoolState.loadPromise) {
+    if (!force) return keyPoolState.loadPromise;
+    keyPoolState.requestEpoch += 1;
+    await keyPoolState.loadPromise;
   }
+  const requestEpoch = ++keyPoolState.requestEpoch;
+  keyPoolState.loading = true;
+  let loadPromise;
+  loadPromise = (async () => {
+    try {
+      const payload = await api("/api/keys");
+      if (requestEpoch !== keyPoolState.requestEpoch) return payload;
+      applyKeyPoolPayload(payload);
+      return payload;
+    } catch (error) {
+      if (requestEpoch !== keyPoolState.requestEpoch) {
+        return { status: "superseded", message: error.message };
+      }
+      setKeyPoolMessage(`加载密钥池失败：${error.message}`, true);
+      return { status: "error", message: error.message };
+    } finally {
+      if (keyPoolState.loadPromise === loadPromise) {
+        keyPoolState.loading = false;
+        keyPoolState.loadPromise = null;
+      }
+    }
+  })();
+  keyPoolState.loadPromise = loadPromise;
+  return loadPromise;
+}
+
+async function refreshModelConfiguration(helpers = {}) {
+  helpers.update?.(25, "正在读取模型配置");
+  // An explicit refresh intentionally discards local model edits.
+  clearModelConfigTouched();
+  modelConfigState.revision += 1;
+  const modelResult = await loadModelConfig({ force: true });
+  helpers.update?.(65, "正在读取密钥池");
+  const keyPoolResult = await loadKeyPool({ force: true });
+  const failures = [modelResult, keyPoolResult]
+    .filter((result) => result?.status === "error")
+    .map((result) => String(result.message || "unknown_error"));
+  if (failures.length) {
+    const message = `刷新模型配置失败：${failures.join("；")}`;
+    setModelConfigMessage(message, true);
+    setStatusMessage(message);
+    return {
+      status: "error",
+      message,
+      model_config: modelResult,
+      key_pool: keyPoolResult,
+    };
+  }
+  return { status: "ok", model_config: modelResult, key_pool: keyPoolResult };
 }
 
 function applyKeyPoolPayload(payload) {
@@ -4827,14 +5445,23 @@ function renderKeyRow(item) {
 async function addKey(helpers = {}) {
   const input = $("#newKeyValue");
   const value = (input?.value || "").trim();
+  const submittedRevision = keyPoolState.inputRevision;
   if (!value) {
     setKeyPoolMessage("请先粘贴密钥", true);
     return { status: "error" };
   }
   helpers.update?.(30, "正在写入密钥池");
+  keyPoolState.requestEpoch += 1;
   try {
     const payload = await api("/api/keys/add", { method: "POST", body: JSON.stringify({ value }) });
-    if (input) input.value = "";
+    keyPoolState.requestEpoch += 1;
+    if (
+      input
+      && keyPoolState.inputRevision === submittedRevision
+      && String(input.value || "").trim() === value
+    ) {
+      input.value = "";
+    }
     applyKeyPoolPayload(payload);
     setKeyPoolMessage("已添加密钥", false);
     setStatusMessage("密钥池已更新");
@@ -4846,9 +5473,14 @@ async function addKey(helpers = {}) {
 }
 
 async function removeKey(ref, helpers = {}) {
+  if (!window.confirm("确定移除这个 API 密钥吗？\n\n依赖该密钥的模型请求可能立即不可用。")) {
+    return { status: "cancelled_by_user", message: "用户取消移除 API 密钥" };
+  }
   helpers.update?.(30, "正在移除密钥");
+  keyPoolState.requestEpoch += 1;
   try {
     const payload = await api("/api/keys/remove", { method: "POST", body: JSON.stringify({ ref }) });
+    keyPoolState.requestEpoch += 1;
     applyKeyPoolPayload(payload);
     setKeyPoolMessage("已移除密钥", false);
     setStatusMessage("密钥池已更新");
@@ -4919,6 +5551,14 @@ bindTaskButton("#saveControls", {
 }, (helpers) => {
   helpers.update(25, "正在保存发送控制");
   return saveControls();
+});
+bindTaskButton("#driverProbeButton", {
+  label: "探测发送后端",
+  category: "发送控制",
+  scope: "diagnostic:driver-probe",
+}, (helpers) => {
+  helpers.update(25, "正在按已保存配置探测发送后端");
+  return probeDriverNow();
 });
 bindTaskButton("#probeButton", {
   label: "探测微信窗口",
@@ -5007,14 +5647,7 @@ bindTaskButton("#weflowClearHistoryButton", {
   label: "清空 WeFlow 操作历史",
   category: "WeFlow",
   scope: "weflow:history",
-}, async (helpers) => {
-  helpers.update(30, "正在清空 WeFlow 操作历史");
-  const payload = await api("/api/weflow/clear-history", { method: "POST", body: JSON.stringify({}) });
-  showWeFlowStatusPayload(payload);
-  setStatusMessage("操作历史已清空");
-  await refresh({ force: true });
-  return payload;
-});
+}, (helpers) => clearWeFlowHistory(helpers));
 bindTaskButton("#weflowPullButton", {
   label: "WeFlow 拉取一次",
   category: "WeFlow",
@@ -5080,6 +5713,11 @@ $("#personaForm").addEventListener("submit", (event) => {
     () => savePersonaCard(event),
   );
 });
+PERSONA_CARD_FIELDS.forEach((selector) => {
+  $(selector)?.addEventListener("input", () => {
+    state.personaCardRevision += 1;
+  });
+});
 $("#channelRuntimeForm").addEventListener("submit", (event) => {
   event.preventDefault();
   runTask(
@@ -5114,6 +5752,11 @@ $("#taskForm").addEventListener("submit", (event) => {
     () => saveTaskCard(event),
   );
 });
+TASK_CARD_FIELDS.forEach((selector) => {
+  $(selector)?.addEventListener("input", () => {
+    state.taskCardRevision += 1;
+  });
+});
 $("#toggleProbe").addEventListener("click", () => {
   state.probeExpanded = !state.probeExpanded;
   renderProbeJson();
@@ -5129,20 +5772,14 @@ $("#newKeyValue").addEventListener("keydown", (event) => {
     $("#addKey").click();
   }
 });
+$("#newKeyValue").addEventListener("input", () => {
+  keyPoolState.inputRevision += 1;
+});
 bindTaskButton("#refreshModelConfig", {
   label: "刷新模型配置",
   category: "模型配置",
   scope: "settings:model-config",
-}, async (helpers) => {
-  helpers.update(25, "正在读取模型配置");
-  // Explicit refresh: user wants the saved values, so discard any local edits.
-  clearModelConfigTouched();
-  modelConfigState.revision += 1;
-  await loadModelConfig({ force: true });
-  helpers.update(65, "正在读取密钥池");
-  await loadKeyPool();
-  return { status: "ok" };
-});
+}, (helpers) => refreshModelConfiguration(helpers));
 ["#modelProvider", "#modelName", "#modelBaseUrl", "#modelMaxWait", "#modelMaxConcurrency"].forEach((selector) => {
   const el = $(selector);
   if (el) {

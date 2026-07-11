@@ -289,6 +289,36 @@ class SendReadinessTest(unittest.TestCase):
             self.assertEqual(by_id["send_driver_name"]["status"], "blocker")
             self.assertEqual(by_id["real_send_driver"]["status"], "blocker")
 
+    def test_passive_readiness_never_probes_send_backends(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(
+                data_dir,
+                mode="confirm",
+                enabled=True,
+                driver="bridge_outbox",
+                backend="wechat_native_http",
+            )
+
+            with (
+                mock.patch(
+                    "app.personal_wechat_bot.control.send_readiness.wechat_native_http_status",
+                    side_effect=AssertionError("passive readiness must stay local"),
+                ) as native_status,
+                mock.patch(
+                    "app.personal_wechat_bot.control.send_readiness.weflow_http_status",
+                    side_effect=AssertionError("passive readiness must stay local"),
+                ) as weflow_status,
+            ):
+                report = build_send_readiness_report(data_dir, active_backend_probe=False)
+
+            native_status.assert_not_called()
+            weflow_status.assert_not_called()
+            self.assertFalse(report["active_backend_probe"])
+            by_id = {item["id"]: item for item in report["checks"]}
+            self.assertEqual(by_id["wechat_native_http_send_bridge"]["status"], "warn")
+
 
 if __name__ == "__main__":
     unittest.main()

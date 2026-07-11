@@ -17,8 +17,17 @@ from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.domain.models import ReplyCandidate
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
 from app.personal_wechat_bot.reply_gate.send_executor import GuardedSendExecutor
-from app.personal_wechat_bot.runtime.send_bridge_worker import BridgeWorker, bridge_worker_lock_alive, run_bridge_worker
-from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxSendDriver, BridgeOutboxStore
+from app.personal_wechat_bot.runtime.send_bridge_worker import (
+    BridgeWorker,
+    bridge_worker_config_signature,
+    bridge_worker_lock_alive,
+    run_bridge_worker,
+)
+from app.personal_wechat_bot.wechat_driver.bridge_send import (
+    BridgeAckStatus,
+    BridgeOutboxSendDriver,
+    BridgeOutboxStore,
+)
 from app.personal_wechat_bot.wechat_driver.send_backends import DryRunSendBackend, SendOutcome
 
 
@@ -62,6 +71,54 @@ def _write_channel(data_dir: Path, conversation_id: str, payload: dict) -> None:
 
 
 class SendBridgeWorkerTest(unittest.TestCase):
+    def test_worker_quarantines_dead_owner_staged_record_without_backend_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "projection crashed", staged=True)
+            backend = mock.Mock(wraps=DryRunSendBackend())
+            backend.name = "dry_run"
+
+            with mock.patch(
+                "app.personal_wechat_bot.wechat_driver.bridge_send.process_pid_alive",
+                return_value=False,
+            ):
+                processed = BridgeWorker(data_dir, backend).run_once()
+
+            item = next(value for value in store.state(limit=10)["items"] if value["bridge_id"] == record["bridge_id"])
+            self.assertEqual(processed, 0)
+            self.assertEqual(item["status"], BridgeAckStatus.FAILED)
+            backend.send_text.assert_not_called()
+            backend.send_file.assert_not_called()
+
+    def test_worker_retries_staged_quarantine_failure_on_later_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            record = BridgeOutboxStore(data_dir).enqueue("wxid_a", "retry quarantine", staged=True)
+            worker = BridgeWorker(data_dir, DryRunSendBackend())
+
+            with mock.patch.object(
+                worker.store,
+                "quarantine_abandoned_staged_records",
+                side_effect=OSError("ack file locked"),
+            ):
+                self.assertEqual(worker.run_once(), 0)
+
+            self.assertIn("staged_quarantine_failed", worker.stats.last_error)
+            with mock.patch(
+                "app.personal_wechat_bot.wechat_driver.bridge_send.process_pid_alive",
+                return_value=False,
+            ):
+                self.assertEqual(worker.run_once(), 0)
+            item = next(
+                value
+                for value in worker.store.state(limit=10)["items"]
+                if value["bridge_id"] == record["bridge_id"]
+            )
+            self.assertEqual(item["status"], BridgeAckStatus.FAILED)
+
     def test_bridge_worker_lock_with_dead_pid_is_not_alive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -73,6 +130,35 @@ class SendBridgeWorkerTest(unittest.TestCase):
             )
 
             self.assertFalse(bridge_worker_lock_alive(data_dir))
+
+    def test_bridge_worker_lock_rejects_reused_pid_with_different_start_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            lock_path = data_dir / "send_bridge" / ".bridge_worker.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 1234,
+                        "label": "send_bridge_worker",
+                        "heartbeat_at": time.time(),
+                        "process_start": "old-process-instance",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch(
+                    "app.personal_wechat_bot.runtime.send_bridge_worker.process_pid_alive",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "app.personal_wechat_bot.runtime.send_bridge_worker.process_start_marker",
+                    return_value="new-process-instance",
+                ),
+            ):
+                self.assertFalse(bridge_worker_lock_alive(data_dir))
 
     def test_worker_delivers_pending_text_and_acks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,6 +179,62 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(state["items"][0]["bridge_id"], record["bridge_id"])
             self.assertEqual(state["items"][0]["ack"]["payload"]["backend"], "dry_run")
             self.assertEqual(state["items"][0]["ack"]["payload"]["operation"], "send_text")
+
+    def test_worker_never_observes_initial_send_before_staged_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            driver = BridgeOutboxSendDriver(send_enabled=True, data_dir=data_dir)
+            result = driver.send_message("wxid_a", "publish projections first")
+            backend = DryRunSendBackend()
+            worker = BridgeWorker(data_dir, backend)
+
+            staged_processed = worker.run_once()
+            staged_record = driver.store._read_all(driver.store.outbox_path)[0]
+            driver.activate_send_result(result, expected_projections=[])
+            activated_processed = worker.run_once()
+
+            self.assertEqual(staged_processed, 0)
+            self.assertFalse(staged_record["ready_for_delivery"])
+            self.assertEqual(backend.sent_texts, [("wxid_a", "publish projections first")])
+            self.assertEqual(activated_processed, 1)
+
+    def test_worker_skips_staged_retry_until_projections_activate_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            original = store.enqueue("wxid_a", "retry after projection")
+            store.append_ack(
+                original["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="wechat_native_http_send_text_error:ConnectionRefusedError:refused",
+            )
+            successor = store.requeue_resolved(original["bridge_id"], staged=True)
+            backend = DryRunSendBackend()
+            worker = BridgeWorker(data_dir, backend)
+
+            staged_processed = worker.run_once()
+            staged_state = store.state(limit=10)
+            store.activate_retry_successor(successor["bridge_id"])
+            activated_processed = worker.run_once()
+            activated_state = store.state(limit=10)
+
+            self.assertEqual(staged_processed, 0)
+            self.assertEqual(backend.sent_texts, [("wxid_a", "retry after projection")])
+            self.assertEqual(staged_state["pending_count"], 1)
+            self.assertEqual(staged_state["ack_count"], 1)
+            staged_by_id = {item["bridge_id"]: item for item in staged_state["items"]}
+            self.assertFalse(staged_by_id[original["bridge_id"]]["retryable"])
+            self.assertIn("active retry already pending", staged_by_id[original["bridge_id"]]["retry_blocker"])
+            self.assertEqual(
+                staged_by_id[original["bridge_id"]]["active_retry_bridge_id"],
+                successor["bridge_id"],
+            )
+            self.assertFalse(staged_by_id[successor["bridge_id"]]["delivery_ready"])
+            self.assertEqual(activated_processed, 1)
+            self.assertEqual(activated_state["pending_count"], 0)
+            self.assertEqual(activated_state["sent_count"], 1)
 
     def test_worker_persists_backend_evidence_payload_on_terminal_ack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,6 +512,65 @@ class SendBridgeWorkerTest(unittest.TestCase):
             self.assertEqual(item["ack"]["reason"], "send_enabled_false")
             self.assertEqual(item["ack"]["payload"]["attempt"], 2)
 
+    def test_worker_rechecks_full_startup_signature_after_inflight_before_wire(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            set_send_controls(
+                data_dir,
+                enabled=True,
+                driver="bridge_outbox",
+                backend="dry_run",
+            )
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("wxid_a", "must not use stale config")
+
+            class _CountingDryRunBackend:
+                name = "dry_run"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def health_check(self) -> bool:
+                    return True
+
+                def send_text(self, receiver: str, text: str) -> SendOutcome:
+                    self.calls += 1
+                    return SendOutcome.success("should_not_send")
+
+                def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                    self.calls += 1
+                    return SendOutcome.success("should_not_send")
+
+                def close(self) -> None:
+                    return None
+
+            changed = {"done": False}
+
+            def mutate_config_after_inflight() -> None:
+                if changed["done"]:
+                    return
+                changed["done"] = True
+                set_send_controls(data_dir, weflow_send_timeout_seconds=36.0)
+
+            backend = _CountingDryRunBackend()
+            signature = bridge_worker_config_signature(load_config(data_dir))
+            worker = BridgeWorker(
+                data_dir,
+                backend,
+                heartbeat=mutate_config_after_inflight,
+                config_signature=signature,
+            )
+
+            processed = worker.run_once()
+            item = store.state(limit=10)["items"][0]
+
+            self.assertEqual(processed, 1)
+            self.assertEqual(backend.calls, 0)
+            self.assertEqual(item["status"], BridgeAckStatus.RETRY)
+            self.assertIn("bridge_worker_runtime_config_changed", item["ack"]["reason"])
+            self.assertIn("weflow_send_timeout_seconds", item["ack"]["reason"])
+
     def test_real_worker_rechecks_channel_authorization_before_each_wire_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -637,6 +838,32 @@ class SendBridgeWorkerTest(unittest.TestCase):
                 [BridgeAckStatus.SENT, BridgeAckStatus.INFLIGHT],
             )
 
+    def test_worker_rechecks_terminal_ack_after_heartbeat_before_wire_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            rec = store.enqueue("wxid_a", "manual stop in race window")
+            backend = DryRunSendBackend()
+            injected = {"done": False}
+
+            def inject_manual_block() -> None:
+                if injected["done"]:
+                    return
+                injected["done"] = True
+                store.append_ack(rec["bridge_id"], status=BridgeAckStatus.BLOCKED, reason="manual_block")
+
+            processed = BridgeWorker(data_dir, backend, heartbeat=inject_manual_block).run_once()
+            acks = [ack for ack in store._read_all(store.ack_path) if ack["bridge_id"] == rec["bridge_id"]]
+
+            self.assertEqual(processed, 1)
+            self.assertEqual(backend.sent_texts, [])
+            self.assertEqual(
+                [ack["status"] for ack in acks],
+                [BridgeAckStatus.INFLIGHT, BridgeAckStatus.BLOCKED],
+            )
+            self.assertEqual(store.state(limit=10)["items"][0]["status"], BridgeAckStatus.BLOCKED)
+
     def test_worker_retries_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -750,7 +977,9 @@ class SendBridgeWorkerTest(unittest.TestCase):
                 attachments=[{"path": str(target), "name": "reply.docx", "status": "indexed"}],
             )
 
-            GuardedSendExecutor(config, driver).execute_confirmed(reply)
+            executor = GuardedSendExecutor(config, driver)
+            result = executor.execute_confirmed(reply)
+            executor.activate_staged(result, expected_projections=[])
 
             backend = DryRunSendBackend()
             BridgeWorker(data_dir, backend).run_once()
@@ -920,6 +1149,92 @@ class SendBridgeWorkerTest(unittest.TestCase):
             item = store.state(limit=10)["items"][0]
             self.assertEqual(item["status"], "failed")
             self.assertIn("unknown_delivery_state", item["ack"]["reason"])
+
+    def test_post_connect_failures_are_quarantined_after_one_wire_attempt(self) -> None:
+        failure_reasons = [
+            "wechat_native_http_send_text_error:ConnectionResetError:connection reset",
+            "wechat_native_http_send_text_error:BrokenPipeError:broken pipe",
+            "wechat_native_http_send_text_error:ValueError:http_500:server error",
+            "weflow_http_send_text_error:RemoteDisconnected:Remote end closed connection without response",
+            "weflow_http_send_text_error:BadStatusLine:invalid HTTP status",
+            "weflow_http_send_text_error:IncompleteRead:response ended early",
+            "weflow_http_send_text_error:ConnectionError:response ended unexpectedly",
+            "weflow_http_send_text_error:SSLEOFError:SSL EOF occurred",
+        ]
+        for failure_reason in failure_reasons:
+            with self.subTest(reason=failure_reason), tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                create_default_config(data_dir)
+                store = BridgeOutboxStore(data_dir)
+                rec = store.enqueue("wxid_a", "ambiguous delivery")
+
+                class _AmbiguousBackend:
+                    name = "ambiguous"
+
+                    def __init__(self) -> None:
+                        self.calls = 0
+
+                    def health_check(self) -> bool:
+                        return True
+
+                    def send_text(self, receiver: str, text: str) -> SendOutcome:
+                        self.calls += 1
+                        return SendOutcome.failure(failure_reason)
+
+                    def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                        self.calls += 1
+                        return SendOutcome.failure(failure_reason)
+
+                    def close(self) -> None:
+                        return None
+
+                backend = _AmbiguousBackend()
+                BridgeWorker(data_dir, backend, max_send_attempts=3).run_once()
+                item = store.state(limit=10)["items"][0]
+
+                self.assertEqual(backend.calls, 1)
+                self.assertEqual(item["status"], BridgeAckStatus.FAILED)
+                self.assertIn("unknown_delivery_state", item["ack"]["reason"])
+                self.assertFalse(item["retryable"])
+                with self.assertRaises(ValueError):
+                    store.requeue_resolved(rec["bridge_id"])
+
+    def test_connection_refused_remains_safely_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            store.enqueue("wxid_a", "backend not listening")
+
+            class _RefusedBackend:
+                name = "refused"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def health_check(self) -> bool:
+                    return True
+
+                def send_text(self, receiver: str, text: str) -> SendOutcome:
+                    self.calls += 1
+                    return SendOutcome.failure(
+                        "wechat_native_http_send_text_error:ConnectionError:[WinError 10061] "
+                        "No connection could be made because the target actively refused it"
+                    )
+
+                def send_file(self, receiver: str, path: str, caption: str = "") -> SendOutcome:
+                    return SendOutcome.failure("ConnectionRefusedError:refused")
+
+                def close(self) -> None:
+                    return None
+
+            backend = _RefusedBackend()
+            BridgeWorker(data_dir, backend, max_send_attempts=1).run_once()
+            item = store.state(limit=10)["items"][0]
+
+            self.assertEqual(backend.calls, 1)
+            self.assertEqual(item["status"], BridgeAckStatus.RETRY)
+            self.assertEqual(store.state(limit=10)["pending_count"], 1)
 
     def test_weflow_http_timeout_is_not_resent_within_same_tick(self) -> None:
         # A local WeFlow send timeout can mean the UI helper is still completing
@@ -1107,6 +1422,209 @@ class SendBridgeWorkerTest(unittest.TestCase):
                 worker_mod.sync_bridge_ack_to_send_state = original
 
             self.assertEqual(ledger.read_entries("wxid_a")[0].send["status"], "sent")
+
+    def test_terminal_ack_upgrade_retries_sync_for_new_fingerprint(self) -> None:
+        import app.personal_wechat_bot.runtime.send_bridge_worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "accepted then verified")
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.ACCEPTED, reason="accepted")
+            worker = BridgeWorker(data_dir, DryRunSendBackend())
+            accepted_ack = worker._effective_ack_state(record["bridge_id"])
+            self.assertIsNotNone(accepted_ack)
+            worker._mark_synced(
+                record["bridge_id"],
+                worker._sync_fingerprint(record["bridge_id"], accepted_ack.ack),
+            )
+
+            with mock.patch.object(
+                worker_mod,
+                "sync_bridge_ack_to_send_state",
+                side_effect=OSError("sent projection locked"),
+            ):
+                self.assertTrue(worker._ack(record["bridge_id"], BridgeAckStatus.SENT, "verified"))
+
+            sent_ack = worker._effective_ack_state(record["bridge_id"])
+            self.assertIsNotNone(sent_ack)
+            sent_fingerprint = worker._sync_fingerprint(record["bridge_id"], sent_ack.ack)
+            self.assertNotEqual(worker._load_synced()[record["bridge_id"]], sent_fingerprint)
+
+            with mock.patch.object(
+                worker_mod,
+                "sync_bridge_ack_to_send_state",
+                return_value={"sync_complete": True, "queue_error": ""},
+            ) as sync:
+                worker._reconcile_unsynced_acks()
+
+            self.assertEqual(sync.call_count, 1)
+            self.assertEqual(sync.call_args.kwargs["status"], BridgeAckStatus.SENT)
+            self.assertEqual(worker._load_synced()[record["bridge_id"]], sent_fingerprint)
+
+    def test_projection_contract_change_invalidates_terminal_sync_proof(self) -> None:
+        import app.personal_wechat_bot.runtime.send_bridge_worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "contract races recovery", staged=True)
+            store.set_staged_projection_contract([record["bridge_id"]], expected_projections=[])
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.FAILED, reason="owner exited")
+            worker = BridgeWorker(data_dir, DryRunSendBackend())
+            state = worker._effective_ack_state(record["bridge_id"])
+            self.assertIsNotNone(state)
+            old_fingerprint = worker._sync_fingerprint(record["bridge_id"], state.ack)
+            worker._mark_synced(record["bridge_id"], old_fingerprint)
+
+            store.set_staged_projection_contract([record["bridge_id"]], expected_projections=["queue"])
+            self.assertNotEqual(
+                worker._load_synced()[record["bridge_id"]],
+                worker._sync_fingerprint(record["bridge_id"], state.ack),
+            )
+            with mock.patch.object(
+                worker_mod,
+                "sync_bridge_ack_to_send_state",
+                return_value={"sync_complete": True, "queue_error": ""},
+            ) as sync:
+                worker._reconcile_unsynced_acks()
+
+            self.assertEqual(sync.call_count, 1)
+            self.assertEqual(
+                worker._load_synced()[record["bridge_id"]],
+                worker._sync_fingerprint(record["bridge_id"], state.ack),
+            )
+
+    def test_ack_only_terminal_upgrade_survives_sync_failure_and_compaction(self) -> None:
+        import app.personal_wechat_bot.runtime.send_bridge_worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "verified after history compaction")
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.FAILED, reason="initial failure")
+            worker = BridgeWorker(data_dir, DryRunSendBackend())
+            failed_state = worker._effective_ack_state(record["bridge_id"])
+            worker._mark_synced(
+                record["bridge_id"],
+                worker._sync_fingerprint(record["bridge_id"], failed_state.ack),
+            )
+            store.compact(keep_resolved=0, synced_ack_fingerprints=worker._load_synced())
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.SENT, reason="verified later")
+
+            with mock.patch.object(
+                worker_mod,
+                "sync_bridge_ack_to_send_state",
+                side_effect=OSError("projection locked"),
+            ):
+                worker._reconcile_unsynced_acks()
+            preserved = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints=worker._load_synced(),
+            )
+
+            self.assertEqual(preserved, {"removed_outbox": 0, "removed_acks": 0})
+            self.assertEqual(worker._effective_ack_state(record["bridge_id"]).status, BridgeAckStatus.SENT)
+
+            with mock.patch.object(
+                worker_mod,
+                "sync_bridge_ack_to_send_state",
+                return_value={"sync_complete": True, "queue_error": ""},
+            ):
+                worker._reconcile_unsynced_acks()
+            removed = store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints=worker._load_synced(),
+            )
+            self.assertEqual(removed, {"removed_outbox": 0, "removed_acks": 1})
+
+    def test_legacy_synced_id_list_forces_resync_and_migrates_to_v3(self) -> None:
+        import app.personal_wechat_bot.runtime.send_bridge_worker as worker_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            record = store.enqueue("wxid_a", "legacy marker")
+            store.append_ack(record["bridge_id"], status=BridgeAckStatus.FAILED, reason="failed")
+            worker = BridgeWorker(data_dir, DryRunSendBackend())
+            worker._synced_marker_path().write_text(
+                json.dumps({"synced": [record["bridge_id"]]}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(worker._load_synced(), {})
+            with mock.patch.object(
+                worker_mod,
+                "sync_bridge_ack_to_send_state",
+                return_value={"sync_complete": True, "queue_error": ""},
+            ) as sync:
+                worker._reconcile_unsynced_acks()
+
+            payload = json.loads(worker._synced_marker_path().read_text(encoding="utf-8"))
+            self.assertEqual(sync.call_count, 1)
+            self.assertEqual(payload["version"], 3)
+            self.assertEqual(
+                payload["synced"][record["bridge_id"]],
+                worker._sync_fingerprint(
+                    record["bridge_id"],
+                    worker._effective_ack_state(record["bridge_id"]).ack,
+                ),
+            )
+
+    def test_prune_synced_marker_drops_missing_and_stale_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = BridgeOutboxStore(data_dir)
+            stale = store.enqueue("wxid_a", "upgraded")
+            store.append_ack(stale["bridge_id"], status=BridgeAckStatus.FAILED, reason="failed")
+            retained = store.enqueue("wxid_a", "current")
+            store.append_ack(retained["bridge_id"], status=BridgeAckStatus.FAILED, reason="failed")
+            worker = BridgeWorker(data_dir, DryRunSendBackend())
+            worker._mark_synced(
+                stale["bridge_id"],
+                worker._sync_fingerprint(
+                    stale["bridge_id"],
+                    worker._effective_ack_state(stale["bridge_id"]).ack,
+                ),
+            )
+            retained_fingerprint = worker._sync_fingerprint(
+                retained["bridge_id"],
+                worker._effective_ack_state(retained["bridge_id"]).ack,
+            )
+            worker._mark_synced(retained["bridge_id"], retained_fingerprint)
+            marker = worker._load_synced()
+            marker["bridge:missing"] = "bridge-ack-v1:missing"
+            worker._synced_marker_path().write_text(
+                json.dumps({"version": 3, "synced": marker}),
+                encoding="utf-8",
+            )
+            store.append_ack(stale["bridge_id"], status=BridgeAckStatus.SENT, reason="verified")
+
+            worker._prune_synced_marker()
+
+            self.assertEqual(worker._load_synced(), {retained["bridge_id"]: retained_fingerprint})
+
+    def test_corrupt_worker_markers_are_quarantined_without_losing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            worker = BridgeWorker(data_dir, DryRunSendBackend())
+            cases = [
+                (worker._synced_marker_path(), worker._load_synced, {}),
+                (worker._accepted_reverify_marker_path(), worker._load_accepted_reverify_marker, {}),
+            ]
+            for path, loader, expected in cases:
+                with self.subTest(marker=path.name):
+                    evidence = b'\xff\xfe{"truncated":'
+                    path.write_bytes(evidence)
+
+                    loaded = loader()
+                    quarantined = list(path.parent.glob(f"{path.name}.corrupt.*"))
+
+                    self.assertEqual(loaded, expected)
+                    self.assertFalse(path.exists())
+                    self.assertEqual(len(quarantined), 1)
+                    self.assertEqual(quarantined[0].read_bytes(), evidence)
 
     def test_full_chain_queue_to_bridge_to_ledger(self) -> None:
         # End-to-end: approve -> bridge_outbox queue -> worker delivers -> ledger sent.

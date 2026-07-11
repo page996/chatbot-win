@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from app.personal_wechat_bot.config.schema import BotConfig
 from app.personal_wechat_bot.wechat_driver.bridge_send import BRIDGE_OUTBOX_SEND_DRIVER
@@ -44,6 +45,40 @@ class SendDriverFactoryTest(unittest.TestCase):
         self.assertFalse(probe["registered"])
         self.assertFalse(probe["driver_present"])
         self.assertIsNone(probe["driver_probe"])
+
+    def test_passive_probe_never_connects_to_backend(self) -> None:
+        config = BotConfig(
+            send_enabled=True,
+            send_driver=BRIDGE_OUTBOX_SEND_DRIVER,
+            send_backend="wechat_native_http",
+        )
+
+        with mock.patch(
+            "app.personal_wechat_bot.wechat_driver.bridge_send.wechat_native_http_status",
+            side_effect=AssertionError("passive probe must stay local"),
+        ) as backend_status:
+            probe = probe_send_driver(config, active_backend_probe=False)
+
+        backend_status.assert_not_called()
+        self.assertFalse(probe["driver_probe"]["backend"]["active_backend_probe"])
+        self.assertEqual(probe["wechat_native_http"], {})
+
+    def test_active_probe_calls_selected_backend_once(self) -> None:
+        config = BotConfig(
+            send_enabled=True,
+            send_driver=BRIDGE_OUTBOX_SEND_DRIVER,
+            send_backend="wechat_native_http",
+        )
+        status = {"available": True, "reason": "", "health": {"IsLogin": 1}}
+
+        with mock.patch(
+            "app.personal_wechat_bot.wechat_driver.bridge_send.wechat_native_http_status",
+            return_value=status,
+        ) as backend_status:
+            probe = probe_send_driver(config)
+
+        backend_status.assert_called_once()
+        self.assertEqual(probe["wechat_native_http"], status)
 
 if __name__ == "__main__":
     unittest.main()

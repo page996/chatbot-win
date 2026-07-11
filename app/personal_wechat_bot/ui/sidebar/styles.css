@@ -346,8 +346,14 @@ h2 {
 }
 
 .send-controls #saveControls {
-  justify-self: end;
   min-width: 86px;
+}
+
+.send-control-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .send-controls > .switch {

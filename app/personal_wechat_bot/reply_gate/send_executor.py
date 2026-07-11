@@ -41,6 +41,33 @@ class GuardedSendExecutor:
         # but it must not be stopped by the human-confirmation flag.
         return self._execute(reply, confirmed=True)
 
+    def activate_staged(
+        self,
+        result: SendResult,
+        *,
+        expected_projections: list[str] | None = None,
+    ) -> dict:
+        activate = getattr(self.driver, "activate_send_result", None)
+        if not callable(activate):
+            return {"status": "not_supported", "bridge_ids": []}
+        return activate(result, expected_projections=expected_projections)
+
+    def fail_staged(
+        self,
+        result: SendResult,
+        *,
+        reason: str,
+        expected_projections: list[str] | None = None,
+    ) -> dict:
+        fail = getattr(self.driver, "fail_staged_send_result", None)
+        if not callable(fail):
+            return {"status": "not_supported", "bridge_ids": []}
+        return fail(
+            result,
+            reason=reason,
+            expected_projections=expected_projections,
+        )
+
     def _execute(self, reply: ReplyCandidate, *, confirmed: bool) -> SendResult:
         decision = self._can_send(reply, confirmed=False)
         if confirmed:
@@ -84,10 +111,26 @@ class GuardedSendExecutor:
         for attachment in _sendable_attachments(reply.attachments):
             path = str(attachment.get("path", "")).strip()
             name = str(attachment.get("name") or Path(path).name)
+            if _attachment_path_not_allowed(attachment):
+                results.append(
+                    FileSendResult(path, name, "failed", "outgoing_attachment_path_not_allowed")
+                )
+                continue
             if not path or not Path(path).exists():
                 results.append(FileSendResult(path, name, "failed", "file_not_found"))
                 continue
-            outcome = driver.send_file(reply.conversation_id, path, "")  # type: ignore[attr-defined]
+            try:
+                outcome = driver.send_file(reply.conversation_id, path, "")  # type: ignore[attr-defined]
+            except Exception as exc:
+                results.append(
+                    FileSendResult(
+                        path,
+                        name,
+                        "failed",
+                        f"send_file_exception:{type(exc).__name__}:{exc}",
+                    )
+                )
+                continue
             results.append(
                 FileSendResult(path, name, outcome.status, outcome.reason, outcome.message_id or "")
             )
@@ -123,6 +166,13 @@ def _sendable_attachments(attachments: list[dict] | None) -> list[dict]:
         if str(item.get("path", "")).strip():
             sendable.append(item)
     return sendable
+
+
+def _attachment_path_not_allowed(attachment: dict) -> bool:
+    if str(attachment.get("status") or "").strip().lower() != "blocked":
+        return False
+    reason = str(attachment.get("reason") or "").strip().lower()
+    return "path outside allowed root" in reason
 
 
 def _combined_file_send_result(reply: ReplyCandidate, results: list[FileSendResult]) -> SendResult:
@@ -179,10 +229,10 @@ def _combined_details(
             "sent_at": text_result.sent_at or "",
         }
         details["text"] = text_payload
-        if text_result.message_id:
+        if str(text_result.message_id or "").startswith("bridge:"):
             bridge_ids.append(text_result.message_id)
     for item in file_results:
-        if item.message_id:
+        if str(item.message_id or "").startswith("bridge:"):
             bridge_ids.append(item.message_id)
     details["bridge_ids"] = bridge_ids
     details["part_count"] = (1 if text_result is not None else 0) + len(file_results)
@@ -202,3 +252,40 @@ def _combined_status(statuses: list[str]) -> str:
     if all(item == "sent" for item in cleaned):
         return "sent"
     return cleaned[-1] or "failed"
+
+
+def send_result_bridge_ids(result: SendResult) -> list[str]:
+    raw_details = getattr(result, "details", {})
+    details = raw_details if isinstance(raw_details, dict) else {}
+    raw_ids = details.get("bridge_ids") if isinstance(details.get("bridge_ids"), list) else []
+    bridge_ids = [
+        str(item or "").strip()
+        for item in raw_ids
+        if str(item or "").strip().startswith("bridge:")
+    ]
+    status = str(getattr(result, "status", "") or "")
+    message_id = str(getattr(result, "message_id", "") or "")
+    if not bridge_ids and status == "queued_to_bridge" and message_id.startswith("bridge:"):
+        bridge_ids.append(message_id)
+    return list(dict.fromkeys(bridge_ids))
+
+
+def send_result_non_bridge_part_statuses(result: SendResult) -> list[str]:
+    raw_details = getattr(result, "details", {})
+    details = raw_details if isinstance(raw_details, dict) else {}
+    bridge_ids = set(send_result_bridge_ids(result))
+    parts: list[dict] = []
+    text = details.get("text") if isinstance(details.get("text"), dict) else {}
+    if text:
+        parts.append(text)
+    files = details.get("files") if isinstance(details.get("files"), list) else []
+    parts.extend(item for item in files if isinstance(item, dict))
+    statuses: list[str] = []
+    for part in parts:
+        message_id = str(part.get("message_id") or "").strip()
+        if message_id and message_id in bridge_ids:
+            continue
+        status = str(part.get("status") or "").strip()
+        if status:
+            statuses.append(status)
+    return statuses

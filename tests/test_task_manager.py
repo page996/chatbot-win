@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import os
+import threading
 import time
 from pathlib import Path
 from unittest import mock
@@ -13,10 +15,157 @@ from app.personal_wechat_bot.conversation.channel_state_store import ChannelStat
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.domain.models import ReplyCandidate
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue
-from app.personal_wechat_bot.tasks.manager import TaskStatusStore
+from app.personal_wechat_bot.tasks.manager import TaskStatusStore, _bridge_worker_config_is_matched
 
 
 class TaskStatusStoreTest(unittest.TestCase):
+    def test_concurrent_store_instances_do_not_overwrite_created_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            first = TaskStatusStore(data_dir)
+            second = TaskStatusStore(data_dir)
+            # Exercise the first-use schema path concurrently as well as the
+            # atomic read-modify-write path.
+            start_barrier = threading.Barrier(2)
+
+            errors: list[BaseException] = []
+
+            def create(store: TaskStatusStore, task_id: str) -> None:
+                try:
+                    start_barrier.wait(timeout=5.0)
+                    store.create({"task_id": task_id, "title": task_id})
+                except BaseException as exc:  # preserve thread failures for the assertion
+                    errors.append(exc)
+
+            workers = [
+                threading.Thread(target=create, args=(first, "task-first")),
+                threading.Thread(target=create, args=(second, "task-second")),
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10.0)
+
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            task_ids = {
+                str(task.get("task_id") or "")
+                for task in TaskStatusStore(data_dir).scheduler_store.list_tasks()
+            }
+            self.assertEqual(task_ids, {"task-first", "task-second"})
+
+    def test_late_projection_writer_rereads_sqlite_under_cross_process_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            first = TaskStatusStore(data_dir)
+            second = TaskStatusStore(data_dir)
+            first_snapshot_ready = threading.Event()
+            release_first_snapshot = threading.Event()
+            original_list = first.scheduler_store.list_tasks
+
+            def delayed_old_snapshot(*args, **kwargs):
+                snapshot = original_list(*args, **kwargs)
+                first_snapshot_ready.set()
+                if not release_first_snapshot.wait(10.0):
+                    raise TimeoutError("timed out waiting to release old task projection snapshot")
+                return snapshot
+
+            first.scheduler_store.list_tasks = delayed_old_snapshot  # type: ignore[method-assign]
+            errors: list[BaseException] = []
+
+            def create(store: TaskStatusStore, task_id: str) -> None:
+                try:
+                    store.create({"task_id": task_id, "title": task_id})
+                except BaseException as exc:
+                    errors.append(exc)
+
+            first_worker = threading.Thread(target=create, args=(first, "task-first"))
+            first_worker.start()
+            self.assertTrue(first_snapshot_ready.wait(5.0))
+
+            second_worker = threading.Thread(target=create, args=(second, "task-second"))
+            second_worker.start()
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if len(TaskStatusStore(data_dir).scheduler_store.list_tasks()) == 2:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("second task was not committed while the first projection was delayed")
+
+            release_first_snapshot.set()
+            first_worker.join(timeout=10.0)
+            second_worker.join(timeout=10.0)
+
+            self.assertFalse(first_worker.is_alive())
+            self.assertFalse(second_worker.is_alive())
+            self.assertEqual(errors, [])
+            projection = json.loads(
+                (data_dir / "task_manager" / "tasks.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                {str(task.get("task_id") or "") for task in projection["tasks"]},
+                {"task-first", "task-second"},
+            )
+
+    def test_atomic_create_preserves_persistent_task_history_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            store = TaskStatusStore(data_dir)
+            store.scheduler_store.replace_tasks(
+                [
+                    {
+                        "task_id": f"seed-{index:03d}",
+                        "title": f"Seed {index}",
+                        "status": "completed",
+                        "updated_at": f"2020-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+                    }
+                    for index in range(500)
+                ]
+            )
+
+            store.create({"task_id": "newest", "title": "Newest"})
+
+            tasks = store.scheduler_store.list_tasks(limit=1000)
+            self.assertEqual(len(tasks), 500)
+            self.assertIn("newest", {str(task.get("task_id") or "") for task in tasks})
+            self.assertNotIn("seed-000", {str(task.get("task_id") or "") for task in tasks})
+
+    def test_worker_config_match_reads_only_local_lock_signature(self) -> None:
+        from app.personal_wechat_bot.runtime.send_bridge_worker import (
+            bridge_worker_config_signature,
+            bridge_worker_lock_path,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            config = create_default_config(data_dir)
+            config.send_enabled = True
+            config.send_driver = "bridge_outbox"
+            config.send_backend = "wechat_native_http"
+            save_config(config)
+            lock_path = bridge_worker_lock_path(data_dir)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "label": "send_bridge_worker",
+                        "heartbeat_at": time.time(),
+                        "config_signature": bridge_worker_config_signature(config),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "app.personal_wechat_bot.wechat_driver.send_driver_factory.build_send_driver",
+                side_effect=AssertionError("backend probe must not run while reading task state"),
+            ) as build_driver:
+                self.assertTrue(_bridge_worker_config_is_matched(data_dir))
+
+            build_driver.assert_not_called()
+
     def test_create_update_transition_and_state_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStatusStore(Path(tmp) / "data")

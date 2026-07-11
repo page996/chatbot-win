@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,15 +11,25 @@ from functools import cmp_to_key
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable, Iterator
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse, quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.runtime.process_lock import short_process_lock
+from app.personal_wechat_bot.tools.web.http_safety import (
+    guarded_local_urlopen,
+    guarded_same_authority_urlopen,
+    read_response_with_deadline,
+    validate_http_url,
+    validate_local_http_url,
+)
 from app.personal_wechat_bot.wechat_driver.jsonl_bus import append_jsonl_once
 from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 
 
 WEFLOW_LOCAL_BUILD_FLAVOR = "chatbot-win-local-fork"
+WEFLOW_JSON_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
 ProgressCallback = Callable[[dict[str, Any]], None]
 WEFLOW_FRIEND_TRUE_KEYS = (
     "is_friend",
@@ -175,12 +184,20 @@ def weflow_health_status(
 
     api_base = _api_base_url(base_url)
     try:
-        if not allow_non_local:
+        if allow_non_local:
+            validate_http_url(api_base)
+        else:
             _require_local_http_url(api_base)
         token = token.strip()
         if require_token and not token:
             raise ValueError("WEFLOW_HTTP_TOKEN is required for formal WeFlow pull")
-        health = _weflow_json(api_base, "/health", token=token, timeout_seconds=timeout_seconds)
+        health = _weflow_json(
+            api_base,
+            "/health",
+            token=token,
+            timeout_seconds=timeout_seconds,
+            allow_non_local=allow_non_local,
+        )
         fork_ok = _weflow_fork_marker_ok(health)
         if require_fork and not fork_ok:
             flavor = _first_text(health, "buildFlavor", "build_flavor", "fork.buildFlavor", "fork.build_flavor")
@@ -266,7 +283,10 @@ class WeFlowHttpBridge:
         self.writer = HookEventJsonlWriter(hook_event_file)
         self.state_path = Path(state_path) if state_path else self.writer.path.parent / "weflow_bridge_state.json"
         self.timeout_seconds = timeout_seconds
-        if not allow_non_local:
+        self.allow_non_local = bool(allow_non_local)
+        if self.allow_non_local:
+            validate_http_url(self.base_url)
+        else:
             _require_local_http_url(self.base_url)
 
     def pull_once(
@@ -496,6 +516,10 @@ class WeFlowHttpBridge:
                     context_only=bool(history_context_only or cursor_recovery_context_only),
                 )
                 raw_id = str(normalized.get("raw_id") or "").strip()
+                message_timestamp = _epoch_seconds(message.get("timestamp") or message.get("createTime"), max_timestamp)
+                max_timestamp = max(max_timestamp, message_timestamp)
+                if raw_id:
+                    current_recent_raw_ids[raw_id] = message_timestamp
                 if raw_id in seen:
                     continue
                 was_appended = self.writer.append(normalized)
@@ -504,10 +528,6 @@ class WeFlowHttpBridge:
                 if raw_id:
                     seen.add(raw_id)
                     appended_raw_ids.append(raw_id)
-                message_timestamp = _epoch_seconds(message.get("timestamp") or message.get("createTime"), max_timestamp)
-                max_timestamp = max(max_timestamp, message_timestamp)
-                if raw_id:
-                    current_recent_raw_ids[raw_id] = message_timestamp
                 _emit_progress(
                     progress_callback,
                     event="message",
@@ -760,8 +780,14 @@ class WeFlowHttpBridge:
         return pages
 
     def _json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        with self._open(path, params=params, method="GET") as response:
-            raw = response.read().decode("utf-8")
+        deadline = time.monotonic() + max(0.2, float(self.timeout_seconds))
+        with self._open(path, params=params, method="GET", deadline=deadline) as response:
+            raw = _read_bounded_response(
+                response,
+                max_bytes=WEFLOW_JSON_RESPONSE_MAX_BYTES,
+                timeout_seconds=self.timeout_seconds,
+                deadline=deadline,
+            ).decode("utf-8")
         payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             raise ValueError("WeFlow API response must be a JSON object")
@@ -775,6 +801,7 @@ class WeFlowHttpBridge:
         method: str = "GET",
         stream: bool = False,
         headers: dict[str, str] | None = None,
+        deadline: float | None = None,
     ):
         url = self.base_url.rstrip("/") + "/" + path.lstrip("/")
         if params:
@@ -785,7 +812,16 @@ class WeFlowHttpBridge:
         if self.token:
             request_headers["Authorization"] = f"Bearer {self.token}"
         request = Request(url, headers=request_headers, method=method)
-        return urlopen(request, timeout=self.timeout_seconds)
+        try:
+            guarded_open = guarded_same_authority_urlopen if self.allow_non_local else guarded_local_urlopen
+            return guarded_open(
+                request,
+                timeout_seconds=self.timeout_seconds,
+                deadline=deadline,
+            )
+        except HTTPError as exc:
+            exc.close()
+            raise
 
 
 def append_hook_source_event(
@@ -1546,18 +1582,57 @@ def _api_base_url(base_url: str) -> str:
     return text if text.endswith("/api/v1") else f"{text}/api/v1"
 
 
-def _weflow_json(api_base_url: str, path: str, *, token: str = "", timeout_seconds: float = 5.0) -> dict[str, Any]:
+def _weflow_json(
+    api_base_url: str,
+    path: str,
+    *,
+    token: str = "",
+    timeout_seconds: float = 5.0,
+    allow_non_local: bool = False,
+) -> dict[str, Any]:
     url = api_base_url.rstrip("/") + "/" + path.lstrip("/")
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, headers=headers, method="GET")
-    with urlopen(request, timeout=timeout_seconds) as response:
-        raw = response.read().decode("utf-8")
+    deadline = time.monotonic() + max(0.2, float(timeout_seconds))
+    try:
+        guarded_open = guarded_same_authority_urlopen if allow_non_local else guarded_local_urlopen
+        with guarded_open(request, timeout_seconds=timeout_seconds, deadline=deadline) as response:
+            raw = _read_bounded_response(
+                response,
+                max_bytes=WEFLOW_JSON_RESPONSE_MAX_BYTES,
+                timeout_seconds=timeout_seconds,
+                deadline=deadline,
+            ).decode("utf-8")
+    except HTTPError as exc:
+        exc.close()
+        raise
     payload = json.loads(raw or "{}")
     if not isinstance(payload, dict):
         raise ValueError("WeFlow health response must be a JSON object")
     return payload
+
+
+def _read_bounded_response(
+    response: Any,
+    *,
+    max_bytes: int,
+    timeout_seconds: float,
+    deadline: float | None = None,
+) -> bytes:
+    try:
+        return read_response_with_deadline(
+            response,
+            max_bytes=max_bytes,
+            deadline=deadline if deadline is not None else time.monotonic() + max(0.2, float(timeout_seconds)),
+        )
+    except TimeoutError as exc:
+        raise TimeoutError("weflow_response_deadline_exceeded") from exc
+    except ValueError as exc:
+        if "http_response_too_large" in str(exc):
+            raise ValueError(str(exc).replace("http_response_too_large", "weflow_response_too_large", 1)) from exc
+        raise
 
 
 def _url_is_local_http(url: str) -> bool:
@@ -1571,15 +1646,7 @@ def _weflow_fork_marker_ok(health: dict[str, Any]) -> bool:
 
 
 def _require_local_http_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme != "http":
-        raise ValueError("message source bridge only allows http by default")
-    _require_local_host(parsed.hostname or "")
-
-
-def _require_local_host(host: str) -> None:
-    if host.lower() not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("message source bridge must bind/connect to localhost unless explicitly overridden")
+    validate_local_http_url(url)
 
 
 def _first_text(payload: dict[str, Any], *keys: str) -> str:
@@ -1806,38 +1873,10 @@ def _talker_lock_path(state_path: Path, talker: str) -> Path:
 
 @contextmanager
 def _path_lock(path: Path, *, timeout_seconds: float) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + max(0.1, timeout_seconds)
-    fd: int | None = None
-    while fd is None:
-        try:
-            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError) as exc:
-            if isinstance(exc, PermissionError) and not path.exists():
-                raise
-            if _stale_lock(path):
-                try:
-                    path.unlink()
-                    continue
-                except OSError:
-                    pass
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for WeFlow state lock: {path}")
-            time.sleep(0.025)
-    try:
-        os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+    with short_process_lock(
+        path,
+        timeout_seconds=timeout_seconds,
+        stale_after_seconds=60.0,
+        timeout_label="WeFlow state lock",
+    ):
         yield
-    finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _stale_lock(path: Path, *, max_age_seconds: float = 60.0) -> bool:
-    try:
-        return time.time() - path.stat().st_mtime > max_age_seconds
-    except OSError:
-        return False

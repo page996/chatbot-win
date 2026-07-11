@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.personal_wechat_bot.conversation.segment import chat_title_from_registry, resolve_segment
+from app.personal_wechat_bot.conversation.segment import (
+    chat_title_from_registry,
+    conversation_projection_dir,
+    resolve_segment,
+    validate_conversation_segment,
+)
 from app.personal_wechat_bot.conversation.ledger_database import ConversationLedgerDatabase
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, utc_now_iso
+from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path, short_process_lock
 from app.personal_wechat_bot.workspace.file_visibility import redact_file_internal_urls
 
 
@@ -409,14 +413,26 @@ class ConversationLedgerStore:
             entries = self._read_entries(conversation_id)
             payload = asdict(send_result) if isinstance(send_result, SendResult) else dict(send_result)
             changed = False
+            matched = False
             updated: list[dict[str, Any]] = []
             now = utc_now_iso()
             for item in entries:
                 if item.get("entry_id") != entry_id:
                     updated.append(item)
                     continue
+                matched = True
                 item = dict(item)
                 send = item.get("send") if isinstance(item.get("send"), dict) else {}
+                current_status = str(send.get("status") or "")
+                incoming_status = str(payload.get("status") or "")
+                if current_status in {"sent", "accepted", "failed"} and incoming_status in {
+                    "",
+                    "pending",
+                    "queued_for_confirm",
+                    "queued_to_bridge",
+                }:
+                    updated.append(item)
+                    continue
                 next_send = {
                     **send,
                     "status": str(payload.get("status") or ""),
@@ -437,10 +453,11 @@ class ConversationLedgerStore:
                 item["updated_at"] = now
                 updated.append(item)
                 changed = True
-            if not changed:
+            if not matched:
                 return False
-            self._rewrite_entries(conversation_id, updated)
-            self._render_conversation(conversation_id)
+            if changed:
+                self._rewrite_entries(conversation_id, updated)
+                self._render_conversation(conversation_id)
             return True
 
     def update_reply_send_result_for_candidate(self, reply: ReplyCandidate, send_result: SendResult | dict[str, Any]) -> bool:
@@ -520,11 +537,13 @@ class ConversationLedgerStore:
         new_bridge_id: str,
         *,
         reason: str = "",
+        old_bridge_ids: list[str] | None = None,
     ) -> bool:
         old_bridge_id = str(old_bridge_id or "").strip()
         new_bridge_id = str(new_bridge_id or "").strip()
         if not old_bridge_id or not new_bridge_id:
             return False
+        retry_candidates = _dedupe_bridge_ids([old_bridge_id, *(old_bridge_ids or [])])
         with self._conversation_lock(conversation_id):
             entries = self._read_entries(conversation_id)
             changed = False
@@ -532,26 +551,28 @@ class ConversationLedgerStore:
             now = utc_now_iso()
             for item in entries:
                 send = item.get("send") if isinstance(item.get("send"), dict) else {}
-                send_reason = str(send.get("reason", ""))
-                send_message_id = str(send.get("message_id", ""))
-                send_status = str(send.get("status") or "")
                 if (
                     item.get("role") == "assistant"
-                    and (send_status != "sent" or "dry_run_not_delivered" in send_reason)
-                    and (old_bridge_id == send_message_id or old_bridge_id in send_reason)
+                    and any(_send_payload_matches_bridge(send, item, candidate) for candidate in retry_candidates)
                 ):
                     item = dict(item)
-                    item["send"] = {
-                        **send,
-                        "status": "queued_to_bridge",
-                        "reason": reason or f"retry_to_non_foreground_bridge:{new_bridge_id}",
-                        "message_id": new_bridge_id,
-                        "conversation_id": conversation_id,
-                        "sent_at": "",
-                        "retry_of": old_bridge_id,
-                        "retry_at": now,
-                        "updated_at": now,
-                    }
+                    retry_reason = reason or f"retry_to_non_foreground_bridge:{new_bridge_id}"
+                    item["send"] = _send_payload_with_bridge_retry(
+                        send,
+                        set(retry_candidates),
+                        new_bridge_id,
+                        retry_parent_id=old_bridge_id,
+                        reason=retry_reason,
+                        now=now,
+                    )
+                    item["attachments"] = _attachments_with_bridge_retry(
+                        item.get("attachments", []),
+                        set(retry_candidates),
+                        new_bridge_id,
+                        retry_parent_id=old_bridge_id,
+                        reason=retry_reason,
+                        now=now,
+                    )
                     item["updated_at"] = now
                     changed = True
                 updated.append(item)
@@ -582,10 +603,23 @@ class ConversationLedgerStore:
 
     def read_entries(self, conversation_id: str, *, include_removed: bool = False) -> list[LedgerEntry]:
         entries = self._read_entries(conversation_id)
-        self._restore_readable_projections(conversation_id, entries)
+        if entries and self._readable_projections_missing(conversation_id):
+            # Re-read under the lifecycle lock before writing projections. A
+            # concurrent channel purge may have deleted the SQLite authority
+            # while this reader was waiting; stale pre-lock rows must never
+            # recreate a deleted conversation directory.
+            with self._conversation_lock(conversation_id):
+                entries = self._read_entries(conversation_id)
+                self._restore_readable_projections(conversation_id, entries)
         if not include_removed:
             entries = [item for item in entries if item.get("status") == "active"]
         return [_entry_from_payload(item) for item in entries]
+
+    def _readable_projections_missing(self, conversation_id: str) -> bool:
+        return not (
+            self._messages_path(conversation_id).exists()
+            and self.conversation_markdown_path(conversation_id).exists()
+        )
 
     def list_conversation_ids(self) -> list[str]:
         return self.database.list_conversation_ids()
@@ -648,22 +682,63 @@ class ConversationLedgerStore:
         # cache, matching what read_entries and channel cleanup expect.
         cached_segment = self._segment_cache.get(conversation_id, "")
         if cached_segment:
-            return self.root / cached_segment
+            return conversation_projection_dir(
+                self.root,
+                cached_segment,
+                label="cached ledger conversation segment",
+            )
         database_segment = self.database.segment_for(conversation_id)
         if database_segment:
+            database_segment = validate_conversation_segment(
+                database_segment,
+                label="ledger database conversation segment",
+            )
+            conversation_dir = conversation_projection_dir(
+                self.root,
+                database_segment,
+                label="ledger database conversation segment",
+            )
             self._segment_cache[conversation_id] = database_segment
-            return self.root / database_segment
-        return self.root / resolve_segment(self.data_dir, conversation_id)
+            return conversation_dir
+        segment = resolve_segment(self.data_dir, conversation_id)
+        return conversation_projection_dir(
+            self.root,
+            segment,
+            label="resolved ledger conversation segment",
+        )
 
     def _remember_segment(self, conversation_id: str, chat_title: str = "") -> str:
         cached_segment = self._segment_cache.get(conversation_id, "")
         if cached_segment:
+            cached_segment = validate_conversation_segment(
+                cached_segment,
+                label="cached ledger conversation segment",
+            )
+            conversation_projection_dir(
+                self.root,
+                cached_segment,
+                label="cached ledger conversation segment",
+            )
             return cached_segment
         database_segment = self.database.segment_for(conversation_id)
         if database_segment:
+            database_segment = validate_conversation_segment(
+                database_segment,
+                label="ledger database conversation segment",
+            )
+            conversation_projection_dir(
+                self.root,
+                database_segment,
+                label="ledger database conversation segment",
+            )
             self._segment_cache[conversation_id] = database_segment
             return database_segment
         segment = resolve_segment(self.data_dir, conversation_id, chat_title)
+        conversation_projection_dir(
+            self.root,
+            segment,
+            label="resolved ledger conversation segment",
+        )
         self._segment_cache[conversation_id] = segment
         self.database.set_segment(conversation_id, segment)
         return segment
@@ -679,33 +754,18 @@ class ConversationLedgerStore:
 
     @contextmanager
     def _conversation_lock(self, conversation_id: str) -> Iterator[None]:
-        lock_path = self._find_conversation_dir(conversation_id) / ".ledger.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + 30.0
-        fd: int | None = None
-        while fd is None:
-            try:
-                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except (FileExistsError, PermissionError):
-                if _stale_lock(lock_path):
-                    try:
-                        lock_path.unlink()
-                        continue
-                    except OSError:
-                        pass
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for conversation ledger lock: {lock_path}")
-                time.sleep(0.025)
-        try:
-            os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+        lock_path = scoped_process_lock_path(
+            self.data_dir,
+            "conversation-lifecycle",
+            conversation_id,
+        )
+        with short_process_lock(
+            lock_path,
+            timeout_seconds=30.0,
+            stale_after_seconds=60.0,
+            timeout_label="conversation ledger lock",
+        ):
             yield
-        finally:
-            if fd is not None:
-                os.close(fd)
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
 
     def _read_entries(self, conversation_id: str) -> list[dict[str, Any]]:
         return self.database.list_entries(conversation_id)
@@ -1176,6 +1236,36 @@ def _attachments_with_bridge_ack(
     return result
 
 
+def _attachments_with_bridge_retry(
+    attachments: Any,
+    old_bridge_ids: set[str],
+    new_bridge_id: str,
+    *,
+    retry_parent_id: str,
+    reason: str,
+    now: str,
+) -> list[Any]:
+    raw = attachments if isinstance(attachments, list) else []
+    result: list[Any] = []
+    for attachment in raw:
+        if not isinstance(attachment, dict):
+            result.append(attachment)
+            continue
+        item = dict(attachment)
+        send = item.get("send") if isinstance(item.get("send"), dict) else {}
+        if any(_bridge_id_matches_send_payload(send, candidate) for candidate in old_bridge_ids):
+            item["send"] = _send_part_with_bridge_retry(
+                send,
+                old_bridge_ids,
+                new_bridge_id,
+                retry_parent_id=retry_parent_id,
+                reason=reason,
+                now=now,
+            )
+        result.append(item)
+    return result
+
+
 def _send_payload_matches_bridge(send: dict[str, Any], item: dict[str, Any], bridge_id: str) -> bool:
     if _bridge_id_matches_send_payload(send, bridge_id):
         return True
@@ -1262,6 +1352,140 @@ def _send_payload_with_bridge_ack(
             updated["sent_at"] = now
     updated["updated_at"] = now
     return updated
+
+
+def _send_payload_with_bridge_retry(
+    send: dict[str, Any],
+    old_bridge_ids: set[str],
+    new_bridge_id: str,
+    *,
+    retry_parent_id: str,
+    reason: str,
+    now: str,
+) -> dict[str, Any]:
+    updated = dict(send)
+    top_matches = any(_bridge_id_matches_send_payload(send, candidate) for candidate in old_bridge_ids)
+    for key in ("message_id", "bridge_id", "external_id"):
+        if str(updated.get(key) or "") in old_bridge_ids:
+            updated[key] = new_bridge_id
+    details = send.get("details") if isinstance(send.get("details"), dict) else {}
+    if details:
+        next_details = dict(details)
+        part_requeued = False
+        bridge_ids = details.get("bridge_ids") if isinstance(details.get("bridge_ids"), list) else []
+        next_bridge_ids = _replace_bridge_ids(bridge_ids, old_bridge_ids, new_bridge_id)
+        if new_bridge_id not in next_bridge_ids:
+            next_bridge_ids.append(new_bridge_id)
+        next_details["bridge_ids"] = next_bridge_ids
+        text = details.get("text") if isinstance(details.get("text"), dict) else {}
+        if text and any(_bridge_id_matches_send_payload(text, candidate) for candidate in old_bridge_ids):
+            part_requeued = True
+            next_details["text"] = _send_part_with_bridge_retry(
+                text,
+                old_bridge_ids,
+                new_bridge_id,
+                retry_parent_id=retry_parent_id,
+                reason=reason,
+                now=now,
+            )
+        files = details.get("files") if isinstance(details.get("files"), list) else []
+        if files:
+            part_requeued = part_requeued or any(
+                isinstance(file_detail, dict)
+                and any(_bridge_id_matches_send_payload(file_detail, candidate) for candidate in old_bridge_ids)
+                for file_detail in files
+            )
+            next_details["files"] = [
+                _send_part_with_bridge_retry(
+                    file_detail,
+                    old_bridge_ids,
+                    new_bridge_id,
+                    retry_parent_id=retry_parent_id,
+                    reason=reason,
+                    now=now,
+                )
+                if isinstance(file_detail, dict)
+                and any(_bridge_id_matches_send_payload(file_detail, candidate) for candidate in old_bridge_ids)
+                else (dict(file_detail) if isinstance(file_detail, dict) else file_detail)
+                for file_detail in files
+            ]
+        detail_acks = next_details.get("bridge_acks") if isinstance(next_details.get("bridge_acks"), dict) else {}
+        if detail_acks:
+            next_details["bridge_acks"] = {
+                str(key): dict(value)
+                for key, value in detail_acks.items()
+                if isinstance(value, dict) and str(key) not in old_bridge_ids and str(key) != new_bridge_id
+            }
+        next_details.pop("last_bridge_ack", None)
+        updated["details"] = next_details
+        aggregate_status = _aggregate_send_status(_send_part_statuses(next_details))
+        if not part_requeued and aggregate_status in {"sent", "accepted"}:
+            aggregate_status = "queued_to_bridge"
+        updated["status"] = aggregate_status or "queued_to_bridge"
+    else:
+        updated["status"] = "queued_to_bridge"
+    updated["reason"] = reason
+    updated["sent_at"] = ""
+    updated["retry_of"] = retry_parent_id
+    updated["retry_at"] = now
+    updated["updated_at"] = now
+    if top_matches:
+        updated.pop("external_message_id", None)
+    bridge_acks = updated.get("bridge_acks") if isinstance(updated.get("bridge_acks"), dict) else {}
+    if bridge_acks:
+        updated["bridge_acks"] = {
+            str(key): dict(value)
+            for key, value in bridge_acks.items()
+            if isinstance(value, dict) and str(key) not in old_bridge_ids and str(key) != new_bridge_id
+        }
+    updated.pop("last_bridge_ack", None)
+    return updated
+
+
+def _send_part_with_bridge_retry(
+    payload: dict[str, Any],
+    old_bridge_ids: set[str],
+    new_bridge_id: str,
+    *,
+    retry_parent_id: str,
+    reason: str,
+    now: str,
+) -> dict[str, Any]:
+    updated = dict(payload)
+    for key in ("message_id", "bridge_id", "external_id"):
+        if str(updated.get(key) or "") in old_bridge_ids:
+            updated[key] = new_bridge_id
+    updated.update(
+        {
+            "status": "queued_to_bridge",
+            "reason": reason,
+            "sent_at": "",
+            "retry_of": retry_parent_id,
+            "retry_at": now,
+            "updated_at": now,
+        }
+    )
+    updated.pop("external_message_id", None)
+    updated.pop("last_bridge_ack", None)
+    return updated
+
+
+def _replace_bridge_ids(values: list[Any], old_bridge_ids: set[str], new_bridge_id: str) -> list[str]:
+    return _dedupe_bridge_ids(
+        [new_bridge_id if str(value) in old_bridge_ids else str(value) for value in values]
+    )
+
+
+def _dedupe_bridge_ids(values: list[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        bridge_id = str(value or "").strip()
+        if not bridge_id or bridge_id in seen:
+            continue
+        seen.add(bridge_id)
+        result.append(bridge_id)
+    return result
 
 
 def _send_file_detail_for_attachment(attachment: dict[str, Any], files: list[Any]) -> dict[str, Any]:
@@ -2252,13 +2476,6 @@ def _write_json(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
-
-
-def _stale_lock(path: Path, *, max_age_seconds: float = 60.0) -> bool:
-    try:
-        return time.time() - path.stat().st_mtime > max_age_seconds
-    except OSError:
-        return False
 
 
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)

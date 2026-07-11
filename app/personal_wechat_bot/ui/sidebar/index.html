@@ -113,7 +113,10 @@
               <span>文件处理上限（MB）</span>
               <input id="fileMaxMb" type="number" min="1" max="2048" step="1" value="20" />
             </label>
-            <button id="saveControls" class="primary">保存</button>
+            <div class="send-control-actions">
+              <button id="driverProbeButton" class="ghost" type="button" data-tooltip="按已保存配置主动检查发送驱动和当前后端；结果保留 60 秒。" disabled>探测后端</button>
+              <button id="saveControls" class="primary">保存</button>
+            </div>
           </section>
           <div class="bookmark-tabs" role="tablist" aria-label="send console">
             <button class="active" data-panel="queue">发送审核</button>

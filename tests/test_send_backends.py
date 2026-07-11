@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.personal_wechat_bot.config.schema import BotConfig
+from app.personal_wechat_bot.wechat_driver import send_backends
 from app.personal_wechat_bot.wechat_driver.send_backends import (
     WeChatNativeHttpSendBackend,
     WeFlowHttpSendBackend,
@@ -79,6 +80,211 @@ def _json_server(routes: dict[tuple[str, str], tuple[int, dict] | list[tuple[int
 
 
 class SendBackendsTest(unittest.TestCase):
+    def test_http_json_allows_only_same_authority_redirects_with_token(self) -> None:
+        target_headers: list[str] = []
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                target_headers.append(self.headers.get("Authorization", ""))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        target.daemon_threads = True
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+        finish_headers: list[str] = []
+
+        class OriginHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/same":
+                    self.send_response(302)
+                    self.send_header("Location", "/finish")
+                    self.end_headers()
+                    return
+                if self.path == "/cross":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{target.server_port}/stolen")
+                    self.end_headers()
+                    return
+                finish_headers.append(self.headers.get("Authorization", ""))
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), OriginHandler)
+        origin.daemon_threads = True
+        origin_thread = threading.Thread(target=origin.serve_forever, daemon=True)
+        origin_thread.start()
+        try:
+            base = f"http://127.0.0.1:{origin.server_port}"
+            self.assertEqual(
+                send_backends._http_json(
+                    base + "/same",
+                    method="GET",
+                    token="secret",
+                    timeout_seconds=1.0,
+                ),
+                {},
+            )
+            with self.assertRaisesRegex(ValueError, "redirect_authority"):
+                send_backends._http_json(
+                    base + "/cross",
+                    method="GET",
+                    token="secret",
+                    timeout_seconds=1.0,
+                )
+        finally:
+            origin.shutdown()
+            origin.server_close()
+            origin_thread.join(timeout=2)
+            target.shutdown()
+            target.server_close()
+            target_thread.join(timeout=2)
+
+        self.assertEqual(finish_headers, ["Bearer secret"])
+        self.assertEqual(target_headers, [])
+
+    def test_http_json_stops_real_slow_stream_at_total_deadline(self) -> None:
+        disconnected = threading.Event()
+
+        class SlowStreamHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                try:
+                    for _ in range(100):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except ConnectionError:
+                    disconnected.set()
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowStreamHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(TimeoutError, "http_response_deadline_exceeded"):
+                send_backends._http_json(
+                    f"http://127.0.0.1:{server.server_port}/slow",
+                    method="GET",
+                    timeout_seconds=0.25,
+                )
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertTrue(disconnected.wait(timeout=1.0))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_http_json_enforces_total_body_deadline(self) -> None:
+        clock = [100.0]
+
+        class SlowResponse:
+            headers: dict[str, str] = {}
+
+            def __init__(self) -> None:
+                self.read_calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read1(self, _size: int) -> bytes:
+                self.read_calls += 1
+                clock[0] += 0.11
+                return b" "
+
+        response = SlowResponse()
+        with (
+            mock.patch.object(send_backends.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(send_backends, "guarded_local_urlopen", return_value=response) as mocked_open,
+        ):
+            with self.assertRaisesRegex(TimeoutError, "http_response_deadline_exceeded"):
+                send_backends._http_json(
+                    "http://127.0.0.1:12345/test",
+                    method="GET",
+                    timeout_seconds=0.2,
+                )
+
+        self.assertEqual(response.read_calls, 2)
+        self.assertEqual(mocked_open.call_args.kwargs["timeout_seconds"], 0.2)
+
+    def test_http_json_rejects_streamed_body_over_limit(self) -> None:
+        limit = send_backends._MAX_HTTP_JSON_RESPONSE_BYTES
+
+        class OversizedResponse:
+            headers: dict[str, str] = {}
+
+            def __init__(self) -> None:
+                self.remaining = limit + 1
+                self.max_read_size = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read1(self, size: int) -> bytes:
+                self.max_read_size = max(self.max_read_size, size)
+                count = min(size, self.remaining)
+                self.remaining -= count
+                return b" " * count
+
+        response = OversizedResponse()
+        with mock.patch.object(send_backends, "guarded_local_urlopen", return_value=response):
+            with self.assertRaisesRegex(ValueError, "http_response_too_large"):
+                send_backends._http_json(
+                    "http://127.0.0.1:12345/test",
+                    method="GET",
+                    timeout_seconds=1.0,
+                )
+
+        self.assertLessEqual(response.max_read_size, send_backends._HTTP_RESPONSE_READ_CHUNK_BYTES)
+        self.assertEqual(response.remaining, 0)
+
+    def test_http_json_rejects_declared_error_body_over_limit_without_reading(self) -> None:
+        class OversizedErrorResponse:
+            headers = {"Content-Length": str(send_backends._MAX_HTTP_JSON_RESPONSE_BYTES + 1)}
+
+            def read1(self, _size: int) -> bytes:
+                raise AssertionError("oversized declared body must not be read")
+
+            def close(self) -> None:
+                return None
+
+        error = send_backends.HTTPError(
+            "http://127.0.0.1:12345/test",
+            500,
+            "error",
+            OversizedErrorResponse.headers,
+            OversizedErrorResponse(),
+        )
+        with mock.patch.object(send_backends, "guarded_local_urlopen", side_effect=error):
+            with self.assertRaisesRegex(ValueError, "http_response_too_large"):
+                send_backends._http_json(
+                    "http://127.0.0.1:12345/test",
+                    method="GET",
+                    timeout_seconds=1.0,
+                )
+
     def test_weflow_http_status_uses_local_health_and_token(self) -> None:
         with _json_server(
             {
@@ -123,6 +329,22 @@ class SendBackendsTest(unittest.TestCase):
         self.assertEqual(requests[0]["headers"].get("Authorization"), "Bearer secret")
         self.assertEqual(requests[0]["body"]["receiver"], SAFE_WECHAT_RECEIVER)
         self.assertEqual(requests[0]["body"]["text"], "hello")
+
+    def test_weflow_backend_rejects_business_failure_in_http_200_response(self) -> None:
+        payloads = (
+            {"code": 500, "message": "send failed"},
+            {"ok": True, "status": "failed", "message": "not delivered"},
+            {"success": True, "status": "processing"},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                routes = {("POST", "/api/v1/send/text"): (200, payload)}
+                with _json_server(routes) as (base_url, _requests):
+                    backend = WeFlowHttpSendBackend(base_url=base_url, token="secret")
+                    result = backend.send_text(SAFE_WECHAT_RECEIVER, "hello")
+
+                self.assertFalse(result.ok)
+                self.assertIn("weflow_http_send_text_failed", result.reason)
 
     def test_weflow_backend_blocks_synthetic_private_receiver_before_http(self) -> None:
         routes = {("POST", "/api/v1/send/text"): (200, {"ok": True})}
@@ -278,6 +500,64 @@ class SendBackendsTest(unittest.TestCase):
         self.assertEqual(requests[0]["headers"].get("Authorization"), "Bearer secret")
         self.assertEqual(requests[1]["body"], {"wxidorgid": SAFE_WECHAT_RECEIVER, "msg": "hello verified"})
 
+    def test_wechat_native_text_verification_uses_text_timeout_only(self) -> None:
+        routes = {("POST", "/SendTextMsg"): (200, {"ret": 0, "retmsg": "accepted_unverified"})}
+        with _json_server(routes) as (base_url, requests):
+            backend = WeChatNativeHttpSendBackend(
+                base_url=base_url,
+                verify_base_url=base_url,
+                verify_token_env="WEFLOW_TEST_TOKEN",
+                verify_timeout_seconds=0,
+                file_verify_timeout_seconds=1.0,
+            )
+            with mock.patch.dict(os.environ, {"WEFLOW_TEST_TOKEN": "secret"}, clear=False):
+                result = backend.send_text(SAFE_WECHAT_RECEIVER, "verification disabled")
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.delivery_verified)
+        self.assertEqual([item["method"] for item in requests], ["POST"])
+
+    def test_wechat_native_text_baseline_failure_cannot_verify_recent_duplicate(self) -> None:
+        now = int(time.time())
+        routes = {
+            ("GET", "/api/v1/messages"): [
+                (503, {"error": "baseline unavailable"}),
+                (
+                    200,
+                    {
+                        "success": True,
+                        "messages": [
+                            {
+                                "localId": 7,
+                                "serverId": "stale-text",
+                                "createTime": now - 2,
+                                "sortSeq": (now - 2) * 1000,
+                                "isSend": 1,
+                                "content": "same text",
+                                "messageKey": "stale-text-key",
+                            }
+                        ],
+                    },
+                ),
+            ],
+            ("POST", "/SendTextMsg"): (200, {"ret": 0, "retmsg": "accepted_unverified"}),
+        }
+        with _json_server(routes) as (base_url, requests):
+            backend = WeChatNativeHttpSendBackend(
+                base_url=base_url,
+                verify_base_url=base_url,
+                verify_token_env="WEFLOW_TEST_TOKEN",
+                verify_timeout_seconds=0.2,
+            )
+            with mock.patch.dict(os.environ, {"WEFLOW_TEST_TOKEN": "secret"}, clear=False):
+                result = backend.send_text(SAFE_WECHAT_RECEIVER, "same text")
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.delivery_verified)
+        self.assertEqual(result.reason, "wechat_native_http_send_text_accepted_unverified")
+        self.assertEqual(result.payload["delivery_verification"]["reason"], "baseline_readback_failed")
+        self.assertEqual([item["method"] for item in requests], ["GET", "POST"])
+
     def test_wechat_native_backend_blocks_default_image_but_accepts_default_file_route(self) -> None:
         routes = {("POST", "/send_file_msg"): (200, {"ret": 0, "retmsg": "accepted_unverified_file_native"})}
         with _json_server(routes) as (base_url, requests):
@@ -353,7 +633,8 @@ class SendBackendsTest(unittest.TestCase):
                 base_url=base_url,
                 verify_base_url=base_url,
                 verify_token_env="WEFLOW_TEST_TOKEN",
-                verify_timeout_seconds=1.0,
+                verify_timeout_seconds=0,
+                file_verify_timeout_seconds=1.0,
             )
             with mock.patch.dict(os.environ, {"WEFLOW_TEST_TOKEN": "secret"}, clear=False):
                 result = backend.send_file(SAFE_WECHAT_RECEIVER, str(target))
@@ -366,6 +647,45 @@ class SendBackendsTest(unittest.TestCase):
         self.assertEqual(result.payload["delivery_verification"]["reason"], "matched_weflow_outgoing_file")
         self.assertEqual([item["method"] for item in requests], ["GET", "POST", "GET"])
         self.assertEqual(requests[1]["body"]["filepath"], str(target.resolve()))
+
+    def test_wechat_native_file_baseline_failure_blocks_late_reverification(self) -> None:
+        routes = {
+            ("GET", "/api/v1/messages"): (503, {"error": "baseline unavailable"}),
+            ("POST", "/send_file_msg"): (200, {"ret": 0, "retmsg": "accepted_unverified_file_native"}),
+        }
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp, _json_server(routes) as (base_url, requests):
+            target = Path(tmp) / "same.csv"
+            target.write_text("file", encoding="utf-8")
+            backend = WeChatNativeHttpSendBackend(
+                base_url=base_url,
+                verify_base_url=base_url,
+                verify_token_env="WEFLOW_TEST_TOKEN",
+                verify_timeout_seconds=0,
+                file_verify_timeout_seconds=0.2,
+            )
+            with mock.patch.dict(os.environ, {"WEFLOW_TEST_TOKEN": "secret"}, clear=False):
+                result = backend.send_file(SAFE_WECHAT_RECEIVER, str(target))
+                late = backend.verify_accepted_bridge_record(
+                    {
+                        "bridge_id": "bridge:file:baseline-failed",
+                        "receiver": SAFE_WECHAT_RECEIVER,
+                        "kind": "file",
+                        "path": str(target),
+                        "name": target.name,
+                    },
+                    {
+                        "bridge_id": "bridge:file:baseline-failed",
+                        "status": "accepted",
+                        "reason": result.reason,
+                        "payload": result.payload,
+                    },
+                )
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.delivery_verified)
+        self.assertEqual(result.payload["delivery_verification"]["baseline_status"], "failed")
+        self.assertIsNone(late)
+        self.assertEqual([item["method"] for item in requests], ["GET", "POST"])
 
     def test_wechat_native_backend_late_verifies_accepted_file_without_resend(self) -> None:
         now = int(time.time())

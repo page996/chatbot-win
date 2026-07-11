@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,12 +33,18 @@ from typing import Any, Callable
 
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.control.send_commands import sync_bridge_ack_to_send_state
-from app.personal_wechat_bot.runtime.process_lock import ProcessLock, ProcessLockError, process_pid_alive
+from app.personal_wechat_bot.runtime.process_lock import (
+    ProcessLock,
+    ProcessLockError,
+    process_pid_alive,
+    process_start_marker,
+)
 from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BridgeAckStatus,
     BridgeAckState,
     BridgeOutboxStore,
     _receiver_authorization_blocker,
+    bridge_sync_fingerprint,
     effective_bridge_ack_states,
     is_terminal_bridge_ack_status,
 )
@@ -82,11 +90,43 @@ _REAL_SEND_BACKENDS = frozenset({"weflow_http", "wechat_native_http"})
 # already-delivered message.
 _UNKNOWN_DELIVERY_MARKERS = (
     "unknown_delivery_state",
+    "connectionreseterror",
+    "connectionabortederror",
+    "brokenpipeerror",
+    "connection reset by peer",
+    "connection aborted",
+    "broken pipe",
+    "econnreset",
+    "econnaborted",
+    "epipe",
+    "winerror 10053",
+    "winerror 10054",
+    "remotedisconnected",
+    "remote end closed connection without response",
+    "badstatusline",
+    "incompleteread",
+    "connectionerror",
+    "ssleoferror",
+    "ssl eof",
+    "response ended",
+    "remote protocol error",
+    "timeouterror",
+    "timed out",
     "weflow_http_send_text_error:timeouterror",
     "weflow_http_send_file_error:timeouterror",
     "wechat_native_http_send_text_error:timeouterror",
     "wechat_native_http_send_image_error:timeouterror",
     "wechat_native_http_send_file_error:timeouterror",
+)
+
+_PRE_CONNECT_FAILURE_MARKERS = (
+    "connectionrefusederror",
+    "econnrefused",
+    "winerror 10061",
+    "connect_failed",
+    "connection refused",
+    "errno 111",
+    "actively refused",
 )
 
 _PERMANENT_FAILURE_MARKERS = (
@@ -101,9 +141,28 @@ _PERMANENT_FAILURE_MARKERS = (
 )
 
 
+def _safe_nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_nonnegative_float(value: Any) -> float:
+    try:
+        parsed = float(value or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else 0.0
+
+
 def _is_unknown_delivery_state(reason: str) -> bool:
     lowered = str(reason or "").lower()
-    return any(marker in lowered for marker in _UNKNOWN_DELIVERY_MARKERS)
+    if any(marker in lowered for marker in _PRE_CONNECT_FAILURE_MARKERS):
+        return False
+    if any(marker in lowered for marker in _UNKNOWN_DELIVERY_MARKERS):
+        return True
+    return re.search(r"(?:^|[^0-9])http_5[0-9]{2}(?:[^0-9]|$)", lowered) is not None
 
 
 def _is_permanent_failure(reason: str) -> bool:
@@ -152,6 +211,10 @@ def bridge_worker_lock_alive(
         pid = 0
     if pid > 0 and not process_pid_alive(pid):
         return False
+    recorded_start = str(payload.get("process_start") or "")
+    current_start = process_start_marker(pid) if pid > 0 and recorded_start else ""
+    if recorded_start and current_start and recorded_start != current_start:
+        return False
     return ((time.time() if now is None else float(now)) - float(heartbeat)) <= max(
         1.0, float(stale_after_seconds)
     )
@@ -184,9 +247,14 @@ def bridge_worker_config_signature(config: Any) -> dict[str, Any]:
     }
 
 
-def _runtime_send_blocker(data_dir: str | Path, backend_name: str) -> str:
+def _runtime_send_blocker(
+    data_dir: str | Path,
+    backend_name: str,
+    *,
+    expected_signature: dict[str, Any] | None = None,
+) -> str:
     backend_name = _normalize_send_backend(backend_name)
-    if backend_name not in _REAL_SEND_BACKENDS:
+    if expected_signature is None and backend_name not in _REAL_SEND_BACKENDS:
         return ""
     try:
         config = load_config(data_dir)
@@ -199,6 +267,15 @@ def _runtime_send_blocker(data_dir: str | Path, backend_name: str) -> str:
     config_backend = _normalize_send_backend(str(getattr(config, "send_backend", "") or "dry_run"))
     if config_backend != backend_name:
         return f"bridge_worker_runtime_backend_mismatch:worker_backend={backend_name}:config_backend={config_backend}"
+    if expected_signature is not None:
+        current_signature = bridge_worker_config_signature(config)
+        if current_signature != expected_signature:
+            changed = sorted(
+                key
+                for key in set(expected_signature) | set(current_signature)
+                if expected_signature.get(key) != current_signature.get(key)
+            )
+            return "bridge_worker_runtime_config_changed:" + ",".join(changed[:8])
     return ""
 
 
@@ -232,12 +309,14 @@ class BridgeWorker:
         *,
         max_send_attempts: int = 3,
         heartbeat: Callable[[], None] | None = None,
+        config_signature: dict[str, Any] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.backend = backend
         self.max_send_attempts = max(1, int(max_send_attempts))
         self.store = BridgeOutboxStore(self.data_dir)
         self.stats = BridgeWorkerStats()
+        self.config_signature = dict(config_signature) if isinstance(config_signature, dict) else None
         # Called before each wire send so a slow drain keeps the single-instance
         # lock fresh (else a second worker could see it stale and double-send).
         self._heartbeat = heartbeat
@@ -264,6 +343,10 @@ class BridgeWorker:
         for record in self.store._read_all(self.store.outbox_path):
             bridge_id = str(record.get("bridge_id", ""))
             if not bridge_id or bridge_id in acked:
+                continue
+            # Manual retries are published in two phases so queue/ledger/task
+            # projections become visible before a fast worker can deliver them.
+            if record.get("ready_for_delivery") is False:
                 continue
             pending.append(record)
         return pending
@@ -295,6 +378,32 @@ class BridgeWorker:
     def run_once(self) -> int:
         """Deliver all currently-pending records. Returns the count processed."""
         self.stats.ticks += 1
+        # A producer can crash after durably writing a staged outbox record but
+        # before publishing its projections and activation bit. Such a record
+        # was never eligible for delivery; terminate it once its owner is known
+        # dead so it cannot remain an invisible pending item forever.
+        try:
+            abandoned_staged = self.store.quarantine_abandoned_staged_records()
+        except Exception as exc:
+            abandoned_staged = []
+            self.stats.last_error = f"staged_quarantine_failed:{type(exc).__name__}:{exc}"
+            logger.error("bridge %s", self.stats.last_error)
+        for ack in abandoned_staged:
+            bridge_id = str(ack.get("bridge_id") or "")
+            reason = str(ack.get("reason") or "staged_record_owner_exited_before_activation")
+            try:
+                sync_result = sync_bridge_ack_to_send_state(
+                    self.data_dir,
+                    bridge_id,
+                    status=BridgeAckStatus.FAILED,
+                    reason=reason,
+                )
+                if isinstance(sync_result, dict) and bool(sync_result.get("sync_complete")):
+                    self._mark_synced(bridge_id, self._sync_fingerprint(bridge_id, ack))
+            except Exception as exc:
+                self.stats.last_error = f"staged_quarantine_sync_failed:{type(exc).__name__}:{exc}"
+                logger.error("bridge %s", self.stats.last_error)
+            self.stats.record(BridgeAckStatus.FAILED, reason)
         # Re-sync any terminal acks whose ledger/confirm-queue sync previously
         # failed, so a transient state-write error becomes eventually consistent.
         self._reconcile_unsynced_acks()
@@ -337,7 +446,10 @@ class BridgeWorker:
         if self.stats.ticks % _COMPACT_EVERY_TICKS != 0:
             return
         try:
-            result = self.store.compact(keep_resolved=_KEEP_RESOLVED_RECORDS)
+            result = self.store.compact(
+                keep_resolved=_KEEP_RESOLVED_RECORDS,
+                synced_ack_fingerprints=self._load_synced(),
+            )
         except Exception as exc:  # pragma: no cover - best effort
             self.stats.last_error = f"compact_failed:{type(exc).__name__}:{exc}"
             logger.error("bridge %s", self.stats.last_error)
@@ -348,11 +460,22 @@ class BridgeWorker:
     def _prune_synced_marker(self) -> None:
         """Drop synced-marker ids no longer present in the (compacted) acks."""
         try:
-            live = {str(ack.get("bridge_id", "")) for ack in self.store._read_all(self.store.ack_path)}
-            synced = self._load_synced() & live
+            ack_states = effective_bridge_ack_states(self.store._read_all(self.store.ack_path))
+            outbox_by_id = self._outbox_records_by_id()
+            synced = {
+                bridge_id: fingerprint
+                for bridge_id, fingerprint in self._load_synced().items()
+                if bridge_id in ack_states
+                and ack_states[bridge_id].terminal
+                and fingerprint
+                == bridge_sync_fingerprint(ack_states[bridge_id].ack, outbox_by_id.get(bridge_id))
+            }
             path = self._synced_marker_path()
             tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps({"synced": sorted(synced)}, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(
+                json.dumps({"version": 3, "synced": synced}, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
             tmp.replace(path)
         except OSError as exc:  # pragma: no cover - best effort
             logger.error("bridge synced-marker prune failed: %s", exc)
@@ -361,7 +484,11 @@ class BridgeWorker:
         bridge_id = str(record.get("bridge_id", ""))
         conversation_id = str(record.get("conversation_id", ""))
         kind = str(record.get("kind", "text"))
-        runtime_blocker = _runtime_send_blocker(self.data_dir, str(getattr(self.backend, "name", "")))
+        runtime_blocker = _runtime_send_blocker(
+            self.data_dir,
+            str(getattr(self.backend, "name", "")),
+            expected_signature=self.config_signature,
+        )
         if runtime_blocker:
             self.stats.last_error = runtime_blocker
             self.stats.record("skipped", runtime_blocker)
@@ -403,7 +530,11 @@ class BridgeWorker:
             # Config and channel authorization are mutable while a backend is
             # unavailable. Re-check them before *every* wire attempt so turning
             # sending off or revoking a channel after attempt 1 prevents attempt 2.
-            runtime_blocker = _runtime_send_blocker(self.data_dir, str(getattr(self.backend, "name", "")))
+            runtime_blocker = _runtime_send_blocker(
+                self.data_dir,
+                str(getattr(self.backend, "name", "")),
+                expected_signature=self.config_signature,
+            )
             if runtime_blocker:
                 self.stats.last_error = runtime_blocker
                 self._ack(
@@ -426,6 +557,15 @@ class BridgeWorker:
             )
             if receiver_blocker:
                 self._ack(bridge_id, BridgeAckStatus.BLOCKED, receiver_blocker)
+                return
+            effective_ack = self._effective_ack_state(bridge_id)
+            if effective_ack is not None and effective_ack.terminal:
+                self.stats.record("skipped", f"terminal_before_wire:{effective_ack.status}")
+                logger.warning(
+                    "bridge %s stopped before wire send by terminal ack: %s",
+                    bridge_id,
+                    effective_ack.status,
+                )
                 return
             if kind == "file":
                 path = str(record.get("path", ""))
@@ -481,6 +621,12 @@ class BridgeWorker:
         left pending so a later tick retries it, up to a cross-tick cap. A
         permanent reason — or an exhausted retry budget — becomes terminal.
         """
+        if _is_unknown_delivery_state(reason):
+            quarantined_reason = str(reason or "unknown_delivery_state")
+            if "unknown_delivery_state" not in quarantined_reason.lower():
+                quarantined_reason = f"unknown_delivery_state:{quarantined_reason}"
+            self._ack(bridge_id, BridgeAckStatus.FAILED, quarantined_reason, payload=payload)
+            return
         if _is_retryable_failure(reason):
             prior_retries = self._retry_count(bridge_id)
             if prior_retries < _MAX_CROSS_TICK_RETRIES:
@@ -554,6 +700,10 @@ class BridgeWorker:
             logger.error("bridge %s", self.stats.last_error)
             return False
         effective_ack = self._effective_ack_state(bridge_id)
+        if effective_ack is None:
+            self.stats.last_error = f"ack_not_observable:{bridge_id}:{status}"
+            logger.error("bridge %s", self.stats.last_error)
+            return False
         if effective_ack is not None and effective_ack.terminal and not is_terminal_bridge_ack_status(status):
             self.stats.record(status, "stale_nonterminal_after_terminal")
             return False
@@ -581,19 +731,29 @@ class BridgeWorker:
                 external_message_id=external_message_id,
             )
             queue_error = str(sync_result.get("queue_error", "")) if isinstance(sync_result, dict) else ""
-            synced = isinstance(sync_result, dict) and sync_result.get("status") == "ok" and not queue_error
+            synced = isinstance(sync_result, dict) and bool(sync_result.get("sync_complete"))
             if queue_error:
                 self.stats.last_error = f"sync_queue_error:{queue_error}"
         except Exception as exc:  # pragma: no cover - best effort
             self.stats.last_error = f"sync_failed:{type(exc).__name__}:{exc}"
             logger.error("bridge %s", self.stats.last_error)
         if is_terminal_bridge_ack_status(status) and synced:
-            self._mark_synced(bridge_id)
+            self._mark_synced(bridge_id, self._sync_fingerprint(bridge_id, effective_ack.ack))
         self.stats.record(status, reason)
         return True
 
     def _effective_ack_state(self, bridge_id: str) -> BridgeAckState | None:
         return effective_bridge_ack_states(self.store._read_all(self.store.ack_path)).get(bridge_id)
+
+    def _outbox_records_by_id(self) -> dict[str, dict[str, Any]]:
+        return {
+            str(record.get("bridge_id", "")): record
+            for record in self.store._read_all(self.store.outbox_path)
+            if isinstance(record, dict) and str(record.get("bridge_id", ""))
+        }
+
+    def _sync_fingerprint(self, bridge_id: str, ack: dict[str, Any]) -> str:
+        return bridge_sync_fingerprint(ack, self._outbox_records_by_id().get(str(bridge_id or "")))
 
     def _synced_marker_path(self) -> Path:
         return self.data_dir / "send_bridge" / "synced_acks.json"
@@ -601,27 +761,47 @@ class BridgeWorker:
     def _accepted_reverify_marker_path(self) -> Path:
         return self.data_dir / "send_bridge" / "accepted_reverify.json"
 
-    def _load_synced(self) -> set[str]:
+    def _load_synced(self) -> dict[str, str]:
         path = self._synced_marker_path()
         if not path.exists():
-            return set()
+            return {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return set()
-        ids = payload.get("synced") if isinstance(payload, dict) else None
-        return {str(item) for item in ids} if isinstance(ids, list) else set()
+        except OSError:
+            return {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            self._quarantine_corrupt_marker(path, exc)
+            return {}
+        values = payload.get("synced") if isinstance(payload, dict) else None
+        version = payload.get("version") if isinstance(payload, dict) else None
+        # Versions 1 and 2 did not bind proof to the current projection
+        # contract. They cannot prove that newly-published queue/ledger/task
+        # projections were updated, so conservatively re-sync into v3.
+        if version != 3 or not isinstance(values, dict):
+            return {}
+        return {
+            str(bridge_id): str(fingerprint)
+            for bridge_id, fingerprint in values.items()
+            if str(bridge_id) and str(fingerprint)
+        }
 
-    def _mark_synced(self, bridge_id: str) -> None:
-        synced = self._load_synced()
-        if bridge_id in synced:
+    def _mark_synced(self, bridge_id: str, ack_fingerprint: str) -> None:
+        bridge_id = str(bridge_id or "")
+        ack_fingerprint = str(ack_fingerprint or "")
+        if not bridge_id or not ack_fingerprint:
             return
-        synced.add(bridge_id)
+        synced = self._load_synced()
+        if synced.get(bridge_id) == ack_fingerprint:
+            return
+        synced[bridge_id] = ack_fingerprint
         path = self._synced_marker_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
-            tmp.write_text(json.dumps({"synced": sorted(synced)}, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(
+                json.dumps({"version": 3, "synced": synced}, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
             tmp.replace(path)
         except OSError as exc:  # pragma: no cover - best effort
             logger.error("bridge synced-marker write failed: %s", exc)
@@ -632,12 +812,25 @@ class BridgeWorker:
             return {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except OSError:
+            return {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            self._quarantine_corrupt_marker(path, exc)
             return {}
         items = payload.get("items") if isinstance(payload, dict) else {}
         if not isinstance(items, dict):
             return {}
         return {str(key): value for key, value in items.items() if isinstance(value, dict)}
+
+    @staticmethod
+    def _quarantine_corrupt_marker(path: Path, error: Exception) -> None:
+        target = path.with_name(f"{path.name}.corrupt.{time.time_ns()}")
+        try:
+            path.replace(target)
+        except OSError as exc:
+            logger.error("bridge marker quarantine failed for %s: %s", path, exc)
+            return
+        logger.error("bridge marker quarantined at %s: %s", target, error)
 
     def _save_accepted_reverify_marker(self, marker: dict[str, dict[str, Any]]) -> None:
         path = self._accepted_reverify_marker_path()
@@ -673,10 +866,10 @@ class BridgeWorker:
             if payload.get("delivery_verified") is True:
                 continue
             item_marker = marker.get(bridge_id, {})
-            attempts = int(item_marker.get("attempts") or 0)
+            attempts = _safe_nonnegative_int(item_marker.get("attempts"))
             if attempts >= _ACCEPTED_REVERIFY_MAX_ATTEMPTS:
                 continue
-            last_checked = float(item_marker.get("last_checked_at") or 0.0)
+            last_checked = _safe_nonnegative_float(item_marker.get("last_checked_at"))
             if now - last_checked < _ACCEPTED_REVERIFY_EVERY_SECONDS:
                 continue
             marker[bridge_id] = {
@@ -686,6 +879,15 @@ class BridgeWorker:
             }
             checked += 1
             changed = True
+            runtime_blocker = _runtime_send_blocker(
+                self.data_dir,
+                str(getattr(self.backend, "name", "")),
+                expected_signature=self.config_signature,
+            )
+            if runtime_blocker:
+                self.stats.last_error = runtime_blocker
+                marker[bridge_id]["last_error"] = runtime_blocker
+                break
             try:
                 outcome = verifier(record, ack)
             except Exception as exc:  # pragma: no cover - backend recheck must not stop worker
@@ -719,13 +921,15 @@ class BridgeWorker:
         avoids redundant work.
         """
         synced = self._load_synced()
+        outbox_by_id = self._outbox_records_by_id()
         terminal = {
             bridge_id: ack_state.ack
             for bridge_id, ack_state in effective_bridge_ack_states(self.store._read_all(self.store.ack_path)).items()
             if ack_state.terminal
         }
         for bridge_id, ack in terminal.items():
-            if bridge_id in synced:
+            fingerprint = bridge_sync_fingerprint(ack, outbox_by_id.get(bridge_id))
+            if synced.get(bridge_id) == fingerprint:
                 continue
             try:
                 sync_result = sync_bridge_ack_to_send_state(
@@ -736,8 +940,8 @@ class BridgeWorker:
                     external_message_id=str(ack.get("external_message_id", "")),
                 )
                 queue_error = str(sync_result.get("queue_error", "")) if isinstance(sync_result, dict) else ""
-                if isinstance(sync_result, dict) and sync_result.get("status") == "ok" and not queue_error:
-                    self._mark_synced(bridge_id)
+                if isinstance(sync_result, dict) and bool(sync_result.get("sync_complete")):
+                    self._mark_synced(bridge_id, fingerprint)
                 elif queue_error:
                     self.stats.last_error = f"reconcile_queue_error:{queue_error}"
             except Exception as exc:  # pragma: no cover - retried next tick
@@ -763,8 +967,8 @@ def run_bridge_worker(
     data_dir = Path(data_dir)
     config = load_config(data_dir)
     backend = build_send_backend(config)
-    worker = BridgeWorker(data_dir, backend)
     config_signature = bridge_worker_config_signature(config)
+    worker = BridgeWorker(data_dir, backend, config_signature=config_signature)
 
     lock_path = bridge_worker_lock_path(data_dir)
     lock: ProcessLock | None = None
@@ -792,7 +996,11 @@ def run_bridge_worker(
     try:
         iterations = 0
         while True:
-            runtime_blocker = _runtime_send_blocker(data_dir, str(getattr(backend, "name", "")))
+            runtime_blocker = _runtime_send_blocker(
+                data_dir,
+                str(getattr(backend, "name", "")),
+                expected_signature=config_signature,
+            )
             if runtime_blocker:
                 worker.stats.last_error = runtime_blocker
                 worker.stats.record("skipped", runtime_blocker)

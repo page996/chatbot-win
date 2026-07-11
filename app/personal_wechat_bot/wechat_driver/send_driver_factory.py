@@ -10,12 +10,6 @@ from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BRIDGE_OUTBOX_SEND_DRIVER,
     BridgeOutboxSendDriver,
 )
-from app.personal_wechat_bot.wechat_driver.send_backends import (
-    wechat_native_http_status,
-    weflow_http_status,
-)
-
-
 SendDriverBuilder = Callable[[BotConfig], SendingDriver]
 
 
@@ -100,7 +94,7 @@ def registered_send_drivers() -> list[dict[str, Any]]:
     ]
 
 
-def probe_send_driver(config: BotConfig) -> dict[str, Any]:
+def probe_send_driver(config: BotConfig, *, active_backend_probe: bool = True) -> dict[str, Any]:
     name = normalize_send_driver_name(config.send_driver)
     driver = build_send_driver(config)
     probe = getattr(driver, "probe", None)
@@ -129,24 +123,18 @@ def probe_send_driver(config: BotConfig) -> dict[str, Any]:
         "driver_present": driver is not None,
         "registered_send_drivers": registered_send_drivers(),
     }
-    if str(payload["send_backend"]).strip().lower() == "weflow_http":
-        payload["weflow_http"] = weflow_http_status(
-            str(payload["weflow_base_url"]),
-            token_env=str(payload["weflow_token_env"]),
-        )
-    if str(payload["send_backend"]).strip().lower() == "wechat_native_http":
-        payload["wechat_native_http"] = wechat_native_http_status(
-            str(payload["wechat_native_base_url"]),
-            text_path=str(payload["wechat_native_send_text_path"]),
-            image_path=str(payload["wechat_native_send_image_path"]),
-            file_path=str(payload["wechat_native_send_file_path"]),
-            status_path=str(payload["wechat_native_status_path"]),
-        )
     if probe is None:
         payload["driver_probe"] = None
         return payload
-    result = probe()
-    payload["driver_probe"] = result.__dict__ if hasattr(result, "__dict__") else result
+    result = probe(active_backend_probe=active_backend_probe)
+    driver_probe = result.__dict__ if hasattr(result, "__dict__") else result
+    payload["driver_probe"] = driver_probe
+    backend = driver_probe.get("backend") if isinstance(driver_probe, dict) else {}
+    if isinstance(backend, dict):
+        if isinstance(backend.get("weflow_http"), dict):
+            payload["weflow_http"] = backend["weflow_http"]
+        if isinstance(backend.get("wechat_native_http"), dict):
+            payload["wechat_native_http"] = backend["wechat_native_http"]
     return payload
 
 

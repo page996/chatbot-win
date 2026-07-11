@@ -5,13 +5,67 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import LedgerContextAssembler
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult, ToolCallResult
+from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path
 
 
 class ConversationLedgerStoreTest(unittest.TestCase):
+    def test_tampered_registry_segment_cannot_escape_ledger_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            conversation_id = "registry-escape"
+            ChannelRegistryStore(data_dir).upsert(
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": "private",
+                    "chat_title": "Unsafe",
+                    "segment": "../../escaped",
+                    "status": "active",
+                }
+            )
+
+            with self.assertRaises(ValueError):
+                ConversationLedgerStore(data_dir).append_message(
+                    _message("unsafe", "must not escape", conversation_id=conversation_id)
+                )
+
+            self.assertFalse((root / "escaped").exists())
+
+    def test_tampered_segment_cache_cannot_escape_ledger_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            store = ConversationLedgerStore(data_dir)
+            store._segment_cache["conv1"] = "../../escaped"
+
+            with self.assertRaises(ValueError):
+                store.append_message(_message("unsafe-cache", "must not escape"))
+
+            self.assertFalse((root / "escaped").exists())
+
+    def test_conversation_lock_lives_outside_deletable_ledger_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = ConversationLedgerStore(data_dir)
+
+            with store._conversation_lock("conv1"):
+                lock_path = scoped_process_lock_path(
+                    data_dir,
+                    "conversation-lifecycle",
+                    "conv1",
+                )
+                self.assertTrue(lock_path.exists())
+                self.assertEqual(lock_path.parent, data_dir / "runtime_locks" / "scoped")
+
+            self.assertFalse(lock_path.exists())
+            self.assertTrue(Path(f"{lock_path}.guard").exists())
+
     def test_append_message_writes_jsonl_and_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
@@ -26,6 +80,20 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(entries[0].links[0]["url"], "https://example.com/a")
             self.assertIn("000001", markdown)
             self.assertIn("hello https://example.com/a", markdown)
+
+    def test_read_with_intact_projections_does_not_take_writer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            store.append_message(_message("m1", "read only"))
+
+            with mock.patch.object(
+                store,
+                "_conversation_lock",
+                side_effect=AssertionError("read-only path must not take writer lock"),
+            ):
+                entries = store.read_entries("conv1")
+
+            self.assertEqual(len(entries), 1)
 
     def test_sqlite_ledger_remains_authoritative_without_readable_projection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

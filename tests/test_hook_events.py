@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.personal_wechat_bot.bootstrap import build_runtime
 from app.personal_wechat_bot.config.loader import accept_contact, create_default_config, load_config
@@ -14,6 +15,7 @@ from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJsonlDriver
+from app.personal_wechat_bot.wechat_driver import hook_events as hook_events_module
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter, hook_event_from_payload
 from app.personal_wechat_bot.wechat_driver.hook_source_bridge import (
     normalize_weflow_message,
@@ -232,6 +234,93 @@ class HookEventsTest(unittest.TestCase):
 
         self.assertEqual(second.appended_count, 1)
         self.assertEqual(json.loads(self.backend_file.read_text(encoding="utf-8").splitlines()[0])["text"], "complete")
+
+    def test_importer_retries_line_after_partial_backend_append_failure(self) -> None:
+        self._append_hook(
+            {
+                "source": "weflow",
+                "messages": [
+                    {"talker": "wxid_page", "sender_name": "PAGE", "msgid": "batch-1", "text": "one"},
+                    {"talker": "wxid_page", "sender_name": "PAGE", "msgid": "batch-2", "text": "two"},
+                ],
+            }
+        )
+        importer = HookEventJsonlImporter(self.hook_file, self.backend_file)
+        append_backend_event = hook_events_module.append_backend_event_record
+        failed_once = False
+
+        def flaky_append(*args, **kwargs):
+            nonlocal failed_once
+            if kwargs.get("text") == "two" and not failed_once:
+                failed_once = True
+                raise OSError("backend bus temporarily unavailable")
+            return append_backend_event(*args, **kwargs)
+
+        with mock.patch.object(hook_events_module, "append_backend_event_record", side_effect=flaky_append):
+            first = importer.import_new()
+        second = importer.import_new()
+        third = importer.import_new()
+        backend = [json.loads(line) for line in self.backend_file.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(first.appended_count, 1)
+        self.assertEqual(first.source_offset, 0)
+        self.assertEqual(first.errors[0]["phase"], "append")
+        self.assertEqual(first.errors[0]["disposition"], "retry")
+        self.assertEqual(first.errors[0]["partial_appended_count"], 1)
+        self.assertEqual(second.appended_count, 1)
+        self.assertEqual(second.source_offset, self.hook_file.stat().st_size)
+        self.assertEqual(third.scanned_count, 0)
+        self.assertEqual([item["text"] for item in backend], ["one", "two"])
+
+    def test_importer_skips_complete_poison_record_and_advances_offset(self) -> None:
+        self._append_hook({"sender_name": "PAGE", "text": "missing conversation"})
+        self._append_hook({"talker": "wxid_page", "sender_name": "PAGE", "msgid": "valid-1", "text": "valid"})
+        importer = HookEventJsonlImporter(self.hook_file, self.backend_file)
+
+        first = importer.import_new()
+        second = importer.import_new()
+
+        self.assertEqual(first.appended_count, 1)
+        self.assertEqual(first.error_count, 1)
+        self.assertEqual(first.errors[0]["phase"], "normalize")
+        self.assertEqual(first.errors[0]["disposition"], "skip_poison")
+        self.assertEqual(first.source_offset, self.hook_file.stat().st_size)
+        self.assertEqual(second.scanned_count, 0)
+
+    def test_importer_restarts_from_zero_after_equal_length_atomic_source_replacement(self) -> None:
+        old_payload = {
+            "talker": "wxid_page",
+            "sender_name": "PAGE",
+            "msgid": "aa",
+            "text": "old",
+        }
+        new_payload = {
+            "talker": "wxid_page",
+            "sender_name": "PAGE",
+            "msgid": "bb",
+            "text": "new",
+        }
+        self.hook_file.parent.mkdir(parents=True, exist_ok=True)
+        self.hook_file.write_text(json.dumps(old_payload) + "\n", encoding="utf-8")
+        importer = HookEventJsonlImporter(self.hook_file, self.backend_file)
+        first = importer.import_new()
+        original_size = self.hook_file.stat().st_size
+
+        replacement = self.hook_file.with_name("hook_events.replacement.jsonl")
+        replacement.write_text(json.dumps(new_payload) + "\n", encoding="utf-8")
+        self.assertEqual(replacement.stat().st_size, original_size)
+        replacement.replace(self.hook_file)
+        second = importer.import_new()
+
+        backend = [json.loads(line) for line in self.backend_file.read_text(encoding="utf-8").splitlines()]
+        state = json.loads(importer.state_path.read_text(encoding="utf-8"))
+        checkpoint = state[hook_events_module._source_checkpoint_state_key(self.hook_file)]
+        self.assertEqual(first.appended_count, 1)
+        self.assertEqual(second.scanned_count, 1)
+        self.assertEqual(second.appended_count, 1)
+        self.assertEqual([item["text"] for item in backend], ["old", "new"])
+        self.assertEqual(checkpoint["offset"], self.hook_file.stat().st_size)
+        self.assertEqual(len(checkpoint["consumed_fingerprint"]), 64)
 
     def test_importer_expands_batched_hook_payloads(self) -> None:
         self._append_hook(

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import time
+from ipaddress import ip_address
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from app.personal_wechat_bot.control.sidebar_api import (
     ack_sidebar_bridge_item,
@@ -57,6 +59,16 @@ from app.personal_wechat_bot.control.sidebar_api import (
 
 
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "ui" / "sidebar"
+_MAX_POST_BODY_BYTES = 1024 * 1024
+_POST_BODY_READ_TIMEOUT_SECONDS = 5.0
+_POST_BODY_READ_CHUNK_BYTES = 64 * 1024
+
+
+class _SidebarRequestError(ValueError):
+    def __init__(self, status: int, error: str):
+        super().__init__(error)
+        self.status = int(status)
+        self.error = str(error)
 
 
 def run_sidebar_server(data_dir: str | Path = "data", host: str = "127.0.0.1", port: int = 8765) -> None:
@@ -69,19 +81,16 @@ def run_sidebar_server(data_dir: str | Path = "data", host: str = "127.0.0.1", p
 def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
     class SidebarHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            host_error = self._host_check()
+            if host_error:
+                self._json({"status": "error", "error": host_error}, status=403)
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/api/state":
                 self._json(build_sidebar_state(data_dir))
                 return
-            if parsed.path == "/api/driver-probe":
-                query = parse_qs(parsed.query)
-                from app.personal_wechat_bot.control.send_commands import probe_send_controls
-
-                driver = query.get("driver", [None])[0]
-                self._json(probe_send_controls(data_dir, driver=driver))
-                return
-            if parsed.path == "/api/wechat-probe":
-                self._json(build_sidebar_wechat_probe(data_dir))
+            if parsed.path in {"/api/driver-probe", "/api/wechat-probe"}:
+                self._json({"status": "error", "error": "method_not_allowed"}, status=405)
                 return
             if parsed.path == "/api/bridge":
                 self._json(build_sidebar_bridge_state(data_dir))
@@ -124,6 +133,15 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 payload = self._read_json()
+                if parsed.path == "/api/driver-probe":
+                    from app.personal_wechat_bot.control.send_commands import probe_send_controls
+
+                    driver = str(payload.get("driver") or "").strip() or None
+                    self._json(probe_send_controls(data_dir, driver=driver))
+                    return
+                if parsed.path == "/api/wechat-probe":
+                    self._json(build_sidebar_wechat_probe(data_dir))
+                    return
                 if parsed.path == "/api/controls":
                     self._json(update_sidebar_controls(data_dir, payload))
                     return
@@ -242,6 +260,8 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     self._json(sidebar_queue_action(data_dir, action, unquote(queue_id), payload))
                     return
                 self._json({"status": "error", "error": "not_found"}, status=404)
+            except _SidebarRequestError as exc:
+                self._json({"status": "error", "error": exc.error}, status=exc.status)
             except Exception as exc:
                 self._json({"status": "error", "error": f"{type(exc).__name__}: {exc}"}, status=400)
 
@@ -265,7 +285,10 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             content_type = str(self.headers.get("content-type", "")).split(";")[0].strip().lower()
             if content_type != "application/json":
                 return "unsupported_content_type"
-            host = str(self.headers.get("host", "")).strip().lower()
+            host_error = self._host_check()
+            if host_error:
+                return host_error
+            request_host, request_port = self._request_authority()
             origin = str(self.headers.get("origin", "")).strip()
             referer = str(self.headers.get("referer", "")).strip()
             source = origin or referer
@@ -275,24 +298,84 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                 # content-type gate above already blocks the cross-site case.
                 return ""
             try:
-                source_host = urlparse(source).netloc.strip().lower()
+                parsed_source = urlparse(source)
+                source_host = _normalize_hostname(parsed_source.hostname or "")
+                source_port = parsed_source.port or (443 if parsed_source.scheme.lower() == "https" else 80)
             except ValueError:
                 return "invalid_origin"
-            if not source_host:
+            if parsed_source.scheme.lower() not in {"http", "https"} or not source_host:
                 return "invalid_origin"
-            # Compare host:port. If our Host header lacks a port (proxied), fall
-            # back to comparing hostname only.
-            if source_host == host:
-                return ""
-            if host and ":" not in host and source_host.split(":")[0] == host:
+            if source_host == request_host and source_port == request_port:
                 return ""
             return "cross_origin_forbidden"
 
+        def _host_check(self) -> str:
+            try:
+                request_host, request_port = self._request_authority()
+            except ValueError:
+                return "invalid_host"
+            expected_port = int(self.server.server_address[1])
+            if request_port != expected_port:
+                return "untrusted_host"
+            if _is_loopback_hostname(request_host):
+                return ""
+            allowed_hosts = {
+                _normalize_hostname(str(self.server.server_address[0] or "")),
+            }
+            try:
+                allowed_hosts.add(_normalize_hostname(str(self.connection.getsockname()[0] or "")))
+            except OSError:
+                pass
+            return "" if request_host in allowed_hosts else "untrusted_host"
+
+        def _request_authority(self) -> tuple[str, int]:
+            raw_host = str(self.headers.get("host", "")).strip()
+            if not raw_host:
+                raise ValueError("missing host")
+            parsed = urlparse(f"//{raw_host}")
+            hostname = _normalize_hostname(parsed.hostname or "")
+            if not hostname or parsed.username or parsed.password:
+                raise ValueError("invalid host")
+            port = parsed.port or 80
+            return hostname, int(port)
+
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("content-length", "0"))
+            raw_length = str(self.headers.get("content-length", "0") or "0").strip()
+            try:
+                length = int(raw_length)
+            except ValueError as exc:
+                raise _SidebarRequestError(400, "invalid_content_length") from exc
+            if length < 0:
+                raise _SidebarRequestError(400, "invalid_content_length")
             if length <= 0:
                 return {}
-            raw = self.rfile.read(length).decode("utf-8")
+            if length > _MAX_POST_BODY_BYTES:
+                raise _SidebarRequestError(413, "request_body_too_large")
+
+            deadline = time.monotonic() + _POST_BODY_READ_TIMEOUT_SECONDS
+            remaining = length
+            chunks: list[bytes] = []
+            connection = self.connection
+            previous_timeout = connection.gettimeout()
+            try:
+                while remaining:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0:
+                        raise _SidebarRequestError(408, "request_body_read_timeout")
+                    connection.settimeout(timeout)
+                    read = getattr(self.rfile, "read1", self.rfile.read)
+                    try:
+                        chunk = read(min(remaining, _POST_BODY_READ_CHUNK_BYTES))
+                    except TimeoutError as exc:
+                        raise _SidebarRequestError(408, "request_body_read_timeout") from exc
+                    if not chunk:
+                        raise _SidebarRequestError(400, "incomplete_request_body")
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+            finally:
+                connection.settimeout(previous_timeout)
+
+            raw = b"".join(chunks).decode("utf-8")
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("request body must be a JSON object")
@@ -300,12 +383,26 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
 
         def _json(self, payload: dict[str, Any], status: int = 200) -> None:
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-            self.send_response(status)
-            self.send_header("content-type", "application/json; charset=utf-8")
-            self.send_header("cache-control", "no-store")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_response_bytes(
+                body,
+                status=status,
+                content_type="application/json; charset=utf-8",
+            )
+
+        def _send_response_bytes(self, body: bytes, *, status: int, content_type: str) -> None:
+            try:
+                self.send_response(status)
+                self.send_header("content-type", content_type)
+                self.send_header("cache-control", "no-store")
+                self.send_header("content-security-policy", "frame-ancestors 'none'")
+                self.send_header("x-frame-options", "DENY")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (ConnectionError, TimeoutError):
+                # Browsers can cancel a stale poll while headers or the body
+                # are being flushed. The request is already abandoned.
+                return
 
         def _static(self, raw_path: str) -> None:
             relative = "index.html" if raw_path in {"", "/"} else raw_path.lstrip("/")
@@ -318,11 +415,26 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                 return
             body = path.read_bytes()
             content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-            self.send_response(200)
-            self.send_header("content-type", content_type)
-            self.send_header("cache-control", "no-store")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_response_bytes(body, status=200, content_type=content_type)
 
     return SidebarHandler
+
+
+def _normalize_hostname(value: str) -> str:
+    host = str(value or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    try:
+        return ip_address(host).compressed.lower()
+    except ValueError:
+        return host
+
+
+def _is_loopback_hostname(value: str) -> bool:
+    host = _normalize_hostname(value)
+    if host == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False

@@ -14,11 +14,20 @@ from app.personal_wechat_bot.conversation.channel_admission import (
 )
 from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.ledger_database import ConversationLedgerDatabase
-from app.personal_wechat_bot.conversation.segment import conversation_segment, resolve_segment
+from app.personal_wechat_bot.conversation.segment import (
+    conversation_projection_dir,
+    conversation_segment,
+    resolve_segment,
+    validate_conversation_segment,
+)
 from app.personal_wechat_bot.conversation.session_database import ConversationSessionDatabase
 from app.personal_wechat_bot.domain.models import NormalizedMessage, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
-from app.personal_wechat_bot.runtime.process_lock import blocking_process_lock
+from app.personal_wechat_bot.runtime.process_lock import (
+    blocking_process_lock,
+    scoped_process_lock_path,
+    short_process_lock,
+)
 
 
 CHANNEL_POLICY = "verified_or_identified_wechat_channels"
@@ -88,7 +97,7 @@ class ConversationChannelStore:
             if not segment:
                 segment = conversation_segment(message.conversation_id, message.chat_title)
             self._segment_cache[message.conversation_id] = segment
-            path = self.root / segment / "channel.json"
+            path = conversation_projection_dir(self.root, segment) / "channel.json"
             now = utc_now_iso()
             key_slots = _key_slots_for(message.conversation_type)
             api_key_refs = _merge_key_refs(
@@ -125,7 +134,7 @@ class ConversationChannelStore:
                 is_friend = False
             elif private_contact_is_explicit_friend(message.metadata):
                 is_friend = True
-            channel_dir = self.root / segment
+            channel_dir = conversation_projection_dir(self.root, segment)
             backend_dir = channel_dir / "backend"
             backend_dir.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -138,8 +147,8 @@ class ConversationChannelStore:
                 "api_key_refs": api_key_refs,
                 "session_scope": "per_conversation_current_session",
                 "backend_dir": str(backend_dir),
-                "context_dir": str(self.context_root / segment),
-                "file_workspace_dir": str(self.file_workspace_root / segment),
+                "context_dir": str(conversation_projection_dir(self.context_root, segment)),
+                "file_workspace_dir": str(conversation_projection_dir(self.file_workspace_root, segment)),
                 "sender_names": sender_names,
                 "sender_wechat_ids": sender_wechat_ids,
                 "conversation_key": conversation_key,
@@ -159,10 +168,12 @@ class ConversationChannelStore:
     def get_channel(self, conversation_id: str) -> ConversationChannel | None:
         payload = self.registry.get(conversation_id) or {}
         if payload:
+            payload = self._restore_readable_projection(payload) or {}
+            if not payload:
+                return None
             segment = _payload_segment(payload, "")
             if segment:
                 self._segment_cache[conversation_id] = segment
-            self._restore_readable_projection(payload)
             return _channel_from_payload(payload)
         return None
 
@@ -179,7 +190,7 @@ class ConversationChannelStore:
                 return None
             segment = _payload_segment(payload, resolve_segment(self.data_dir, conversation_id))
             self._segment_cache[conversation_id] = segment
-            path = self.root / segment / "channel.json"
+            path = conversation_projection_dir(self.root, segment) / "channel.json"
             refs = [str(item) for item in payload.get("api_key_refs", []) if item]
             available_refs = [ref for ref in refs if self.key_pool.key_for_ref(ref)]
             if not available_refs:
@@ -195,47 +206,62 @@ class ConversationChannelStore:
 
     def list_channels(self) -> list[ConversationChannel]:
         payloads = self.registry.list_channels()
+        restored: list[dict[str, Any]] = []
         for payload in payloads:
-            self._restore_readable_projection(payload)
-        return [_channel_from_payload(payload) for payload in payloads]
+            current = self._restore_readable_projection(payload)
+            if current:
+                restored.append(current)
+        return [_channel_from_payload(payload) for payload in restored]
 
     def delete_channel(self, conversation_id: str) -> bool:
         return self.delete_channel_with_cleanup(conversation_id)["deleted"]
 
     def delete_channel_with_cleanup(self, conversation_id: str) -> dict[str, Any]:
-        with self._lock, self._store_lock():
-            payload = self.registry.get(conversation_id) or {}
-            if not payload:
+        lifecycle_path = scoped_process_lock_path(
+            self.data_dir,
+            "conversation-lifecycle",
+            conversation_id,
+        )
+        with short_process_lock(
+            lifecycle_path,
+            timeout_seconds=30.0,
+            stale_after_seconds=60.0,
+            timeout_label="conversation lifecycle lock",
+        ):
+            with self._lock, self._store_lock():
+                payload = self.registry.get(conversation_id) or {}
+                if not payload:
+                    return {
+                        "deleted": False,
+                        "cleanup_policy": "missing",
+                        "removed": [],
+                        "retained": [],
+                    }
+                segment = _payload_segment(payload, resolve_segment(self.data_dir, conversation_id))
+                path = conversation_projection_dir(self.root, segment) / "channel.json"
+                cleanup_policy = _cleanup_policy_for(payload)
+                removed: list[str] = []
+                retained: list[str] = []
+                if cleanup_policy == "non_wechat_purge":
+                    with self._file_workspace_root_lock(), self._file_workspace_conversation_lock(segment):
+                        for target in self._associated_paths(conversation_id, segment):
+                            if _remove_path(target):
+                                removed.append(str(target))
+                        ConversationLedgerDatabase(self.data_dir).delete_conversation(conversation_id)
+                        ConversationSessionDatabase(self.data_dir).delete_conversation(conversation_id)
+                else:
+                    retained.extend(str(target) for target in self._associated_paths(conversation_id, segment))
+                channel_dir = path.parent
+                if _remove_path(channel_dir):
+                    removed.append(str(channel_dir))
+                self._remove_from_index(conversation_id)
+                self.registry.delete(conversation_id)
                 return {
-                    "deleted": False,
-                    "cleanup_policy": "missing",
-                    "removed": [],
-                    "retained": [],
+                    "deleted": True,
+                    "cleanup_policy": cleanup_policy,
+                    "removed": removed,
+                    "retained": retained,
                 }
-            segment = _payload_segment(payload, resolve_segment(self.data_dir, conversation_id))
-            path = self.root / segment / "channel.json"
-            cleanup_policy = _cleanup_policy_for(payload)
-            removed: list[str] = []
-            retained: list[str] = []
-            if cleanup_policy == "non_wechat_purge":
-                for target in self._associated_paths(conversation_id, segment):
-                    if _remove_path(target):
-                        removed.append(str(target))
-                ConversationLedgerDatabase(self.data_dir).delete_conversation(conversation_id)
-                ConversationSessionDatabase(self.data_dir).delete_conversation(conversation_id)
-            else:
-                retained.extend(str(target) for target in self._associated_paths(conversation_id, segment))
-            channel_dir = path.parent
-            if _remove_path(channel_dir):
-                removed.append(str(channel_dir))
-            self._remove_from_index(conversation_id)
-            self.registry.delete(conversation_id)
-            return {
-                "deleted": True,
-                "cleanup_policy": cleanup_policy,
-                "removed": removed,
-                "retained": retained,
-            }
 
     def _assign_key_refs(self, conversation_id: str, slots: int) -> list[str]:
         refs = self.key_pool.refs()
@@ -249,11 +275,12 @@ class ConversationChannelStore:
 
     def _associated_paths(self, conversation_id: str, segment: str = "") -> list[Path]:
         segment = segment or self._segment_cache.get(conversation_id) or resolve_segment(self.data_dir, conversation_id)
-        return [
-            self.context_root / segment,
-            self.file_workspace_root / segment,
-            self.data_dir / "conversation_sessions" / segment,
+        roots = [
+            self.context_root,
+            self.file_workspace_root,
+            self.data_dir / "conversation_sessions",
         ]
+        return [conversation_projection_dir(root, segment) for root in roots]
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         if not path.exists():
@@ -270,40 +297,75 @@ class ConversationChannelStore:
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
 
-    def _restore_readable_projection(self, payload: dict[str, Any]) -> None:
+    def _restore_readable_projection(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         conversation_id = str(payload.get("conversation_id") or "").strip()
         if not conversation_id:
-            return
-        segment = _payload_segment(
-            payload,
-            resolve_segment(self.data_dir, conversation_id, str(payload.get("chat_title") or "")),
-        )
-        channel_path = self.root / segment / "channel.json"
-        index_path = self.root / "index.json"
-        index = self._read_json(index_path)
-        indexed = any(
-            isinstance(item, dict) and str(item.get("conversation_id") or "") == conversation_id
-            for item in (index.get("channels", []) if isinstance(index.get("channels"), list) else [])
-        )
-        if channel_path.exists() and indexed:
-            return
+            return None
         with self._lock, self._store_lock():
+            # The caller's payload may predate a concurrent delete. Re-read the
+            # SQLite authority after taking the same lock as deletion so a stale
+            # reader cannot recreate a removed channel projection.
+            current = self.registry.get(conversation_id) or {}
+            if not current:
+                return None
+            segment = _payload_segment(
+                current,
+                resolve_segment(
+                    self.data_dir,
+                    conversation_id,
+                    str(current.get("chat_title") or ""),
+                ),
+            )
+            channel_path = conversation_projection_dir(self.root, segment) / "channel.json"
+            index_path = self.root / "index.json"
             if not channel_path.exists():
-                self._write_json(channel_path, payload)
+                self._write_json(channel_path, current)
             index = self._read_json(index_path)
             indexed = any(
                 isinstance(item, dict) and str(item.get("conversation_id") or "") == conversation_id
                 for item in (index.get("channels", []) if isinstance(index.get("channels"), list) else [])
             )
             if not indexed:
-                self._update_index(payload)
+                self._update_index(current)
+            return current
 
     def _store_lock(self):
         return blocking_process_lock(
-            self.root / ".channel_store.lock",
+            scoped_process_lock_path(
+                self.data_dir,
+                "conversation-channel-store",
+                "global",
+            ),
             label="conversation_channel_store",
             stale_after_seconds=30.0,
             wait_timeout_seconds=30.0,
+        )
+
+    def _file_workspace_root_lock(self):
+        workspace_root = self.file_workspace_root.resolve()
+        return short_process_lock(
+            scoped_process_lock_path(
+                workspace_root.parent,
+                "file-workspace-root",
+                str(workspace_root),
+            ),
+            timeout_seconds=120.0,
+            stale_after_seconds=120.0,
+            timeout_label="file workspace root lifecycle lock",
+        )
+
+    def _file_workspace_conversation_lock(self, segment: str):
+        workspace_root = self.file_workspace_root.resolve()
+        conversation_dir = conversation_projection_dir(workspace_root, segment)
+        return short_process_lock(
+            scoped_process_lock_path(
+                workspace_root.parent,
+                "file-workspace-conversation",
+                str(conversation_dir),
+            ),
+            timeout_seconds=120.0,
+            stale_after_seconds=120.0,
+            timeout_label="file workspace conversation lifecycle lock",
         )
 
     def _update_index(self, payload: dict[str, Any]) -> None:
@@ -405,7 +467,12 @@ def _conversation_key_from_message(message: NormalizedMessage) -> str:
 
 def _payload_segment(payload: dict[str, Any], fallback: str = "") -> str:
     segment = str(payload.get("segment", "") or "").strip() if payload else ""
-    return segment or str(fallback or "").strip()
+    if segment:
+        return validate_conversation_segment(segment, label="channel storage segment")
+    fallback_segment = str(fallback or "").strip()
+    if fallback_segment:
+        return validate_conversation_segment(fallback_segment, label="channel fallback segment")
+    return ""
 
 
 def _merge_key_refs(existing: list[str], assigned: list[str], slots: int) -> list[str]:

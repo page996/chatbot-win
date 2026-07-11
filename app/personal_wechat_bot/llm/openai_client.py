@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from typing import Iterator
+from urllib.parse import urljoin, urlparse
 
 from app.personal_wechat_bot.config.schema import ProviderConfig
 from app.personal_wechat_bot.conversation.channel_store import ConversationChannelStore
@@ -16,6 +17,7 @@ from app.personal_wechat_bot.domain.models import NormalizedMessage, SpeakDecisi
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
 from app.personal_wechat_bot.runtime.resource_gate import acquire_llm
 from app.personal_wechat_bot.runtime.resource_scheduler import ResourceScheduler
+from app.personal_wechat_bot.tools.web.http_safety import read_response_with_deadline
 
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36"
@@ -28,6 +30,106 @@ _KEY_FAILOVER_STATUSES = {401, 403, 429}
 # retried (a 429 is often transient; a 401 usually is not, but a bounded
 # cooldown lets a rotated/re-enabled key recover without a restart).
 _BAD_KEY_COOLDOWN_SECONDS = 300.0
+_DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
+_MAX_OPENAI_RESPONSE_BYTES = 16 * 1024 * 1024
+_OPENAI_OPEN_SLOTS = threading.BoundedSemaphore(8)
+
+
+class UnsafeRelayRedirectError(RuntimeError):
+    """Raised before a relay redirect can carry credentials to a new authority."""
+
+
+class _RelayRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target_url = urljoin(req.full_url, str(newurl or ""))
+        source = urlparse(req.full_url)
+        target = urlparse(target_url)
+        has_authorization = bool(req.get_header("Authorization"))
+        blocked_reason = ""
+        if source.scheme == "https" and target.scheme != "https":
+            blocked_reason = "https_downgrade"
+        elif has_authorization and _url_authority(source) != _url_authority(target):
+            blocked_reason = "cross_authority"
+        if blocked_reason:
+            if fp is not None:
+                fp.close()
+            raise UnsafeRelayRedirectError(f"unsafe relay redirect blocked:{blocked_reason}")
+        return super().redirect_request(req, fp, code, msg, headers, target_url)
+
+
+def _url_authority(parsed) -> tuple[str, int]:
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "", 0
+    host = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    return host, port
+
+
+def _open_relay_request(request: urllib.request.Request, timeout=None):
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _RelayRedirectHandler(),
+    )
+    timeout_seconds = max(0.2, float(timeout or _DEFAULT_OPENAI_TIMEOUT_SECONDS))
+    deadline = time.monotonic() + timeout_seconds
+    if not _OPENAI_OPEN_SLOTS.acquire(timeout=timeout_seconds):
+        raise TimeoutError("openai_request_deadline_exceeded")
+
+    completed = threading.Event()
+    cancelled = threading.Event()
+    outcome_guard = threading.Lock()
+    outcome: dict[str, object] = {}
+
+    def open_request() -> None:
+        try:
+            response = opener.open(request, timeout=timeout_seconds)
+            with outcome_guard:
+                if cancelled.is_set():
+                    response.close()
+                else:
+                    outcome["response"] = response
+        except BaseException as exc:
+            with outcome_guard:
+                if not cancelled.is_set():
+                    outcome["error"] = exc
+        finally:
+            _OPENAI_OPEN_SLOTS.release()
+            completed.set()
+
+    worker = threading.Thread(target=open_request, name="openai-http-open", daemon=True)
+    try:
+        worker.start()
+    except Exception:
+        _OPENAI_OPEN_SLOTS.release()
+        raise
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not completed.wait(remaining):
+        cancelled.set()
+        with outcome_guard:
+            response = outcome.pop("response", None)
+            if response is not None:
+                response.close()  # type: ignore[attr-defined]
+        raise TimeoutError("openai_request_deadline_exceeded")
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    response = outcome.get("response")
+    if response is None:
+        raise RuntimeError("openai_request_missing_response")
+    return response
+
+
+def _relay_request_open(request: urllib.request.Request, *, timeout_seconds: float):
+    return _open_relay_request(request, timeout=timeout_seconds)
+
+
+def _provider_timeout_seconds(config: ProviderConfig) -> float:
+    try:
+        value = float(config.max_wait_seconds or _DEFAULT_OPENAI_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        value = _DEFAULT_OPENAI_TIMEOUT_SECONDS
+    return max(0.2, value)
 
 
 def normalize_openai_base_url(base_url: str, provider: str = "relay") -> str:
@@ -48,8 +150,6 @@ def validate_endpoint_url(url: str) -> str:
     path and the live chat send path so the API key is never egressed to a
     non-http(s) scheme (file://, ftp://, ...) or a schemeless/hostless string.
     """
-    from urllib.parse import urlparse
-
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -58,6 +158,8 @@ def validate_endpoint_url(url: str) -> str:
         return f"unsupported_url_scheme:{parsed.scheme or 'none'}"
     if not parsed.hostname:
         return "missing_url_host"
+    if parsed.username is not None or parsed.password is not None:
+        return "url_credentials_not_allowed"
     return ""
 
 
@@ -218,14 +320,24 @@ class RelayOpenAIClient:
             try:
                 with self._llm_slot(workload, conversation_id):
                     with self._key_slot(ref, provider_config.max_concurrency):
-                        with urllib.request.urlopen(req, timeout=provider_config.max_wait_seconds) as resp:
-                            return json.loads(resp.read().decode("utf-8"))
+                        timeout_seconds = _provider_timeout_seconds(provider_config)
+                        deadline = time.monotonic() + timeout_seconds
+                        with _relay_request_open(req, timeout_seconds=timeout_seconds) as resp:
+                            raw = read_response_with_deadline(
+                                resp,
+                                max_bytes=_MAX_OPENAI_RESPONSE_BYTES,
+                                deadline=deadline,
+                            )
+                            return json.loads(raw.decode("utf-8"))
             except urllib.error.HTTPError as exc:
-                if exc.code in _KEY_FAILOVER_STATUSES:
-                    self._retire_key(ref)
-                    last_auth_error = RuntimeError(f"key {ref} rejected: HTTP {exc.code}")
-                    continue
-                raise
+                try:
+                    if exc.code in _KEY_FAILOVER_STATUSES:
+                        self._retire_key(ref)
+                        last_auth_error = RuntimeError(f"key {ref} rejected: HTTP {exc.code}")
+                        continue
+                    raise
+                finally:
+                    exc.close()
         raise RuntimeError(
             f"all candidate API keys exhausted (last auth error: {last_auth_error})"
         )

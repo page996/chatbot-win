@@ -7,6 +7,10 @@ from typing import Any
 
 from app.personal_wechat_bot.bootstrap import BotRuntime
 from app.personal_wechat_bot.domain.models import NormalizedMessage, RawWeChatMessage, ReplyCandidate, SpeakDecision
+from app.personal_wechat_bot.reply_gate.send_executor import (
+    send_result_bridge_ids,
+    send_result_non_bridge_part_statuses,
+)
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.tools.permissions import resolve_allowed_roots
 from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
@@ -170,14 +174,41 @@ class MessageProcessor:
             item["memory_after_reply"] = memory
         self.runtime.event_logger.log("reply.candidate", reply, message_id=message.message_id)
         send = self.runtime.reply_gate.handle(reply)
-        self.runtime.ledger_store.update_reply_send_result(message.conversation_id, reply_entry.entry_id, send)
+        ledger_updated = self.runtime.ledger_store.update_reply_send_result(
+            message.conversation_id,
+            reply_entry.entry_id,
+            send,
+        )
         self.runtime.event_logger.log("send.result", send, message_id=message.message_id)
         self._transition_task(
             reply_task_id,
             "complete",
             {"progress": 100, "phase": "回复候选已入账", "detail": reply.summary or reply.text[:200], "actual_cost": 1},
         )
-        self._record_send_task(reply, session_id, send)
+        task_projection_error = self._record_send_task(reply, session_id, send)
+        projection_error = ""
+        if not ledger_updated:
+            projection_error = "ledger_projection_not_updated"
+        elif task_projection_error:
+            projection_error = task_projection_error
+        if projection_error:
+            self.runtime.reply_gate.fail_staged(
+                send,
+                reason=f"staged_projection_failed:{projection_error}",
+                expected_projections=["ledger", "task"],
+            )
+        else:
+            try:
+                self.runtime.reply_gate.activate_staged(
+                    send,
+                    expected_projections=["ledger", "task"],
+                )
+            except Exception as exc:
+                self.runtime.reply_gate.fail_staged(
+                    send,
+                    reason=f"staged_activation_failed:{type(exc).__name__}:{exc}",
+                    expected_projections=["ledger", "task"],
+                )
         item["reply"] = asdict(reply)
         item["send"] = asdict(send)
         self._mark_message_done(message, original_message_id)
@@ -260,11 +291,14 @@ class MessageProcessor:
             return task_id
         return task_id
 
-    def _record_send_task(self, reply: ReplyCandidate, session_id: str, send: Any) -> None:
+    def _record_send_task(self, reply: ReplyCandidate, session_id: str, send: Any) -> str:
         task_id = _task_id("send", reply.message_id)
         status = str(getattr(send, "status", "") or "")
         reason = str(getattr(send, "reason", "") or "")
-        bridge_id = _bridge_id_from_reason(reason)
+        bridge_ids = send_result_bridge_ids(send)
+        bridge_id = bridge_ids[0] if bridge_ids else _bridge_id_from_reason(reason)
+        if bridge_id and bridge_id not in bridge_ids:
+            bridge_ids.append(bridge_id)
         try:
             store = TaskStatusStore(self.runtime.config.data_dir)
             store.create(
@@ -284,8 +318,10 @@ class MessageProcessor:
                     "metadata": {
                         "message_id": reply.message_id,
                         "bridge_id": bridge_id,
+                        "bridge_ids": bridge_ids,
                         "send_status": status,
                         "send_reason": reason,
+                        "non_bridge_part_statuses": send_result_non_bridge_part_statuses(send),
                     },
                 }
             )
@@ -301,8 +337,9 @@ class MessageProcessor:
                 store.transition(task_id, "complete", {"progress": 100, "phase": "发送链路已完成", "detail": reason})
             else:
                 store.transition(task_id, "fail", {"progress": 100, "phase": "发送失败", "detail": reason, "last_error": reason})
-        except Exception:
-            return
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+        return ""
 
     def _transition_task(self, task_id: str, action: str, patch: dict[str, Any]) -> None:
         if not task_id:
