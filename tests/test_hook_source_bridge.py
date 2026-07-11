@@ -515,6 +515,75 @@ class HookSourceBridgeTest(unittest.TestCase):
         self.assertEqual([(row["event_type"], row["raw_id"]) for row in rows], [("message", raw_id)])
         self.assertEqual(state["sessions"]["wxid_a"]["recent_raw_ids"], {raw_id: now})
 
+    def test_history_reset_epoch_keeps_old_pull_context_only_and_allows_new_messages(self) -> None:
+        reset_epoch = int(time.time()) - 1000
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "history_reset_id": "reset-test",
+                    "history_reset_epoch": reset_epoch,
+                    "sessions": {},
+                    "seen_raw_ids": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        bridge = WeFlowHttpBridge(
+            hook_event_file=self.hook_file,
+            state_path=self.state_file,
+            timeout_seconds=2,
+        )
+        bridge.list_sessions = lambda limit=100: [
+            {
+                "username": "wxid_a",
+                "displayName": "A",
+                "type": "private",
+                "isFriend": True,
+                "lastMessageTime": reset_epoch + 100,
+            }
+        ]
+        pull_starts: list[int] = []
+
+        def raw_message_pages(_talker, **kwargs):
+            pull_starts.append(int(kwargs["start"]))
+            return [
+                {
+                    "messages": [
+                        {
+                            "platformMessageId": "before-reset",
+                            "senderUsername": "wxid_a",
+                            "content": "old message",
+                            "timestamp": reset_epoch - 5,
+                        },
+                        {
+                            "platformMessageId": "after-reset",
+                            "senderUsername": "wxid_a",
+                            "content": "new message",
+                            "timestamp": reset_epoch + 100,
+                        },
+                    ],
+                    "hasMore": False,
+                    "count": 2,
+                }
+            ]
+
+        bridge.raw_message_pages = raw_message_pages
+
+        result = bridge.pull_once(talkers=["wxid_a"], lookback_seconds=300)
+
+        rows = [json.loads(line) for line in self.hook_file.read_text(encoding="utf-8").splitlines()]
+        by_text = {row["text"]: row for row in rows}
+        self.assertEqual(result.appended_count, 2)
+        self.assertEqual(pull_starts, [reset_epoch - 2])
+        self.assertTrue(by_text["old message"]["context_only"])
+        self.assertEqual(by_text["old message"]["capture_phase"], "history_backfill")
+        self.assertFalse(by_text["new message"]["context_only"])
+        self.assertEqual(by_text["new message"]["capture_phase"], "incremental")
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(state["history_reset_id"], "reset-test")
+        self.assertEqual(state["history_reset_epoch"], reset_epoch)
+
     def test_weflow_state_lock_retries_transient_windows_permission_error(self) -> None:
         lock_path = self.root / "weflow_state.json.lock"
         real_open = os.open

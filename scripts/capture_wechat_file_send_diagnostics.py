@@ -22,6 +22,12 @@ from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.personal_wechat_bot.runtime.history_fence import history_writer_lease_if_owned
+
+
 DEFAULT_BASE_URL = "http://127.0.0.1:30001"
 WXID_RE = re.compile(r"^(?:wxid_[0-9a-z_]+|gh_[0-9a-z_]+|filehelper)$", re.IGNORECASE)
 ROOMID_RE = re.compile(r"^\d+@chatroom$", re.IGNORECASE)
@@ -659,19 +665,20 @@ def read_events_with_fallback(base_url: str) -> dict:
     return payload
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Capture WeChat native file-send diagnostics")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--data-dir", default=str(ROOT / "data"))
-    parser.add_argument("--out", default="")
-    parser.add_argument("--input", default="", help="analyze an existing diagnostic .json/.jsonl instead of querying WeChat")
-    parser.add_argument("--clear", action="store_true", help="clear old in-memory diagnostic events first")
-    parser.add_argument("--enable", action="store_true", help="enable native diagnostic hooks first")
-    parser.add_argument("--wait", type=float, default=0.0, help="seconds to wait for events")
-    parser.add_argument("--min-events", type=int, default=6, help="minimum events to wait for")
-    args = parser.parse_args()
+def diagnostic_output_anchor(
+    *,
+    data_dir: Path,
+    out_value: str,
+    input_path: Path | None,
+) -> Path:
+    if out_value:
+        return Path(out_value).parent
+    if input_path is not None:
+        return input_path.parent
+    return data_dir
 
-    input_path = Path(args.input) if args.input else None
+
+def capture_and_write(args: argparse.Namespace, input_path: Path | None) -> int:
     if input_path:
         payload = load_input_payload(input_path)
     else:
@@ -713,6 +720,31 @@ def main() -> int:
         print("warning: no enough events captured; send one ordinary file manually while diagnostics are enabled", file=sys.stderr)
         return 1
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Capture WeChat native file-send diagnostics")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--data-dir", default=str(ROOT / "data"))
+    parser.add_argument("--out", default="")
+    parser.add_argument("--input", default="", help="analyze an existing diagnostic .json/.jsonl instead of querying WeChat")
+    parser.add_argument("--clear", action="store_true", help="clear old in-memory diagnostic events first")
+    parser.add_argument("--enable", action="store_true", help="enable native diagnostic hooks first")
+    parser.add_argument("--wait", type=float, default=0.0, help="seconds to wait for events")
+    parser.add_argument("--min-events", type=int, default=6, help="minimum events to wait for")
+    args = parser.parse_args()
+
+    input_path = Path(args.input) if args.input else None
+    output_anchor = diagnostic_output_anchor(
+        data_dir=Path(args.data_dir),
+        out_value=str(args.out or ""),
+        input_path=input_path,
+    )
+    with history_writer_lease_if_owned(
+        output_anchor,
+        label="capture_wechat_file_send_diagnostics",
+    ):
+        return capture_and_write(args, input_path)
 
 
 if __name__ == "__main__":

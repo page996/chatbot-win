@@ -13,6 +13,11 @@ from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import as_payload, memory_dir_for_conversation
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.runtime.history_fence import (
+    HistoryWriterLease,
+    history_writer_fence_if_owned,
+    register_history_writer_lease_if_owned,
+)
 
 
 _MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-maintainer")
@@ -63,6 +68,13 @@ class MemoryMaintainer:
         self.async_llm = async_llm
 
     def maintain(self, conversation_id: str, *, session_id: str = DEFAULT_SESSION_ID) -> MemoryMaintenanceResult:
+        with history_writer_fence_if_owned(
+            self.ledger_store.data_dir,
+            label="memory_maintainer",
+        ):
+            return self._maintain_fenced(conversation_id, session_id=session_id)
+
+    def _maintain_fenced(self, conversation_id: str, *, session_id: str) -> MemoryMaintenanceResult:
         conversation_dir = self.ledger_store.conversation_markdown_path(conversation_id).parent
         memory_dir = memory_dir_for_conversation(conversation_dir, session_id)
         state = _read_json(memory_dir / "maintenance_state.json")
@@ -106,7 +118,28 @@ class MemoryMaintainer:
         )
         if self.llm is not None:
             if self.async_llm:
-                _MEMORY_EXECUTOR.submit(self._write_llm_memory, conversation_id, session_id, memory_dir, entries, draft)
+                lease = register_history_writer_lease_if_owned(
+                    self.ledger_store.data_dir,
+                    label="memory_maintainer_async_llm",
+                    metadata={
+                        "conversation_id": conversation_id,
+                        "session_id": session_id,
+                    },
+                )
+                try:
+                    _MEMORY_EXECUTOR.submit(
+                        self._write_llm_memory_with_lease,
+                        conversation_id,
+                        session_id,
+                        memory_dir,
+                        entries,
+                        draft,
+                        history_lease=lease,
+                    )
+                except BaseException:
+                    if lease is not None:
+                        lease.release()
+                    raise
             else:
                 self._write_llm_memory(conversation_id, session_id, memory_dir, entries, draft)
         return MemoryMaintenanceResult(
@@ -122,6 +155,13 @@ class MemoryMaintainer:
         )
 
     def maintain_all(self) -> list[MemoryMaintenanceResult]:
+        with history_writer_fence_if_owned(
+            self.ledger_store.data_dir,
+            label="memory_maintainer_all",
+        ):
+            return self._maintain_all_fenced()
+
+    def _maintain_all_fenced(self) -> list[MemoryMaintenanceResult]:
         results: list[MemoryMaintenanceResult] = []
         root = self.ledger_store.root
         if not root.exists():
@@ -239,6 +279,32 @@ class MemoryMaintainer:
         _write_json_atomic(memory_dir / "preferences.json", preferences)
         _write_json_atomic(memory_dir / "entities.json", entities)
         _write_json_atomic(memory_dir / "maintenance_state.json", state)
+
+    def _write_llm_memory_with_lease(
+        self,
+        conversation_id: str,
+        session_id: str,
+        memory_dir: Path,
+        entries: list[dict[str, Any]],
+        fallback: MemoryDraft,
+        *,
+        history_lease: HistoryWriterLease | None = None,
+    ) -> None:
+        try:
+            with history_writer_fence_if_owned(
+                self.ledger_store.data_dir,
+                label="memory_maintainer_async_llm_write",
+            ):
+                self._write_llm_memory(
+                    conversation_id,
+                    session_id,
+                    memory_dir,
+                    entries,
+                    fallback,
+                )
+        finally:
+            if history_lease is not None:
+                history_lease.release()
 
 
 def _entry_session_id(entry: dict[str, Any]) -> str:

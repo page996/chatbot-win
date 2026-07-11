@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.runtime.history_fence import history_writer_fences_if_owned
 from app.personal_wechat_bot.runtime.process_lock import short_process_lock
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_record
 
@@ -90,8 +91,16 @@ class HookEventJsonlImporter:
         self.state_path = Path(state_path) if state_path else self.backend_event_path.parent / "hook_events_state.json"
 
     def import_new(self) -> HookImportResult:
-        with _state_file_lock(self.state_path.with_suffix(self.state_path.suffix + ".lock")):
-            return self._import_new_locked()
+        with history_writer_fences_if_owned(
+            (
+                self.source_path.parent,
+                self.backend_event_path.parent,
+                self.state_path.parent,
+            ),
+            label="hook_event_import",
+        ):
+            with _state_file_lock(self.state_path.with_suffix(self.state_path.suffix + ".lock")):
+                return self._import_new_locked()
 
     def _import_new_locked(self) -> HookImportResult:
         state = _read_state(self.state_path)

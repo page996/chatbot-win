@@ -6,6 +6,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
+from app.personal_wechat_bot.runtime.history_fence import (
+    HistoryWriterLeaseGroup,
+    history_writer_fences_if_owned,
+    history_writer_leases_if_owned,
+    register_history_writer_leases_if_owned,
+)
 from app.personal_wechat_bot.runtime.process_lock import ProcessLock, blocking_process_lock, process_lock
 from app.personal_wechat_bot.wechat_driver.hook_events import HookEventJsonlImporter, HookImportResult
 
@@ -28,8 +34,12 @@ class HookMessagePullRunner:
         self.polling_runner = polling_runner
         self.hook_event_file = Path(hook_event_file)
         self.backend_event_file = Path(backend_event_file)
-        self.backend_event_file.parent.mkdir(parents=True, exist_ok=True)
-        self.backend_event_file.touch(exist_ok=True)
+        with history_writer_fences_if_owned(
+            self._history_paths(),
+            label="hook_pull_runner_init",
+        ):
+            self.backend_event_file.parent.mkdir(parents=True, exist_ok=True)
+            self.backend_event_file.touch(exist_ok=True)
         self._lock: ProcessLock | None = None
         # Per-tick cross-process consume lock. Distinct from the long-held
         # loop-ownership lock (:meth:`single_instance`): this one is grabbed and
@@ -40,6 +50,23 @@ class HookMessagePullRunner:
         self.consume_lock_enabled = consume_lock_enabled
         self.consume_lock_stale_after_seconds = consume_lock_stale_after_seconds
         self.consume_lock_wait_seconds = consume_lock_wait_seconds
+
+    def _history_paths(self) -> tuple[Path, ...]:
+        paths = [
+            self.hook_event_file.parent,
+            self.backend_event_file.parent,
+            self.importer.state_path.parent,
+        ]
+        runtime = getattr(self.polling_runner, "runtime", None)
+        config = getattr(runtime, "config", None)
+        data_dir = getattr(config, "data_dir", None)
+        if data_dir:
+            try:
+                paths.append(Path(data_dir))
+            except TypeError:
+                # Lightweight test/custom runtimes may expose a sentinel here.
+                pass
+        return tuple(paths)
 
     def lock_path(self) -> Path:
         """Single-instance lock file guarding this hook/backend consumer pair."""
@@ -62,19 +89,30 @@ class HookMessagePullRunner:
         goes stale and can be taken over.
         """
 
-        with process_lock(
-            self.lock_path(),
+        with history_writer_leases_if_owned(
+            self._history_paths(),
             label=label,
-            stale_after_seconds=stale_after_seconds,
-            enabled=enabled,
-        ) as lock:
-            self._lock = lock
-            try:
-                yield
-            finally:
-                self._lock = None
+        ):
+            with process_lock(
+                self.lock_path(),
+                label=label,
+                stale_after_seconds=stale_after_seconds,
+                enabled=enabled,
+            ) as lock:
+                self._lock = lock
+                try:
+                    yield
+                finally:
+                    self._lock = None
 
     def run_once(self, *, process_imported: bool = True) -> dict[str, Any]:
+        with history_writer_fences_if_owned(
+            self._history_paths(),
+            label="hook_pull_runner",
+        ):
+            return self._run_once_fenced(process_imported=process_imported)
+
+    def _run_once_fenced(self, *, process_imported: bool) -> dict[str, Any]:
         if self._lock is not None:
             self._lock.heartbeat()
         if not self.consume_lock_enabled:
@@ -119,7 +157,22 @@ class HookMessagePullRunner:
             "send_enabled": False,
         }
 
-    def run_forever(self, max_loops: int | None = None) -> dict[str, Any]:
+    def run_forever(
+        self,
+        max_loops: int | None = None,
+        *,
+        history_lease: HistoryWriterLeaseGroup | None = None,
+    ) -> dict[str, Any]:
+        lease = history_lease or register_history_writer_leases_if_owned(
+            self._history_paths(),
+            label="hook_pull_runner_loop",
+        )
+        try:
+            return self._run_forever_leased(max_loops=max_loops)
+        finally:
+            lease.release()
+
+    def _run_forever_leased(self, max_loops: int | None = None) -> dict[str, Any]:
         loops = 0
         imported_count = 0
         processed_count = 0

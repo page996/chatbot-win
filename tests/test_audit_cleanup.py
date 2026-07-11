@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,29 @@ from app.personal_wechat_bot.conversation.session_database import ConversationSe
 
 
 class AuditCleanupTest(unittest.TestCase):
+    def _create_directory_alias(self, alias: Path, destination: Path) -> None:
+        if os.name != "nt":
+            try:
+                alias.symlink_to(destination, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+            return
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(destination)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.skipTest(f"directory junctions are unavailable (exit {completed.returncode})")
+
+    @staticmethod
+    def _remove_directory_alias(alias: Path) -> None:
+        try:
+            alias.rmdir()
+        except FileNotFoundError:
+            pass
+
     def test_plan_audit_reports_stale_notes_and_current_safety_truth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -82,6 +106,87 @@ class AuditCleanupTest(unittest.TestCase):
             self.assertFalse(disposable.exists())
             self.assertTrue(retained.exists())
             self.assertTrue(unknown.exists())
+
+    def test_cleanup_rejects_internal_directory_alias_without_deleting_retained_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            retained = data_dir / "send_bridge"
+            retained.mkdir()
+            sentinel = retained / "outbox.jsonl"
+            sentinel.write_text("delivery evidence\n", encoding="utf-8")
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir()
+            alias = runtime_dir / "sidebar_browser_profile"
+            self._create_directory_alias(alias, retained)
+
+            try:
+                with self.assertRaisesRegex(PermissionError, "symlink or reparse point"):
+                    build_artifact_cleanup_report(data_dir, apply=True)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "delivery evidence\n")
+            finally:
+                self._remove_directory_alias(alias)
+
+    def test_cleanup_rejects_disposable_artifact_alias_without_deleting_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            retained = data_dir / "send_bridge"
+            retained.mkdir()
+            sentinel = retained / "acks.jsonl"
+            sentinel.write_text("retained ack\n", encoding="utf-8")
+            alias = data_dir / "wechat_window.bmp"
+            self._create_directory_alias(alias, retained)
+
+            try:
+                with self.assertRaisesRegex(PermissionError, "symlink or reparse point"):
+                    build_artifact_cleanup_report(data_dir, apply=True)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "retained ack\n")
+            finally:
+                self._remove_directory_alias(alias)
+
+    def test_cleanup_preflights_external_native_alias_before_any_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            create_default_config(data_dir)
+            disposable = data_dir / "inbox" / "backend_parse_smoke.txt"
+            disposable.parent.mkdir(exist_ok=True)
+            disposable.write_text("must survive failed preflight", encoding="utf-8")
+            outside = root / "outside-native"
+            outside.mkdir()
+            outside_probe = outside / "native-migration-old.json"
+            outside_probe.write_text("external evidence", encoding="utf-8")
+            alias = data_dir / "native_diagnostics"
+            self._create_directory_alias(alias, outside)
+
+            try:
+                with self.assertRaisesRegex(PermissionError, "symlink or reparse point"):
+                    build_artifact_cleanup_report(data_dir, apply=True)
+                self.assertEqual(disposable.read_text(encoding="utf-8"), "must survive failed preflight")
+                self.assertEqual(outside_probe.read_text(encoding="utf-8"), "external evidence")
+            finally:
+                self._remove_directory_alias(alias)
+
+    def test_cleanup_rejects_nested_alias_before_traversing_disposable_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            retained = data_dir / "send_bridge"
+            retained.mkdir()
+            sentinel = retained / "acks.jsonl"
+            sentinel.write_text("ack evidence\n", encoding="utf-8")
+            outgoing = data_dir / "outgoing_uploads"
+            outgoing.mkdir()
+            alias = outgoing / "linked-evidence"
+            self._create_directory_alias(alias, retained)
+
+            try:
+                with self.assertRaisesRegex(PermissionError, "symlink or reparse point"):
+                    build_artifact_cleanup_report(data_dir, apply=True)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "ack evidence\n")
+            finally:
+                self._remove_directory_alias(alias)
 
     def test_cleanup_retains_send_audit_ledger_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,6 +291,25 @@ class AuditCleanupTest(unittest.TestCase):
             self.assertEqual(report["database_contract_summary"]["existing_count"], 2)
             self.assertEqual(report["database_contract_summary"]["error_count"], 2)
             self.assertFalse((data_dir / "conversation_ledger.sqlite").exists())
+
+    def test_diagnostics_storage_contract_matches_history_reset_manifest(self) -> None:
+        from app.personal_wechat_bot.control import sidebar_api
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+
+            report = build_storage_migration_status(data_dir, include_sizes=False)
+            diagnostics = next(
+                item for item in report["items"] if item["component_id"] == "diagnostics_and_native_probe"
+            )
+
+            self.assertEqual(diagnostics["clear_history"], "reset")
+            self.assertIn("history reset removes all diagnostics", diagnostics["migration_action"])
+            self.assertTrue(
+                {item["relative_path"] for item in diagnostics["paths"]}
+                .issubset(set(sidebar_api._HISTORY_RESET_DIRS))
+            )
 
     def test_storage_status_reports_sqlite_authority_schema_and_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

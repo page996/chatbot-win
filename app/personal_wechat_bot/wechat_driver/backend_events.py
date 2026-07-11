@@ -10,6 +10,7 @@ from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_I
 from app.personal_wechat_bot.domain.models import RawWeChatMessage, SendResult, utc_now_iso
 from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
+from app.personal_wechat_bot.runtime.history_fence import history_writer_fence_if_owned
 from app.personal_wechat_bot.wechat_driver.system_accounts import is_system_account
 from app.personal_wechat_bot.vision.ocr import build_default_ocr_engine
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
@@ -530,12 +531,14 @@ def append_backend_event_record(
         payload["source_payload"] = source_payload
     raw_id = raw_id.strip() or _event_raw_id(payload)
     payload["raw_id"] = raw_id
-    appended = append_jsonl_once(
-        event_path,
-        payload,
-        key_field="raw_id",
-        index_path=Path(event_path).with_suffix(Path(event_path).suffix + ".raw_ids.json"),
-    )
+    event_path = Path(event_path)
+    with history_writer_fence_if_owned(event_path.parent, label="append_backend_event"):
+        appended = append_jsonl_once(
+            event_path,
+            payload,
+            key_field="raw_id",
+            index_path=event_path.with_suffix(event_path.suffix + ".raw_ids.json"),
+        )
     return raw_id, appended
 
 

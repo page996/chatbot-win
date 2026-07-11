@@ -110,7 +110,12 @@ def gpu_gate_snapshot(*, root: str | Path | None = None, max_parallel: int | Non
     slots = _effective_gpu_max_parallel(max_parallel)
     with _LOCAL_STATE_LOCK:
         active = int(_LOCAL_ACTIVE.get("gpu", 0))
-    slot_activity = _resource_slot_activity("gpu", lock_root=lock_root, max_parallel=slots)
+    slot_activity = _resource_slot_activity(
+        "gpu",
+        lock_root=lock_root,
+        max_parallel=slots,
+        create_missing=False,
+    )
     return {
         "resource": "gpu",
         "max_parallel": slots,
@@ -273,12 +278,29 @@ def _acquire_slot_file(
         time.sleep(0.1)
 
 
-def _resource_slot_activity(resource: str, *, lock_root: Path, max_parallel: int) -> list[dict[str, object]]:
+def _resource_slot_activity(
+    resource: str,
+    *,
+    lock_root: Path,
+    max_parallel: int,
+    create_missing: bool = True,
+) -> list[dict[str, object]]:
     activity: list[dict[str, object]] = []
-    lock_root.mkdir(parents=True, exist_ok=True)
+    if create_missing:
+        lock_root.mkdir(parents=True, exist_ok=True)
     for slot in range(max_parallel):
         path = lock_root / f"{resource}.{slot}.lock"
-        handle = path.open("a+b")
+        if not create_missing and not path.exists():
+            activity.append({"slot": slot, "locked": False, "owner": "", "lock_path": str(path)})
+            continue
+        try:
+            handle = path.open("a+b" if create_missing else "r+b")
+        except FileNotFoundError:
+            activity.append({"slot": slot, "locked": False, "owner": "", "lock_path": str(path)})
+            continue
+        except OSError:
+            activity.append({"slot": slot, "locked": True, "owner": "", "lock_path": str(path)})
+            continue
         owner = ""
         locked = False
         try:

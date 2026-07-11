@@ -4,6 +4,10 @@ import argparse
 import time
 
 from app.personal_wechat_bot.agent.workspace import TaskWorkspaceStore
+from app.personal_wechat_bot.runtime.history_fence import (
+    history_writer_lease_after_startup_handoff_if_owned,
+)
+from app.personal_wechat_bot.runtime.worker_job import ensure_worker_descendant_job
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,6 +19,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    ensure_worker_descendant_job()
+    with history_writer_lease_after_startup_handoff_if_owned(
+        args.data_dir,
+        label="fake_agent_worker",
+        metadata={"task_id": args.task_id},
+    ):
+        return _run_worker(args)
+
+
+def _run_worker(args: argparse.Namespace) -> int:
     workspace = TaskWorkspaceStore(args.data_dir)
     request = workspace.read_request(args.task_id)
     instructions = request.get("instructions", {})

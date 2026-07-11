@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+import sys
 import tempfile
+import threading
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
+
+from app.personal_wechat_bot.config.loader import create_default_config
+from app.personal_wechat_bot.control.sidebar_api import clear_sidebar_history_data
+from app.personal_wechat_bot.runtime.history_fence import active_history_writer_leases, history_writer_fence
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "capture_wechat_file_send_diagnostics.py"
+
+
+def _listed_history_writer_leases(data_dir: Path) -> list[dict]:
+    with history_writer_fence(data_dir, label="diagnostics_test_lease_inspection"):
+        return active_history_writer_leases(data_dir)
 
 
 def _load_module():
@@ -214,6 +228,121 @@ class CaptureWechatFileSendDiagnosticsTests(unittest.TestCase):
         self.assertIn("file_path", report)
         self.assertIn("probe.csv", report)
         self.assertIn("Confirm the top receiver hint", report)
+
+    def test_waiting_capture_holds_writer_lease_and_blocks_history_clear(self) -> None:
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            create_default_config(data_dir)
+            native_dir = data_dir / "native_diagnostics"
+            native_dir.mkdir()
+            sentinel = native_dir / "before-reset.json"
+            sentinel.write_text("sentinel", encoding="utf-8")
+            waiting = threading.Event()
+            finish_capture = threading.Event()
+            results: list[int] = []
+            errors: list[BaseException] = []
+            read_calls = 0
+
+            def read_events(_base_url: str) -> dict:
+                nonlocal read_calls
+                read_calls += 1
+                if read_calls == 1:
+                    return {"event_count": 0, "events": []}
+                waiting.set()
+                if not finish_capture.wait(5.0):
+                    raise TimeoutError("capture test was not released")
+                return {"event_count": 1, "events": [{"wrapper": "sendfile_task_entry", "args": {}}]}
+
+            def run_capture() -> None:
+                try:
+                    results.append(module.main())
+                except BaseException as exc:
+                    errors.append(exc)
+
+            argv = [
+                str(SCRIPT),
+                "--data-dir",
+                str(data_dir),
+                "--wait",
+                "10",
+                "--min-events",
+                "1",
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                module,
+                "read_events_with_fallback",
+                side_effect=read_events,
+            ), mock.patch.object(module.time, "sleep", return_value=None), redirect_stdout(
+                io.StringIO()
+            ), redirect_stderr(io.StringIO()):
+                thread = threading.Thread(target=run_capture, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(waiting.wait(2.0))
+                    self.assertTrue(_listed_history_writer_leases(data_dir))
+
+                    clear_result = clear_sidebar_history_data(data_dir)
+
+                    self.assertEqual(clear_result["status"], "blocked")
+                    self.assertTrue(sentinel.exists())
+                finally:
+                    finish_capture.set()
+                    thread.join(timeout=5.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [0])
+            self.assertEqual(_listed_history_writer_leases(data_dir), [])
+            self.assertEqual(len(list(native_dir.glob("file-send-events-*.json"))), 1)
+            self.assertEqual(len(list(native_dir.glob("file-send-events-*.report.md"))), 1)
+
+    def test_external_analysis_output_does_not_bind_default_data_dir(self) -> None:
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            create_default_config(data_dir)
+            config_path = data_dir / "config.json"
+            config_before = config_path.read_bytes()
+            external_dir = root / "external"
+            external_dir.mkdir()
+            input_path = external_dir / "capture.json"
+            input_path.write_text(
+                json.dumps({"events": [{"wrapper": "sendfile_task_entry", "args": {}}]}),
+                encoding="utf-8",
+            )
+            output_path = external_dir / "analyzed.json"
+            observed_data_leases: list[bool] = []
+            original_generate = module.generate_markdown_report
+
+            def generate_report(payload: dict) -> str:
+                observed_data_leases.append(bool(_listed_history_writer_leases(data_dir)))
+                return original_generate(payload)
+
+            argv = [
+                str(SCRIPT),
+                "--data-dir",
+                str(data_dir),
+                "--input",
+                str(input_path),
+                "--out",
+                str(output_path),
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                module,
+                "generate_markdown_report",
+                side_effect=generate_report,
+            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                result = module.main()
+
+            self.assertEqual(result, 0)
+            self.assertEqual(observed_data_leases, [False])
+            self.assertEqual(_listed_history_writer_leases(data_dir), [])
+            self.assertEqual(config_path.read_bytes(), config_before)
+            self.assertFalse((data_dir / "native_diagnostics").exists())
+            self.assertTrue(output_path.exists())
+            self.assertTrue(module.report_path_for(output_path).exists())
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -470,7 +471,11 @@ class SidebarApiTest(unittest.TestCase):
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
             set_send_controls(data_dir, mode="confirm", enabled=True, driver="bridge_outbox", backend="dry_run")
-            from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeAckStatus, BridgeOutboxStore
+            from app.personal_wechat_bot.wechat_driver.bridge_send import (
+                BridgeAckStatus,
+                BridgeOutboxStore,
+                effective_bridge_ack_states,
+            )
 
             store = BridgeOutboxStore(data_dir)
             record = store.enqueue("wxid_a", "preserve bridge evidence", receiver="wxid_a")
@@ -583,10 +588,21 @@ class SidebarApiTest(unittest.TestCase):
             self.assertTrue((data_dir / "send_bridge" / "outbox.jsonl").exists())
             self.assertTrue((data_dir / "send_bridge" / "acks.jsonl").exists())
             self.assertEqual((data_dir / "send_bridge" / "outbox.jsonl").read_text(encoding="utf-8"), outbox_before)
-            self.assertEqual((data_dir / "send_bridge" / "acks.jsonl").read_text(encoding="utf-8"), acks_before)
+            acks_after = (data_dir / "send_bridge" / "acks.jsonl").read_text(encoding="utf-8")
+            self.assertTrue(acks_after.startswith(acks_before))
+            frozen_state = effective_bridge_ack_states(store._read_all(store.ack_path))[record["bridge_id"]]
+            self.assertEqual(frozen_state.status, BridgeAckStatus.SENT)
+            self.assertTrue(frozen_state.ack["payload"]["history_reset_frozen"])
             self.assertEqual(lock_path.read_text(encoding="utf-8"), lock_before)
-            self.assertEqual(synced_path.read_text(encoding="utf-8"), synced_before)
-            self.assertEqual(reverify_path.read_text(encoding="utf-8"), reverify_before)
+            synced_after = json.loads(synced_path.read_text(encoding="utf-8"))
+            reverify_after = json.loads(reverify_path.read_text(encoding="utf-8"))
+            self.assertEqual(synced_after["seen"], json.loads(synced_before)["seen"])
+            self.assertEqual(
+                reverify_after[record["bridge_id"]],
+                json.loads(reverify_before)[record["bridge_id"]],
+            )
+            self.assertIn("history_reset", synced_after)
+            self.assertIn("history_reset", reverify_after)
             self.assertFalse(agent_state_path.exists())
             self.assertTrue(launch_path.exists())
             self.assertTrue(resource_audit_path.exists())
@@ -712,6 +728,150 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn(str(Path("send_bridge") / "outbox.jsonl"), result["preserved_runtime"])
             self.assertIn(str(Path("send_bridge") / "acks.jsonl"), result["preserved_runtime"])
 
+    def test_history_clear_archives_bridge_work_and_installs_weflow_replay_barrier(self) -> None:
+        from app.personal_wechat_bot.runtime.send_bridge_worker import BridgeWorker
+        from app.personal_wechat_bot.wechat_driver.bridge_send import (
+            BridgeAckStatus,
+            BridgeOutboxStore,
+            bridge_sync_fingerprint,
+            effective_bridge_ack_states,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            queued = store.enqueue("queued", "queued before reset", receiver="wxid_queued")
+            retry = store.enqueue("retry", "retry before reset", receiver="wxid_retry")
+            store.append_ack(retry["bridge_id"], status=BridgeAckStatus.RETRY, reason="transient")
+            inflight = store.enqueue("inflight", "possibly sent", receiver="wxid_inflight")
+            store.append_ack(inflight["bridge_id"], status=BridgeAckStatus.INFLIGHT, reason="wire_started")
+            accepted = store.enqueue("accepted", "accepted before reset", receiver="wxid_accepted")
+            store.append_ack(
+                accepted["bridge_id"],
+                status=BridgeAckStatus.ACCEPTED,
+                reason="native_accepted_unverified",
+                payload={"delivery_verified": False},
+            )
+            sent = store.enqueue("sent", "sent before reset", receiver="wxid_sent")
+            store.append_ack(sent["bridge_id"], status=BridgeAckStatus.SENT, reason="delivered")
+            failed = store.enqueue("failed", "failed before reset", receiver="wxid_failed")
+            store.append_ack(
+                failed["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="wechat_native_http_send_text_error:ConnectionRefusedError:refused",
+            )
+            dry_run = store.enqueue("dry-run", "dry run before reset", receiver="wxid_dry_run")
+            store.append_ack(
+                dry_run["bridge_id"],
+                status=BridgeAckStatus.SENT,
+                reason="dry_run_not_delivered:text",
+            )
+            ack_only = store.enqueue("ack-only", "compacted before reset", receiver="wxid_ack_only")
+            store.append_ack(
+                ack_only["bridge_id"],
+                status=BridgeAckStatus.FAILED,
+                reason="initial compacted failure",
+            )
+            ack_only_state = effective_bridge_ack_states(store._read_all(store.ack_path))[ack_only["bridge_id"]]
+            store.compact(
+                keep_resolved=0,
+                synced_ack_fingerprints={
+                    ack_only["bridge_id"]: bridge_sync_fingerprint(ack_only_state.ack, ack_only)
+                },
+            )
+            store.append_ack(
+                ack_only["bridge_id"],
+                status=BridgeAckStatus.SENT,
+                reason="dry_run_not_delivered:ack_only_upgrade",
+            )
+            outbox_before = store.outbox_path.read_bytes()
+            acks_before = store.ack_path.read_bytes()
+            (data_dir / "weflow_bridge_state.json").write_text(
+                json.dumps({"seen_raw_ids": ["old"], "sessions": {"wxid_old": {"since": 1}}}),
+                encoding="utf-8",
+            )
+
+            result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["send_bridge_archive"]["archived_count"], 3)
+            self.assertEqual(store.outbox_path.read_bytes(), outbox_before)
+            self.assertTrue(store.ack_path.read_bytes().startswith(acks_before))
+            states = effective_bridge_ack_states(store._read_all(store.ack_path))
+            for record in (queued, retry, inflight):
+                self.assertEqual(states[record["bridge_id"]].status, BridgeAckStatus.BLOCKED)
+            self.assertEqual(
+                states[inflight["bridge_id"]].ack["reason"],
+                "history_reset_cancelled_inflight_outcome_unknown",
+            )
+            self.assertTrue(states[inflight["bridge_id"]].ack["payload"]["outcome_unknown"])
+            self.assertEqual(states[accepted["bridge_id"]].status, BridgeAckStatus.ACCEPTED)
+            self.assertEqual(states[sent["bridge_id"]].status, BridgeAckStatus.SENT)
+            self.assertEqual(states[failed["bridge_id"]].status, BridgeAckStatus.FAILED)
+            self.assertEqual(states[dry_run["bridge_id"]].status, BridgeAckStatus.SENT)
+            self.assertEqual(states[ack_only["bridge_id"]].status, BridgeAckStatus.SENT)
+            self.assertTrue(states[ack_only["bridge_id"]].ack["payload"]["history_reset_frozen"])
+
+            item_by_id = {item["bridge_id"]: item for item in store.state(limit=20)["items"]}
+            for record in (failed, dry_run):
+                self.assertTrue(item_by_id[record["bridge_id"]]["history_reset_frozen"])
+                self.assertFalse(item_by_id[record["bridge_id"]]["retryable"])
+                with self.assertRaisesRegex(ValueError, "frozen by history reset"):
+                    store.requeue_resolved(record["bridge_id"], reason="must_not_replay")
+                with self.assertRaisesRegex(ValueError, "frozen by history reset"):
+                    retry_sidebar_bridge_item(data_dir, {"bridge_id": record["bridge_id"]})
+
+            synced = json.loads((data_dir / "send_bridge" / "synced_acks.json").read_text(encoding="utf-8"))
+            self.assertEqual(synced["version"], 3)
+            self.assertTrue(
+                {
+                    record["bridge_id"]
+                    for record in (queued, retry, inflight, accepted, sent, failed, dry_run, ack_only)
+                }
+                .issubset(synced["synced"])
+            )
+            reverify = json.loads(
+                (data_dir / "send_bridge" / "accepted_reverify.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(reverify["items"][accepted["bridge_id"]]["history_reset_frozen"])
+
+            barrier = json.loads((data_dir / "weflow_bridge_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(barrier["history_reset_id"], result["history_reset_id"])
+            self.assertEqual(barrier["history_reset_epoch"], result["history_reset_epoch"])
+            self.assertEqual(barrier["sessions"], {})
+            self.assertEqual(barrier["seen_raw_ids"], [])
+
+            worker = BridgeWorker(data_dir, SimpleNamespace(name="test"))
+            self.assertEqual(worker.pending_records(), [])
+            self.assertEqual(worker.run_once(), 0)
+
+            send_audit_path = data_dir / "send_audit.jsonl"
+            send_audit_db = data_dir / "send_audit.sqlite"
+            audit_before = send_audit_path.read_bytes()
+            audit_db_before = send_audit_db.read_bytes()
+            marker_path = data_dir / "send_bridge" / "synced_acks.json"
+            marker_path.unlink()
+            with mock.patch(
+                "app.personal_wechat_bot.runtime.send_bridge_worker.sync_bridge_ack_to_send_state"
+            ) as sync:
+                worker._reconcile_accepted_unverified_delivery()
+                worker._reconcile_unsynced_acks()
+                marker_path.write_text("{not-json", encoding="utf-8")
+                worker._reconcile_accepted_unverified_delivery()
+                worker._reconcile_unsynced_acks()
+            sync.assert_not_called()
+            self.assertEqual(send_audit_path.read_bytes(), audit_before)
+            self.assertEqual(send_audit_db.read_bytes(), audit_db_before)
+            rebuilt = json.loads(marker_path.read_text(encoding="utf-8"))
+            self.assertEqual(rebuilt["version"], 3)
+            self.assertTrue(
+                {
+                    record["bridge_id"]
+                    for record in (queued, retry, inflight, accepted, sent, failed, dry_run, ack_only)
+                }.issubset(rebuilt["synced"])
+            )
+
     def test_history_clear_removes_scheduler_authority_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -829,37 +989,450 @@ class SidebarApiTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
             create_default_config(data_dir)
+            secret = b"SIDEBAR_HISTORY_SECRET_7c19a4"
+            secret_text = (secret * 200).decode("ascii")
             sidebar_api._write_weflow_sidebar_state(
                 data_dir,
                 {
                     "base_url": "http://127.0.0.1:5039",
+                    "token_env": "WEFLOW_TEST_TOKEN",
+                    "allow_non_local": True,
                     "talkers": ["wxid_alice"],
                     "last_health": {"status": "ok", "fork_ok": True},
-                    "last_pull": {"status": "ok", "count": 2},
+                    "last_pull": {"status": "ok", "count": 2, "message": secret_text},
                     "pull_job": {"job_id": "pull-old", "status": "completed"},
                     "operation_history": [
                         {
                             "time": "2026-07-10T00:00:00Z",
                             "action": "old",
                             "status": "ok",
-                            "summary": "old runtime trace",
-                            "result": {"status": "ok"},
+                            "summary": secret_text,
+                            "result": {"status": "ok", "message": secret_text},
                         }
                     ],
                 },
             )
+            database_path = data_dir / "sidebar_state.sqlite"
+            db = sqlite3.connect(database_path)
+            try:
+                db.execute(
+                    """
+                    INSERT INTO sidebar_state_values(scope, key, value_json, updated_at)
+                    VALUES ('legacy_history', 'conversation', ?, '2026-07-10T00:00:00Z')
+                    """,
+                    (json.dumps({"message": secret_text}),),
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO sidebar_state_meta(key, value) VALUES ('legacy_history', ?)",
+                    (secret_text,),
+                )
+                db.commit()
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                db.close()
+            self.assertTrue(secret in database_path.read_bytes())
 
             result = clear_sidebar_history_data(data_dir)
             state = sidebar_api.build_sidebar_weflow_state(data_dir)
 
             self.assertEqual(result["status"], "ok")
             self.assertEqual(state["base_url"], "http://127.0.0.1:5039")
+            self.assertEqual(state["token_env"], "WEFLOW_TEST_TOKEN")
             self.assertEqual(state["requested_talkers"], ["wxid_alice"])
             self.assertEqual(state["last_health"], {})
             self.assertEqual(state["last_pull"], {})
             self.assertEqual(state["pull_job"], {})
             self.assertEqual(state["operation_history"], [])
-            self.assertTrue((data_dir / "sidebar_state.sqlite").exists())
+            self.assertTrue(sidebar_api._read_weflow_sidebar_state(data_dir)["allow_non_local"])
+            self.assertTrue(database_path.exists())
+            db = sqlite3.connect(database_path)
+            try:
+                rows = db.execute(
+                    "SELECT scope, key FROM sidebar_state_values ORDER BY scope, key"
+                ).fetchall()
+                meta_rows = db.execute("SELECT key, value FROM sidebar_state_meta").fetchall()
+                history_count = db.execute("SELECT COUNT(*) FROM weflow_operation_history").fetchone()[0]
+                free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+            finally:
+                db.close()
+            self.assertEqual({scope for scope, _key in rows}, {"weflow"})
+            self.assertEqual(
+                {key for _scope, key in rows},
+                {
+                    "allow_non_local",
+                    "backfill_job",
+                    "base_url",
+                    "last_backfill",
+                    "last_discover",
+                    "last_error",
+                    "last_health",
+                    "last_pull",
+                    "pull_job",
+                    "talkers",
+                    "token_env",
+                    "updated_at",
+                },
+            )
+            self.assertEqual(meta_rows, [("schema_version", "1")])
+            self.assertEqual(history_count, 0)
+            self.assertEqual(free_pages, 0)
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                path = Path(f"{database_path}{suffix}")
+                if path.exists():
+                    self.assertNotIn(secret, path.read_bytes(), path.name)
+            self.assertNotIn(secret, (data_dir / "weflow_sidebar_state.json").read_bytes())
+
+    def test_history_clear_reports_removed_items_when_final_state_reset_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            history_file = data_dir / "logs.jsonl"
+            history_file.write_text("history already removed before final reset\n", encoding="utf-8")
+
+            with mock.patch.object(
+                sidebar_api,
+                "_reset_weflow_sidebar_history",
+                side_effect=OSError("sidebar state locked"),
+            ):
+                result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "partial_error")
+            self.assertFalse(history_file.exists())
+            self.assertIn("logs.jsonl", {item["relative_path"] for item in result["removed"]})
+            self.assertEqual(result["error_count"], 1)
+            self.assertEqual(result["errors"][0]["phase"], "reset_weflow_sidebar_history")
+            self.assertIn("sidebar state locked", result["errors"][0]["error"])
+
+    def test_history_clear_barrier_failure_is_structured_and_starts_no_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            history_file = data_dir / "logs.jsonl"
+            history_file.write_text("must survive barrier failure\n", encoding="utf-8")
+
+            with mock.patch.object(
+                sidebar_api,
+                "_write_weflow_history_reset_barrier",
+                side_effect=OSError("barrier locked"),
+            ):
+                result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "partial_error")
+            self.assertEqual(result["removed"], [])
+            self.assertTrue(history_file.exists())
+            self.assertEqual(result["errors"][0]["phase"], "write_weflow_history_reset_barrier")
+            self.assertIn("barrier locked", result["errors"][0]["error"])
+
+    def test_history_clear_bridge_archive_failure_is_structured_and_starts_no_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            history_file = data_dir / "logs.jsonl"
+            history_file.write_text("must survive archive failure\n", encoding="utf-8")
+
+            with mock.patch.object(
+                sidebar_api,
+                "_archive_send_bridge_for_history_reset",
+                side_effect=OSError("ack archive locked"),
+            ):
+                result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "partial_error")
+            self.assertEqual(result["removed"], [])
+            self.assertTrue(history_file.exists())
+            self.assertTrue(result["weflow_reset_barrier"])
+            self.assertEqual(result["errors"][0]["phase"], "archive_send_bridge_for_history_reset")
+            self.assertIn("ack archive locked", result["errors"][0]["error"])
+
+    def test_history_clear_reports_bridge_archive_partial_progress(self) -> None:
+        from app.personal_wechat_bot.wechat_driver.bridge_send import BridgeOutboxStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = BridgeOutboxStore(data_dir)
+            first = store.enqueue("first", "first pre-reset item")
+            second = store.enqueue("second", "second pre-reset item")
+            history_file = data_dir / "logs.jsonl"
+            history_file.write_text("must survive partial archive\n", encoding="utf-8")
+            original_append = BridgeOutboxStore._append_unlocked
+            append_calls = 0
+
+            def fail_second_append(path, record):
+                nonlocal append_calls
+                append_calls += 1
+                if append_calls == 2:
+                    raise OSError("second freeze append failed")
+                return original_append(path, record)
+
+            with mock.patch.object(
+                BridgeOutboxStore,
+                "_append_unlocked",
+                new=staticmethod(fail_second_append),
+            ):
+                result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "partial_error")
+            self.assertEqual(result["removed"], [])
+            self.assertTrue(history_file.exists())
+            progress = result["send_bridge_archive"]
+            self.assertEqual(progress["status"], "partial_error")
+            self.assertEqual(progress["frozen_terminal_count"], 1)
+            self.assertIn(first["bridge_id"], progress["frozen_bridge_ids"])
+            self.assertNotIn(second["bridge_id"], progress["frozen_bridge_ids"])
+
+    def test_history_reset_status_is_sanitized_and_exposed_by_sidebar_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "history_reset_shutdown.json").write_text(
+                json.dumps(
+                    {
+                        "status": "partial_error",
+                        "phase": "clear_incomplete",
+                        "updated_at": "2026-07-12T04:00:00Z",
+                        "manual_reopen_required": True,
+                        "helper_pid": 4321,
+                        "helper_process_start": "must-not-leak-start",
+                        "owner_token": "must-not-leak",
+                        "command": ["python", "secret-script"],
+                        "error": "token=top-secret sk-abcdefghijklmnop",
+                        "clear_result": {
+                            "status": "partial_error",
+                            "policy": "history_only_preserve_sidebar_config",
+                            "removed_count": 8,
+                            "retained_locked_count": 1,
+                            "error_count": 2,
+                            "history_reset_id": "reset-safe-id",
+                            "history_reset_epoch": 123,
+                            "errors": [
+                                {
+                                    "relative_path": "logs.jsonl",
+                                    "phase": "remove",
+                                    "error": "api_key=do-not-leak",
+                                    "path": "C:/private/full/path",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = sidebar_api._sidebar_history_reset_status(data_dir)
+            state = build_sidebar_state(data_dir)
+
+            self.assertEqual(status["status"], "partial_error")
+            self.assertTrue(status["terminal"])
+            self.assertEqual(status["clear_result"]["removed_count"], 8)
+            self.assertEqual(status["clear_result"]["history_reset_id"], "reset-safe-id")
+            self.assertEqual(state["history_reset"], status)
+            serialized = json.dumps(status, ensure_ascii=False)
+            self.assertNotIn("must-not-leak", serialized)
+            self.assertNotIn("top-secret", serialized)
+            self.assertNotIn("abcdefghijklmnop", serialized)
+            self.assertNotIn("do-not-leak", serialized)
+            self.assertNotIn("helper_pid", status)
+            self.assertNotIn("helper_process_start", status)
+            self.assertNotIn("command", status)
+
+    def test_history_reset_status_fails_closed_on_unidentified_nonterminal_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "history_reset_shutdown.json").write_text(
+                json.dumps({"status": "running", "phase": "clearing_history"}),
+                encoding="utf-8",
+            )
+
+            status = sidebar_api._sidebar_history_reset_status(data_dir)
+
+            self.assertEqual(status["status"], "running")
+            self.assertEqual(status["phase"], "clearing_history")
+            self.assertFalse(status["terminal"])
+            self.assertTrue(status["active"])
+            self.assertTrue(status["outcome_unknown"])
+            self.assertNotIn("helper_pid", status)
+
+    def test_history_reset_status_reconciles_orphaned_helper_identity(self) -> None:
+        cases = (
+            ("matching_live_helper", True, "helper-start", True),
+            ("dead_helper", False, "", False),
+            ("reused_pid", True, "different-start", False),
+            ("marker_unavailable", True, "", True),
+        )
+        for name, pid_alive, current_start, expected_active in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                create_default_config(data_dir)
+                runtime_dir = data_dir / "runtime"
+                runtime_dir.mkdir(parents=True, exist_ok=True)
+                (runtime_dir / "history_reset_shutdown.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "running",
+                            "phase": "clearing_history",
+                            "helper_pid": 4321,
+                            "helper_process_start": "helper-start",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with mock.patch.object(sidebar_api, "_pid_exists", return_value=pid_alive), mock.patch.object(
+                    sidebar_api,
+                    "process_start_marker",
+                    return_value=current_start,
+                ):
+                    status = sidebar_api._sidebar_history_reset_status(data_dir)
+
+                self.assertEqual(status["active"], expected_active)
+                self.assertEqual(status["terminal"], not expected_active)
+                self.assertEqual(status["outcome_unknown"], expected_active)
+                if expected_active:
+                    self.assertEqual(status["status"], "running")
+                else:
+                    self.assertEqual(status["status"], "error")
+                    self.assertEqual(status["phase"], "interrupted")
+
+    def test_history_reset_status_keeps_live_helper_run_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "history_reset_shutdown.json").write_text(
+                json.dumps({"status": "running", "phase": "stopping_weflow"}),
+                encoding="utf-8",
+            )
+            (runtime_dir / "history_reset_shutdown.lock").write_text(
+                json.dumps({"helper_pid": 0, "updated_at_epoch": time.time()}),
+                encoding="utf-8",
+            )
+
+            status = sidebar_api._sidebar_history_reset_status(data_dir)
+
+            self.assertEqual(status["status"], "running")
+            self.assertTrue(status["active"])
+            self.assertFalse(status["terminal"])
+
+    def test_history_reset_status_fails_closed_on_lock_only_schedule_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "history_reset_shutdown.lock").write_text(
+                json.dumps(
+                    {
+                        "helper_pid": 0,
+                        "owner_pid": os.getpid(),
+                        "owner_token": "must-not-leak",
+                        "updated_at_epoch": time.time(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            status = sidebar_api.sidebar_history_reset_status(data_dir)
+
+            self.assertEqual(status["status"], "unknown")
+            self.assertTrue(status["active"])
+            self.assertTrue(status["outcome_unknown"])
+            self.assertNotIn("must-not-leak", json.dumps(status))
+
+    def test_history_reset_status_active_lock_overrides_old_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "history_reset_shutdown.json").write_text(
+                json.dumps({"status": "ok", "phase": "stopped_after_clear"}),
+                encoding="utf-8",
+            )
+            (runtime_dir / "history_reset_shutdown.lock").write_text(
+                json.dumps(
+                    {
+                        "helper_pid": 4321,
+                        "helper_process_start": "helper-start",
+                        "updated_at_epoch": time.time(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(sidebar_api, "_pid_exists", return_value=True), mock.patch.object(
+                sidebar_api,
+                "process_start_marker",
+                return_value="helper-start",
+            ):
+                status = sidebar_api.sidebar_history_reset_status(data_dir)
+
+            self.assertEqual(status["status"], "unknown")
+            self.assertTrue(status["active"])
+            self.assertTrue(status["outcome_unknown"])
+
+    def test_history_reset_status_corrupt_lock_is_unknown_even_with_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "history_reset_shutdown.json").write_text(
+                json.dumps({"status": "ok"}),
+                encoding="utf-8",
+            )
+            (runtime_dir / "history_reset_shutdown.lock").write_text("{not-json", encoding="utf-8")
+
+            status = sidebar_api.sidebar_history_reset_status(data_dir)
+
+            self.assertEqual(status["status"], "unknown")
+            self.assertTrue(status["active"])
+            self.assertTrue(status["outcome_unknown"])
+
+    def test_history_clear_reports_every_runtime_reinitialization_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            original_write_text = Path.write_text
+
+            def fail_runtime_file(path: Path, *args, **kwargs):
+                if path.parent == data_dir and path.name in {"confirm_queue.jsonl", "send_audit.jsonl"}:
+                    raise OSError(f"cannot create {path.name}")
+                return original_write_text(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", fail_runtime_file), mock.patch.object(
+                sidebar_api.ConfirmQueue,
+                "list_pending",
+                side_effect=OSError("confirm schema unavailable"),
+            ), mock.patch.object(
+                sidebar_api.SendAuditLog,
+                "list_recent",
+                side_effect=OSError("audit schema unavailable"),
+            ), mock.patch.object(
+                sidebar_api.TaskStatusStore,
+                "state",
+                side_effect=OSError("task schema unavailable"),
+            ):
+                result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "partial_error")
+            phases = {item["phase"] for item in result["errors"]}
+            self.assertTrue(
+                {
+                    "reinitialize_runtime_file",
+                    "reinitialize_confirm_queue",
+                    "reinitialize_send_audit",
+                    "reinitialize_task_status",
+                }.issubset(phases)
+            )
+            self.assertFalse((data_dir / "confirm_queue.jsonl").exists())
+            self.assertFalse((data_dir / "send_audit.jsonl").exists())
 
     def test_history_clear_blocks_while_history_writer_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -886,7 +1459,10 @@ class SidebarApiTest(unittest.TestCase):
                 ):
                     blocked = clear_sidebar_history_data(data_dir)
                     self.assertTrue(event_file.exists())
-                    forced = clear_sidebar_history_data(data_dir, {"source": "shutdown_helper"})
+                    forged = clear_sidebar_history_data(
+                        data_dir,
+                        {"source": "shutdown_helper", "force": True, "forceClear": True},
+                    )
             finally:
                 stop.set()
                 thread.join(timeout=1.0)
@@ -894,8 +1470,8 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(blocked["status"], "blocked")
             self.assertEqual(blocked["reason"], "history_clear_runtime_active")
             self.assertEqual(blocked["active_workers"][0]["worker"], "dialog_agent")
-            self.assertEqual(forced["status"], "ok")
-            self.assertFalse(event_file.exists())
+            self.assertEqual(forged["status"], "blocked")
+            self.assertTrue(event_file.exists())
 
     def test_history_clear_blocks_while_cross_process_agent_tick_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -917,6 +1493,27 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             self.assertEqual(result["reason"], "history_clear_runtime_active")
             self.assertEqual(result["active_workers"][0]["worker"], "dialog_agent_tick")
+            self.assertTrue(event_file.exists())
+
+    def test_history_clear_blocks_while_weflow_operation_lock_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            event_file = data_dir / "backend_events.jsonl"
+            event_file.write_text("{}\n", encoding="utf-8")
+            lock = sidebar_api.ProcessLock(
+                data_dir / "weflow_global_operation.lock",
+                label="weflow_pull_tick",
+                stale_after_seconds=1800,
+            )
+            lock.acquire()
+            try:
+                result = clear_sidebar_history_data(data_dir)
+            finally:
+                lock.release()
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["active_workers"][0]["worker"], "weflow_operation")
             self.assertTrue(event_file.exists())
 
     def test_history_clear_blocks_while_external_send_bridge_is_active(self) -> None:
@@ -1081,6 +1678,47 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("backend_events.jsonl", result["errors"][0]["relative_path"])
             self.assertTrue(event_file.exists())
 
+    def test_history_clear_never_reports_success_when_locked_log_cannot_be_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            locked_log = data_dir / "weflow_process.out.log"
+            secret = "pre-reset plaintext must remain visible on failure"
+            locked_log.write_text(secret, encoding="utf-8")
+            original_unlink = Path.unlink
+            real_open = os.open
+
+            def fail_target_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                if path == locked_log:
+                    error = PermissionError("sharing violation during unlink")
+                    error.winerror = 32
+                    raise error
+                return original_unlink(path, *args, **kwargs)
+
+            def fail_target_open(path, flags, *args, **kwargs):
+                if Path(path) == locked_log:
+                    error = PermissionError("sharing violation during truncate")
+                    error.winerror = 32
+                    raise error
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", fail_target_unlink), mock.patch.object(
+                sidebar_api.os,
+                "open",
+                side_effect=fail_target_open,
+            ):
+                result = clear_sidebar_history_data(data_dir)
+
+            self.assertEqual(result["status"], "partial_error")
+            self.assertEqual(locked_log.read_text(encoding="utf-8"), secret)
+            retained = next(
+                item for item in result["retained_locked"] if item["relative_path"] == locked_log.name
+            )
+            self.assertEqual(retained["fallback"], "retained")
+            error = next(item for item in result["errors"] if item["relative_path"] == locked_log.name)
+            self.assertEqual(error["phase"], "truncate_locked_history_file")
+            self.assertIn("sharing violation during truncate", error["error"])
+
     def test_history_clear_with_shutdown_schedules_helper_without_immediate_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -1088,7 +1726,9 @@ class SidebarApiTest(unittest.TestCase):
             event_file = data_dir / "backend_events.jsonl"
             event_file.write_text("{}\n", encoding="utf-8")
             launch_state = {
-                "pid": 1234,
+                "pid": os.getpid(),
+                "process_start": "sidebar-current-start",
+                "data_dir": str(data_dir.resolve()),
                 "mode": "server",
                 "host": "127.0.0.1",
                 "port": 8765,
@@ -1100,13 +1740,28 @@ class SidebarApiTest(unittest.TestCase):
                 "weflow_wait_seconds": 8,
                 "weflow_window": "normal",
                 "weflow_pid": 5678,
+                "weflow_process_start": "weflow-start-5678",
             }
             launch_file = data_dir / "runtime" / "sidebar_launch.json"
             launch_file.parent.mkdir(parents=True, exist_ok=True)
             launch_file.write_text(json.dumps(launch_state), encoding="utf-8")
 
-            with mock.patch.object(sidebar_api.subprocess, "Popen", return_value=mock.Mock(pid=4321)) as popen:
-                result = clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
+            def process_marker(pid: int) -> str:
+                return "sidebar-current-start" if pid == os.getpid() else "helper-4321-start"
+
+            with mock.patch.object(
+                sidebar_api, "process_start_marker", side_effect=process_marker
+            ), mock.patch.object(sidebar_api.subprocess, "Popen", return_value=mock.Mock(pid=4321)) as popen:
+                result = clear_sidebar_history_data(
+                    data_dir,
+                    {
+                        "shutdown_processes": True,
+                        "parent_pid": 9991,
+                        "weflow_pid": 9992,
+                        "weflow": "off",
+                        "weflow_port": 9993,
+                    },
+                )
 
             command = popen.call_args.args[0]
             self.assertEqual(result["status"], "shutdown_scheduled")
@@ -1115,11 +1770,274 @@ class SidebarApiTest(unittest.TestCase):
             self.assertIn("sidebar_history_reset_shutdown.py", " ".join(command))
             self.assertNotIn("start_sidebar_frontend.py", " ".join(command))
             self.assertIn("--parent-pid", command)
-            self.assertIn("1234", command)
+            self.assertIn(str(os.getpid()), command)
+            self.assertEqual(command[command.index("--parent-process-start") + 1], "sidebar-current-start")
+            self.assertTrue(command[command.index("--shutdown-owner-token") + 1])
+            self.assertNotIn("9991", command)
             self.assertIn("--weflow-pid", command)
             self.assertIn("5678", command)
+            self.assertEqual(command[command.index("--weflow-process-start") + 1], "weflow-start-5678")
+            self.assertNotIn("9992", command)
+            self.assertNotIn("9993", command)
             self.assertTrue(result["manual_reopen_required"])
             self.assertIn("send_bridge/outbox.jsonl", result["preserved_runtime_policy"])
+            lock = json.loads((data_dir / "runtime" / "history_reset_shutdown.lock").read_text(encoding="utf-8"))
+            self.assertEqual(Path(lock["data_dir"]), data_dir.resolve())
+            self.assertEqual(lock["owner_pid"], os.getpid())
+            self.assertEqual(lock["owner_process_start"], "sidebar-current-start")
+            self.assertTrue(lock["owner_token"])
+            self.assertEqual(lock["helper_process_start"], "helper-4321-start")
+
+    def test_history_clear_shutdown_waits_for_active_writer_fence_before_scheduling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            writer_entered = threading.Event()
+            release_writer = threading.Event()
+            schedule_called = threading.Event()
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+
+            def hold_writer_fence() -> None:
+                with sidebar_api.history_writer_fence(
+                    data_dir,
+                    label="test_http_writer",
+                    wait_timeout_seconds=5.0,
+                ):
+                    writer_entered.set()
+                    if not release_writer.wait(timeout=5):
+                        raise TimeoutError("writer release was not signaled")
+
+            def schedule_reset() -> None:
+                try:
+                    results.append(clear_sidebar_history_data(data_dir, {"shutdown_processes": True}))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            writer = threading.Thread(target=hold_writer_fence, daemon=True)
+            reset = threading.Thread(target=schedule_reset, daemon=True)
+            writer.start()
+            self.assertTrue(writer_entered.wait(timeout=5))
+            try:
+                with mock.patch.object(
+                    sidebar_api,
+                    "_schedule_sidebar_history_reset_shutdown",
+                    side_effect=lambda *_args, **_kwargs: (
+                        schedule_called.set() or {"status": "shutdown_scheduled"}
+                    ),
+                ):
+                    reset.start()
+                    self.assertFalse(schedule_called.wait(timeout=0.2))
+                    release_writer.set()
+                    reset.join(timeout=5)
+            finally:
+                release_writer.set()
+                writer.join(timeout=5)
+                reset.join(timeout=5)
+
+            self.assertFalse(writer.is_alive())
+            self.assertFalse(reset.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [{"status": "shutdown_scheduled"}])
+            self.assertTrue(schedule_called.is_set())
+
+    def test_history_clear_shutdown_popen_failure_is_proven_not_scheduled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "sidebar_launch.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "process_start": "sidebar-current-start",
+                        "data_dir": str(data_dir.resolve()),
+                        "weflow": "off",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                sidebar_api,
+                "process_start_marker",
+                return_value="sidebar-current-start",
+            ), mock.patch.object(
+                sidebar_api.subprocess,
+                "Popen",
+                side_effect=OSError("spawn rejected"),
+            ):
+                with self.assertRaisesRegex(
+                    sidebar_api.HistoryResetNotScheduledError,
+                    "spawn rejected",
+                ):
+                    clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
+
+            self.assertFalse((runtime_dir / "history_reset_shutdown.lock").exists())
+            status = json.loads((runtime_dir / "history_reset_shutdown.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "error")
+            self.assertEqual(status["phase"], "helper_spawn_failed")
+            self.assertFalse(status["manual_reopen_required"])
+            self.assertNotIn("helper_pid", status)
+
+    def test_history_clear_shutdown_retains_fence_when_spawn_failure_status_cannot_be_written(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            status_path = runtime_dir / "history_reset_shutdown.json"
+            (runtime_dir / "sidebar_launch.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "process_start": "sidebar-current-start",
+                        "data_dir": str(data_dir.resolve()),
+                        "weflow": "off",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            real_write_json = sidebar_api._write_json
+            real_unlink = Path.unlink
+
+            def fail_terminal_status_write(path, payload):
+                if Path(path) == status_path and payload.get("phase") == "helper_spawn_failed":
+                    raise OSError("status write rejected")
+                return real_write_json(path, payload)
+
+            def fail_status_unlink(path: Path, *args, **kwargs):
+                if path == status_path:
+                    raise PermissionError("status unlink rejected")
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(
+                sidebar_api,
+                "process_start_marker",
+                return_value="sidebar-current-start",
+            ), mock.patch.object(
+                sidebar_api,
+                "_write_json",
+                side_effect=fail_terminal_status_write,
+            ), mock.patch.object(Path, "unlink", fail_status_unlink), mock.patch.object(
+                sidebar_api.subprocess,
+                "Popen",
+                side_effect=OSError("spawn rejected"),
+            ):
+                with self.assertRaisesRegex(
+                    sidebar_api.HistoryResetNotScheduledError,
+                    "spawn rejected",
+                ):
+                    clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
+
+            self.assertTrue((runtime_dir / "history_reset_shutdown.lock").exists())
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "shutdown_scheduled")
+            self.assertEqual(status["phase"], "scheduled")
+
+    def test_history_clear_shutdown_preflight_failure_is_proven_not_scheduled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_data_dir = Path(tmp) / "not-owned-data"
+
+            with self.assertRaisesRegex(
+                sidebar_api.HistoryResetNotScheduledError,
+                "missing config",
+            ):
+                clear_sidebar_history_data(
+                    missing_data_dir,
+                    {"shutdown_processes": True},
+                )
+
+            self.assertFalse(missing_data_dir.exists())
+
+    def test_history_clear_shutdown_helper_marker_failure_retains_live_pid_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "sidebar_launch.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "process_start": "sidebar-current-start",
+                        "data_dir": str(data_dir.resolve()),
+                        "weflow": "off",
+                        "weflow_port": 5031,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def process_marker(pid: int) -> str:
+                return "sidebar-current-start" if pid == os.getpid() else ""
+
+            with mock.patch.object(sidebar_api, "process_start_marker", side_effect=process_marker), mock.patch.object(
+                sidebar_api.subprocess, "Popen", return_value=mock.Mock(pid=4321)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "helper process identity is unavailable") as ctx:
+                    clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
+            self.assertNotIsInstance(ctx.exception, sidebar_api.HistoryResetNotScheduledError)
+
+            lock = json.loads((runtime_dir / "history_reset_shutdown.lock").read_text(encoding="utf-8"))
+            status = json.loads((runtime_dir / "history_reset_shutdown.json").read_text(encoding="utf-8"))
+            self.assertEqual(lock["helper_pid"], 4321)
+            self.assertNotIn("helper_process_start", lock)
+            self.assertEqual(status["phase"], "helper_identity_unavailable")
+            with mock.patch.object(sidebar_api, "_pid_exists", return_value=True):
+                active = sidebar_api._active_sidebar_history_reset_shutdown(runtime_dir)
+            self.assertIsNotNone(active)
+            self.assertTrue((runtime_dir / "history_reset_shutdown.lock").exists())
+
+    def test_concurrent_history_shutdown_scheduling_spawns_one_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "sidebar_launch.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "process_start": "sidebar-current-start",
+                        "data_dir": str(data_dir.resolve()),
+                        "weflow": "off",
+                        "weflow_port": 5031,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+
+            def process_marker(pid: int) -> str:
+                return "sidebar-current-start" if pid == os.getpid() else "helper-4321-start"
+
+            def schedule() -> None:
+                try:
+                    results.append(clear_sidebar_history_data(data_dir, {"shutdown_processes": True}))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(sidebar_api, "process_start_marker", side_effect=process_marker), mock.patch.object(
+                sidebar_api, "_pid_exists", return_value=True
+            ), mock.patch.object(
+                sidebar_api.subprocess,
+                "Popen",
+                return_value=mock.Mock(pid=4321),
+            ) as popen:
+                threads = [threading.Thread(target=schedule) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5.0)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(popen.call_count, 1)
+            self.assertEqual(sum(bool(result.get("deduplicated")) for result in results), 1)
 
     def test_history_clear_with_shutdown_deduplicates_active_helper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1130,7 +2048,13 @@ class SidebarApiTest(unittest.TestCase):
             runtime_dir = data_dir / "runtime"
             runtime_dir.mkdir(parents=True, exist_ok=True)
             (runtime_dir / "history_reset_shutdown.lock").write_text(
-                json.dumps({"helper_pid": 4321, "updated_at_epoch": time.time()}),
+                json.dumps(
+                    {
+                        "helper_pid": 4321,
+                        "helper_process_start": "helper-4321-start",
+                        "updated_at_epoch": time.time(),
+                    }
+                ),
                 encoding="utf-8",
             )
             (runtime_dir / "history_reset_shutdown.json").write_text(
@@ -1138,7 +2062,9 @@ class SidebarApiTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with mock.patch.object(sidebar_api, "_pid_exists", return_value=True), mock.patch.object(sidebar_api.subprocess, "Popen") as popen:
+            with mock.patch.object(sidebar_api, "_pid_exists", return_value=True), mock.patch.object(
+                sidebar_api, "process_start_marker", return_value="helper-4321-start"
+            ), mock.patch.object(sidebar_api.subprocess, "Popen") as popen:
                 result = clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
 
             popen.assert_not_called()
@@ -1147,7 +2073,214 @@ class SidebarApiTest(unittest.TestCase):
             self.assertEqual(result["helper_pid"], 4321)
             self.assertEqual(result["phase"], "stopping_weflow")
             self.assertTrue(result["manual_reopen_required"])
+            self.assertFalse(result["outcome_unknown"])
             self.assertTrue(event_file.exists())
+
+    def test_history_clear_with_shutdown_deduplicates_orphan_helper_status(self) -> None:
+        cases = (
+            (
+                "matching_identity",
+                {"helper_pid": 4321, "helper_process_start": "helper-start"},
+                "helper-start",
+            ),
+            (
+                "marker_unavailable",
+                {"helper_pid": 4321, "helper_process_start": "helper-start"},
+                "",
+            ),
+            ("missing_helper_pid", {"helper_process_start": "helper-start"}, "helper-start"),
+            ("missing_helper_process_start", {"helper_pid": 4321}, "helper-start"),
+        )
+        for name, helper_identity, current_start in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                create_default_config(data_dir)
+                runtime_dir = data_dir / "runtime"
+                runtime_dir.mkdir(parents=True, exist_ok=True)
+                (runtime_dir / "history_reset_shutdown.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "running",
+                            "phase": "clearing_history",
+                            **helper_identity,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with mock.patch.object(sidebar_api, "_pid_exists", return_value=True), mock.patch.object(
+                    sidebar_api,
+                    "process_start_marker",
+                    return_value=current_start,
+                ), mock.patch.object(sidebar_api.subprocess, "Popen") as popen:
+                    result = clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
+
+                popen.assert_not_called()
+                self.assertEqual(result["status"], "shutdown_scheduled")
+                self.assertTrue(result["deduplicated"])
+                self.assertTrue(result["outcome_unknown"])
+                self.assertEqual(result["helper_pid"], int(helper_identity.get("helper_pid") or 0))
+                self.assertEqual(result["phase"], "clearing_history")
+                self.assertFalse((runtime_dir / "history_reset_shutdown.lock").exists())
+
+    def test_history_clear_with_shutdown_deduplicates_unverifiable_status_file(self) -> None:
+        cases = (
+            ("corrupt_json", "{not-json"),
+            ("non_object_json", "[]"),
+            ("unknown_status", json.dumps({"status": "mystery", "phase": "unknown"})),
+        )
+        for name, status_text in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                create_default_config(data_dir)
+                runtime_dir = data_dir / "runtime"
+                runtime_dir.mkdir(parents=True, exist_ok=True)
+                (runtime_dir / "history_reset_shutdown.json").write_text(status_text, encoding="utf-8")
+
+                with mock.patch.object(sidebar_api.subprocess, "Popen") as popen:
+                    result = clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
+
+                popen.assert_not_called()
+                self.assertEqual(result["status"], "shutdown_scheduled")
+                self.assertTrue(result["deduplicated"])
+                self.assertTrue(result["outcome_unknown"])
+                self.assertFalse((runtime_dir / "history_reset_shutdown.lock").exists())
+
+    def test_history_clear_shutdown_rejects_launch_state_from_another_sidebar_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "sidebar_launch.json").write_text(
+                json.dumps(
+                    {
+                        "pid": 7771,
+                        "data_dir": str(data_dir.resolve()),
+                        "weflow": "off",
+                        "weflow_port": 7772,
+                        "weflow_pid": 7773,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(sidebar_api.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(RuntimeError, "launch process identity could not be verified"):
+                    clear_sidebar_history_data(
+                        data_dir,
+                        {
+                            "shutdown_processes": True,
+                            "parent_pid": 8881,
+                            "weflow": "off",
+                            "weflow_port": 8882,
+                            "weflow_pid": 8883,
+                        },
+                    )
+
+            popen.assert_not_called()
+            self.assertFalse((runtime_dir / "history_reset_shutdown.lock").exists())
+
+    def test_history_clear_shutdown_rejects_reused_sidebar_pid_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "sidebar_launch.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "process_start": "stale-sidebar-start",
+                        "data_dir": str(data_dir.resolve()),
+                        "weflow": "off",
+                        "weflow_port": 7772,
+                        "weflow_pid": 7773,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def marker(pid: int) -> str:
+                return "current-sidebar-start" if pid == os.getpid() else "helper-start"
+
+            with mock.patch.object(sidebar_api, "process_start_marker", side_effect=marker), mock.patch.object(
+                sidebar_api.subprocess, "Popen"
+            ) as popen:
+                with self.assertRaisesRegex(RuntimeError, "launch process identity could not be verified"):
+                    clear_sidebar_history_data(data_dir, {"shutdown_processes": True})
+
+            popen.assert_not_called()
+            self.assertFalse((runtime_dir / "history_reset_shutdown.lock").exists())
+
+    def test_active_history_reset_helper_rejects_reused_pid_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "runtime"
+            runtime_dir.mkdir(parents=True)
+            lock_path = runtime_dir / "history_reset_shutdown.lock"
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "helper_pid": 4321,
+                        "helper_process_start": "old-helper-start",
+                        "updated_at_epoch": time.time(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(sidebar_api, "_pid_exists", return_value=True), mock.patch.object(
+                sidebar_api, "process_start_marker", return_value="reused-helper-start"
+            ):
+                active = sidebar_api._active_sidebar_history_reset_shutdown(runtime_dir)
+
+            self.assertIsNone(active)
+            self.assertFalse(lock_path.exists())
+
+    def test_active_history_reset_helper_matching_marker_is_not_expired_by_lock_age(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "runtime"
+            runtime_dir.mkdir(parents=True)
+            lock_path = runtime_dir / "history_reset_shutdown.lock"
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "helper_pid": 4321,
+                        "helper_process_start": "helper-start",
+                        "updated_at_epoch": time.time() - 7200,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(sidebar_api, "_pid_exists", return_value=True), mock.patch.object(
+                sidebar_api, "process_start_marker", return_value="helper-start"
+            ):
+                active = sidebar_api._active_sidebar_history_reset_shutdown(runtime_dir)
+
+            self.assertIsNotNone(active)
+            self.assertTrue(lock_path.exists())
+
+    def test_active_history_reset_helper_marker_query_failure_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "runtime"
+            runtime_dir.mkdir(parents=True)
+            lock_path = runtime_dir / "history_reset_shutdown.lock"
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "helper_pid": 4321,
+                        "helper_process_start": "helper-start",
+                        "updated_at_epoch": time.time() - 7200,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(sidebar_api, "_pid_exists", return_value=True), mock.patch.object(
+                sidebar_api, "process_start_marker", return_value=""
+            ):
+                active = sidebar_api._active_sidebar_history_reset_shutdown(runtime_dir)
+
+            self.assertIsNotNone(active)
+            self.assertTrue(lock_path.exists())
 
     def test_sidebar_channel_state_hides_probe_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1902,6 +3035,9 @@ class SidebarApiTest(unittest.TestCase):
         # Two consume steps (e.g. background worker tick + pull-once) must not
         # run runner.run_once() at the same time, or they race the shared hook
         # offset and message deduper.
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        temp_root = Path(temp_dir.name)
         overlap = {"max": 0, "active": 0}
         lock = threading.Lock()
 
@@ -1937,8 +3073,8 @@ class SidebarApiTest(unittest.TestCase):
                 "media": True,
                 "context_only": False,
                 "process_backend_events": True,
-                "hook_event_file": "hook.jsonl",
-                "backend_event_file": "backend.jsonl",
+                "hook_event_file": str(temp_root / "hook.jsonl"),
+                "backend_event_file": str(temp_root / "backend.jsonl"),
             },
             "bridge": fake_bridge,
             "runner": FakeRunner(),
@@ -1978,6 +3114,9 @@ class SidebarApiTest(unittest.TestCase):
             self.assertFalse(captured["process_backend_events"])
 
     def test_weflow_pull_tick_can_import_without_processing_backend_events(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        temp_root = Path(temp_dir.name)
         calls: list[bool] = []
 
         class FakeRunner:
@@ -2011,8 +3150,8 @@ class SidebarApiTest(unittest.TestCase):
                 "media": True,
                 "context_only": False,
                 "process_backend_events": False,
-                "hook_event_file": "hook.jsonl",
-                "backend_event_file": "backend.jsonl",
+                "hook_event_file": str(temp_root / "hook.jsonl"),
+                "backend_event_file": str(temp_root / "backend.jsonl"),
             },
             "bridge": fake_bridge,
             "runner": FakeRunner(),
@@ -4702,7 +5841,7 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
                     sidebar_api, "_pid_exists", side_effect=[True, False, False, False]
                 ), mock.patch.object(
                     sidebar_api, "process_start_marker", return_value="start-123456"
-                ), mock.patch.object(sidebar_api, "_terminate_process_tree", return_value=True) as terminate, mock.patch(
+                ), mock.patch.object(sidebar_api, "_terminate_verified_process", return_value=True) as terminate, mock.patch(
                     "app.personal_wechat_bot.runtime.send_bridge_worker.run_bridge_worker",
                     side_effect=fake_run,
                 ):
@@ -4740,7 +5879,7 @@ class SidebarBridgeWorkerSupervisionTest(unittest.TestCase):
                 mock.patch.object(sidebar_api, "bridge_worker_lock_alive", return_value=True),
                 mock.patch.object(sidebar_api, "_pid_exists", return_value=True),
                 mock.patch.object(sidebar_api, "process_start_marker", return_value="reused-pid-start"),
-                mock.patch.object(sidebar_api, "_terminate_process_tree") as terminate,
+                mock.patch.object(sidebar_api, "_terminate_verified_process") as terminate,
             ):
                 repaired = sidebar_api._repair_stale_external_bridge_worker(root, signature)
 

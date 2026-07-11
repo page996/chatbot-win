@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, is_dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +35,6 @@ from app.personal_wechat_bot.control.sidebar_api import (
     sidebar_native_migration_probe,
 )
 from app.personal_wechat_bot.control.send_readiness import build_send_readiness_report
-from app.personal_wechat_bot.control.sidebar_server import run_sidebar_server
-from app.personal_wechat_bot.control.sidebar_window import run_sidebar_window
 from app.personal_wechat_bot.control.send_commands import (
     approve_confirm_item,
     list_confirm_queue,
@@ -49,6 +48,9 @@ from app.personal_wechat_bot.control.send_commands import (
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 from app.personal_wechat_bot.runtime.agent_runner import AgentRunner
+from app.personal_wechat_bot.runtime.history_fence import (
+    register_history_writer_leases_if_owned,
+)
 from app.personal_wechat_bot.runtime.hook_pull_runner import HookMessagePullRunner
 from app.personal_wechat_bot.runtime.polling_runner import PollingRunner
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer, result_payload
@@ -415,6 +417,78 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_HISTORY_WRITER_CLI_COMMANDS = {
+    "init",
+    "run-agent",
+    "send-driver-probe",
+    "diagnostics-export",
+    "native-migration-probe",
+    "confirm-list",
+    "send-audit",
+    "send-bridge-state",
+    "set-send-controls",
+    "send-bridge-ack",
+    "send-bridge-retry",
+    "confirm-approve",
+    "confirm-reject",
+    "confirm-send-approved",
+    "cleanup-artifacts",
+    "maintain-memory",
+    "maintain-memory-all",
+    "accept-contact",
+    "accept-group",
+    "rename-group",
+    "set-chat-provider",
+    "set-deepseek-provider",
+    "replay",
+    "poll-fake",
+    "append-backend-event",
+    "import-hook-events",
+    "pull-hook-messages",
+    "append-hook-source-event",
+    "pull-weflow-messages",
+    "backfill-weflow-history",
+    "listen-weflow-sse",
+    "poll-backend-events",
+    "scan-backend-files",
+    "poll-snapshot",
+    "delete-channel",
+    "cleanup-hidden-channels",
+    "wechat-capture",
+    "wechat-snapshot",
+}
+
+
+def _guard_history_writer_cli(command: Any):
+    @wraps(command)
+    def guarded(argv: list[str] | None = None) -> None:
+        parsed = build_parser().parse_args(argv)
+        if parsed.command not in _HISTORY_WRITER_CLI_COMMANDS:
+            command(argv)
+            return
+        paths: list[Path] = [Path(parsed.data_dir)]
+        for attribute in (
+            "event_file",
+            "backend_event_file",
+            "hook_event_file",
+            "hook_state_file",
+            "state_file",
+            "weflow_state_file",
+            "output",
+        ):
+            value = getattr(parsed, attribute, None)
+            if value:
+                paths.append(Path(value).parent)
+        with register_history_writer_leases_if_owned(
+            tuple(paths),
+            label=f"cli:{parsed.command}",
+        ):
+            command(argv)
+
+    return guarded
+
+
+@_guard_history_writer_cli
 def main(argv: list[str] | None = None) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -435,10 +509,10 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "run-agent":
         config = load_config(args.data_dir)
+        event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
         runtime = build_runtime(config)
         runners = []
         if not args.no_backend_events:
-            event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
             if args.hook_event_file:
                 poller = PollingRunner(
                     runtime,
@@ -473,7 +547,11 @@ def main(argv: list[str] | None = None) -> None:
                 )
         if not runners:
             raise SystemExit("run-agent requires at least one input source")
-        result = AgentRunner(runners, poll_interval_seconds=args.interval).run_forever(max_loops=args.loops)
+        result = AgentRunner(
+            runners,
+            poll_interval_seconds=args.interval,
+            data_dir=config.data_dir,
+        ).run_forever(max_loops=args.loops)
         if not args.verbose:
             for item in result.get("runners", []):
                 if isinstance(item, dict):
@@ -484,10 +562,42 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "send-sidebar":
-        run_sidebar_server(args.data_dir, host=args.host, port=args.port)
+        from scripts.start_sidebar_frontend import main as start_sidebar_frontend
+
+        exit_code = start_sidebar_frontend(
+            [
+                "--data-dir",
+                str(args.data_dir),
+                "--mode",
+                "server",
+                "--host",
+                str(args.host),
+                "--port",
+                str(args.port),
+                "--weflow",
+                "off",
+            ]
+        )
+        if exit_code:
+            raise SystemExit(exit_code)
         return
     if args.command == "send-sidebar-window":
-        run_sidebar_window(args.data_dir, poll_interval_ms=args.interval_ms)
+        from scripts.start_sidebar_frontend import main as start_sidebar_frontend
+
+        exit_code = start_sidebar_frontend(
+            [
+                "--data-dir",
+                str(args.data_dir),
+                "--mode",
+                "window",
+                "--interval-ms",
+                str(args.interval_ms),
+                "--weflow",
+                "off",
+            ]
+        )
+        if exit_code:
+            raise SystemExit(exit_code)
         return
     if args.command == "send-driver-probe":
         result = probe_send_controls(args.data_dir, driver=args.driver)
@@ -706,17 +816,18 @@ def main(argv: list[str] | None = None) -> None:
         config = load_config(args.data_dir)
         if args.mode:
             config.mode = args.mode
-        runtime = build_runtime(config)
         hook_event_file = args.hook_event_file or str(Path(args.data_dir) / "hook_events.jsonl")
         backend_event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
         state_file = args.state_file or Path(args.data_dir) / "hook_events_state.json"
+        weflow_state_file = args.weflow_state_file or Path(hook_event_file).parent / "weflow_bridge_state.json"
+        runtime = build_runtime(config)
         token = _token_arg(args.token, args.token_env)
         weflow_ready = require_weflow_ready(args.base_url, token=token, allow_non_local=args.allow_non_local)
         bridge = WeFlowHttpBridge(
             args.base_url,
             token=token,
             hook_event_file=hook_event_file,
-            state_path=args.weflow_state_file,
+            state_path=weflow_state_file,
             allow_non_local=args.allow_non_local,
         )
         weflow_extra_roots = [*args.extra_root, *_weflow_media_roots(weflow_ready)]
@@ -791,10 +902,10 @@ def main(argv: list[str] | None = None) -> None:
         config = load_config(args.data_dir)
         if args.mode:
             config.mode = args.mode
-        runtime = build_runtime(config)
         hook_event_file = args.hook_event_file
         backend_event_file = args.backend_event_file or str(Path(args.data_dir) / "backend_events.jsonl")
         state_file = args.state_file or Path(args.data_dir) / "hook_events_state.json"
+        runtime = build_runtime(config)
         driver = _backend_event_driver(config, runtime, backend_event_file, extra_roots=args.extra_root)
         runner = HookMessagePullRunner(
             HookEventJsonlImporter(hook_event_file, backend_event_file, state_path=state_file),
@@ -813,8 +924,8 @@ def main(argv: list[str] | None = None) -> None:
         config = load_config(args.data_dir)
         if args.mode:
             config.mode = args.mode
-        runtime = build_runtime(config)
         event_file = args.event_file or str(Path(args.data_dir) / "backend_events.jsonl")
+        runtime = build_runtime(config)
         driver = _backend_event_driver(config, runtime, event_file, extra_roots=args.extra_root)
         runner = PollingRunner(runtime, driver, poll_interval_seconds=args.interval)
         result = runner.run_forever(max_loops=args.loops)
@@ -959,6 +1070,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "ocr-image":
+        config = _load_config_or_default(args.data_dir)
         engine = build_default_ocr_engine(mode=config.ocr_mode)
         try:
             text = engine.read_text(args.image)
@@ -968,6 +1080,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "local-asr":
+        config = _load_config_or_default(args.data_dir)
         engine = LocalAsrSubprocessEngine(model=args.model, language=args.language, mode=config.asr_mode)
         transcript = engine.transcribe(args.audio)
         result = {

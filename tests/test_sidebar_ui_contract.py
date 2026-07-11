@@ -1082,6 +1082,328 @@ class SidebarUiContractTest(unittest.TestCase):
         self.assertIn("invalidateWechatProbeOverlay();", clear_history)
         self.assertIn("invalidateDriverProbeOverlay();", clear_history)
 
+    def test_history_reset_status_reconciles_after_sidebar_reopen(self) -> None:
+        js = (SIDEBAR_DIR / "app.js").read_text(encoding="utf-8")
+        reconcile = _javascript_function(js, "reconcileHistoryResetStatus")
+        refresh_queue = _javascript_function(js, "drainRefreshQueue")
+        self.assertIn("reconcileHistoryResetStatus(payload.history_reset);", refresh_queue)
+        script = textwrap.dedent(
+            f"""
+            const assert = require("node:assert/strict");
+            const state = {{ historyResetPending: false, historyResetNoticeKey: "" }};
+            const messages = [];
+            let lockSyncs = 0;
+            function setStatusMessage(message) {{ messages.push(message); }}
+            function syncTaskButtonLocks() {{ lockSyncs += 1; }}
+            {reconcile}
+
+            reconcileHistoryResetStatus({{
+              status: "running", phase: "clearing_history", active: true,
+              terminal: false, outcome_unknown: false,
+            }});
+            assert.equal(state.historyResetPending, true);
+            assert.match(messages.at(-1), /仍在进行/);
+
+            reconcileHistoryResetStatus({{
+              status: "ok", phase: "stopped_after_clear", active: false,
+              terminal: true, updated_at: "2026-07-12T04:00:00Z",
+              clear_result: {{ removed_count: 12, history_reset_id: "reset-1" }},
+            }});
+            assert.equal(state.historyResetPending, false);
+            assert.match(messages.at(-1), /已完成/);
+            const afterFirstTerminal = messages.length;
+            reconcileHistoryResetStatus({{
+              status: "ok", phase: "stopped_after_clear", active: false,
+              terminal: true, updated_at: "2026-07-12T04:00:00Z",
+              clear_result: {{ removed_count: 12, history_reset_id: "reset-1" }},
+            }});
+            assert.equal(messages.length, afterFirstTerminal);
+
+            reconcileHistoryResetStatus({{
+              status: "partial_error", phase: "clear_incomplete", active: false,
+              terminal: true, updated_at: "2026-07-12T04:01:00Z",
+              clear_result: {{ error_count: 3, history_reset_id: "reset-2" }},
+            }});
+            assert.match(messages.at(-1), /3 项失败/);
+
+            reconcileHistoryResetStatus({{
+              status: "unknown", phase: "status_unverifiable", active: true,
+              terminal: false, outcome_unknown: true,
+            }});
+            assert.equal(state.historyResetPending, true);
+            assert.match(messages.at(-1), /无法核实/);
+            assert.ok(lockSyncs >= 4);
+            """
+        )
+
+        completed = _run_node(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_history_clear_scheduled_is_single_post_and_keeps_global_button_lock(self) -> None:
+        js = (SIDEBAR_DIR / "app.js").read_text(encoding="utf-8")
+        clear_history = _javascript_function(js, "clearHistoryData")
+        run_task = _javascript_function(js, "runTask")
+        active_task = _javascript_function(js, "activeTaskForScope")
+        sync_locks = _javascript_function(js, "syncTaskButtonLocks")
+        sync_lock = _javascript_function(js, "syncTaskButtonLock")
+        script = textwrap.dedent(
+            f"""
+            const assert = require("node:assert/strict");
+            const buttons = [
+              {{ disabled: false, dataset: {{ taskScope: "history:clear" }} }},
+              {{ disabled: false, dataset: {{ taskScope: "other:write" }} }},
+            ];
+            const state = {{
+              historyResetPending: false,
+              dataEpoch: 0,
+              tasks: [],
+              taskScopeChains: new Map(),
+            }};
+            const window = {{ confirm: () => true }};
+            let posts = 0;
+            let statusMessage = "";
+            function $$() {{ return buttons; }}
+            function invalidateWechatProbeOverlay() {{}}
+            function invalidateDriverProbeOverlay() {{}}
+            function setStatusMessage(message) {{ statusMessage = message; }}
+            function updateButtonTaskProgress() {{}}
+            async function refresh() {{ throw new Error("scheduled reset must not refresh"); }}
+            async function api(path, options) {{
+              assert.equal(path, "/api/history/clear");
+              assert.equal(options.method, "POST");
+              posts += 1;
+              await Promise.resolve();
+              return {{ status: "shutdown_scheduled" }};
+            }}
+            let taskSequence = 0;
+            function createTask(meta) {{
+              const task = {{ ...meta, id: `task-${{++taskSequence}}`, status: "queued" }};
+              state.tasks.push(task);
+              return task;
+            }}
+            async function executeTask(task, worker) {{
+              task.status = "running";
+              const result = await worker({{ update() {{}} }});
+              task.status = taskResultFailed(result) ? "failed" : "completed";
+              return result;
+            }}
+            function taskResultFailed(result) {{
+              return ["error", "failed", "partial_error", "blocked", "conflict"]
+                .includes(String(result?.status || ""));
+            }}
+            {active_task}
+            {sync_lock}
+            {sync_locks}
+            {run_task}
+            {clear_history}
+            (async () => {{
+              const meta = {{ scope: "history:clear" }};
+              const first = runTask(meta, (helpers) => clearHistoryData(helpers));
+              const second = runTask(meta, (helpers) => clearHistoryData(helpers));
+              assert.equal(first, second);
+              const [firstResult, secondResult] = await Promise.all([first, second]);
+              assert.equal(firstResult.status, "shutdown_scheduled");
+              assert.equal(secondResult.status, "shutdown_scheduled");
+              assert.equal(posts, 1);
+              assert.equal(state.historyResetPending, true);
+              assert.deepEqual(buttons.map((button) => button.disabled), [true, true]);
+              assert.match(statusMessage, /手动重新打开 sidebar/);
+            }})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
+            """
+        )
+
+        completed = _run_node(script)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_api_history_reset_admission_block_locks_stale_tab(self) -> None:
+        js = (SIDEBAR_DIR / "app.js").read_text(encoding="utf-8")
+        api_function = _javascript_function(js, "api")
+        script = textwrap.dedent(
+            f"""
+            const assert = require("node:assert/strict");
+            const state = {{ historyResetPending: false }};
+            const buttons = [{{ disabled: false }}, {{ disabled: false }}];
+            let statusMessage = "";
+            let lockSyncs = 0;
+            function setStatusMessage(message) {{ statusMessage = message; }}
+            function syncTaskButtonLocks() {{
+              lockSyncs += 1;
+              for (const button of buttons) button.disabled = state.historyResetPending;
+            }}
+            async function fetch() {{
+              return {{
+                ok: false,
+                status: 409,
+                text: async () => JSON.stringify({{
+                  status: "blocked",
+                  error: "history_reset_in_progress",
+                  history_reset_in_progress: true,
+                  outcome_unknown: true,
+                }}),
+              }};
+            }}
+            {api_function}
+            (async () => {{
+              await assert.rejects(() => api("/api/model-config", {{ method: "POST", body: "{{}}" }}));
+              assert.equal(state.historyResetPending, true);
+              assert.equal(lockSyncs, 1);
+              assert.deepEqual(buttons.map((button) => button.disabled), [true, true]);
+              assert.ok(statusMessage.length > 0);
+            }})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
+            """
+        )
+
+        completed = _run_node(script)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_history_clear_explicit_failures_and_proven_4xx_rejection_unlock(self) -> None:
+        js = (SIDEBAR_DIR / "app.js").read_text(encoding="utf-8")
+        clear_history = _javascript_function(js, "clearHistoryData")
+        task_failed = _javascript_function(js, "taskResultFailed")
+        script = textwrap.dedent(
+            f"""
+            const assert = require("node:assert/strict");
+            const state = {{ historyResetPending: false, dataEpoch: 0 }};
+            const window = {{ confirm: () => true }};
+            const responses = [
+              {{ status: "blocked", message: "writer active" }},
+              {{ status: "partial_error", error_count: 2 }},
+              Object.assign(new Error("HTTP 409"), {{
+                httpStatus: 409,
+                payload: {{
+                  status: "conflict",
+                  message: "request rejected",
+                  history_reset_not_scheduled: true,
+                }},
+              }}),
+            ];
+            const messages = [];
+            let refreshes = 0;
+            function invalidateWechatProbeOverlay() {{}}
+            function invalidateDriverProbeOverlay() {{}}
+            function syncTaskButtonLocks() {{}}
+            function setStatusMessage(message) {{ messages.push(message); }}
+            async function refresh(options) {{
+              assert.deepEqual(options, {{ force: true }});
+              refreshes += 1;
+              return {{ status: "ok" }};
+            }}
+            async function api() {{
+              const response = responses.shift();
+              if (response instanceof Error) throw response;
+              return response;
+            }}
+            {task_failed}
+            {clear_history}
+            (async () => {{
+              const blocked = await clearHistoryData();
+              assert.equal(blocked.status, "blocked");
+              assert.equal(taskResultFailed(blocked), true);
+              assert.equal(state.historyResetPending, false);
+              const partial = await clearHistoryData();
+              assert.equal(partial.status, "partial_error");
+              assert.equal(taskResultFailed(partial), true);
+              assert.equal(state.historyResetPending, false);
+              const rejected = await clearHistoryData();
+              assert.equal(rejected.status, "error");
+              assert.equal(rejected.response_status, "conflict");
+              assert.equal(taskResultFailed(rejected), true);
+              assert.equal(state.historyResetPending, false);
+              assert.equal(refreshes, 3);
+              assert.match(messages[0], /历史清理被阻断/);
+              assert.match(messages[1], /2 项删除失败/);
+              assert.match(messages[2], /请求未受理/);
+            }})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
+            """
+        )
+
+        completed = _run_node(script)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_history_clear_unknown_network_and_2xx_outcomes_remain_locked_failures(self) -> None:
+        js = (SIDEBAR_DIR / "app.js").read_text(encoding="utf-8")
+        clear_history = _javascript_function(js, "clearHistoryData")
+        task_failed = _javascript_function(js, "taskResultFailed")
+        active_task = _javascript_function(js, "activeTaskForScope")
+        sync_locks = _javascript_function(js, "syncTaskButtonLocks")
+        sync_lock = _javascript_function(js, "syncTaskButtonLock")
+        script = textwrap.dedent(
+            f"""
+            const assert = require("node:assert/strict");
+            const state = {{ historyResetPending: false, dataEpoch: 0, tasks: [] }};
+            const window = {{ confirm: () => true }};
+            const buttons = [
+              {{ disabled: false, dataset: {{ taskScope: "history:clear" }} }},
+              {{ disabled: false, dataset: {{ taskScope: "other:write" }} }},
+            ];
+            const responses = [
+              new Error("connection reset"),
+              Object.assign(new Error("ambiguous HTTP 400"), {{
+                httpStatus: 400,
+                payload: {{ status: "blocked", message: "post-spawn failure" }},
+              }}),
+              {{ status: "failed", message: "ambiguous 2xx" }},
+              {{ status: "conflict" }},
+              {{}},
+              {{ status: "shutdown_scheduled", outcome_unknown: true, message: "state cannot be verified" }},
+              {{ status: "ok", removed_count: 4 }},
+            ];
+            const messages = [];
+            let refreshes = 0;
+            function $$() {{ return buttons; }}
+            function invalidateWechatProbeOverlay() {{}}
+            function invalidateDriverProbeOverlay() {{}}
+            function setStatusMessage(message) {{ messages.push(message); }}
+            async function refresh(options) {{
+              assert.deepEqual(options, {{ force: true }});
+              refreshes += 1;
+              return {{ status: "ok" }};
+            }}
+            async function api() {{
+              const response = responses.shift();
+              if (response instanceof Error) throw response;
+              return response;
+            }}
+            {active_task}
+            {sync_lock}
+            {sync_locks}
+            {task_failed}
+            {clear_history}
+            (async () => {{
+              for (const expectedStatus of ["", "blocked", "failed", "conflict", "", "shutdown_scheduled"]) {{
+                state.historyResetPending = false;
+                syncTaskButtonLocks();
+                assert.deepEqual(buttons.map((button) => button.disabled), [false, false]);
+                const result = await clearHistoryData();
+                assert.equal(result.status, "error");
+                assert.equal(result.outcome, "unknown");
+                assert.equal(result.response_status, expectedStatus);
+                assert.equal(taskResultFailed(result), true);
+                assert.equal(state.historyResetPending, true);
+                assert.deepEqual(buttons.map((button) => button.disabled), [true, true]);
+                assert.match(result.message, /请勿重复清空/);
+                assert.match(result.message, /手动关闭并重新打开 sidebar/);
+              }}
+              assert.equal(refreshes, 0);
+              state.historyResetPending = false;
+              syncTaskButtonLocks();
+              const ok = await clearHistoryData();
+              assert.equal(ok.status, "ok");
+              assert.equal(state.historyResetPending, false);
+              assert.deepEqual(buttons.map((button) => button.disabled), [false, false]);
+              assert.equal(refreshes, 1);
+              assert.match(messages.at(-1), /历史数据已清空/);
+            }})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
+            """
+        )
+
+        completed = _run_node(script)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

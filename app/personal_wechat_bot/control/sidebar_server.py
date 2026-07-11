@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import threading
 import time
 from ipaddress import ip_address
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from app.personal_wechat_bot.control.sidebar_api import (
+    HistoryResetNotScheduledError,
     ack_sidebar_bridge_item,
     add_api_key,
     append_sidebar_backend_event,
@@ -43,6 +45,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     sidebar_runtime_probe,
     sidebar_runtime_card_action,
     sidebar_resource_audit,
+    sidebar_history_reset_status,
     sidebar_task_action,
     sidebar_weflow_dependency_status,
     sidebar_weflow_backfill,
@@ -56,6 +59,7 @@ from app.personal_wechat_bot.control.sidebar_api import (
     sidebar_weflow_stop,
     update_sidebar_controls,
 )
+from app.personal_wechat_bot.runtime.history_fence import history_writer_fence_if_owned
 
 
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "ui" / "sidebar"
@@ -79,6 +83,8 @@ def run_sidebar_server(data_dir: str | Path = "data", host: str = "127.0.0.1", p
 
 
 def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
+    post_admission_lock = threading.RLock()
+
     class SidebarHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             host_error = self._host_check()
@@ -86,37 +92,50 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                 self._json({"status": "error", "error": host_error}, status=403)
                 return
             parsed = urlparse(self.path)
-            if parsed.path == "/api/state":
-                self._json(build_sidebar_state(data_dir))
-                return
-            if parsed.path in {"/api/driver-probe", "/api/wechat-probe"}:
-                self._json({"status": "error", "error": "method_not_allowed"}, status=405)
-                return
-            if parsed.path == "/api/bridge":
-                self._json(build_sidebar_bridge_state(data_dir))
-                return
-            if parsed.path == "/api/runtime-cards":
-                self._json(build_sidebar_runtime_cards(data_dir))
-                return
-            if parsed.path == "/api/tasks":
-                self._json(build_sidebar_task_manager(data_dir))
-                return
-            if parsed.path == "/api/weflow/status":
-                self._json(build_sidebar_weflow_state(data_dir))
-                return
-            if parsed.path == "/api/diagnostics/export":
-                self._json(sidebar_diagnostics_export(data_dir, {"persist": False}))
-                return
-            if parsed.path == "/api/storage/status":
-                self._json(sidebar_storage_migration_status(data_dir, {"include_sizes": True}))
-                return
-            if parsed.path == "/api/keys":
-                self._json(list_api_keys(data_dir))
-                return
-            if parsed.path == "/api/model-config":
-                self._json(get_model_config(data_dir))
+            if parsed.path.startswith("/api/"):
+                deferred: list[tuple[dict[str, Any], int]] = []
+                self._deferred_json_responses = deferred
+                try:
+                    with history_writer_fence_if_owned(data_dir, label="sidebar_http_get"):
+                        self._dispatch_GET(parsed.path)
+                finally:
+                    del self._deferred_json_responses
+                self._flush_deferred_json_response(deferred)
                 return
             self._static(parsed.path)
+
+        def _dispatch_GET(self, path: str) -> None:
+            if path == "/api/state":
+                self._json(build_sidebar_state(data_dir))
+                return
+            if path in {"/api/driver-probe", "/api/wechat-probe"}:
+                self._json({"status": "error", "error": "method_not_allowed"}, status=405)
+                return
+            if path == "/api/bridge":
+                self._json(build_sidebar_bridge_state(data_dir))
+                return
+            if path == "/api/runtime-cards":
+                self._json(build_sidebar_runtime_cards(data_dir))
+                return
+            if path == "/api/tasks":
+                self._json(build_sidebar_task_manager(data_dir))
+                return
+            if path == "/api/weflow/status":
+                self._json(build_sidebar_weflow_state(data_dir))
+                return
+            if path == "/api/diagnostics/export":
+                self._json(sidebar_diagnostics_export(data_dir, {"persist": False}))
+                return
+            if path == "/api/storage/status":
+                self._json(sidebar_storage_migration_status(data_dir, {"include_sizes": True}))
+                return
+            if path == "/api/keys":
+                self._json(list_api_keys(data_dir))
+                return
+            if path == "/api/model-config":
+                self._json(get_model_config(data_dir))
+                return
+            self._static(path)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
@@ -129,118 +148,180 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             # handler execution and before any API key is touched.
             csrf_error = self._csrf_check()
             if csrf_error:
-                self._json({"status": "error", "error": csrf_error}, status=403)
+                error_payload: dict[str, Any] = {"status": "error", "error": csrf_error}
+                if parsed.path == "/api/history/clear":
+                    error_payload["history_reset_not_scheduled"] = True
+                self._json(error_payload, status=403)
+                return
+            if self._reject_post_during_history_reset(parsed.path):
                 return
             try:
                 payload = self._read_json()
-                if parsed.path == "/api/driver-probe":
+                if parsed.path == "/api/history/clear":
+                    # HTTP callers always use the shutdown helper. The request
+                    # itself must not hold the writer fence because the helper
+                    # waits until this server has exited before taking it.
+                    clear_payload = dict(payload)
+                    clear_payload["shutdown_processes"] = True
+                    with post_admission_lock:
+                        clear_result = clear_sidebar_history_data(data_dir, clear_payload)
+                    self._json(clear_result)
+                    return
+                if parsed.path.startswith("/api/"):
+                    deferred = []
+                    self._deferred_json_responses = deferred
+                    try:
+                        with post_admission_lock:
+                            with history_writer_fence_if_owned(data_dir, label="sidebar_http_post"):
+                                if not self._reject_post_during_history_reset(parsed.path):
+                                    self._dispatch_POST(parsed.path, payload)
+                    finally:
+                        del self._deferred_json_responses
+                    self._flush_deferred_json_response(deferred)
+                    return
+                self._json({"status": "error", "error": "not_found"}, status=404)
+            except _SidebarRequestError as exc:
+                error_payload = {"status": "error", "error": exc.error}
+                if parsed.path == "/api/history/clear":
+                    error_payload["history_reset_not_scheduled"] = True
+                self._json(error_payload, status=exc.status)
+            except HistoryResetNotScheduledError as exc:
+                self._json(
+                    {
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "history_reset_not_scheduled": True,
+                    },
+                    status=400,
+                )
+            except Exception as exc:
+                self._json({"status": "error", "error": f"{type(exc).__name__}: {exc}"}, status=400)
+
+        def _reject_post_during_history_reset(self, path: str) -> bool:
+            if path == "/api/history/clear" or not path.startswith("/api/"):
+                return False
+            reset = sidebar_history_reset_status(data_dir)
+            if not bool(reset.get("active") or reset.get("outcome_unknown")):
+                return False
+            self._json(
+                {
+                    "status": "blocked",
+                    "error": "history_reset_in_progress",
+                    "message": "History reset is in progress or cannot be verified; do not retry or continue writing.",
+                    "history_reset_in_progress": True,
+                    "outcome_unknown": bool(reset.get("outcome_unknown")),
+                    "phase": str(reset.get("phase") or ""),
+                },
+                status=409,
+            )
+            return True
+
+        def _dispatch_POST(self, path: str, payload: dict[str, Any]) -> None:
+                if path == "/api/driver-probe":
                     from app.personal_wechat_bot.control.send_commands import probe_send_controls
 
                     driver = str(payload.get("driver") or "").strip() or None
                     self._json(probe_send_controls(data_dir, driver=driver))
                     return
-                if parsed.path == "/api/wechat-probe":
+                if path == "/api/wechat-probe":
                     self._json(build_sidebar_wechat_probe(data_dir))
                     return
-                if parsed.path == "/api/controls":
+                if path == "/api/controls":
                     self._json(update_sidebar_controls(data_dir, payload))
                     return
-                if parsed.path == "/api/backend-events":
+                if path == "/api/backend-events":
                     self._json(append_sidebar_backend_event(data_dir, payload))
                     return
-                if parsed.path == "/api/bridge/ack":
+                if path == "/api/bridge/ack":
                     self._json(ack_sidebar_bridge_item(data_dir, payload))
                     return
-                if parsed.path == "/api/bridge/retry":
+                if path == "/api/bridge/retry":
                     self._json(retry_sidebar_bridge_item(data_dir, payload))
                     return
-                if parsed.path == "/api/audit/clear":
+                if path == "/api/audit/clear":
                     self._json(clear_sidebar_send_audit(data_dir))
                     return
-                if parsed.path == "/api/history/clear":
-                    self._json(clear_sidebar_history_data(data_dir, payload))
-                    return
-                if parsed.path == "/api/weflow/health":
+                if path == "/api/weflow/health":
                     self._json(sidebar_weflow_health(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/pull-once":
+                if path == "/api/weflow/pull-once":
                     self._json(sidebar_weflow_pull_once(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/backfill":
+                if path == "/api/weflow/backfill":
                     self._json(sidebar_weflow_backfill(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/cancel-backfill":
+                if path == "/api/weflow/cancel-backfill":
                     self._json(sidebar_weflow_cancel_backfill(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/discover-sessions":
+                if path == "/api/weflow/discover-sessions":
                     self._json(sidebar_weflow_discover_sessions(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/clear-history":
+                if path == "/api/weflow/clear-history":
                     self._json(sidebar_weflow_clear_history(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/start":
+                if path == "/api/weflow/start":
                     self._json(sidebar_weflow_start(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/stop":
+                if path == "/api/weflow/stop":
                     self._json(sidebar_weflow_stop(data_dir, payload))
                     return
-                if parsed.path == "/api/weflow/dependencies":
+                if path == "/api/weflow/dependencies":
                     self._json(sidebar_weflow_dependency_status(data_dir))
                     return
-                if parsed.path == "/api/weflow/install-deps":
+                if path == "/api/weflow/install-deps":
                     self._json(sidebar_weflow_install_deps(data_dir, payload))
                     return
-                if parsed.path == "/api/keys/add":
+                if path == "/api/keys/add":
                     self._json(add_api_key(data_dir, payload))
                     return
-                if parsed.path == "/api/keys/remove":
+                if path == "/api/keys/remove":
                     self._json(remove_api_key(data_dir, payload))
                     return
-                if parsed.path == "/api/model-config":
+                if path == "/api/model-config":
                     self._json(set_model_config(data_dir, payload))
                     return
-                if parsed.path == "/api/model-config/probe":
+                if path == "/api/model-config/probe":
                     self._json(probe_model_fetch(data_dir, payload))
                     return
-                if parsed.path == "/api/runtime/probe":
+                if path == "/api/runtime/probe":
                     self._json(sidebar_runtime_probe(data_dir, payload))
                     return
-                if parsed.path == "/api/resources/audit":
+                if path == "/api/resources/audit":
                     self._json(sidebar_resource_audit(data_dir, payload))
                     return
-                if parsed.path == "/api/diagnostics/export":
+                if path == "/api/diagnostics/export":
                     self._json(sidebar_diagnostics_export(data_dir, payload))
                     return
-                if parsed.path == "/api/storage/status":
+                if path == "/api/storage/status":
                     self._json(sidebar_storage_migration_status(data_dir, payload))
                     return
-                if parsed.path == "/api/native/migration-probe":
+                if path == "/api/native/migration-probe":
                     self._json(sidebar_native_migration_probe(data_dir, payload))
                     return
-                if parsed.path == "/api/agent/tick":
+                if path == "/api/agent/tick":
                     self._json(sidebar_agent_tick(data_dir, payload))
                     return
-                if parsed.path == "/api/agent/start":
+                if path == "/api/agent/start":
                     self._json(sidebar_agent_start(data_dir, payload))
                     return
-                if parsed.path == "/api/agent/stop":
+                if path == "/api/agent/stop":
                     self._json(sidebar_agent_stop(data_dir, payload))
                     return
-                if parsed.path == "/api/tasks":
+                if path == "/api/tasks":
                     self._json(sidebar_task_action(data_dir, payload))
                     return
-                if parsed.path == "/api/channel-state":
+                if path == "/api/channel-state":
                     self._json(sidebar_channel_state_action(data_dir, payload))
                     return
-                if parsed.path == "/api/workspace/cleanup":
+                if path == "/api/workspace/cleanup":
                     self._json(cleanup_file_workspace(data_dir, payload))
                     return
-                parts = [part for part in parsed.path.split("/") if part]
+                parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "runtime-cards"]:
                     _, _, action = parts
                     self._json(sidebar_runtime_card_action(data_dir, action, payload))
                     return
-                if parsed.path == "/api/channels/cleanup-hidden":
+                if path == "/api/channels/cleanup-hidden":
                     self._json(cleanup_sidebar_channels(data_dir, hidden_only=True))
                     return
                 if len(parts) == 4 and parts[:2] == ["api", "channels"] and parts[3] == "test-reply":
@@ -260,10 +341,6 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     self._json(sidebar_queue_action(data_dir, action, unquote(queue_id), payload))
                     return
                 self._json({"status": "error", "error": "not_found"}, status=404)
-            except _SidebarRequestError as exc:
-                self._json({"status": "error", "error": exc.error}, status=exc.status)
-            except Exception as exc:
-                self._json({"status": "error", "error": f"{type(exc).__name__}: {exc}"}, status=400)
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -375,19 +452,35 @@ def _handler_factory(data_dir: Path) -> type[BaseHTTPRequestHandler]:
             finally:
                 connection.settimeout(previous_timeout)
 
-            raw = b"".join(chunks).decode("utf-8")
-            payload = json.loads(raw)
+            try:
+                raw = b"".join(chunks).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise _SidebarRequestError(400, "invalid_utf8") from exc
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise _SidebarRequestError(400, "invalid_json") from exc
             if not isinstance(payload, dict):
-                raise ValueError("request body must be a JSON object")
+                raise _SidebarRequestError(400, "request_body_must_be_object")
             return payload
 
         def _json(self, payload: dict[str, Any], status: int = 200) -> None:
+            deferred = getattr(self, "_deferred_json_responses", None)
+            if isinstance(deferred, list):
+                deferred.append((payload, int(status)))
+                return
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self._send_response_bytes(
                 body,
                 status=status,
                 content_type="application/json; charset=utf-8",
             )
+
+        def _flush_deferred_json_response(self, deferred: list[tuple[dict[str, Any], int]]) -> None:
+            if len(deferred) != 1:
+                raise RuntimeError(f"API handler produced {len(deferred)} JSON responses")
+            payload, status = deferred[0]
+            self._json(payload, status=status)
 
         def _send_response_bytes(self, body: bytes, *, status: int, content_type: str) -> None:
             try:

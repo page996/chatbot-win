@@ -12,6 +12,14 @@ from app.personal_wechat_bot.memory.sqlite_utils import connect
 
 SCHEMA_VERSION = 1
 WEFLOW_HISTORY_LIMIT = 50
+WEFLOW_PREFERENCE_KEYS = frozenset(
+    {
+        "allow_non_local",
+        "base_url",
+        "talkers",
+        "token_env",
+    }
+)
 
 
 class SidebarStateStore:
@@ -162,6 +170,95 @@ class SidebarStateStore:
             payload.setdefault("summary", str(row["summary"] or ""))
             history.append(payload)
         return history
+
+    def reset_weflow_history(self) -> dict[str, Any]:
+        """Physically purge runtime/history state while retaining preferences."""
+
+        self._ensure_schema()
+        db = sqlite3.connect(str(self.path), timeout=30.0)
+        db.row_factory = sqlite3.Row
+        state: dict[str, Any] = {}
+        try:
+            db.execute("PRAGMA busy_timeout=30000")
+            checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is not None and int(checkpoint[0]) != 0:
+                raise sqlite3.OperationalError("sidebar state WAL checkpoint is busy")
+            journal_mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                raise sqlite3.OperationalError("sidebar state could not leave WAL mode")
+            secure_delete = db.execute("PRAGMA secure_delete=ON").fetchone()
+            if secure_delete is None or int(secure_delete[0]) != 1:
+                raise sqlite3.OperationalError("sidebar state secure_delete is unavailable")
+
+            placeholders = ", ".join("?" for _ in WEFLOW_PREFERENCE_KEYS)
+            rows = db.execute(
+                f"""
+                SELECT key, value_json
+                FROM sidebar_state_values
+                WHERE scope = 'weflow' AND key IN ({placeholders})
+                """,
+                tuple(sorted(WEFLOW_PREFERENCE_KEYS)),
+            ).fetchall()
+            for row in rows:
+                try:
+                    state[str(row["key"])] = json.loads(str(row["value_json"] or "null"))
+                except json.JSONDecodeError:
+                    continue
+
+            reset_at = _now_z()
+            state.update(
+                {
+                    "backfill_job": {},
+                    "last_backfill": {},
+                    "last_discover": {},
+                    "last_error": "",
+                    "last_health": {},
+                    "last_pull": {},
+                    "pull_job": {},
+                    "updated_at": reset_at,
+                }
+            )
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM sidebar_state_meta")
+            db.execute(
+                "INSERT INTO sidebar_state_meta(key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            db.execute("DELETE FROM sidebar_state_values")
+            db.execute("DELETE FROM weflow_operation_history")
+            db.execute("DELETE FROM sqlite_sequence WHERE name = 'weflow_operation_history'")
+            for key, value in state.items():
+                db.execute(
+                    """
+                    INSERT INTO sidebar_state_values(scope, key, value_json, updated_at)
+                    VALUES ('weflow', ?, ?, ?)
+                    """,
+                    (key, _json_dumps(value), reset_at),
+                )
+            db.commit()
+
+            # secure_delete scrubs the rows removed above. VACUUM also rebuilds
+            # the file so content left by older deletes cannot survive in free
+            # pages. DELETE journal mode ensures no pre-reset WAL remains.
+            db.execute("VACUUM")
+            if int(db.execute("PRAGMA freelist_count").fetchone()[0]) != 0:
+                raise sqlite3.OperationalError("sidebar state VACUUM left free pages")
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        remaining_sidecars = [
+            str(Path(f"{self.path}{suffix}"))
+            for suffix in ("-wal", "-shm", "-journal")
+            if Path(f"{self.path}{suffix}").exists()
+        ]
+        if remaining_sidecars:
+            raise sqlite3.OperationalError(
+                "sidebar state reset left SQLite sidecars: " + ", ".join(remaining_sidecars)
+            )
+        return {**state, "operation_history": []}
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

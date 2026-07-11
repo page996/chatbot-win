@@ -9,6 +9,7 @@
   controlsSaving: false,
   controlsRevision: 0,
   historyResetPending: false,
+  historyResetNoticeKey: "",
   statusMessage: "",
   probeExpanded: false,
   wechatProbeOverlay: null,
@@ -68,6 +69,11 @@ async function api(path, options = {}) {
         throw invalid;
       }
     }
+    if (payload?.history_reset_in_progress === true) {
+      state.historyResetPending = true;
+      setStatusMessage("历史清理正在进行或状态无法核实；已停止所有写操作，请勿重试");
+      syncTaskButtonLocks();
+    }
     if (!response.ok || payload.status === "error") {
       const error = new Error(payload.error || payload.message || `HTTP ${response.status}`);
       error.payload = payload;
@@ -120,6 +126,7 @@ async function drainRefreshQueue() {
         const payload = await api("/api/state");
         if (epoch === state.dataEpoch && !state.historyResetPending) {
           state.data = payload;
+          reconcileHistoryResetStatus(payload.history_reset);
           state.successfulRefreshRevision += 1;
           render({
             forceControls: request.forceControls && request.forceControlsRevision === state.controlsRevision,
@@ -136,6 +143,42 @@ async function drainRefreshQueue() {
     state.refreshing = false;
     state.refreshPromise = null;
   }
+}
+
+function reconcileHistoryResetStatus(reset) {
+  if (!reset || typeof reset !== "object" || reset.status === "idle") return;
+  const status = String(reset.status || "unknown");
+  const phase = String(reset.phase || "");
+  const active = reset.active === true || reset.outcome_unknown === true;
+  if (active) {
+    state.historyResetPending = true;
+    const message = reset.outcome_unknown === true
+      ? "历史清理状态无法核实；请勿重复清空或继续写入，请检查运行状态后再处理"
+      : `历史清理仍在进行${phase ? `（${phase}）` : ""}；请等待完成后重新打开 sidebar`;
+    setStatusMessage(message);
+    syncTaskButtonLocks();
+    return;
+  }
+  if (reset.terminal !== true) return;
+  state.historyResetPending = false;
+  syncTaskButtonLocks();
+  const clearResult = reset.clear_result || {};
+  const noticeKey = [status, phase, reset.updated_at || "", clearResult.history_reset_id || ""].join("|");
+  if (noticeKey === state.historyResetNoticeKey) return;
+  state.historyResetNoticeKey = noticeKey;
+  let message;
+  if (status === "ok") {
+    message = `上次历史清理已完成：删除 ${Number(clearResult.removed_count || 0)} 项`;
+  } else if (status === "partial_error") {
+    message = `上次历史清理未完整完成：${Number(clearResult.error_count || 0)} 项失败`;
+  } else if (phase === "interrupted") {
+    message = "上次历史清理在写入终态前中断；请检查残留状态后再重试";
+  } else if (status === "blocked") {
+    message = "上次历史清理被运行中的写入任务阻断";
+  } else {
+    message = `上次历史清理失败${phase ? `（${phase}）` : ""}`;
+  }
+  setStatusMessage(message);
 }
 
 function render({ forceControls = false } = {}) {
@@ -1471,6 +1514,34 @@ async function clearHistoryData(helpers = {}) {
   state.dataEpoch += 1;
   syncTaskButtonLocks();
   helpers.update?.(18, "已确认，正在调度关闭清空");
+  const unlockKnownFailure = async (payload, message) => {
+    state.historyResetPending = false;
+    syncTaskButtonLocks();
+    helpers.update?.(100, message);
+    setStatusMessage(message);
+    await refresh({ force: true });
+    return payload;
+  };
+  const retainUnknownOutcome = (payload, detail = "") => {
+    const responseStatus = String(payload?.status || "");
+    const message = [
+      "历史清理请求结果未知；请勿重复清空。请手动关闭并重新打开 sidebar，重新打开前不要继续写入。",
+      detail,
+    ].filter(Boolean).join(" ");
+    helpers.update?.(100, message);
+    setStatusMessage(message);
+    syncTaskButtonLocks();
+    return {
+      ...(payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {}),
+      status: "error",
+      outcome: "unknown",
+      response_status: responseStatus,
+      message,
+    };
+  };
+  const explicitFailureMessage = (payload) => payload.status === "blocked"
+    ? `历史清理被阻断：${payload.message || payload.reason || "仍有历史写入任务运行"}`
+    : `历史清理未完整完成：${payload.error_count || 0} 项删除失败`;
   let payload;
   try {
     payload = await api("/api/history/clear", {
@@ -1478,25 +1549,47 @@ async function clearHistoryData(helpers = {}) {
       body: JSON.stringify({ source: "sidebar", shutdown_processes: true }),
     });
   } catch (error) {
-    state.historyResetPending = false;
-    syncTaskButtonLocks();
-    throw error;
+    const errorPayload = error?.payload;
+    const errorPayloadStatus = String(errorPayload?.status || "");
+    const httpStatus = Number(error?.httpStatus);
+    const isProvenClientRejection = Number.isInteger(httpStatus)
+      && httpStatus >= 400
+      && httpStatus < 500
+      && errorPayload
+      && typeof errorPayload === "object"
+      && !Array.isArray(errorPayload)
+      && errorPayload.history_reset_not_scheduled === true;
+    if (isProvenClientRejection) {
+      const message = `历史清理请求未受理：${errorPayload.message || errorPayload.error || error.message || `HTTP ${httpStatus}`}`;
+      return unlockKnownFailure(
+        {
+          ...errorPayload,
+          status: "error",
+          response_status: errorPayloadStatus,
+          message,
+        },
+        message,
+      );
+    }
+    return retainUnknownOutcome(errorPayload, error?.message || "请求连接已中断");
   }
-  if (payload.status === "shutdown_scheduled") {
+  if (payload?.outcome_unknown === true) {
+    return retainUnknownOutcome(payload, payload?.message || "服务无法核实清理进程状态");
+  }
+  if (payload?.status === "shutdown_scheduled") {
     helpers.update?.(96, "已调度：窗口即将关闭；完成后请手动重新打开 sidebar");
     setStatusMessage("已调度关闭清空；完成后请手动重新打开 sidebar");
     return payload;
   }
-  if (["blocked", "partial_error"].includes(String(payload.status || ""))) {
-    state.historyResetPending = false;
-    syncTaskButtonLocks();
-    const message = payload.status === "blocked"
-      ? `历史清理被阻断：${payload.message || payload.reason || "仍有历史写入任务运行"}`
-      : `历史清理未完整完成：${payload.error_count || 0} 项删除失败`;
-    helpers.update?.(100, message);
-    setStatusMessage(message);
-    await refresh({ force: true });
-    return payload;
+  if (["blocked", "partial_error"].includes(String(payload?.status || ""))) {
+    return unlockKnownFailure(payload, explicitFailureMessage(payload));
+  }
+  if (payload?.status !== "ok") {
+    const responseStatus = String(payload?.status || "");
+    return retainUnknownOutcome(
+      payload,
+      responseStatus ? `服务返回未识别状态：${responseStatus}` : "服务未返回明确结果",
+    );
   }
   helpers.update?.(78, "历史数据已清空，正在刷新页面状态");
   const retainedLocked = Number(payload.retained_locked_count || 0);

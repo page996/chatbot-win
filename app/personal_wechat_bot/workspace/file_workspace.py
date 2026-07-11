@@ -17,6 +17,12 @@ from typing import Any, Iterator
 
 from app.personal_wechat_bot.conversation.segment import resolve_segment
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.runtime.history_fence import (
+    HistoryWriterLease,
+    history_writer_fence_if_owned,
+    history_writer_lease_if_owned,
+    register_history_writer_lease_if_owned,
+)
 from app.personal_wechat_bot.runtime.process_lock import (
     pid_lock_file_is_stale,
     scoped_process_lock_path,
@@ -83,7 +89,11 @@ class FileWorkspace:
 
     def __init__(self, root: str | Path, *, analyzer: Any = None, analysis_async: bool = False):
         self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        with history_writer_fence_if_owned(
+            self.root,
+            label="file_workspace_init",
+        ):
+            self.root.mkdir(parents=True, exist_ok=True)
         # Optional LLM-backed analyzer (workspace.file_analysis.FileAnalyzer).
         # When absent, analysis.json holds mechanical metadata only. Set once in
         # bootstrap so the driver + pipeline that share this instance all use it.
@@ -128,6 +138,31 @@ class FileWorkspace:
         )
 
     def stage_file(
+        self,
+        source_path: str | Path,
+        *,
+        conversation_id: str,
+        session_id: str,
+        original_name: str = "",
+        kind: str = "file",
+        source: str = "backend_event_attachment",
+        chat_title: str = "",
+    ) -> StagedFile:
+        with history_writer_fence_if_owned(
+            self.root,
+            label="file_workspace_stage",
+        ):
+            return self._stage_file_fenced(
+                source_path,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                original_name=original_name,
+                kind=kind,
+                source=source,
+                chat_title=chat_title,
+            )
+
+    def _stage_file_fenced(
         self,
         source_path: str | Path,
         *,
@@ -247,14 +282,18 @@ class FileWorkspace:
         embedded_media_ocr: OcrEngine | None = None,
         embedded_media_asr: AsrEngine | None = None,
     ) -> None:
-        with self._conversation_lifecycle_lock(staged.workspace_dir):
-            self._require_staged_manifest(staged)
-            self._write_parse_result_unlocked(
-                staged,
-                result,
-                embedded_media_ocr=embedded_media_ocr,
-                embedded_media_asr=embedded_media_asr,
-            )
+        with history_writer_fence_if_owned(
+            self.root,
+            label="file_workspace_write_parse_result",
+        ):
+            with self._conversation_lifecycle_lock(staged.workspace_dir):
+                self._require_staged_manifest(staged)
+                self._write_parse_result_unlocked(
+                    staged,
+                    result,
+                    embedded_media_ocr=embedded_media_ocr,
+                    embedded_media_asr=embedded_media_asr,
+                )
 
     def _write_parse_result_unlocked(
         self,
@@ -327,17 +366,31 @@ class FileWorkspace:
         self._record_file_parse_task(staged, result, chunks)
         if self._should_schedule_file_analysis(ai_analysis):
             self._record_file_ai_task(staged, result, status="queued", progress=0, phase="等待文件 AI 分析")
-            _FILE_ANALYSIS_EXECUTOR.submit(
-                self._finish_async_file_analysis,
-                staged,
-                result,
-                chunks,
-                table_artifacts,
-                media_artifacts,
-                ocr_table_artifacts,
-                content_path,
-                analysis_path,
+            lease = register_history_writer_lease_if_owned(
+                self.root,
+                label="file_workspace_async_analysis",
+                metadata={
+                    "conversation_id": staged.conversation_id,
+                    "file_id": staged.file_id,
+                },
             )
+            try:
+                _FILE_ANALYSIS_EXECUTOR.submit(
+                    self._finish_async_file_analysis,
+                    staged,
+                    result,
+                    chunks,
+                    table_artifacts,
+                    media_artifacts,
+                    ocr_table_artifacts,
+                    content_path,
+                    analysis_path,
+                    history_lease=lease,
+                )
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
 
     def _run_file_analysis(
         self,
@@ -416,6 +469,38 @@ class FileWorkspace:
         return bool(self.analysis_async and self.analyzer is not None and ai_analysis.get("status") == "pending")
 
     def _finish_async_file_analysis(
+        self,
+        staged: StagedFile,
+        result: AttachmentParseResult,
+        chunks: list[dict[str, Any]],
+        table_artifacts: dict[str, Any],
+        media_artifacts: dict[str, Any],
+        ocr_table_artifacts: dict[str, Any],
+        content_path: Path,
+        analysis_path: Path,
+        *,
+        history_lease: HistoryWriterLease | None = None,
+    ) -> None:
+        try:
+            with history_writer_fence_if_owned(
+                self.root,
+                label="file_workspace_async_analysis_write",
+            ):
+                self._finish_async_file_analysis_fenced(
+                    staged,
+                    result,
+                    chunks,
+                    table_artifacts,
+                    media_artifacts,
+                    ocr_table_artifacts,
+                    content_path,
+                    analysis_path,
+                )
+        finally:
+            if history_lease is not None:
+                history_lease.release()
+
+    def _finish_async_file_analysis_fenced(
         self,
         staged: StagedFile,
         result: AttachmentParseResult,
@@ -660,6 +745,25 @@ class FileWorkspace:
         embedded_media_ocr: OcrEngine | None = None,
         embedded_media_asr: AsrEngine | None = None,
     ) -> AttachmentParseResult:
+        with history_writer_fence_if_owned(
+            self.root,
+            label="file_workspace_parse",
+        ):
+            return self._parse_or_get_cached_fenced(
+                staged,
+                parser,
+                embedded_media_ocr=embedded_media_ocr,
+                embedded_media_asr=embedded_media_asr,
+            )
+
+    def _parse_or_get_cached_fenced(
+        self,
+        staged: StagedFile,
+        parser: Any,
+        *,
+        embedded_media_ocr: OcrEngine | None = None,
+        embedded_media_asr: AsrEngine | None = None,
+    ) -> AttachmentParseResult:
         with self._conversation_lifecycle_lock(staged.workspace_dir):
             self._require_staged_manifest(staged)
             self._ensure_staged_content(staged)
@@ -754,6 +858,23 @@ class FileWorkspace:
         recent context is never dropped. Session ``index.json`` files are updated
         to drop pruned entries. Best-effort and idempotent.
         """
+        with history_writer_fence_if_owned(
+            self.root,
+            label="file_workspace_cleanup",
+        ):
+            return self._cleanup_fenced(
+                max_age_seconds=max_age_seconds,
+                max_total_bytes=max_total_bytes,
+                keep_min=keep_min,
+            )
+
+    def _cleanup_fenced(
+        self,
+        *,
+        max_age_seconds: float | None,
+        max_total_bytes: int | None,
+        keep_min: int,
+    ) -> dict[str, Any]:
         removed: list[str] = []
         removed_blobs = 0
         with self._root_lifecycle_lock():
@@ -885,12 +1006,16 @@ class FileWorkspace:
         staged: StagedFile,
         runtime: LibreOfficeRuntime | None = None,
     ) -> WorkspaceOperationResult:
-        output_dir = Path(staged.outputs_dir) / "libreoffice"
-        try:
-            output = (runtime or LibreOfficeRuntime()).convert_to_pdf(staged.staged_path, output_dir)
-            return WorkspaceOperationResult("completed", "libreoffice.convert_to_pdf completed", str(output))
-        except Exception as exc:
-            return WorkspaceOperationResult("failed", "libreoffice.convert_to_pdf failed", error=f"{type(exc).__name__}: {exc}")
+        with history_writer_lease_if_owned(
+            self.root,
+            label="file_workspace_libreoffice",
+        ):
+            output_dir = Path(staged.outputs_dir) / "libreoffice"
+            try:
+                output = (runtime or LibreOfficeRuntime()).convert_to_pdf(staged.staged_path, output_dir)
+                return WorkspaceOperationResult("completed", "libreoffice.convert_to_pdf completed", str(output))
+            except Exception as exc:
+                return WorkspaceOperationResult("failed", "libreoffice.convert_to_pdf failed", error=f"{type(exc).__name__}: {exc}")
 
     def _session_index_path(self, conversation_id: str, session_id: str) -> Path:
         return self.root / self._conversation_segment(conversation_id) / _safe_segment(session_id) / "index.json"

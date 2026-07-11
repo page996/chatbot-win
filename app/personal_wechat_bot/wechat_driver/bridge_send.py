@@ -61,6 +61,40 @@ def is_terminal_bridge_ack_status(status: str) -> bool:
     return str(status or "") in BRIDGE_TERMINAL_ACK_STATUSES
 
 
+def bridge_ack_history_reset_frozen(ack: dict[str, Any] | None) -> bool:
+    if not isinstance(ack, dict):
+        return False
+    payload = ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
+    return payload.get("history_reset_frozen") is True
+
+
+def _history_reset_terminal_freeze_ack(
+    bridge_id: str,
+    state: "BridgeAckState",
+    *,
+    reset_id: str,
+    reset_at_epoch: int,
+) -> dict[str, Any]:
+    payload = state.ack.get("payload") if isinstance(state.ack.get("payload"), dict) else {}
+    # An unverified native ``sent`` ack is projected as ``accepted``. Preserve
+    # its raw status so normalization keeps the delivery semantics unchanged.
+    status = str(state.ack.get("original_status") or state.ack.get("status") or state.status)
+    return {
+        "bridge_id": bridge_id,
+        "status": status,
+        "reason": str(state.ack.get("reason") or "history_reset_frozen_terminal"),
+        "external_message_id": str(state.ack.get("external_message_id") or ""),
+        "payload": {
+            **payload,
+            "history_reset_frozen": True,
+            "history_reset_id": reset_id,
+            "history_reset_epoch": int(reset_at_epoch),
+            "previous_status": state.status,
+        },
+        "created_at": utc_now_iso(),
+    }
+
+
 _BRIDGE_TERMINAL_ACK_PRIORITY = {
     BridgeAckStatus.FAILED: 1,
     BridgeAckStatus.BLOCKED: 2,
@@ -516,6 +550,120 @@ class BridgeOutboxStore:
         self._append(self.ack_path, record)
         return record
 
+    def archive_for_history_reset(
+        self,
+        *,
+        reset_id: str,
+        reset_at_epoch: int,
+    ) -> dict[str, Any]:
+        """Freeze all pre-reset bridge work without deleting its evidence."""
+
+        reset_id = str(reset_id or "").strip()
+        if not reset_id:
+            raise ValueError("reset_id is required")
+        with self._store_lock():
+            outbox, invalid_outbox = self._read_all_with_invalid(self.outbox_path)
+            acks, invalid_acks = self._read_all_with_invalid(self.ack_path)
+            ack_states = effective_bridge_ack_states(acks)
+            archived: list[dict[str, Any]] = []
+            archived_ids: set[str] = set()
+            outbox_by_id: dict[str, dict[str, Any]] = {}
+            for record in outbox:
+                bridge_id = str(record.get("bridge_id") or "").strip()
+                if not bridge_id:
+                    continue
+                outbox_by_id[bridge_id] = record
+                current = ack_states.get(bridge_id)
+                if bridge_id in archived_ids:
+                    continue
+                if current is not None and current.terminal:
+                    if bridge_ack_history_reset_frozen(current.ack):
+                        continue
+                    freeze_ack = _history_reset_terminal_freeze_ack(
+                        bridge_id,
+                        current,
+                        reset_id=reset_id,
+                        reset_at_epoch=reset_at_epoch,
+                    )
+                    self._append_unlocked(self.ack_path, freeze_ack)
+                    acks.append(freeze_ack)
+                    archived_ids.add(bridge_id)
+                    continue
+                previous_status = current.status if current is not None else "queued"
+                outcome_unknown = previous_status == BridgeAckStatus.INFLIGHT
+                reason = (
+                    "history_reset_cancelled_inflight_outcome_unknown"
+                    if outcome_unknown
+                    else "history_reset_cancelled_pending"
+                )
+                ack = {
+                    "bridge_id": bridge_id,
+                    "status": BridgeAckStatus.BLOCKED,
+                    "reason": reason,
+                    "external_message_id": "",
+                    "payload": {
+                        "history_reset": True,
+                        "history_reset_frozen": True,
+                        "history_reset_id": reset_id,
+                        "history_reset_epoch": int(reset_at_epoch),
+                        "previous_status": previous_status,
+                        "outcome_unknown": outcome_unknown,
+                    },
+                    "created_at": utc_now_iso(),
+                }
+                self._append_unlocked(self.ack_path, ack)
+                acks.append(ack)
+                archived_ids.add(bridge_id)
+                archived.append(
+                    {
+                        "bridge_id": bridge_id,
+                        "previous_status": previous_status,
+                        "status": BridgeAckStatus.BLOCKED,
+                        "outcome_unknown": outcome_unknown,
+                    }
+                )
+            # A crash between outbox and ack compaction can leave a terminal
+            # ack without its outbox record. It is still pre-reset evidence and
+            # must be frozen so marker loss cannot project it into new history.
+            for bridge_id, current in sorted(ack_states.items()):
+                if bridge_id in outbox_by_id or not current.terminal:
+                    continue
+                if bridge_ack_history_reset_frozen(current.ack):
+                    continue
+                freeze_ack = _history_reset_terminal_freeze_ack(
+                    bridge_id,
+                    current,
+                    reset_id=reset_id,
+                    reset_at_epoch=reset_at_epoch,
+                )
+                self._append_unlocked(self.ack_path, freeze_ack)
+                acks.append(freeze_ack)
+            ack_states = effective_bridge_ack_states(acks)
+            frozen_terminal_count = sum(
+                1
+                for state in ack_states.values()
+                if state.terminal and bridge_ack_history_reset_frozen(state.ack)
+            )
+            terminal_sync_fingerprints = {
+                bridge_id: bridge_sync_fingerprint(state.ack, outbox_by_id.get(bridge_id))
+                for bridge_id, state in ack_states.items()
+                if state.terminal
+            }
+            accepted_ids = sorted(
+                bridge_id
+                for bridge_id, state in ack_states.items()
+                if state.status == BridgeAckStatus.ACCEPTED
+            )
+        return {
+            "archived_count": len(archived),
+            "archived": archived,
+            "frozen_terminal_count": frozen_terminal_count,
+            "terminal_sync_fingerprints": terminal_sync_fingerprints,
+            "accepted_ids": accepted_ids,
+            "invalid_outbox_line_count": len(invalid_outbox),
+            "invalid_ack_line_count": len(invalid_acks),
+        }
+
     def append_terminal_ack_if_queued(
         self,
         bridge_id: str,
@@ -617,6 +765,8 @@ class BridgeOutboxStore:
             ack_state = ack_states.get(original_id)
             if ack_state is None or not ack_state.terminal:
                 raise ValueError("bridge item is not terminal; wait for the current attempt to finish")
+            if bridge_ack_history_reset_frozen(ack_state.ack):
+                raise ValueError("bridge item was frozen by history reset and cannot be retried")
             retryable, retry_reason = bridge_item_retryable(
                 ack_state.status,
                 str(ack_state.ack.get("reason", "")),
@@ -630,6 +780,8 @@ class BridgeOutboxStore:
                 descendant_state = ack_states.get(descendant_id)
                 if descendant_state is None or not descendant_state.terminal:
                     continue
+                if bridge_ack_history_reset_frozen(descendant_state.ack):
+                    raise ValueError("bridge retry lineage was frozen by history reset")
                 descendant_retryable, descendant_blocker = bridge_item_retryable(
                     descendant_state.status,
                     str(descendant_state.ack.get("reason", "")),
@@ -666,6 +818,8 @@ class BridgeOutboxStore:
             retry_parent_state = ack_states.get(retry_parent_id)
             if retry_parent_state is None or not retry_parent_state.terminal:
                 raise ValueError("retry lineage leaf is not terminal; wait for the current attempt to finish")
+            if bridge_ack_history_reset_frozen(retry_parent_state.ack):
+                raise ValueError("bridge retry lineage was frozen by history reset")
             retryable, retry_reason = bridge_item_retryable(
                 retry_parent_state.status,
                 str(retry_parent_state.ack.get("reason", "")),
@@ -986,6 +1140,10 @@ class BridgeOutboxStore:
                     )
                 else:
                     retry_reason = f"active retry already pending: {latest_descendant_id}"
+            history_reset_frozen = bridge_ack_history_reset_frozen(ack)
+            if history_reset_frozen:
+                retryable = False
+                retry_reason = "bridge item was frozen by history reset"
             effective_status_counts[status] = effective_status_counts.get(status, 0) + 1
             ack_backend = _bridge_ack_backend(ack)
             backend_counts = status_counts_by_backend.setdefault(ack_backend, {})
@@ -998,6 +1156,7 @@ class BridgeOutboxStore:
                     "ack_backend": ack_backend,
                     "delivery_verified": _bridge_ack_delivery_verified(ack),
                     "accepted_unverified": _bridge_ack_accepted_unverified(ack),
+                    "history_reset_frozen": history_reset_frozen,
                     "delivery_ready": item.get("ready_for_delivery") is not False,
                     "retryable": retryable,
                     "retry_blocker": "" if retryable else retry_reason,

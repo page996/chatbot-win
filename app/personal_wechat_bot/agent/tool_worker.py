@@ -9,6 +9,10 @@ from app.personal_wechat_bot.agent.workspace import TaskWorkspaceStore
 from app.personal_wechat_bot.domain.models import ToolCallRequest
 from app.personal_wechat_bot.logging.event_log import EventLogger
 from app.personal_wechat_bot.memory.file_index import FileIndex
+from app.personal_wechat_bot.runtime.history_fence import (
+    history_writer_lease_after_startup_handoff_if_owned,
+)
+from app.personal_wechat_bot.runtime.worker_job import ensure_worker_descendant_job
 from app.personal_wechat_bot.tools.defaults import register_default_tools
 from app.personal_wechat_bot.tools.registry import ToolRegistry
 from app.personal_wechat_bot.tools.runtime import ToolRuntime
@@ -32,7 +36,17 @@ def build_tool_runtime(data_dir: Path) -> ToolRuntime:
 
 def main() -> int:
     args = parse_args()
-    data_dir = Path(args.data_dir)
+    ensure_worker_descendant_job()
+    data_dir = Path(args.data_dir).resolve()
+    with history_writer_lease_after_startup_handoff_if_owned(
+        data_dir,
+        label="tool_agent_worker",
+        metadata={"task_id": args.task_id},
+    ):
+        return _run_worker(args, data_dir)
+
+
+def _run_worker(args: argparse.Namespace, data_dir: Path) -> int:
     workspace = TaskWorkspaceStore(data_dir)
     request = workspace.read_request(args.task_id)
     tool_payload = request.get("instructions", {}).get("tool_request")

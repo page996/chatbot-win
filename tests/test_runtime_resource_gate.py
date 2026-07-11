@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.personal_wechat_bot.runtime.resource_gate import acquire_gpu, acquire_llm, gpu_gate_snapshot, llm_gate_snapshot
 
@@ -46,6 +48,25 @@ class RuntimeResourceGateTests(unittest.TestCase):
         self.assertEqual(snapshot["active_slots"], 0)
         self.assertEqual(len(snapshot["slots"]), 2)
         self.assertIn("显式选择 GPU", str(snapshot["policy"]))
+
+    def test_gpu_gate_snapshot_does_not_create_missing_lock_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "missing-lock-root"
+
+            snapshot = gpu_gate_snapshot(root=root, max_parallel=2)
+
+            self.assertFalse(root.exists())
+            self.assertEqual(snapshot["active_slots"], 0)
+            self.assertEqual(len(snapshot["slots"]), 2)
+
+    def test_gpu_gate_snapshot_respects_shared_environment_root_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "shared-gpu-gate"
+            with mock.patch.dict(os.environ, {"CHATBOT_GPU_GATE_DIR": str(root)}):
+                snapshot = gpu_gate_snapshot(max_parallel=1)
+
+            self.assertEqual(Path(str(snapshot["lock_root"])), root.resolve())
+            self.assertFalse(root.exists())
 
     def test_gpu_gate_snapshot_reports_cross_process_slot_activity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

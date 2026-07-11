@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -42,6 +43,423 @@ def _edge_executable() -> Path | None:
 
 
 class SidebarServerTest(unittest.TestCase):
+    def test_api_response_is_sent_only_after_writer_fence_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            fence_exit_started = threading.Event()
+            allow_fence_exit = threading.Event()
+            fence_exited = threading.Event()
+            response_received = threading.Event()
+            request_errors: list[BaseException] = []
+
+            @contextmanager
+            def paused_fence(*_args, **_kwargs):
+                try:
+                    yield
+                finally:
+                    fence_exit_started.set()
+                    if not allow_fence_exit.wait(timeout=5):
+                        raise TimeoutError("fence exit was not released")
+                    fence_exited.set()
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            host, port = server.server_address
+
+            def post_controls() -> None:
+                try:
+                    request = Request(
+                        f"http://{host}:{port}/api/controls",
+                        data=json.dumps({}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    urlopen(request, timeout=6).read()
+                    response_received.set()
+                except BaseException as exc:
+                    request_errors.append(exc)
+
+            request_thread = threading.Thread(target=post_controls, daemon=True)
+            try:
+                with mock.patch.object(
+                    sidebar_server,
+                    "sidebar_history_reset_status",
+                    return_value={"active": False, "outcome_unknown": False},
+                ), mock.patch.object(
+                    sidebar_server,
+                    "history_writer_fence_if_owned",
+                    side_effect=paused_fence,
+                ), mock.patch.object(
+                    sidebar_server,
+                    "update_sidebar_controls",
+                    return_value={"status": "ok"},
+                ):
+                    request_thread.start()
+                    self.assertTrue(fence_exit_started.wait(timeout=5))
+                    self.assertFalse(response_received.wait(timeout=0.2))
+                    self.assertFalse(fence_exited.is_set())
+                    allow_fence_exit.set()
+                    request_thread.join(timeout=6)
+            finally:
+                allow_fence_exit.set()
+                request_thread.join(timeout=6)
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+            self.assertFalse(request_thread.is_alive())
+            self.assertEqual(request_errors, [])
+            self.assertTrue(fence_exited.is_set())
+            self.assertTrue(response_received.is_set())
+
+    def test_api_request_fence_blocks_direct_history_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            disposable = data_dir / "backend_events.jsonl"
+            disposable.write_text("history-sentinel\n", encoding="utf-8")
+            request_entered = threading.Event()
+            release_request = threading.Event()
+            request_errors: list[BaseException] = []
+
+            def blocked_state(_data_dir: Path) -> dict[str, str]:
+                request_entered.set()
+                if not release_request.wait(timeout=5):
+                    raise TimeoutError("test request fence was not released")
+                return {"status": "ok"}
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            host, port = server.server_address
+
+            def request_state() -> None:
+                try:
+                    urlopen(f"http://{host}:{port}/api/state", timeout=6).read()
+                except BaseException as exc:
+                    request_errors.append(exc)
+
+            request_thread = threading.Thread(target=request_state, daemon=True)
+            try:
+                with mock.patch.object(sidebar_server, "build_sidebar_state", side_effect=blocked_state):
+                    request_thread.start()
+                    self.assertTrue(request_entered.wait(timeout=5))
+
+                    result = sidebar_server.clear_sidebar_history_data(data_dir, {})
+
+                    self.assertEqual(result["status"], "blocked")
+                    self.assertTrue(disposable.is_file())
+            finally:
+                release_request.set()
+                request_thread.join(timeout=7)
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+            self.assertFalse(request_thread.is_alive())
+            self.assertEqual(request_errors, [])
+
+    def test_history_clear_http_route_always_schedules_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                with mock.patch.object(
+                    sidebar_server,
+                    "clear_sidebar_history_data",
+                    return_value={"status": "shutdown_scheduled"},
+                ) as clear_history, mock.patch.object(
+                    sidebar_server,
+                    "sidebar_history_reset_status",
+                    return_value={"active": True, "outcome_unknown": False},
+                ):
+                    request = Request(
+                        f"http://{host}:{port}/api/history/clear",
+                        data=json.dumps({"shutdown_processes": False, "source": "forged"}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    payload = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+
+                self.assertEqual(payload["status"], "shutdown_scheduled")
+                clear_history.assert_called_once()
+                called_data_dir, called_payload = clear_history.call_args.args
+                self.assertEqual(Path(called_data_dir), data_dir)
+                self.assertIs(called_payload["shutdown_processes"], True)
+                self.assertEqual(called_payload["source"], "forged")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_history_reset_admission_blocks_other_posts_before_dispatch(self) -> None:
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                with mock.patch.object(
+                    sidebar_server,
+                    "sidebar_history_reset_status",
+                    return_value={"active": True, "outcome_unknown": False, "phase": "scheduled"},
+                ), mock.patch.object(sidebar_server, "set_model_config") as set_model_config:
+                    request = Request(
+                        f"http://{host}:{port}/api/model-config",
+                        data=json.dumps({"provider": "relay"}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as ctx:
+                        urlopen(request, timeout=5)
+                    self.assertEqual(ctx.exception.code, 409)
+                    payload = json.loads(ctx.exception.read().decode("utf-8"))
+                    ctx.exception.close()
+
+                self.assertEqual(payload["status"], "blocked")
+                self.assertEqual(payload["error"], "history_reset_in_progress")
+                self.assertIs(payload["history_reset_in_progress"], True)
+                self.assertEqual(payload["phase"], "scheduled")
+                set_model_config.assert_not_called()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_history_reset_admission_rechecks_after_writer_fence(self) -> None:
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            reset_states = (
+                {"active": False, "outcome_unknown": False},
+                {"active": True, "outcome_unknown": True, "phase": "status_unverifiable"},
+            )
+            try:
+                with mock.patch.object(
+                    sidebar_server,
+                    "sidebar_history_reset_status",
+                    side_effect=reset_states,
+                ) as reset_status, mock.patch.object(sidebar_server, "set_model_config") as set_model_config:
+                    request = Request(
+                        f"http://{host}:{port}/api/model-config",
+                        data=json.dumps({"provider": "relay"}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as ctx:
+                        urlopen(request, timeout=5)
+                    self.assertEqual(ctx.exception.code, 409)
+                    payload = json.loads(ctx.exception.read().decode("utf-8"))
+                    ctx.exception.close()
+
+                self.assertEqual(reset_status.call_count, 2)
+                self.assertIs(payload["outcome_unknown"], True)
+                set_model_config.assert_not_called()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_history_reset_admission_drains_handler_before_scheduling_and_blocks_next_post(self) -> None:
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            handler_entered = threading.Event()
+            release_handler = threading.Event()
+            reset_scheduled = threading.Event()
+            request_errors: list[BaseException] = []
+
+            def blocked_model_update(_data_dir: Path, _payload: dict[str, object]) -> dict[str, str]:
+                handler_entered.set()
+                if not release_handler.wait(timeout=5):
+                    raise TimeoutError("model handler was not released")
+                return {"status": "ok"}
+
+            def scheduled_clear(_data_dir: Path, _payload: dict[str, object]) -> dict[str, str]:
+                reset_scheduled.set()
+                return {"status": "shutdown_scheduled"}
+
+            def reset_status(_data_dir: Path) -> dict[str, object]:
+                return {
+                    "active": reset_scheduled.is_set(),
+                    "outcome_unknown": False,
+                    "phase": "scheduled" if reset_scheduled.is_set() else "",
+                }
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            host, port = server.server_address
+
+            def post(path: str, payload: dict[str, object]) -> None:
+                try:
+                    request = Request(
+                        f"http://{host}:{port}{path}",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    urlopen(request, timeout=6).read()
+                except BaseException as exc:
+                    request_errors.append(exc)
+
+            first = threading.Thread(target=post, args=("/api/model-config", {"provider": "relay"}), daemon=True)
+            clear = threading.Thread(target=post, args=("/api/history/clear", {}), daemon=True)
+            try:
+                with mock.patch.object(
+                    sidebar_server,
+                    "sidebar_history_reset_status",
+                    side_effect=reset_status,
+                ), mock.patch.object(
+                    sidebar_server,
+                    "set_model_config",
+                    side_effect=blocked_model_update,
+                ) as set_model_config, mock.patch.object(
+                    sidebar_server,
+                    "clear_sidebar_history_data",
+                    side_effect=scheduled_clear,
+                ):
+                    first.start()
+                    self.assertTrue(handler_entered.wait(timeout=5))
+                    clear.start()
+                    self.assertFalse(reset_scheduled.wait(timeout=0.2))
+                    release_handler.set()
+                    first.join(timeout=6)
+                    clear.join(timeout=6)
+                    self.assertTrue(reset_scheduled.is_set())
+
+                    request = Request(
+                        f"http://{host}:{port}/api/model-config",
+                        data=json.dumps({"provider": "relay"}).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as ctx:
+                        urlopen(request, timeout=5)
+                    self.assertEqual(ctx.exception.code, 409)
+                    ctx.exception.close()
+                    self.assertEqual(set_model_config.call_count, 1)
+            finally:
+                release_handler.set()
+                first.join(timeout=6)
+                clear.join(timeout=6)
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(clear.is_alive())
+            self.assertEqual(request_errors, [])
+
+    def test_history_clear_validation_failure_proves_helper_was_not_scheduled(self) -> None:
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                with mock.patch.object(sidebar_server, "clear_sidebar_history_data") as clear_history:
+                    request = Request(
+                        f"http://{host}:{port}/api/history/clear",
+                        data=b"{not-json",
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as ctx:
+                        urlopen(request, timeout=5)
+                    self.assertEqual(ctx.exception.code, 400)
+                    payload = json.loads(ctx.exception.read().decode("utf-8"))
+                    ctx.exception.close()
+
+                    cross_origin = Request(
+                        f"http://{host}:{port}/api/history/clear",
+                        data=b"{}",
+                        headers={
+                            "content-type": "application/json",
+                            "origin": "http://attacker.example",
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as cross_origin_ctx:
+                        urlopen(cross_origin, timeout=5)
+                    self.assertEqual(cross_origin_ctx.exception.code, 403)
+                    cross_origin_payload = json.loads(
+                        cross_origin_ctx.exception.read().decode("utf-8")
+                    )
+                    cross_origin_ctx.exception.close()
+
+                self.assertEqual(payload["status"], "error")
+                self.assertEqual(payload["error"], "invalid_json")
+                self.assertIs(payload["history_reset_not_scheduled"], True)
+                self.assertEqual(cross_origin_payload["error"], "cross_origin_forbidden")
+                self.assertIs(cross_origin_payload["history_reset_not_scheduled"], True)
+                clear_history.assert_not_called()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_history_clear_distinguishes_pre_spawn_failure_from_unknown_outcome(self) -> None:
+        from urllib.error import HTTPError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_factory(data_dir))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+
+            def post_failure(error: Exception) -> dict[str, object]:
+                with mock.patch.object(sidebar_server, "clear_sidebar_history_data", side_effect=error):
+                    request = Request(
+                        f"http://{host}:{port}/api/history/clear",
+                        data=b"{}",
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as ctx:
+                        urlopen(request, timeout=5)
+                    self.assertEqual(ctx.exception.code, 400)
+                    payload = json.loads(ctx.exception.read().decode("utf-8"))
+                    ctx.exception.close()
+                    return payload
+
+            try:
+                rejected = post_failure(
+                    sidebar_server.HistoryResetNotScheduledError("launch identity rejected")
+                )
+                unknown = post_failure(RuntimeError("helper may already be running"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertIs(rejected["history_reset_not_scheduled"], True)
+            self.assertNotIn("history_reset_not_scheduled", unknown)
+
     def test_sidebar_server_rejects_oversized_post_before_reading_body(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -368,7 +786,7 @@ class SidebarServerTest(unittest.TestCase):
 
         static_calls = set(re.findall(r"api\(\s*['\"](/api/[^'\"]+)['\"]", script))
         template_calls = set(re.findall(r"api\(\s*`(/api/[^`]+)`", script))
-        exact_routes = set(re.findall(r"parsed\.path == \"([^\"]+)\"", server_source))
+        exact_routes = set(re.findall(r"(?:parsed\.path|path) == \"([^\"]+)\"", server_source))
         dynamic_templates = {
             "/api/agent/${action}",
             "/api/channels/${encodeURIComponent(id)}/test-file",

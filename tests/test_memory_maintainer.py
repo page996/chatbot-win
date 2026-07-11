@@ -4,16 +4,47 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from app.personal_wechat_bot.config.loader import create_default_config
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import LedgerContextAssembler
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SendResult
 from app.personal_wechat_bot.memory.maintainer import MemoryMaintainer
+from app.personal_wechat_bot.runtime.history_fence import active_history_writer_leases
 
 
 class MemoryMaintainerTest(unittest.TestCase):
+    def test_async_llm_lease_is_registered_before_submit_and_released_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            store = ConversationLedgerStore(data_dir)
+            store.append_message(_message("async-lease", "remember this"))
+            maintainer = MemoryMaintainer(
+                store,
+                llm=_JsonMemoryLLM({}),
+                async_llm=True,
+            )
+            observed: list[bool] = []
+
+            class RejectingExecutor:
+                def submit(self, *_args, **_kwargs):
+                    observed.append(bool(active_history_writer_leases(data_dir)))
+                    raise RuntimeError("submit failed")
+
+            with mock.patch(
+                "app.personal_wechat_bot.memory.maintainer._MEMORY_EXECUTOR",
+                RejectingExecutor(),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "submit failed"):
+                    maintainer.maintain("conv1")
+
+            self.assertEqual(observed, [True])
+            self.assertEqual(active_history_writer_leases(data_dir), [])
+
     def test_maintain_writes_summary_preferences_entities_and_context_reads_them(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))

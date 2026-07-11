@@ -16,6 +16,10 @@ from urllib.parse import urlencode, urlparse, quote
 from urllib.request import Request
 
 from app.personal_wechat_bot.domain.models import utc_now_iso
+from app.personal_wechat_bot.runtime.history_fence import (
+    history_writer_fence_if_owned,
+    history_writer_leases_if_owned,
+)
 from app.personal_wechat_bot.runtime.process_lock import short_process_lock
 from app.personal_wechat_bot.tools.web.http_safety import (
     guarded_local_urlopen,
@@ -251,18 +255,26 @@ class HookEventJsonlWriter:
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.touch(exist_ok=True)
+        with history_writer_fence_if_owned(
+            self.path.parent,
+            label="hook_event_writer_init",
+        ):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.touch(exist_ok=True)
 
     def append(self, payload: dict[str, Any]) -> bool:
         if not isinstance(payload, dict):
             raise ValueError("hook payload must be a JSON object")
-        return append_jsonl_once(
-            self.path,
-            _sorted_payload(payload),
-            key_field="raw_id",
-            index_path=self.path.with_suffix(self.path.suffix + ".raw_ids.json"),
-        )
+        with history_writer_fence_if_owned(
+            self.path.parent,
+            label="hook_event_writer_append",
+        ):
+            return append_jsonl_once(
+                self.path,
+                _sorted_payload(payload),
+                key_field="raw_id",
+                index_path=self.path.with_suffix(self.path.suffix + ".raw_ids.json"),
+            )
 
 
 class WeFlowHttpBridge:
@@ -289,7 +301,47 @@ class WeFlowHttpBridge:
         else:
             _require_local_http_url(self.base_url)
 
+    def _history_paths(self) -> tuple[Path, ...]:
+        return (self.writer.path.parent, self.state_path.parent)
+
     def pull_once(
+        self,
+        *,
+        talkers: list[str] | None = None,
+        session_limit: int = 100,
+        message_limit: int = 100,
+        max_pages: int = 1,
+        max_messages: int = 0,
+        since: int | None = None,
+        lookback_seconds: int = 300,
+        media: bool = True,
+        context_only: bool | None = None,
+        ignore_seen: bool = False,
+        workers: int = 1,
+        cancel_event: Event | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> WeFlowPullResult:
+        with history_writer_leases_if_owned(
+            self._history_paths(),
+            label="weflow_pull_once",
+        ):
+            return self._pull_once_leased(
+                talkers=talkers,
+                session_limit=session_limit,
+                message_limit=message_limit,
+                max_pages=max_pages,
+                max_messages=max_messages,
+                since=since,
+                lookback_seconds=lookback_seconds,
+                media=media,
+                context_only=context_only,
+                ignore_seen=ignore_seen,
+                workers=workers,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+
+    def _pull_once_leased(
         self,
         *,
         talkers: list[str] | None = None,
@@ -452,6 +504,7 @@ class WeFlowHttpBridge:
         with _path_lock(_talker_lock_path(self.state_path, session_id), timeout_seconds=self.timeout_seconds):
             _raise_if_cancelled(cancel_event)
             state_snapshot = _read_weflow_state_locked(self.state_path, timeout_seconds=self.timeout_seconds)
+            history_reset_epoch = _safe_int(state_snapshot.get("history_reset_epoch"), 0)
             seen = set() if ignore_seen else set(_string_list(state_snapshot.get("seen_raw_ids")))
             sessions_state = state_snapshot.get("sessions")
             if not isinstance(sessions_state, dict):
@@ -461,8 +514,21 @@ class WeFlowHttpBridge:
             session_since = since
             if session_since is None:
                 session_since = _safe_int(session_state.get("since"), now_since)
+            reset_cursor_bootstrap = bool(
+                since is None
+                and history_reset_epoch > 0
+                and _safe_int(session_state.get("since"), 0) <= 0
+            )
+            if reset_cursor_bootstrap:
+                session_since = history_reset_epoch
             last_message_at = _session_last_message_at(session)
-            if since is None and last_message_at > 0 and session_since > last_message_at + 2 and not seen:
+            if (
+                since is None
+                and not reset_cursor_bootstrap
+                and last_message_at > 0
+                and session_since > last_message_at + 2
+                and not seen
+            ):
                 session_since = max(0, last_message_at - max(2, min(max(0, lookback_seconds), 3600)))
                 cursor_recovery_context_only = True
             start_time = max(0, session_since - 2)
@@ -509,14 +575,25 @@ class WeFlowHttpBridge:
             for message in messages:
                 _raise_if_cancelled(cancel_event)
                 scanned += 1
+                message_timestamp = _epoch_seconds(
+                    message.get("timestamp") or message.get("createTime"),
+                    0 if history_reset_epoch > 0 else max_timestamp,
+                )
+                reset_context_only = bool(
+                    history_reset_epoch > 0
+                    and (message_timestamp <= 0 or message_timestamp <= history_reset_epoch)
+                )
                 normalized = normalize_weflow_message(
                     message,
                     session_id=session_id,
                     session_meta=meta,
-                    context_only=bool(history_context_only or cursor_recovery_context_only),
+                    context_only=bool(
+                        history_context_only
+                        or cursor_recovery_context_only
+                        or reset_context_only
+                    ),
                 )
                 raw_id = str(normalized.get("raw_id") or "").strip()
-                message_timestamp = _epoch_seconds(message.get("timestamp") or message.get("createTime"), max_timestamp)
                 max_timestamp = max(max_timestamp, message_timestamp)
                 if raw_id:
                     current_recent_raw_ids[raw_id] = message_timestamp
@@ -579,7 +656,23 @@ class WeFlowHttpBridge:
         max_events: int | None = None,
         max_seconds: float | None = None,
     ) -> WeFlowSseResult:
+        with history_writer_leases_if_owned(
+            self._history_paths(),
+            label="weflow_sse_listener",
+        ):
+            return self._listen_sse_leased(
+                max_events=max_events,
+                max_seconds=max_seconds,
+            )
+
+    def _listen_sse_leased(
+        self,
+        *,
+        max_events: int | None = None,
+        max_seconds: float | None = None,
+    ) -> WeFlowSseResult:
         state = _read_json_object(self.state_path)
+        history_reset_epoch = _safe_int(state.get("history_reset_epoch"), 0)
         last_event_id = str(state.get("weflow_sse_last_event_id") or "").strip()
         seen = set(_string_list(state.get("weflow_sse_seen")))
         started = time.monotonic()
@@ -618,7 +711,22 @@ class WeFlowHttpBridge:
                 if dedupe_key in seen:
                     skipped += 1
                 else:
-                    normalized = normalize_weflow_push_event({**payload, "event": normalized_event or "message.new"})
+                    event_timestamp = _epoch_seconds(payload.get("timestamp"), 0)
+                    reset_context_only = bool(
+                        history_reset_epoch > 0
+                        and (event_timestamp <= 0 or event_timestamp <= history_reset_epoch)
+                    )
+                    normalized = normalize_weflow_push_event(
+                        {
+                            **payload,
+                            "event": normalized_event or "message.new",
+                            "context_only": bool(
+                                payload.get("context_only")
+                                or payload.get("contextOnly")
+                                or reset_context_only
+                            ),
+                        }
+                    )
                     if event_id:
                         normalized["event_id"] = event_id
                     seen.add(dedupe_key)
@@ -830,6 +938,20 @@ def append_hook_source_event(
     *,
     source: str,
 ) -> HookSourceAppendResult:
+    event_path = Path(hook_event_file)
+    with history_writer_fence_if_owned(
+        event_path.parent,
+        label="append_hook_source_event",
+    ):
+        return _append_hook_source_event_fenced(event_path, payload, source=source)
+
+
+def _append_hook_source_event_fenced(
+    hook_event_file: str | Path,
+    payload: dict[str, Any],
+    *,
+    source: str,
+) -> HookSourceAppendResult:
     writer = HookEventJsonlWriter(hook_event_file)
     try:
         if source == "weflow-push":
@@ -859,6 +981,7 @@ def normalize_weflow_push_event(payload: dict[str, Any]) -> dict[str, Any]:
     rawid = _first_text(payload, "rawid", "rawId", "platformMessageId", "serverId")
     timestamp = _epoch_seconds(payload.get("timestamp"), int(time.time()))
     is_recall = event_name in {"message.revoke", "message.recall", "revoke", "recall"}
+    context_only = bool(payload.get("context_only") or payload.get("contextOnly"))
     recall_message_id = _weflow_recall_message_id(payload, fallback=rawid) if is_recall else ""
     raw_id_suffix = rawid or recall_message_id or str(timestamp)
     sender_name = _first_text(payload, "sourceName", "senderName", "accountName", "sender") or ("system" if is_recall else "unknown")
@@ -885,12 +1008,14 @@ def normalize_weflow_push_event(payload: dict[str, Any]) -> dict[str, Any]:
         "timestamp": timestamp,
         "is_self": _weflow_is_self(payload),
         "is_group": _session_type_is_group(payload, session_id),
+        "context_only": context_only,
+        "capture_phase": "history_backfill" if context_only else "incremental",
         "source_payload": _weflow_source_payload(
             "weflow_push",
             conversation_key=session_id,
             session_meta=payload,
             message=payload,
-            context_only=bool(payload.get("context_only") or payload.get("contextOnly")),
+            context_only=context_only,
             message_type=_first_text(payload, "messageType", "message_type", "type"),
             server_id=rawid,
             msg_id=rawid,

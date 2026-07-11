@@ -9,17 +9,52 @@ import stat
 import time
 import zipfile
 from pathlib import Path
+from unittest import mock
 
+from app.personal_wechat_bot.config.loader import create_default_config
 from app.personal_wechat_bot.conversation.channel_registry_store import ChannelRegistryStore
 from app.personal_wechat_bot.conversation.segment import conversation_segment
 from app.personal_wechat_bot.tasks.manager import TaskStatusStore
 from app.personal_wechat_bot.runtime.process_lock import scoped_process_lock_path, short_process_lock
+from app.personal_wechat_bot.runtime.history_fence import active_history_writer_leases
 from app.personal_wechat_bot.voice.asr import AsrHealth, AsrTranscript
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import AttachmentParseResult
 from app.personal_wechat_bot.workspace.file_workspace import FileWorkspace
 
 
 class FileWorkspaceTest(unittest.TestCase):
+    def test_async_analysis_lease_is_registered_before_submit_and_released_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            create_default_config(data_dir)
+            source = Path(tmp) / "note.txt"
+            source.write_text("async lease", encoding="utf-8")
+            workspace = FileWorkspace(
+                data_dir / "file_workspace",
+                analyzer=_CaptureAnalyzer(),
+                analysis_async=True,
+            )
+            staged = workspace.stage_file(source, conversation_id="conv", session_id="session")
+            observed: list[bool] = []
+
+            class RejectingExecutor:
+                def submit(self, *_args, **_kwargs):
+                    observed.append(bool(active_history_writer_leases(data_dir)))
+                    raise RuntimeError("submit failed")
+
+            with mock.patch(
+                "app.personal_wechat_bot.workspace.file_workspace._FILE_ANALYSIS_EXECUTOR",
+                RejectingExecutor(),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "submit failed"):
+                    workspace.write_parse_result(
+                        staged,
+                        AttachmentParseResult("parsed", "text", "summary", "async lease"),
+                    )
+
+            self.assertEqual(observed, [True])
+            self.assertEqual(active_history_writer_leases(data_dir), [])
+
     def test_stage_file_copies_original_and_writes_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

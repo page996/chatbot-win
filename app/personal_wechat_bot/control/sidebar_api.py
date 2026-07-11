@@ -17,7 +17,7 @@ import time
 import unicodedata
 import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from importlib.util import find_spec
@@ -41,10 +41,23 @@ from app.personal_wechat_bot.conversation.channel_state_store import (
     merge_channel_state_projection,
 )
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
-from app.personal_wechat_bot.config.loader import ensure_config, load_config, set_model_provider, update_config
-from app.personal_wechat_bot.control.audit import build_storage_migration_status
+from app.personal_wechat_bot.config.loader import (
+    config_update_lock,
+    ensure_config,
+    load_config,
+    set_model_provider,
+    update_config,
+)
+from app.personal_wechat_bot.control.audit import (
+    DISPOSABLE_ARTIFACTS,
+    DISPOSABLE_DIRECTORIES,
+    build_storage_migration_status,
+)
+from app.personal_wechat_bot.control.sidebar_browser_runtime import sidebar_browser_runtime_blockers
+from app.personal_wechat_bot.domain.errors import ConfigError
 from app.personal_wechat_bot.domain.models import NormalizedMessage, ReplyCandidate, SpeakDecision, utc_now_iso
 from app.personal_wechat_bot.llm.key_pool import ApiKeyPool
+from app.personal_wechat_bot.logging.jsonl_rotation import DEFAULT_KEEP as JSONL_ROTATION_KEEP
 from app.personal_wechat_bot.normalizer.normalizer import conversation_id_for
 from app.personal_wechat_bot.persona.runtime_cards import RuntimeCardStore
 from app.personal_wechat_bot.reply_gate.confirm_queue import ConfirmQueue, ConfirmQueueClaimConflict
@@ -62,6 +75,15 @@ from app.personal_wechat_bot.runtime.process_lock import (
     blocking_process_lock,
     process_pid_alive,
     process_start_marker,
+    short_process_lock,
+)
+from app.personal_wechat_bot.runtime.history_fence import (
+    HistoryWriterLease,
+    active_history_writer_leases,
+    history_writer_fence,
+    history_writer_fence_if_owned,
+    history_writer_lease_if_owned,
+    register_history_writer_lease_if_owned,
 )
 from app.personal_wechat_bot.runtime.resource_governor import audit_local_resources
 from app.personal_wechat_bot.runtime.resource_gate import gpu_gate_snapshot, llm_gate_snapshot
@@ -98,8 +120,10 @@ from app.personal_wechat_bot.wechat_driver.backend_events import BackendEventJso
 from app.personal_wechat_bot.wechat_driver.backend_events import append_backend_event_payload
 from app.personal_wechat_bot.wechat_driver.backend_attachment_parser import BackendAttachmentParser
 from app.personal_wechat_bot.wechat_driver.bridge_send import (
+    BridgeOutboxStore,
     bridge_ack_if_queued,
     bridge_state,
+    effective_bridge_ack_states,
     is_terminal_bridge_ack_status,
 )
 from app.personal_wechat_bot.wechat_driver.send_backends import (
@@ -127,61 +151,103 @@ _HISTORY_RESET_DIRS = (
     "conversation_channels",
     "conversation_ledgers",
     "conversation_sessions",
+    "diagnostics",
     "file_workspace",
+    "native_diagnostics",
     "tool_outputs",
     "task_manager",
+    *sorted(
+        relative
+        for relative in DISPOSABLE_DIRECTORIES
+        if len(Path(relative).parts) == 1
+    ),
+)
+_HISTORY_RESET_NESTED_DIRS = tuple(
+    sorted(
+        relative
+        for relative in DISPOSABLE_DIRECTORIES
+        if len(Path(relative).parts) > 1
+    )
+)
+_HISTORY_RESET_SQLITE_FILES = (
+    "backend_file_watcher.sqlite",
+    "confirm_queue.sqlite",
+    "conversation_cooldowns.sqlite",
+    "channel_state.sqlite",
+    "conversation_channels.sqlite",
+    "conversation_ledger.sqlite",
+    "conversation_sessions.sqlite",
+    "file_index.sqlite",
+    "processed_messages.sqlite",
+    "scheduler.sqlite",
+    "send_audit.sqlite",
+)
+_HISTORY_RESET_SQLITE_PATHS = tuple(
+    f"{relative}{suffix}"
+    for relative in _HISTORY_RESET_SQLITE_FILES
+    for suffix in ("", "-wal", "-shm", "-journal")
+)
+_HISTORY_RESET_ROTATED_LOG_PATHS = tuple(
+    f"{relative}.{generation}"
+    for relative in ("logs.jsonl", "send_audit.jsonl")
+    for generation in range(1, JSONL_ROTATION_KEEP + 1)
+)
+_HISTORY_RESET_FIXED_ORPHAN_TMP_PATHS = (
+    "backend_events.jsonl.raw_ids.json.tmp",
+    "confirm_queue.jsonl.tmp",
+    "hook_events.jsonl.raw_ids.json.tmp",
+    "hook_events_state.json.tmp",
+    "weflow_bridge_state.json.tmp",
+)
+_HISTORY_RESET_UUID_TMP_BASES = (
+    "runtime/agent_state.json",
+    "weflow_bridge_state.json",
+    "weflow_sessions.json",
+    "weflow_sidebar_state.json",
 )
 _HISTORY_RESET_FILES = (
     "backend_events.jsonl",
     "backend_events.jsonl.raw_ids.json",
-    "backend_file_watcher.sqlite",
     "confirm_queue.jsonl",
-    "confirm_queue.sqlite",
-    "confirm_queue.sqlite-shm",
-    "confirm_queue.sqlite-wal",
-    "conversation_cooldowns.sqlite",
-    "channel_state.sqlite",
-    "channel_state.sqlite-shm",
-    "channel_state.sqlite-wal",
-    "conversation_channels.sqlite",
-    "conversation_channels.sqlite-shm",
-    "conversation_channels.sqlite-wal",
-    "conversation_ledger.sqlite",
-    "conversation_ledger.sqlite-shm",
-    "conversation_ledger.sqlite-wal",
-    "conversation_sessions.sqlite",
-    "conversation_sessions.sqlite-shm",
-    "conversation_sessions.sqlite-wal",
-    "file_index.sqlite",
     "hook_events.jsonl",
     "hook_events.jsonl.raw_ids.json",
     "hook_events_state.json",
-    "hook_events_state.json.consumer.lock",
     "logs.jsonl",
-    "processed_messages.sqlite",
     "runtime/agent_state.json",
-    "scheduler.sqlite",
-    "scheduler.sqlite-shm",
-    "scheduler.sqlite-wal",
     "send_audit.jsonl",
-    "send_audit.sqlite",
-    "send_audit.sqlite-shm",
-    "send_audit.sqlite-wal",
-    "weflow_bridge_state.json",
     "weflow_sessions.json",
     "weflow_process.err.log",
     "weflow_process.out.log",
+    *_HISTORY_RESET_SQLITE_PATHS,
+    *_HISTORY_RESET_ROTATED_LOG_PATHS,
+    *_HISTORY_RESET_FIXED_ORPHAN_TMP_PATHS,
+    *sorted(DISPOSABLE_ARTIFACTS),
 )
 _HISTORY_RESET_LOCK_TOLERANT_FILES = {
     "weflow_process.err.log",
     "weflow_process.out.log",
 }
+_HISTORY_CLEAR_WRITABLE_CONTROL_FILES = (
+    "sidebar_state.sqlite",
+    "sidebar_state.sqlite-shm",
+    "sidebar_state.sqlite-wal",
+    "sidebar_state.sqlite-journal",
+    "weflow_sidebar_state.json",
+    "weflow_bridge_state.json",
+)
+_HISTORY_CLEAR_MUTATED_PRESERVED_FILES = (
+    "send_bridge/acks.jsonl",
+    "send_bridge/synced_acks.json",
+    "send_bridge/accepted_reverify.json",
+)
 _HISTORY_PRESERVED_RUNTIME_PATHS = (
     "send_bridge/outbox.jsonl",
     "send_bridge/acks.jsonl",
     "send_bridge/synced_acks.json",
     "send_bridge/accepted_reverify.json",
     "send_bridge/.bridge_worker.lock",
+    "send_bridge/.outbox_rw.lock",
+    "send_bridge/.outbox_rw.lock.guard",
 )
 logger = logging.getLogger(__name__)
 _SIDEBAR_API_SCHEMA_VERSION = "20260707-runtime-probe-v2"
@@ -193,6 +259,7 @@ _WEFLOW_LOCK = threading.RLock()
 _WEFLOW_STATE_FILE_LOCK = threading.RLock()
 _AGENT_WORKERS: dict[str, dict[str, Any]] = {}
 _AGENT_LOCK = threading.RLock()
+_AGENT_TICK_ADMISSION_LOCK = threading.Lock()
 _AGENT_TICK_LOCK = threading.Lock()
 # Max times the supervisor auto-restarts a died worker loop before giving up.
 _WEFLOW_MAX_RESTARTS = 10
@@ -221,6 +288,24 @@ _NATIVE_MESSAGE_ROOT_ENV_NAMES = (
     "WECHAT_FILES_DIR",
     "WEFLOW_DATA_ROOT",
 )
+
+
+class HistoryResetNotScheduledError(RuntimeError):
+    """A reset scheduling failure proven to have occurred before helper spawn."""
+
+
+def _run_history_leased_thread(
+    target: Any,
+    args: tuple[Any, ...],
+    history_lease: HistoryWriterLease | None,
+) -> None:
+    """Run a legacy-compatible thread target under a pre-registered lease."""
+
+    try:
+        target(*args)
+    finally:
+        if history_lease is not None:
+            history_lease.release()
 
 
 def _normalize_send_backend(value: str) -> str:
@@ -309,7 +394,222 @@ def build_sidebar_state(data_dir: str | Path = "data") -> dict[str, Any]:
         "native_migration": build_sidebar_native_migration_state(data_dir),
         "wechat_window_probe": _passive_wechat_window_probe(),
         "audit": audit,
+        "history_reset": sidebar_history_reset_status(data_dir),
     }
+
+
+def _history_reset_safe_status_text(value: Any, *, limit: int = 400) -> str:
+    text = " ".join(str(value or "").split())
+    text = re.sub(
+        r"(?i)\b(api[_ -]?key|authorization|token|secret)\b(\s*[:=]\s*)([^\s,;]+)",
+        r"\1\2[redacted]",
+        text,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[redacted]", text)
+    return text[: max(0, int(limit))]
+
+
+def _sanitized_history_reset_clear_result(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    if not source:
+        return {}
+    result = {
+        "status": _history_reset_safe_status_text(source.get("status"), limit=40),
+        "policy": _history_reset_safe_status_text(source.get("policy"), limit=80),
+        "removed_count": max(0, _int_value(source.get("removed_count"), 0)),
+        "retained_locked_count": max(0, _int_value(source.get("retained_locked_count"), 0)),
+        "error_count": max(0, _int_value(source.get("error_count"), 0)),
+        "history_reset_id": _history_reset_safe_status_text(source.get("history_reset_id"), limit=64),
+        "history_reset_epoch": max(0, _int_value(source.get("history_reset_epoch"), 0)),
+    }
+    source_errors = source.get("errors") if isinstance(source.get("errors"), list) else []
+    result["errors"] = [
+        {
+            "relative_path": _history_reset_safe_status_text(item.get("relative_path"), limit=160),
+            "phase": _history_reset_safe_status_text(item.get("phase"), limit=100),
+            "error": _history_reset_safe_status_text(item.get("error"), limit=240),
+        }
+        for item in source_errors[:20]
+        if isinstance(item, dict)
+    ]
+    return result
+
+
+def _unknown_history_reset_status(reason: str) -> dict[str, Any]:
+    return {
+        "status": "unknown",
+        "phase": "status_unverifiable",
+        "terminal": False,
+        "active": True,
+        "outcome_unknown": True,
+        "manual_reopen_required": True,
+        "updated_at": "",
+        "error": _history_reset_safe_status_text(reason),
+        "clear_result": {},
+    }
+
+
+_HISTORY_RESET_TERMINAL_STATUSES = frozenset(
+    {"ok", "partial_error", "blocked", "error", "failed", "interrupted"}
+)
+_HISTORY_RESET_NONTERMINAL_STATUSES = frozenset({"running", "scheduled", "shutdown_scheduled"})
+
+
+def _nonterminal_history_reset_helper_state(payload: dict[str, Any]) -> str:
+    """Classify persisted helper identity without fencing out uncertain owners."""
+
+    helper_pid = _int_value(payload.get("helper_pid"), 0)
+    expected_process_start = str(payload.get("helper_process_start") or "").strip()
+    if helper_pid <= 0 or not expected_process_start:
+        return "unknown"
+    if not _pid_exists(helper_pid):
+        return "inactive"
+    current_process_start = process_start_marker(helper_pid)
+    if not current_process_start:
+        return "unknown"
+    if current_process_start != expected_process_start:
+        return "inactive"
+    return "active"
+
+
+def _history_reset_payload_is_nonterminal(payload: dict[str, Any]) -> bool:
+    return str(payload.get("status") or "").strip().lower() in _HISTORY_RESET_NONTERMINAL_STATUSES
+
+
+def _history_reset_payload_is_terminal(payload: dict[str, Any]) -> bool:
+    return str(payload.get("status") or "").strip().lower() in _HISTORY_RESET_TERMINAL_STATUSES
+
+
+def _history_reset_shutdown_lock_state(root: Path) -> tuple[str, str]:
+    lock_relative = "runtime/history_reset_shutdown.lock"
+    try:
+        lock_path = _validate_history_reset_target(root, lock_relative, expected_kind="file")
+        lock_stat = _history_path_lstat(lock_path)
+    except (OSError, ValueError) as exc:
+        return "unknown", f"reset lock path is unsafe: {type(exc).__name__}"
+    if lock_stat is None:
+        return "missing", ""
+    if not _history_path_is_private_regular_file(lock_stat):
+        return "unknown", "reset lock file is not private and regular"
+    lock = _read_json(lock_path, None)
+    if not isinstance(lock, dict):
+        return "unknown", "reset lock file is unreadable"
+    helper_pid = _int_value(lock.get("helper_pid"), 0)
+    if helper_pid <= 0:
+        try:
+            updated_at = float(lock.get("updated_at_epoch") or 0.0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        if updated_at <= 0:
+            return "unknown", "reset lock owner identity is incomplete"
+        return ("active", "") if max(0.0, time.time() - updated_at) <= 20.0 else ("inactive", "")
+    if not _pid_exists(helper_pid):
+        return "inactive", ""
+    expected_process_start = str(lock.get("helper_process_start") or "").strip()
+    if not expected_process_start:
+        return "unknown", "reset helper process identity is incomplete"
+    current_process_start = process_start_marker(helper_pid)
+    if not current_process_start:
+        return "unknown", "reset helper process identity cannot be queried"
+    if current_process_start != expected_process_start:
+        return "inactive", ""
+    return "active", ""
+
+
+def _idle_history_reset_status() -> dict[str, Any]:
+    return {
+        "status": "idle",
+        "phase": "",
+        "terminal": True,
+        "active": False,
+        "outcome_unknown": False,
+        "manual_reopen_required": False,
+        "updated_at": "",
+        "error": "",
+        "clear_result": {},
+    }
+
+
+def _sidebar_history_reset_status(data_dir: str | Path) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    status_relative = "runtime/history_reset_shutdown.json"
+    try:
+        status_path = _validate_history_reset_target(root, status_relative, expected_kind="file")
+        status_stat = _history_path_lstat(status_path)
+    except (OSError, ValueError) as exc:
+        return _unknown_history_reset_status(f"reset status path is unsafe: {type(exc).__name__}")
+    payload: dict[str, Any] | None = None
+    status_error = ""
+    raw_status = ""
+    if status_stat is not None:
+        if not _history_path_is_private_regular_file(status_stat):
+            status_error = "reset status file is not private and regular"
+        else:
+            loaded = _read_json(status_path, None)
+            if not isinstance(loaded, dict):
+                status_error = "reset status file is unreadable"
+            else:
+                payload = loaded
+                raw_status = _history_reset_safe_status_text(payload.get("status"), limit=40).lower()
+                if raw_status not in _HISTORY_RESET_TERMINAL_STATUSES | _HISTORY_RESET_NONTERMINAL_STATUSES:
+                    status_error = "reset status is not recognized"
+
+    lock_state, lock_error = _history_reset_shutdown_lock_state(root)
+    if lock_state == "unknown":
+        return _unknown_history_reset_status(lock_error)
+    if status_error:
+        return _unknown_history_reset_status(status_error)
+    if payload is None:
+        if lock_state == "active":
+            return _unknown_history_reset_status("reset lock is active before a matching status was recorded")
+        return _idle_history_reset_status()
+
+    result = {
+        "status": raw_status,
+        "phase": _history_reset_safe_status_text(payload.get("phase"), limit=100),
+        "terminal": raw_status in _HISTORY_RESET_TERMINAL_STATUSES,
+        "active": False,
+        "outcome_unknown": False,
+        "manual_reopen_required": bool(payload.get("manual_reopen_required")),
+        "updated_at": _history_reset_safe_status_text(payload.get("updated_at"), limit=80),
+        "error": _history_reset_safe_status_text(payload.get("error")),
+        "clear_result": _sanitized_history_reset_clear_result(payload.get("clear_result")),
+    }
+    if result["terminal"]:
+        if lock_state == "active":
+            return _unknown_history_reset_status("reset lock is active while the persisted status is terminal")
+        return result
+
+    if lock_state == "active":
+        result["active"] = True
+        return result
+    helper_state = _nonterminal_history_reset_helper_state(payload)
+    if helper_state != "inactive":
+        result.update(
+            {
+                "active": True,
+                "outcome_unknown": True,
+                "error": "history reset helper identity could not be fully reconciled after its lock disappeared",
+            }
+        )
+        return result
+    result.update(
+        {
+            "status": "error",
+            "phase": "interrupted",
+            "terminal": True,
+            "active": False,
+            "outcome_unknown": False,
+            "error": "history reset stopped before recording a terminal result",
+        }
+    )
+    return result
+
+
+def sidebar_history_reset_status(data_dir: str | Path) -> dict[str, Any]:
+    """Return the sanitized reset state used for cross-surface admission."""
+
+    return _sidebar_history_reset_status(data_dir)
 
 
 def _sidebar_queue_state(
@@ -2852,14 +3152,19 @@ def _sidebar_channel_send_scope_error(channel: Any, payload: dict[str, Any], *, 
 
 def sidebar_agent_tick(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
     root = Path(data_dir).resolve()
-    with _AGENT_TICK_LOCK:
-        with blocking_process_lock(
-            root / "runtime_locks" / "sidebar_agent_tick.lock",
-            label="sidebar_agent_tick",
-            stale_after_seconds=3600,
-            wait_timeout_seconds=600,
-        ):
-            return _sidebar_agent_tick_unlocked(root, payload)
+    # Peer requests queue before joining the process-wide fence. Nested
+    # scheduler threads may still adopt the active fence without forcing the
+    # first HTTP request to wait for every later peer request to finish.
+    with _AGENT_TICK_ADMISSION_LOCK:
+        with history_writer_fence(root, label="sidebar_agent_tick"):
+            with _AGENT_TICK_LOCK:
+                with blocking_process_lock(
+                    root / "runtime_locks" / "sidebar_agent_tick.lock",
+                    label="sidebar_agent_tick",
+                    stale_after_seconds=3600,
+                    wait_timeout_seconds=600,
+                ):
+                    return _sidebar_agent_tick_unlocked(root, payload)
 
 
 def _sidebar_agent_tick_unlocked(data_dir: str | Path = "data", payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3126,6 +3431,11 @@ def sidebar_agent_start(data_dir: str | Path = "data", payload: dict[str, Any] |
 
     payload = payload if isinstance(payload, dict) else {}
     root = Path(data_dir).resolve()
+    with history_writer_fence_if_owned(root, label="sidebar_agent_start"):
+        return _sidebar_agent_start_fenced(root, payload)
+
+
+def _sidebar_agent_start_fenced(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     event_file = _backend_event_file_path(root, payload)
     key = str(root)
     with _AGENT_LOCK:
@@ -3174,9 +3484,17 @@ def sidebar_agent_start(data_dir: str | Path = "data", payload: dict[str, Any] |
         worker_payload = dict(payload)
         worker_payload["loops"] = _bounded_int(worker_payload.get("loops"), 1, 1, 5)
         interval = _bounded_float(worker_payload.get("interval_seconds") or worker_payload.get("intervalSeconds"), 2.0, 0.05, 60.0)
+        history_lease = register_history_writer_lease_if_owned(
+            root,
+            label="sidebar_agent_loop",
+        )
         thread = threading.Thread(
-            target=_agent_background_loop,
-            args=(root, worker_payload, stop_event),
+            target=_run_history_leased_thread,
+            args=(
+                _agent_background_loop,
+                (root, worker_payload, stop_event),
+                history_lease,
+            ),
             name="sidebar-agent-worker",
             daemon=True,
         )
@@ -3202,7 +3520,13 @@ def sidebar_agent_start(data_dir: str | Path = "data", payload: dict[str, Any] |
             phase="连续接话后台 worker 已启动",
             detail=str(event_file),
         )
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            _AGENT_WORKERS.pop(key, None)
+            if history_lease is not None:
+                history_lease.release()
+            raise
     return {
         "status": "ok",
         "worker": _agent_worker_state(root),
@@ -3298,7 +3622,19 @@ def sidebar_agent_stop(data_dir: str | Path = "data", payload: dict[str, Any] | 
     }
 
 
-def _agent_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
+def _agent_background_loop(
+    root: Path,
+    payload: dict[str, Any],
+    stop_event: threading.Event,
+) -> None:
+    with history_writer_lease_if_owned(
+        root,
+        label="sidebar_agent_loop",
+    ):
+        _agent_background_loop_leased(root, payload, stop_event)
+
+
+def _agent_background_loop_leased(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
     interval = _bounded_float(payload.get("interval_seconds") or payload.get("intervalSeconds"), 2.0, 0.05, 60.0)
     tick_payload = _agent_worker_tick_payload(payload)
     try:
@@ -3598,81 +3934,271 @@ def clear_sidebar_history_data(data_dir: str | Path, payload: dict[str, Any] | N
     """Clear disposable conversation/runtime history while preserving config."""
 
     payload = payload if isinstance(payload, dict) else {}
-    root = Path(data_dir).resolve()
-    ensure_config(root)
-    if bool(
+    shutdown_requested = bool(
         payload.get("shutdown_processes")
         or payload.get("shutdownProcesses")
-    ):
-        return _schedule_sidebar_history_reset_shutdown(root, payload)
-    if not bool(payload.get("force") or payload.get("forceClear")) and str(payload.get("source") or "") != "shutdown_helper":
-        blockers = _history_clear_active_runtime_blockers(root)
-        if blockers:
-            return _history_clear_blocked_result(root, blockers)
-    if not _AGENT_TICK_LOCK.acquire(blocking=False):
-        return _history_clear_blocked_result(root, [{"worker": "dialog_agent_tick", "source": "in_process"}])
+    )
     try:
+        root = _resolve_history_data_root(data_dir)
+        _require_owned_history_config_file(root)
+    except Exception as exc:
+        if shutdown_requested:
+            raise HistoryResetNotScheduledError(str(exc)) from exc
+        raise
+    if shutdown_requested:
+        try:
+            _validate_history_reset_target(root, "runtime_locks", expected_kind="dir")
+            _validate_private_history_file(
+                root,
+                "runtime_locks/history_reset_fence.lock",
+                purpose="admission fence",
+            )
+            _validate_private_history_file(
+                root,
+                "runtime_locks/history_reset_fence.lock.guard",
+                purpose="admission fence guard",
+            )
+        except Exception as exc:
+            raise HistoryResetNotScheduledError(str(exc)) from exc
         try:
             with blocking_process_lock(
-                root / "runtime_locks" / "sidebar_agent_tick.lock",
-                label="history_clear",
-                stale_after_seconds=3600,
-                wait_timeout_seconds=0.0,
+                root / "runtime_locks" / "history_reset_fence.lock",
+                label="history_reset_schedule_admission",
+                stale_after_seconds=3600.0,
+                wait_timeout_seconds=30.0,
             ):
-                return _clear_sidebar_history_data_locked(root)
+                return _clear_sidebar_history_data_admitted(root, payload)
+        except HistoryResetNotScheduledError:
+            raise
         except ProcessLockError as exc:
-            holder = exc.holder if isinstance(exc.holder, dict) else {}
-            return _history_clear_blocked_result(
-                root,
-                [
-                    {
-                        "worker": "dialog_agent_tick",
-                        "source": "process_lock",
-                        "pid": int(holder.get("pid", 0) or 0),
-                        "label": str(holder.get("label") or ""),
-                    }
-                ],
-            )
-    finally:
-        _AGENT_TICK_LOCK.release()
+            raise HistoryResetNotScheduledError(str(exc)) from exc
+    return _clear_sidebar_history_data_admitted(root, payload)
+
+
+def _clear_sidebar_history_data_admitted(
+    data_dir: str | Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    shutdown_requested = bool(
+        payload.get("shutdown_processes")
+        or payload.get("shutdownProcesses")
+    )
+    try:
+        root = _resolve_history_data_root(data_dir)
+        # A destructive reset must never initialize and thereby "claim" an
+        # arbitrary directory supplied as data_dir. Existing config (including
+        # its persistent sidecar) is the minimum ownership proof for this root.
+        _require_owned_history_config_file(root)
+        with config_update_lock(root):
+            _load_owned_history_config(root)
+            _validate_history_clear_preflight(root)
+    except Exception as exc:
+        if shutdown_requested:
+            raise HistoryResetNotScheduledError(str(exc)) from exc
+        raise
+    if shutdown_requested:
+        return _schedule_sidebar_history_reset_shutdown(root, payload)
+    try:
+        with blocking_process_lock(
+            root / "runtime_locks" / "history_reset_fence.lock",
+            label="history_clear",
+            stale_after_seconds=3600.0,
+            wait_timeout_seconds=0.0,
+        ):
+            if not _AGENT_TICK_LOCK.acquire(blocking=False):
+                return _history_clear_blocked_result(
+                    root,
+                    [{"worker": "dialog_agent_tick", "source": "in_process"}],
+                )
+            try:
+                with blocking_process_lock(
+                    root / "runtime_locks" / "sidebar_agent_tick.lock",
+                    label="history_clear",
+                    stale_after_seconds=3600,
+                    wait_timeout_seconds=0.0,
+                ):
+                    with blocking_process_lock(
+                        root / "weflow_global_operation.lock",
+                        label="history_clear",
+                        stale_after_seconds=1800.0,
+                        wait_timeout_seconds=0.0,
+                    ):
+                        with _legacy_history_writer_authority(root) as legacy_blockers:
+                            if legacy_blockers:
+                                return _history_clear_blocked_result(root, legacy_blockers)
+                            blockers = _history_clear_active_runtime_blockers(root)
+                            if blockers:
+                                return _history_clear_blocked_result(root, blockers)
+                            return _clear_sidebar_history_data_locked(root)
+            finally:
+                _AGENT_TICK_LOCK.release()
+    except ProcessLockError as exc:
+        holder = exc.holder if isinstance(exc.holder, dict) else {}
+        label = str(holder.get("label") or "")
+        if label.startswith("weflow_"):
+            worker_name = "weflow_operation"
+        elif label.endswith("agent_tick"):
+            worker_name = "dialog_agent_tick"
+        else:
+            worker_name = "history_writer"
+        return _history_clear_blocked_result(
+            root,
+            [
+                {
+                    "worker": worker_name,
+                    "source": "process_lock",
+                    "pid": int(holder.get("pid", 0) or 0),
+                    "label": label,
+                }
+            ],
+        )
 
 
 def _clear_sidebar_history_data_locked(root: Path) -> dict[str, Any]:
-    removed: list[dict[str, Any]] = []
-    retained_locked: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    retained = _retained_config_paths(root)
-    for relative in _HISTORY_RESET_DIRS:
-        _remove_history_path(root, relative, removed, retained_locked, errors, retained)
-    for relative in _HISTORY_RESET_FILES:
-        _remove_history_path(root, relative, removed, retained_locked, errors, retained)
-    reinitialized = _reinitialize_history_runtime_files(root)
-    _write_weflow_sidebar_state(
-        root,
-        {
-            "last_health": {},
-            "last_discover": {},
-            "last_pull": {},
-            "last_backfill": {},
-            "pull_job": {},
-            "backfill_job": {},
-            "operation_history": [],
-            "last_error": "",
-        },
-    )
-    return {
-        "status": "partial_error" if errors else "ok",
-        "policy": "history_only_preserve_sidebar_config",
-        "removed_count": len(removed),
-        "removed": removed,
-        "retained_locked_count": len(retained_locked),
-        "retained_locked": retained_locked,
-        "error_count": len(errors),
-        "errors": errors,
-        "retained_config": [str(item) for item in sorted(retained)],
-        "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
-        "reinitialized": reinitialized,
-    }
+    with config_update_lock(root):
+        # Re-read the owned config while updates are excluded. The retained-file
+        # set and every destructive action below must describe one config state.
+        _load_owned_history_config(root)
+        _validate_history_clear_preflight(root)
+        removed: list[dict[str, Any]] = []
+        retained_locked: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        retained = _retained_config_paths(root)
+        orphan_tmp_paths = _history_reset_uuid_tmp_paths(root)
+        retained_history_paths = _validate_retained_history_paths(
+            root,
+            retained,
+            extra_file_relatives=orphan_tmp_paths,
+        )
+        reset_at_epoch = int(time.time())
+        reset_id = uuid4().hex
+        weflow_reset_barrier: dict[str, Any] = {}
+        send_bridge_archive: dict[str, Any] = {}
+
+        def pre_delete_failure(phase: str, exc: BaseException) -> dict[str, Any]:
+            phase_error = {
+                "relative_path": "weflow_bridge_state.json"
+                if phase == "write_weflow_history_reset_barrier"
+                else "send_bridge/acks.jsonl",
+                "path": str(
+                    root / (
+                        "weflow_bridge_state.json"
+                        if phase == "write_weflow_history_reset_barrier"
+                        else Path("send_bridge") / "acks.jsonl"
+                    )
+                ),
+                "kind": "reset_barrier"
+                if phase == "write_weflow_history_reset_barrier"
+                else "bridge_archive",
+                "phase": phase,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            return {
+                "status": "partial_error",
+                "policy": "history_only_preserve_sidebar_config",
+                "removed_count": 0,
+                "removed": [],
+                "retained_locked_count": 0,
+                "retained_locked": [],
+                "error_count": 1,
+                "errors": [phase_error],
+                "retained_config": [str(item) for item in sorted(retained)],
+                "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
+                "reinitialized": [],
+                "history_reset_id": reset_id,
+                "history_reset_epoch": reset_at_epoch,
+                "weflow_reset_barrier": weflow_reset_barrier,
+                "send_bridge_archive": send_bridge_archive,
+            }
+
+        try:
+            weflow_reset_barrier = _write_weflow_history_reset_barrier(
+                root,
+                reset_id=reset_id,
+                reset_at_epoch=reset_at_epoch,
+            )
+        except Exception as exc:
+            return pre_delete_failure("write_weflow_history_reset_barrier", exc)
+        try:
+            send_bridge_archive = _archive_send_bridge_for_history_reset(
+                root,
+                reset_id=reset_id,
+                reset_at_epoch=reset_at_epoch,
+            )
+        except Exception as exc:
+            send_bridge_archive = _send_bridge_history_reset_progress(root, reset_id=reset_id)
+            return pre_delete_failure("archive_send_bridge_for_history_reset", exc)
+        for relative in _HISTORY_RESET_DIRS:
+            _remove_history_path(
+                root,
+                relative,
+                removed,
+                retained_locked,
+                errors,
+                expected_kind="dir",
+                retained_history_paths=retained_history_paths,
+            )
+        for relative in _HISTORY_RESET_NESTED_DIRS:
+            _remove_history_path(
+                root,
+                relative,
+                removed,
+                retained_locked,
+                errors,
+                expected_kind="nested_dir",
+                retained_history_paths=retained_history_paths,
+            )
+        for relative in _HISTORY_RESET_FILES:
+            _remove_history_path(
+                root,
+                relative,
+                removed,
+                retained_locked,
+                errors,
+                expected_kind="file",
+                retained_history_paths=retained_history_paths,
+            )
+        for relative in orphan_tmp_paths:
+            _remove_history_path(
+                root,
+                relative,
+                removed,
+                retained_locked,
+                errors,
+                expected_kind="file",
+                retained_history_paths=retained_history_paths,
+            )
+        reinitialized, reinitialize_errors = _reinitialize_history_runtime_files(root)
+        errors.extend(reinitialize_errors)
+        try:
+            _reset_weflow_sidebar_history(root)
+        except Exception as exc:
+            errors.append(
+                {
+                    "relative_path": "sidebar_state.sqlite",
+                    "path": str(root / "sidebar_state.sqlite"),
+                    "kind": "writable_control",
+                    "phase": "reset_weflow_sidebar_history",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        return {
+            "status": "partial_error" if errors else "ok",
+            "policy": "history_only_preserve_sidebar_config",
+            "removed_count": len(removed),
+            "removed": removed,
+            "retained_locked_count": len(retained_locked),
+            "retained_locked": retained_locked,
+            "error_count": len(errors),
+            "errors": errors,
+            "retained_config": [str(item) for item in sorted(retained)],
+            "preserved_runtime": _existing_relative_paths(root, _HISTORY_PRESERVED_RUNTIME_PATHS),
+            "reinitialized": reinitialized,
+            "history_reset_id": reset_id,
+            "history_reset_epoch": reset_at_epoch,
+            "weflow_reset_barrier": weflow_reset_barrier,
+            "send_bridge_archive": send_bridge_archive,
+        }
 
 
 def _history_clear_blocked_result(root: Path, blockers: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3746,7 +4272,10 @@ def _history_clear_active_runtime_blockers(root: Path) -> list[dict[str, Any]]:
             )
     if not managed_bridge_running and bridge_worker_lock_alive(root):
         lock = _bridge_worker_lock_snapshot(root)
-        pid = int(lock.get("pid", 0) or 0)
+        try:
+            pid = int(lock.get("pid", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            pid = 0
         lock_data_dir = str(lock.get("data_dir") or "").strip()
         same_data_dir = False
         if lock_data_dir:
@@ -3767,7 +4296,109 @@ def _history_clear_active_runtime_blockers(root: Path) -> list[dict[str, Any]]:
                     "backend_name": str(lock.get("backend_name") or ""),
                 }
             )
+    blockers.extend(sidebar_browser_runtime_blockers(root))
+    blockers.extend(active_history_writer_leases(root))
     return blockers
+
+
+@contextmanager
+def _legacy_history_writer_authority(root: Path):
+    """Hold legacy hook authorities until destructive reset has finished."""
+
+    process_paths = (
+        (root / "hook_events_state.json.consumer.lock", "hook_pull_runner"),
+        (root / "hook_events_state.json.consume.lock", "hook_consume_tick"),
+    )
+    state_path = root / "hook_events_state.json.lock"
+    authority_paths = [path for path, _ in process_paths]
+    authority_paths.append(state_path)
+    authority_paths.extend(Path(f"{path}.guard") for path in tuple(authority_paths))
+    for path in authority_paths:
+        path_stat = _history_path_lstat(path)
+        if path_stat is None:
+            continue
+        if (
+            _history_path_is_reparse_point(path_stat)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or int(getattr(path_stat, "st_nlink", 1) or 1) != 1
+        ):
+            yield [
+                {
+                    "worker": "hook_pull_runner",
+                    "source": "legacy_process_lock",
+                    "pid": 0,
+                    "label": "",
+                    "path": str(path),
+                    "reason": "unsafe_legacy_lock_path",
+                }
+            ]
+            return
+
+    with ExitStack() as stack:
+        for path, label in process_paths:
+            lock = ProcessLock(
+                path,
+                label=f"history_clear_authority:{label}",
+                stale_after_seconds=60.0,
+            )
+            try:
+                lock.acquire(mutation_deadline=time.monotonic() + 2.0)
+            except ProcessLockError as exc:
+                holder = exc.holder if isinstance(exc.holder, dict) else {}
+                yield [_legacy_history_lock_blocker(path, label, holder)]
+                return
+            except (OSError, TimeoutError) as exc:
+                yield [_legacy_history_lock_blocker(path, label, {}, error=exc)]
+                return
+            stack.callback(lock.release)
+
+        try:
+            stack.enter_context(
+                short_process_lock(
+                    state_path,
+                    timeout_seconds=0.1,
+                    stale_after_seconds=120.0,
+                    timeout_label="legacy hook state authority",
+                )
+            )
+        except (OSError, TimeoutError) as exc:
+            holder = _read_json(state_path, None)
+            yield [
+                _legacy_history_lock_blocker(
+                    state_path,
+                    "hook_state_writer",
+                    holder if isinstance(holder, dict) else {},
+                    error=exc,
+                )
+            ]
+            return
+        yield []
+
+
+def _legacy_history_lock_blocker(
+    path: Path,
+    label: str,
+    holder: dict[str, Any],
+    *,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    try:
+        pid = int(holder.get("pid") or 0)
+    except (TypeError, ValueError, OverflowError):
+        pid = 0
+    result = {
+        "worker": "hook_pull_runner",
+        "source": "legacy_process_lock",
+        "pid": pid,
+        "label": str(holder.get("label") or label),
+        "path": str(path),
+        "process_start": str(holder.get("process_start") or ""),
+    }
+    if error is not None:
+        result["reason"] = f"legacy_lock_probe_failed:{type(error).__name__}"
+    elif pid <= 0:
+        result["reason"] = "invalid_live_lock_identity"
+    return result
 
 
 def build_sidebar_weflow_state(data_dir: str | Path = "data") -> dict[str, Any]:
@@ -3944,14 +4575,24 @@ def sidebar_weflow_discover_sessions(data_dir: str | Path, payload: dict[str, An
 def sidebar_weflow_pull_once(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     if bool(payload.get("background") or payload.get("async")):
         return _start_weflow_pull_job(data_dir, payload)
-    result = _run_sidebar_weflow_once(data_dir, payload)
-    params = _weflow_params(data_dir, payload)
-    result["session_store"] = _register_weflow_result_sessions(data_dir, payload, result)
-    _record_weflow_state_safely(data_dir, {"last_pull": result, **_weflow_public_params(params)}, action="pull-once", result=result)
-    return result
+    with history_writer_lease_if_owned(
+        Path(data_dir).resolve(),
+        label="sidebar_weflow_pull_once",
+    ):
+        result = _run_sidebar_weflow_once(data_dir, payload)
+        params = _weflow_params(data_dir, payload)
+        result["session_store"] = _register_weflow_result_sessions(data_dir, payload, result)
+        _record_weflow_state_safely(data_dir, {"last_pull": result, **_weflow_public_params(params)}, action="pull-once", result=result)
+        return result
 
 
 def _start_weflow_pull_job(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    with history_writer_fence_if_owned(root, label="sidebar_weflow_pull_job_start"):
+        return _start_weflow_pull_job_fenced(root, payload)
+
+
+def _start_weflow_pull_job_fenced(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(data_dir).resolve()
     key = str(root)
     with _WEFLOW_LOCK:
@@ -3983,15 +4624,30 @@ def _start_weflow_pull_job(data_dir: str | Path, payload: dict[str, Any]) -> dic
             "result": {},
             "last_error": "",
         }
+        history_lease = register_history_writer_lease_if_owned(
+            root,
+            label="sidebar_weflow_pull_job",
+            metadata={"job_id": job_id},
+        )
         thread = threading.Thread(
-            target=_weflow_pull_job_loop,
-            args=(root, dict(payload), job_id),
+            target=_run_history_leased_thread,
+            args=(
+                _weflow_pull_job_loop,
+                (root, dict(payload), job_id),
+                history_lease,
+            ),
             name="sidebar-weflow-pull-once",
             daemon=True,
         )
         job["thread"] = thread
         _WEFLOW_PULL_JOBS[key] = job
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            _WEFLOW_PULL_JOBS.pop(key, None)
+            if history_lease is not None:
+                history_lease.release()
+            raise
         job_snapshot = _public_pull_job(job)
         result = {
             "status": "started",
@@ -4027,6 +4683,14 @@ def _backfill_payload(payload: dict[str, Any], talkers: list[str]) -> dict[str, 
 
 
 def run_weflow_backfill_sync(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    with history_writer_lease_if_owned(
+        Path(data_dir).resolve(),
+        label="sidebar_weflow_backfill_sync",
+    ):
+        return _run_weflow_backfill_sync_leased(data_dir, payload)
+
+
+def _run_weflow_backfill_sync_leased(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Run a history backfill synchronously and return the final result.
 
     The sidebar UI uses the async :func:`sidebar_weflow_backfill` (returns
@@ -4062,6 +4726,12 @@ def run_weflow_backfill_sync(data_dir: str | Path, payload: dict[str, Any]) -> d
 
 
 def sidebar_weflow_backfill(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
+    with history_writer_fence_if_owned(root, label="sidebar_weflow_backfill_start"):
+        return _sidebar_weflow_backfill_fenced(root, payload)
+
+
+def _sidebar_weflow_backfill_fenced(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Backfill a conversation's history so a newly added talker starts with
     context instead of an empty ledger.
 
@@ -4121,15 +4791,30 @@ def sidebar_weflow_backfill(data_dir: str | Path, payload: dict[str, Any]) -> di
             "last_error": "",
             "stop": stop_event,
         }
+        history_lease = register_history_writer_lease_if_owned(
+            root,
+            label="sidebar_weflow_backfill_job",
+            metadata={"job_id": job_id},
+        )
         thread = threading.Thread(
-            target=_weflow_backfill_job_loop,
-            args=(root, backfill_payload, job_id, stop_event),
+            target=_run_history_leased_thread,
+            args=(
+                _weflow_backfill_job_loop,
+                (root, backfill_payload, job_id, stop_event),
+                history_lease,
+            ),
             name="sidebar-weflow-backfill",
             daemon=True,
         )
         job["thread"] = thread
         _WEFLOW_BACKFILL_JOBS[key] = job
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            _WEFLOW_BACKFILL_JOBS.pop(key, None)
+            if history_lease is not None:
+                history_lease.release()
+            raise
         job_snapshot = _public_backfill_job(job)
         result = {
             "status": "started",
@@ -4173,6 +4858,12 @@ def sidebar_weflow_cancel_backfill(data_dir: str | Path, payload: dict[str, Any]
 
 def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(data_dir).resolve()
+    with history_writer_fence_if_owned(root, label="sidebar_weflow_start"):
+        return _sidebar_weflow_start_fenced(root, payload)
+
+
+def _sidebar_weflow_start_fenced(data_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(data_dir).resolve()
     key = str(root)
     worker_payload = _weflow_background_payload(payload)
     with _WEFLOW_LOCK:
@@ -4183,9 +4874,17 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
             _append_weflow_operation_history(data_dir, "start", result)
             return result
         stop_event = threading.Event()
+        history_lease = register_history_writer_lease_if_owned(
+            root,
+            label="sidebar_weflow_loop",
+        )
         thread = threading.Thread(
-            target=_weflow_background_loop,
-            args=(root, worker_payload, stop_event),
+            target=_run_history_leased_thread,
+            args=(
+                _weflow_background_loop,
+                (root, worker_payload, stop_event),
+                history_lease,
+            ),
             name="sidebar-weflow-pull",
             daemon=True,
         )
@@ -4196,7 +4895,13 @@ def sidebar_weflow_start(data_dir: str | Path, payload: dict[str, Any]) -> dict[
             "loops": 0,
             "metrics": WeflowWorkerMetrics(),
         }
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            _WEFLOW_WORKERS.pop(key, None)
+            if history_lease is not None:
+                history_lease.release()
+            raise
     # Start the send-bridge delivery worker alongside the pull worker: the
     # pull->reply->deliver chain needs both halves running. No-op unless the
     # active send driver is bridge_outbox.
@@ -5081,7 +5786,19 @@ def _reconcile_bridge_worker_after_config_change(root: Path, payload: dict[str, 
     return _bridge_worker_state(root)
 
 
-def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
+def _bridge_worker_supervisor(
+    root: Path,
+    payload: dict[str, Any],
+    stop_event: threading.Event,
+) -> None:
+    with history_writer_lease_if_owned(
+        root,
+        label="sidebar_send_bridge_loop",
+    ):
+        _bridge_worker_supervisor_leased(root, payload, stop_event)
+
+
+def _bridge_worker_supervisor_leased(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
     """Supervise the send-bridge worker loop, mirroring the WeFlow supervisor.
 
     Runs ``run_bridge_worker`` (its own single-instance ProcessLock guards
@@ -5158,6 +5875,11 @@ def _bridge_worker_supervisor(root: Path, payload: dict[str, Any], stop_event: t
 
 
 def _start_bridge_worker(root: Path, payload: dict[str, Any]) -> None:
+    with history_writer_fence_if_owned(root, label="sidebar_send_bridge_start"):
+        _start_bridge_worker_fenced(root, payload)
+
+
+def _start_bridge_worker_fenced(root: Path, payload: dict[str, Any]) -> None:
     """Start the supervised send-bridge worker for this data dir if not running.
 
     Only starts when the active send driver is bridge_outbox; that is the only
@@ -5204,9 +5926,17 @@ def _start_bridge_worker(root: Path, payload: dict[str, Any]) -> None:
         stop_event = threading.Event()
         worker_payload = dict(payload)
         worker_payload["_bridge_worker_id"] = worker_id
+        history_lease = register_history_writer_lease_if_owned(
+            root,
+            label="sidebar_send_bridge_loop",
+        )
         worker_thread = threading.Thread(
-            target=_bridge_worker_supervisor,
-            args=(root, worker_payload, stop_event),
+            target=_run_history_leased_thread,
+            args=(
+                _bridge_worker_supervisor,
+                (root, worker_payload, stop_event),
+                history_lease,
+            ),
             name="sidebar-send-bridge",
             daemon=True,
         )
@@ -5221,7 +5951,13 @@ def _start_bridge_worker(root: Path, payload: dict[str, Any]) -> None:
             "worker_id": worker_id,
             "config_signature": config_signature,
         }
-        worker_thread.start()
+        try:
+            worker_thread.start()
+        except BaseException:
+            _BRIDGE_WORKERS.pop(key, None)
+            if history_lease is not None:
+                history_lease.release()
+            raise
 
 
 def _repair_stale_external_bridge_worker(root: Path, expected_signature: dict[str, Any]) -> bool:
@@ -5262,13 +5998,13 @@ def _repair_stale_external_bridge_worker(root: Path, expected_signature: dict[st
     current_start = process_start_marker(pid)
     if not recorded_start or not current_start or current_start != recorded_start:
         return False
-    if not _terminate_process_tree(pid, expected_process_start=recorded_start):
+    if not _terminate_verified_process(pid, expected_process_start=recorded_start):
         return False
     deadline = time.monotonic() + 6.0
     while time.monotonic() < deadline and _pid_exists(pid):
         time.sleep(0.1)
     if _pid_exists(pid):
-        if not _terminate_process_tree(pid, force=True, expected_process_start=recorded_start):
+        if not _terminate_verified_process(pid, force=True, expected_process_start=recorded_start):
             return False
         deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline and _pid_exists(pid):
@@ -5278,7 +6014,7 @@ def _repair_stale_external_bridge_worker(root: Path, expected_signature: dict[st
     return not bridge_worker_lock_alive(root)
 
 
-def _terminate_process_tree(
+def _terminate_verified_process(
     pid: int,
     *,
     force: bool = False,
@@ -5289,21 +6025,10 @@ def _terminate_process_tree(
     if expected_process_start and process_start_marker(pid) != expected_process_start:
         return False
     if os.name == "nt":
-        command = ["taskkill", "/PID", str(pid), "/T"]
-        if force:
-            command.append("/F")
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("bridge stale worker taskkill failed for pid %s: %s", pid, exc)
-            return False
-        return completed.returncode == 0 or not _pid_exists(pid)
+        return _terminate_windows_verified_process_handle(
+            pid,
+            expected_process_start=expected_process_start,
+        )
     try:
         os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
     except ProcessLookupError:
@@ -5335,7 +6060,19 @@ def _stop_bridge_worker(root: Path) -> None:
             _BRIDGE_WORKERS[key] = worker
 
 
-def _weflow_background_loop(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
+def _weflow_background_loop(
+    root: Path,
+    payload: dict[str, Any],
+    stop_event: threading.Event,
+) -> None:
+    with history_writer_lease_if_owned(
+        root,
+        label="sidebar_weflow_loop",
+    ):
+        _weflow_background_loop_leased(root, payload, stop_event)
+
+
+def _weflow_background_loop_leased(root: Path, payload: dict[str, Any], stop_event: threading.Event) -> None:
     """Supervise the worker loop: restart it if it dies while still intended-running.
 
     The inner loop (`_weflow_worker_loop`) can terminate on a genuine stop, or die
@@ -5575,15 +6312,16 @@ def _weflow_exclusive_operation(
 ):
     root = Path(data_dir)
     lock_path = root / "weflow_global_operation.lock"
-    with _WEFLOW_OPERATION_LOCK:
-        with blocking_process_lock(
-            lock_path,
-            label=label,
-            stale_after_seconds=1800.0,
-            wait_timeout_seconds=wait_timeout_seconds,
-            poll_interval_seconds=0.05,
-        ):
-            yield
+    with history_writer_fence_if_owned(root, label=label):
+        with _WEFLOW_OPERATION_LOCK:
+            with blocking_process_lock(
+                lock_path,
+                label=label,
+                stale_after_seconds=1800.0,
+                wait_timeout_seconds=wait_timeout_seconds,
+                poll_interval_seconds=0.05,
+            ):
+                yield
 
 
 def _normalize_weflow_session(session: dict[str, Any]) -> dict[str, Any]:
@@ -5997,7 +6735,20 @@ def _voice_cache_resolver(config: Any, *, extra_roots: list[str] | None = None) 
     )
 
 
-def _weflow_pull_job_loop(root: Path, payload: dict[str, Any], job_id: str) -> None:
+def _weflow_pull_job_loop(
+    root: Path,
+    payload: dict[str, Any],
+    job_id: str,
+) -> None:
+    with history_writer_lease_if_owned(
+        root,
+        label="sidebar_weflow_pull_job",
+        metadata={"job_id": job_id},
+    ):
+        _weflow_pull_job_loop_leased(root, payload, job_id)
+
+
+def _weflow_pull_job_loop_leased(root: Path, payload: dict[str, Any], job_id: str) -> None:
     def progress(update: dict[str, Any]) -> None:
         _update_pull_job(root, job_id, progress=update, force=False)
         _update_weflow_task_progress(root, job_id, update)
@@ -6281,7 +7032,26 @@ def _merge_weflow_progress(job: dict[str, Any], progress: dict[str, Any]) -> Non
     job["progress"] = current
 
 
-def _weflow_backfill_job_loop(root: Path, payload: dict[str, Any], job_id: str, stop_event: threading.Event) -> None:
+def _weflow_backfill_job_loop(
+    root: Path,
+    payload: dict[str, Any],
+    job_id: str,
+    stop_event: threading.Event,
+) -> None:
+    with history_writer_lease_if_owned(
+        root,
+        label="sidebar_weflow_backfill_job",
+        metadata={"job_id": job_id},
+    ):
+        _weflow_backfill_job_loop_leased(root, payload, job_id, stop_event)
+
+
+def _weflow_backfill_job_loop_leased(
+    root: Path,
+    payload: dict[str, Any],
+    job_id: str,
+    stop_event: threading.Event,
+) -> None:
     def progress(update: dict[str, Any]) -> None:
         _update_backfill_job(root, job_id, progress=update, force=False)
 
@@ -6544,6 +7314,13 @@ def _write_weflow_sidebar_state(data_dir: str | Path, update: dict[str, Any]) ->
         payload.update(update)
         payload["updated_at"] = now
         payload = store.update_weflow_state(payload)
+        _write_json(path, payload)
+
+
+def _reset_weflow_sidebar_history(data_dir: str | Path) -> None:
+    path = Path(data_dir) / "weflow_sidebar_state.json"
+    with _WEFLOW_STATE_FILE_LOCK:
+        payload = SidebarStateStore(data_dir).reset_weflow_history()
         _write_json(path, payload)
 
 
@@ -6812,7 +7589,16 @@ def _retained_config_paths(root: Path) -> set[Path]:
         "api_keys.local.md",
         "api_key_models.local.json",
     }
-    retained = {(root / name).resolve() for name in names}
+    retained = {Path(os.path.abspath(root / name)) for name in names}
+    config = load_config(root)
+    for provider in config.providers.values():
+        configured = str(provider.api_key_file or "").strip()
+        if not configured:
+            continue
+        key_path = Path(configured)
+        if not key_path.is_absolute():
+            key_path = root / key_path
+        retained.add(Path(os.path.abspath(key_path)))
     return retained
 
 
@@ -6834,32 +7620,55 @@ def _remove_history_path(
     removed: list[dict[str, Any]],
     retained_locked: list[dict[str, Any]],
     errors: list[dict[str, Any]],
-    retained: set[Path],
+    *,
+    expected_kind: str,
+    retained_history_paths: set[Path],
 ) -> None:
-    target = (root / relative).resolve()
-    if target in retained or any(parent in retained for parent in target.parents):
-        return
-    if target != root and root not in target.parents:
-        raise ValueError(f"history reset target escapes data_dir: {relative}")
-    if not target.exists():
+    target = _validate_history_reset_target(root, relative, expected_kind=expected_kind)
+    if _history_path_lstat(target) is None:
         return
     try:
-        if target.is_dir():
-            _remove_history_tree(target)
-            kind = "dir"
+        if expected_kind in {"dir", "nested_dir"}:
+            target_removed = _remove_history_tree(
+                target,
+                retained_paths=retained_history_paths,
+            )
+            kind = "dir" if target_removed else "dir_contents"
         else:
+            if target in retained_history_paths:
+                raise ValueError(f"history reset file conflicts with retained config: {relative}")
             _remove_history_file(target)
             kind = "file"
-    except OSError as exc:
-        if not target.is_dir() and relative in _HISTORY_RESET_LOCK_TOLERANT_FILES and _is_windows_locked_file_error(exc):
+    except (OSError, ValueError) as exc:
+        if (
+            isinstance(exc, OSError)
+            and expected_kind == "file"
+            and relative in _HISTORY_RESET_LOCK_TOLERANT_FILES
+            and _is_windows_locked_file_error(exc)
+        ):
             retained_locked.append(_locked_history_record(relative, target, exc))
-            _truncate_locked_history_file(target, relative, retained_locked[-1])
+            retained_record = retained_locked[-1]
+            _truncate_locked_history_file(target, relative, retained_record)
+            if retained_record.get("fallback") != "truncated":
+                errors.append(
+                    {
+                        "relative_path": relative,
+                        "path": str(target),
+                        "kind": expected_kind,
+                        "phase": "truncate_locked_history_file",
+                        "error": str(
+                            retained_record.get("fallback_error")
+                            or "locked history file could not be removed or truncated"
+                        ),
+                        "winerror": retained_record.get("fallback_winerror"),
+                    }
+                )
             return
         errors.append(
             {
                 "relative_path": relative,
                 "path": str(target),
-                "kind": "dir" if target.is_dir() else "file",
+                "kind": expected_kind,
                 "error": f"{type(exc).__name__}: {exc}",
                 "winerror": getattr(exc, "winerror", None),
             }
@@ -6868,37 +7677,572 @@ def _remove_history_path(
     removed.append({"relative_path": relative, "path": str(target), "kind": kind})
 
 
-def _remove_history_tree(target: Path) -> None:
-    """Remove resettable trees that may contain immutable workspace artifacts."""
+def _validate_history_reset_manifest(root: Path) -> None:
+    """Validate every fixed reset target before the first destructive action."""
+
+    seen: set[Path] = set()
+    for expected_kind, relatives in (
+        ("dir", _HISTORY_RESET_DIRS),
+        ("nested_dir", _HISTORY_RESET_NESTED_DIRS),
+        ("file", _HISTORY_RESET_FILES),
+    ):
+        for relative in relatives:
+            target = _validate_history_reset_target(root, relative, expected_kind=expected_kind)
+            if target in seen:
+                raise ValueError(f"duplicate history reset target: {relative}")
+            seen.add(target)
+
+
+def _history_reset_uuid_tmp_paths(root: Path) -> tuple[str, ...]:
+    """Enumerate only atomic-write orphans for known history state files."""
+
+    found: set[str] = set()
+    for base_relative in _HISTORY_RESET_UUID_TMP_BASES:
+        base = _validate_history_reset_target(root, base_relative, expected_kind="file")
+        parent_stat = _history_path_lstat(base.parent)
+        if parent_stat is None:
+            continue
+        if _history_path_is_reparse_point(parent_stat) or not stat.S_ISDIR(parent_stat.st_mode):
+            raise ValueError(f"history reset temp parent is unsafe: {base_relative}")
+        name_pattern = re.compile(rf"^{re.escape(base.name)}\.[0-9a-f]{{32}}\.tmp$")
+        with os.scandir(base.parent) as entries:
+            names = sorted(entry.name for entry in entries if name_pattern.fullmatch(entry.name))
+        for name in names:
+            relative = (Path(base_relative).parent / name).as_posix()
+            target = _validate_history_reset_target(root, relative, expected_kind="file")
+            target_stat = _history_path_lstat(target)
+            if target_stat is None:
+                continue
+            if not _history_path_is_private_regular_file(target_stat):
+                raise ValueError(f"history reset orphan temp must be private and regular: {relative}")
+            found.add(relative)
+    return tuple(sorted(found))
+
+
+def _load_owned_history_config(root: Path) -> None:
+    _require_owned_history_config_file(root)
+    load_config(root)
+    _require_owned_history_config_file(root)
+
+
+def _require_owned_history_config_file(root: Path) -> None:
+    config_path = root / "config.json"
+    config_stat = _history_path_lstat(config_path)
+    if config_stat is None:
+        raise ConfigError(f"missing config: {config_path}; run init first")
+    if (
+        _history_path_is_reparse_point(config_stat)
+        or not stat.S_ISREG(config_stat.st_mode)
+        or int(getattr(config_stat, "st_nlink", 1) or 1) != 1
+    ):
+        raise ValueError("history reset config.json must be a private regular file")
+
+
+def _validate_history_clear_preflight(root: Path) -> None:
+    _validate_history_reset_manifest(root)
+    orphan_tmp_paths = _history_reset_uuid_tmp_paths(root)
+    _validate_retained_history_paths(
+        root,
+        _retained_config_paths(root),
+        extra_file_relatives=orphan_tmp_paths,
+    )
+    for relative in _HISTORY_RESET_LOCK_TOLERANT_FILES:
+        _validate_private_history_file(root, relative, purpose="lock-tolerant file")
+    for relative in ("runtime", "runtime_locks", "send_bridge"):
+        _validate_history_reset_target(root, relative, expected_kind="dir")
+    _validate_private_history_file(root, "runtime/sidebar_launch.json", purpose="sidebar launch state")
+    for relative in (
+        "runtime/history_reset_shutdown.lock",
+        "runtime/history_reset_shutdown.json",
+        "runtime/history_reset_shutdown.out.log",
+        "runtime/history_reset_shutdown.err.log",
+        "runtime_locks/sidebar_agent_tick.lock",
+        "runtime_locks/sidebar_agent_tick.lock.guard",
+        "runtime_locks/history_reset_fence.lock",
+        "runtime_locks/history_reset_fence.lock.guard",
+        "runtime_locks/history_reset_shutdown_schedule.lock",
+        "runtime_locks/history_reset_shutdown_schedule.lock.guard",
+        "runtime_locks/sidebar_frontend_lifecycle.lock",
+        "runtime_locks/sidebar_frontend_lifecycle.lock.guard",
+        "runtime_locks/weflow_lifecycle.lock",
+        "runtime_locks/weflow_lifecycle.lock.guard",
+        "weflow_global_operation.lock",
+        "weflow_global_operation.lock.guard",
+        "send_bridge/.bridge_worker.lock",
+        "send_bridge/.bridge_worker.lock.guard",
+    ):
+        target = _validate_history_reset_target(root, relative, expected_kind="file")
+        target_stat = _history_path_lstat(target)
+        if target_stat is not None and int(getattr(target_stat, "st_nlink", 1) or 1) != 1:
+            raise ValueError(f"history reset control file must not be hardlinked: {relative}")
+    for relative in _HISTORY_CLEAR_WRITABLE_CONTROL_FILES:
+        _validate_private_history_file(root, relative, purpose="writable control file")
+    for relative in _HISTORY_PRESERVED_RUNTIME_PATHS:
+        _validate_private_history_file(root, relative, purpose="preserved runtime file")
+
+
+def _validate_private_history_file(root: Path, relative: str, *, purpose: str) -> None:
+    target = _validate_history_reset_target(root, relative, expected_kind="file")
+    target_stat = _history_path_lstat(target)
+    if target_stat is not None and not _history_path_is_private_regular_file(target_stat):
+        raise ValueError(f"history reset {purpose} must be private and regular: {relative}")
+
+
+def _resolve_history_data_root(data_dir: str | Path) -> Path:
+    """Resolve a destructive-operation root without accepting path aliases."""
+
+    lexical_root = Path(os.path.abspath(os.fspath(data_dir)))
+    root_stat = _history_path_lstat(lexical_root)
+    if root_stat is not None and _history_path_is_reparse_point(root_stat):
+        raise ValueError("history reset data_dir must not be a symlink or reparse point")
+    try:
+        canonical_root = lexical_root.resolve(strict=False)
+    except OSError as exc:
+        raise ValueError("history reset data_dir cannot be resolved safely") from exc
+    if canonical_root != lexical_root:
+        raise ValueError("history reset data_dir must use its canonical path")
+    return canonical_root
+
+
+def _validate_history_reset_target(root: Path, relative: str, *, expected_kind: str) -> Path:
+    if expected_kind not in {"dir", "nested_dir", "file"}:
+        raise ValueError(f"unsupported history reset target kind: {expected_kind}")
+
+    root = root.resolve()
+    relative_path = Path(relative)
+    parts = relative_path.parts
+    if (
+        not parts
+        or relative_path.is_absolute()
+        or relative_path.anchor
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ValueError(f"invalid history reset target: {relative}")
+    if expected_kind == "dir" and len(parts) != 1:
+        raise ValueError(f"history reset directory must be a direct child of data_dir: {relative}")
+
+    target = root.joinpath(*parts)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"history reset target escapes data_dir: {relative}") from exc
+
+    for index in range(1, len(parts) + 1):
+        component = root.joinpath(*parts[:index])
+        path_stat = _history_path_lstat(component)
+        if path_stat is None:
+            continue
+        if _history_path_is_reparse_point(path_stat):
+            raise ValueError(f"history reset target uses a symlink or reparse point: {relative}")
+        if index < len(parts) and not stat.S_ISDIR(path_stat.st_mode):
+            raise ValueError(f"history reset target parent is not a directory: {relative}")
+
+    target_stat = _history_path_lstat(target)
+    if target_stat is not None:
+        if expected_kind in {"dir", "nested_dir"} and not stat.S_ISDIR(target_stat.st_mode):
+            raise ValueError(f"history reset directory has unexpected type: {relative}")
+        if expected_kind == "file" and not stat.S_ISREG(target_stat.st_mode):
+            raise ValueError(f"history reset file has unexpected type: {relative}")
 
     try:
-        paths = list(target.rglob("*"))
-    except OSError:
-        paths = []
-    for path in paths:
-        if path.is_symlink():
+        canonical_target = target.resolve(strict=False)
+    except OSError as exc:
+        raise ValueError(f"history reset target cannot be resolved safely: {relative}") from exc
+    if canonical_target != target:
+        raise ValueError(f"history reset target is not its expected canonical path: {relative}")
+    return target
+
+
+def _history_path_lstat(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _history_path_is_reparse_point(path_stat: os.stat_result) -> bool:
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+    attributes = int(getattr(path_stat, "st_file_attributes", 0) or 0)
+    reparse_attribute = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & reparse_attribute)
+
+
+def _history_path_is_private_regular_file(path_stat: os.stat_result) -> bool:
+    return (
+        not _history_path_is_reparse_point(path_stat)
+        and stat.S_ISREG(path_stat.st_mode)
+        and int(getattr(path_stat, "st_nlink", 1) or 1) == 1
+    )
+
+
+def _validate_retained_history_paths(
+    root: Path,
+    retained: set[Path],
+    *,
+    extra_file_relatives: tuple[str, ...] = (),
+) -> set[Path]:
+    """Return explicit config files nested under reset trees, or fail closed."""
+
+    directory_targets = [
+        root / relative
+        for relative in (*_HISTORY_RESET_DIRS, *_HISTORY_RESET_NESTED_DIRS)
+    ]
+    file_targets = [
+        root / relative
+        for relative in (
+            *_HISTORY_RESET_FILES,
+            *_HISTORY_CLEAR_WRITABLE_CONTROL_FILES,
+            *_HISTORY_CLEAR_MUTATED_PRESERVED_FILES,
+            *extra_file_relatives,
+        )
+    ]
+    protected: set[Path] = set()
+    for path in retained:
+        if any(path == target or path in target.parents for target in (*directory_targets, *file_targets)):
+            raise ValueError(f"retained config path contains a history reset target: {path}")
+        if any(path == target or target in path.parents for target in file_targets):
+            raise ValueError(f"retained config path conflicts with a history reset file: {path}")
+        containing_tree = next((target for target in directory_targets if target in path.parents), None)
+        if containing_tree is None:
             continue
-        _make_history_path_writable(path)
+        path_stat = _history_path_lstat(path)
+        if path_stat is None:
+            continue
+        current = containing_tree
+        relative = path.relative_to(containing_tree)
+        for part in relative.parts[:-1]:
+            current = current / part
+            current_stat = _history_path_lstat(current)
+            if (
+                current_stat is None
+                or _history_path_is_reparse_point(current_stat)
+                or not stat.S_ISDIR(current_stat.st_mode)
+            ):
+                raise ValueError(f"retained config path has an unsafe parent: {path}")
+        if _history_path_is_reparse_point(path_stat) or not stat.S_ISREG(path_stat.st_mode):
+            raise ValueError(f"retained config path must be a regular file: {path}")
+        protected.add(path)
+    return protected
+
+
+def _remove_history_tree(
+    target: Path,
+    *,
+    hardlink_counts: dict[tuple[int, int], int] | None = None,
+    retained_paths: set[Path] | None = None,
+) -> bool:
+    """Remove resettable trees that may contain immutable workspace artifacts."""
+
+    retained_paths = retained_paths or set()
+    target_stat = _history_path_lstat(target)
+    if target_stat is None:
+        return True
+    if _history_path_is_reparse_point(target_stat) or not stat.S_ISDIR(target_stat.st_mode):
+        raise ValueError(f"refusing to traverse unsafe history reset tree: {target}")
+    if hardlink_counts is None:
+        hardlink_counts = _history_tree_hardlink_counts(target, retained_paths=retained_paths)
+
+    with os.scandir(target) as iterator:
+        entries = list(iterator)
+    for entry in entries:
+        path = Path(entry.path)
+        path_stat = _history_path_lstat(path)
+        if path_stat is None:
+            continue
+        if path in retained_paths:
+            if _history_path_is_reparse_point(path_stat) or not stat.S_ISREG(path_stat.st_mode):
+                raise ValueError(f"retained config path changed type during history reset: {path}")
+            continue
+        contains_retained = any(path in retained.parents for retained in retained_paths)
+        if contains_retained and (
+            _history_path_is_reparse_point(path_stat)
+            or not stat.S_ISDIR(path_stat.st_mode)
+        ):
+            raise ValueError(f"retained config path parent changed type during history reset: {path}")
+        if _history_path_is_reparse_point(path_stat):
+            _remove_history_reparse_point(path, path_stat)
+        elif stat.S_ISDIR(path_stat.st_mode):
+            _remove_history_tree(
+                path,
+                hardlink_counts=hardlink_counts,
+                retained_paths=retained_paths,
+            )
+        else:
+            _remove_history_file(path, hardlink_counts=hardlink_counts)
+    if any(target in retained.parents for retained in retained_paths):
+        return False
     _make_history_path_writable(target)
-    shutil.rmtree(target)
+    target.rmdir()
+    return True
 
 
-def _remove_history_file(target: Path) -> None:
+def _terminate_windows_verified_process_handle(pid: int, *, expected_process_start: str) -> bool:
+    """Terminate one Windows process after same-handle identity verification."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (ImportError, OSError) as exc:
+        logger.warning("bridge stale worker Win32 API unavailable for pid %s: %s", pid, exc)
+        return False
+
+    process_terminate = 0x0001
+    process_query_limited_information = 0x1000
+    synchronize = 0x00100000
+    wait_object_0 = 0
+    wait_timeout = 258
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    access = process_terminate | process_query_limited_information | synchronize
+    handle = kernel32.OpenProcess(access, False, pid)
+    if not handle:
+        error_code = int(ctypes.get_last_error())
+        return error_code in {87, 1168}
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return False
+        current_start = f"win:{(int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)}"
+        if current_start != str(expected_process_start or ""):
+            return False
+        if int(kernel32.WaitForSingleObject(handle, 0)) == wait_object_0:
+            return True
+        if not kernel32.TerminateProcess(handle, 1):
+            return False
+        wait_result = int(kernel32.WaitForSingleObject(handle, 8000))
+        if wait_result == wait_object_0:
+            return True
+        if wait_result != wait_timeout:
+            logger.warning("bridge stale worker wait returned %s for pid %s", wait_result, pid)
+        return False
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _remove_history_reparse_point(path: Path, path_stat: os.stat_result) -> None:
+    """Remove an alias itself without following or changing its destination."""
+
+    if stat.S_ISDIR(path_stat.st_mode):
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _remove_history_file(
+    target: Path,
+    *,
+    hardlink_counts: dict[tuple[int, int], int] | None = None,
+) -> None:
     try:
         target.unlink()
     except PermissionError:
+        target_stat = _history_path_lstat(target)
+        if (
+            target_stat is not None
+            and int(getattr(target_stat, "st_nlink", 1) or 1) > 1
+            and not _history_tree_contains_all_hardlinks(hardlink_counts, target_stat)
+        ):
+            raise PermissionError(f"refusing to change permissions on multiply-linked history file: {target}")
         _make_history_path_writable(target)
         target.unlink()
 
 
+def _history_tree_hardlink_counts(
+    root: Path,
+    *,
+    retained_paths: set[Path] | None = None,
+) -> dict[tuple[int, int], int]:
+    counts: dict[tuple[int, int], int] = {}
+    retained_paths = retained_paths or set()
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        current_stat = _history_path_lstat(current)
+        if current_stat is None or _history_path_is_reparse_point(current_stat):
+            continue
+        if stat.S_ISDIR(current_stat.st_mode):
+            with os.scandir(current) as iterator:
+                pending.extend(Path(entry.path) for entry in iterator)
+            continue
+        if current in retained_paths:
+            continue
+        if int(getattr(current_stat, "st_nlink", 1) or 1) <= 1:
+            continue
+        identity = _history_file_identity(current_stat)
+        if identity is not None:
+            counts[identity] = counts.get(identity, 0) + 1
+    return counts
+
+
+def _history_tree_contains_all_hardlinks(
+    counts: dict[tuple[int, int], int] | None,
+    target_stat: os.stat_result,
+) -> bool:
+    if counts is None:
+        return False
+    expected = int(getattr(target_stat, "st_nlink", 1) or 1)
+    if expected <= 1:
+        return True
+    identity = _history_file_identity(target_stat)
+    return identity is not None and counts.get(identity, 0) >= expected
+
+
+def _history_file_identity(path_stat: os.stat_result) -> tuple[int, int] | None:
+    identity = (
+        int(getattr(path_stat, "st_dev", 0) or 0),
+        int(getattr(path_stat, "st_ino", 0) or 0),
+    )
+    return identity if identity[1] else None
+
+
 def _make_history_path_writable(path: Path) -> None:
+    path_stat = _history_path_lstat(path)
+    if path_stat is None or _history_path_is_reparse_point(path_stat):
+        return
     try:
-        path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        path.chmod(path_stat.st_mode | stat.S_IWUSR)
     except OSError:
         return
 
 
-def _reinitialize_history_runtime_files(root: Path) -> list[str]:
+def _write_weflow_history_reset_barrier(
+    root: Path,
+    *,
+    reset_id: str,
+    reset_at_epoch: int,
+) -> dict[str, Any]:
+    payload = {
+        "version": 1,
+        "history_reset_id": str(reset_id),
+        "history_reset_epoch": int(reset_at_epoch),
+        "sessions": {},
+        "seen_raw_ids": [],
+    }
+    _write_json(root / "weflow_bridge_state.json", payload)
+    return {
+        "path": "weflow_bridge_state.json",
+        "history_reset_id": str(reset_id),
+        "history_reset_epoch": int(reset_at_epoch),
+    }
+
+
+def _archive_send_bridge_for_history_reset(
+    root: Path,
+    *,
+    reset_id: str,
+    reset_at_epoch: int,
+) -> dict[str, Any]:
+    archive = BridgeOutboxStore(root).archive_for_history_reset(
+        reset_id=reset_id,
+        reset_at_epoch=reset_at_epoch,
+    )
+    fingerprints = archive.pop("terminal_sync_fingerprints", {})
+    accepted_ids = archive.pop("accepted_ids", [])
+    reset_metadata = {
+        "history_reset_id": str(reset_id),
+        "history_reset_epoch": int(reset_at_epoch),
+        "archived_count": int(archive.get("archived_count", 0) or 0),
+    }
+
+    synced_path = root / "send_bridge" / "synced_acks.json"
+    synced_payload = _read_json(synced_path, {})
+    if not isinstance(synced_payload, dict):
+        synced_payload = {}
+    synced = synced_payload.get("synced")
+    if not isinstance(synced, dict):
+        synced = {}
+    synced.update(
+        {
+            str(bridge_id): str(fingerprint)
+            for bridge_id, fingerprint in fingerprints.items()
+            if str(bridge_id) and str(fingerprint)
+        }
+    )
+    synced_payload.update({"version": 3, "synced": synced, "history_reset": reset_metadata})
+    _write_json(synced_path, synced_payload)
+
+    reverify_path = root / "send_bridge" / "accepted_reverify.json"
+    reverify_payload = _read_json(reverify_path, {})
+    if not isinstance(reverify_payload, dict):
+        reverify_payload = {}
+    reverify_items = reverify_payload.get("items")
+    if not isinstance(reverify_items, dict):
+        reverify_items = {}
+    for bridge_id in accepted_ids:
+        bridge_id = str(bridge_id or "").strip()
+        if not bridge_id:
+            continue
+        previous = reverify_items.get(bridge_id)
+        previous = previous if isinstance(previous, dict) else {}
+        reverify_items[bridge_id] = {
+            **previous,
+            "history_reset_frozen": True,
+            "history_reset_id": str(reset_id),
+            "history_reset_epoch": int(reset_at_epoch),
+        }
+    reverify_payload.update({"items": reverify_items, "history_reset": reset_metadata})
+    _write_json(reverify_path, reverify_payload)
+    return {**archive, **reset_metadata, "accepted_frozen_count": len(accepted_ids)}
+
+
+def _send_bridge_history_reset_progress(root: Path, *, reset_id: str) -> dict[str, Any]:
+    """Best-effort snapshot after an interrupted bridge archive phase."""
+
+    try:
+        store = BridgeOutboxStore(root)
+        states = effective_bridge_ack_states(store._read_all(store.ack_path))
+        frozen_ids = sorted(
+            bridge_id
+            for bridge_id, state in states.items()
+            if isinstance(state.ack.get("payload"), dict)
+            and state.ack["payload"].get("history_reset_frozen") is True
+            and str(state.ack["payload"].get("history_reset_id") or "") == str(reset_id)
+        )
+        return {
+            "status": "partial_error",
+            "history_reset_id": str(reset_id),
+            "frozen_terminal_count": len(frozen_ids),
+            "frozen_bridge_ids": frozen_ids,
+            "progress_unavailable": False,
+        }
+    except Exception:
+        return {
+            "status": "partial_error",
+            "history_reset_id": str(reset_id),
+            "frozen_terminal_count": 0,
+            "frozen_bridge_ids": [],
+            "progress_unavailable": True,
+        }
+
+
+def _reinitialize_history_runtime_files(root: Path) -> tuple[list[str], list[dict[str, Any]]]:
     """Recreate empty review files and report preserved bridge files.
 
     The reset may clear conversation history, but the verified native bridge
@@ -6906,6 +8250,7 @@ def _reinitialize_history_runtime_files(root: Path) -> list[str]:
     """
 
     created: list[str] = []
+    errors: list[dict[str, Any]] = []
     for relative in ("confirm_queue.jsonl", "send_audit.jsonl"):
         path = root / relative
         try:
@@ -6913,33 +8258,73 @@ def _reinitialize_history_runtime_files(root: Path) -> list[str]:
             if not path.exists():
                 path.write_text("", encoding="utf-8")
                 created.append(relative)
-        except OSError:
-            continue
+        except OSError as exc:
+            errors.append(
+                {
+                    "relative_path": relative,
+                    "path": str(path),
+                    "kind": "runtime_reinitialize",
+                    "phase": "reinitialize_runtime_file",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
     try:
         ConfirmQueue(root / "confirm_queue.jsonl").list_pending()
         if (root / "confirm_queue.sqlite").exists():
             created.append("confirm_queue.sqlite")
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(
+            {
+                "relative_path": "confirm_queue.sqlite",
+                "path": str(root / "confirm_queue.sqlite"),
+                "kind": "runtime_reinitialize",
+                "phase": "reinitialize_confirm_queue",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
     try:
         SendAuditLog(root / "send_audit.jsonl").list_recent(limit=1)
         if (root / "send_audit.sqlite").exists():
             created.append("send_audit.sqlite")
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(
+            {
+                "relative_path": "send_audit.sqlite",
+                "path": str(root / "send_audit.sqlite"),
+                "kind": "runtime_reinitialize",
+                "phase": "reinitialize_send_audit",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
     try:
         bridge_snapshot = bridge_state(root, limit=1)
         for key in ("outbox_path", "ack_path"):
             value = str(bridge_snapshot.get(key) or "")
             if value:
                 created.append(str(Path(value).relative_to(root)))
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(
+            {
+                "relative_path": "send_bridge",
+                "path": str(root / "send_bridge"),
+                "kind": "runtime_reinitialize",
+                "phase": "verify_preserved_send_bridge",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
     try:
         TaskStatusStore(root).state()
-    except Exception:
-        pass
-    return sorted(dict.fromkeys(created))
+    except Exception as exc:
+        errors.append(
+            {
+                "relative_path": "task_manager",
+                "path": str(root / "task_manager"),
+                "kind": "runtime_reinitialize",
+                "phase": "reinitialize_task_status",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+    return sorted(dict.fromkeys(created)), errors
 
 
 def _is_windows_locked_file_error(exc: OSError) -> bool:
@@ -6958,24 +8343,102 @@ def _locked_history_record(relative: str, target: Path, exc: OSError) -> dict[st
 
 
 def _truncate_locked_history_file(target: Path, relative: str, record: dict[str, Any]) -> None:
+    descriptor: int | None = None
     try:
-        target.write_bytes(b"")
+        before = _history_path_lstat(target)
+        if before is None or not _history_path_is_private_regular_file(before):
+            raise ValueError("locked history file is not a private regular file")
+        before_identity = _history_file_identity(before)
+        if before_identity is None:
+            raise ValueError("locked history file identity is unavailable")
+        descriptor = os.open(str(target), os.O_WRONLY | int(getattr(os, "O_BINARY", 0) or 0))
+        opened = os.fstat(descriptor)
+        current = _history_path_lstat(target)
+        if (
+            current is None
+            or not _history_path_is_private_regular_file(opened)
+            or not _history_path_is_private_regular_file(current)
+            or _history_file_identity(opened) != before_identity
+            or _history_file_identity(current) != before_identity
+        ):
+            raise ValueError("locked history file changed identity before truncation")
+        os.ftruncate(descriptor, 0)
         record["fallback"] = "truncated"
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         record["fallback"] = "retained"
         record["fallback_error"] = f"{type(exc).__name__}: {exc}"
         record["fallback_winerror"] = getattr(exc, "winerror", None)
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _schedule_sidebar_history_reset_shutdown(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    spawn_state = {"started": False}
+    try:
+        with blocking_process_lock(
+            root / "runtime_locks" / "history_reset_shutdown_schedule.lock",
+            label="history_reset_shutdown_schedule",
+            stale_after_seconds=3600.0,
+            wait_timeout_seconds=30.0,
+        ):
+            return _schedule_sidebar_history_reset_shutdown_locked(
+                root,
+                payload,
+                spawn_state=spawn_state,
+            )
+    except HistoryResetNotScheduledError:
+        raise
+    except Exception as exc:
+        if spawn_state["started"]:
+            raise
+        raise HistoryResetNotScheduledError(str(exc)) from exc
+
+
+def _schedule_sidebar_history_reset_shutdown_locked(
+    root: Path,
+    payload: dict[str, Any],
+    *,
+    spawn_state: dict[str, bool] | None = None,
+) -> dict[str, Any]:
     runtime_dir = root / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    status_path = runtime_dir / "history_reset_shutdown.json"
     active = _active_sidebar_history_reset_shutdown(runtime_dir)
     if active:
         return active
+    if status_path.exists():
+        persisted_status = _read_json(status_path, None)
+        if not isinstance(persisted_status, dict):
+            return _deduped_sidebar_history_reset_shutdown(
+                runtime_dir / "history_reset_shutdown.lock",
+                {},
+                outcome_unknown=True,
+            )
+        if _history_reset_payload_is_nonterminal(persisted_status):
+            helper_state = _nonterminal_history_reset_helper_state(persisted_status)
+            if helper_state != "inactive":
+                return _deduped_sidebar_history_reset_shutdown(
+                    runtime_dir / "history_reset_shutdown.lock",
+                    persisted_status,
+                    helper_pid=_int_value(persisted_status.get("helper_pid"), 0),
+                    outcome_unknown=True,
+                )
+        elif not _history_reset_payload_is_terminal(persisted_status):
+            return _deduped_sidebar_history_reset_shutdown(
+                runtime_dir / "history_reset_shutdown.lock",
+                persisted_status,
+                outcome_unknown=True,
+            )
     lock_path = runtime_dir / "history_reset_shutdown.lock"
-    status_path = runtime_dir / "history_reset_shutdown.json"
-    if not _try_acquire_sidebar_history_reset_shutdown_lock(lock_path):
+    shutdown_owner_token = uuid4().hex
+    if not _try_acquire_sidebar_history_reset_shutdown_lock(
+        lock_path,
+        owner_token=shutdown_owner_token,
+    ):
         active = _active_sidebar_history_reset_shutdown(runtime_dir)
         if active:
             return active
@@ -6984,22 +8447,63 @@ def _schedule_sidebar_history_reset_shutdown(root: Path, payload: dict[str, Any]
         except FileNotFoundError:
             pass
         except OSError:
-            return _deduped_sidebar_history_reset_shutdown(lock_path, _read_json(status_path, {}))
-        if not _try_acquire_sidebar_history_reset_shutdown_lock(lock_path):
-            return _deduped_sidebar_history_reset_shutdown(lock_path, _read_json(status_path, {}))
+            return _deduped_sidebar_history_reset_shutdown(
+                lock_path,
+                _read_json(status_path, {}),
+                outcome_unknown=True,
+            )
+        if not _try_acquire_sidebar_history_reset_shutdown_lock(
+            lock_path,
+            owner_token=shutdown_owner_token,
+        ):
+            return _deduped_sidebar_history_reset_shutdown(
+                lock_path,
+                _read_json(status_path, {}),
+                outcome_unknown=True,
+            )
 
-    launch_state = _read_json(root / "runtime" / "sidebar_launch.json", {})
+    launch_state_path = root / "runtime" / "sidebar_launch.json"
+    launch_state = _read_json(launch_state_path, None)
+    if not launch_state_path.exists():
+        _remove_sidebar_history_reset_shutdown_lock(lock_path)
+        raise RuntimeError("current sidebar launch state is required for verified shutdown")
+    if not isinstance(launch_state, dict) or not launch_state:
+        _remove_sidebar_history_reset_shutdown_lock(lock_path)
+        raise RuntimeError("current sidebar launch state is unreadable or incomplete")
     launch_state = launch_state if isinstance(launch_state, dict) else {}
+    launch_state_data_dir = str(launch_state.get("data_dir") or "").strip()
+    launch_state_process_start = str(launch_state.get("process_start") or "").strip()
+    launch_state_trusted = False
+    launch_state_pid = _int_value(launch_state.get("pid"), 0)
+    launch_state_data_matches = False
+    if launch_state_data_dir:
+        try:
+            launch_state_data_matches = Path(launch_state_data_dir).resolve() == root
+        except OSError:
+            launch_state_data_matches = False
+    if launch_state_pid == os.getpid() and launch_state_data_matches:
+        current_process_start = process_start_marker(os.getpid())
+        if not launch_state_process_start or not current_process_start:
+            _remove_sidebar_history_reset_shutdown_lock(lock_path)
+            raise RuntimeError("current sidebar launch process identity is unavailable")
+        launch_state_trusted = current_process_start == launch_state_process_start
+    if launch_state_path.exists() and not launch_state_trusted:
+        _remove_sidebar_history_reset_shutdown_lock(lock_path)
+        raise RuntimeError("current sidebar launch process identity could not be verified")
     weflow_result = launch_state.get("weflow_result") if isinstance(launch_state.get("weflow_result"), dict) else {}
-    parent_pid = _int_value(payload.get("parent_pid") or payload.get("parentPid") or launch_state.get("pid"), os.getpid())
+    parent_pid = os.getpid()
+    parent_process_start = launch_state_process_start
     weflow_pid = _int_value(
-        payload.get("weflow_pid") or payload.get("weflowPid") or launch_state.get("weflow_pid") or weflow_result.get("pid"),
+        launch_state.get("weflow_pid") or weflow_result.get("pid"),
         0,
     )
-    weflow_mode = str(payload.get("weflow") or launch_state.get("weflow") or "auto")
+    weflow_process_start = str(
+        launch_state.get("weflow_process_start") or weflow_result.get("process_start") or ""
+    )
+    weflow_mode = str(launch_state.get("weflow") or "auto")
     if weflow_mode not in {"auto", "on", "off"}:
         weflow_mode = "auto"
-    weflow_port = _int_value(payload.get("weflow_port") or payload.get("weflowPort") or launch_state.get("weflow_port"), 5031)
+    weflow_port = _int_value(launch_state.get("weflow_port"), 5031)
     helper = Path(__file__).resolve().parents[3] / "scripts" / "sidebar_history_reset_shutdown.py"
     command = [
         sys.executable,
@@ -7008,18 +8512,26 @@ def _schedule_sidebar_history_reset_shutdown(root: Path, payload: dict[str, Any]
         str(root),
         "--parent-pid",
         str(parent_pid),
+        "--parent-process-start",
+        parent_process_start,
+        "--shutdown-owner-token",
+        shutdown_owner_token,
         "--weflow",
         weflow_mode,
         "--weflow-port",
         str(weflow_port),
         "--weflow-pid",
         str(weflow_pid),
+        "--weflow-process-start",
+        weflow_process_start,
     ]
     status = {
         "status": "shutdown_scheduled",
         "phase": "scheduled",
         "parent_pid": parent_pid,
+        "parent_process_start": parent_process_start,
         "weflow_pid": weflow_pid,
+        "weflow_process_start": weflow_process_start,
         "weflow": weflow_mode,
         "weflow_port": weflow_port,
         "manual_reopen_required": True,
@@ -7042,16 +8554,64 @@ def _schedule_sidebar_history_reset_shutdown(root: Path, payload: dict[str, Any]
                 close_fds=True,
                 creationflags=creationflags,
             )
-    except Exception:
-        _remove_sidebar_history_reset_shutdown_lock(lock_path)
+            if spawn_state is not None:
+                spawn_state["started"] = True
+    except Exception as exc:
+        status.update(
+            {
+                "status": "error",
+                "phase": "helper_spawn_failed",
+                "manual_reopen_required": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        )
+        terminal_status_persisted = False
+        status_removed = False
+        try:
+            _write_json(status_path, status)
+            terminal_status_persisted = True
+        except Exception:
+            try:
+                status_path.unlink()
+                status_removed = True
+            except FileNotFoundError:
+                status_removed = True
+            except OSError:
+                pass
+        if terminal_status_persisted or status_removed:
+            _remove_sidebar_history_reset_shutdown_lock(lock_path)
         raise
     status["helper_pid"] = process.pid
+    helper_process_start = process_start_marker(process.pid)
+    if not helper_process_start:
+        status["status"] = "error"
+        status["phase"] = "helper_identity_unavailable"
+        _write_json(status_path, status)
+        _write_json(
+            lock_path,
+            {
+                "helper_pid": process.pid,
+                "owner_pid": os.getpid(),
+                "owner_process_start": parent_process_start,
+                "owner_token": shutdown_owner_token,
+                "data_dir": str(root),
+                "updated_at_epoch": time.time(),
+                "status_file": str(status_path),
+            },
+        )
+        raise RuntimeError("history reset helper process identity is unavailable")
+    status["helper_process_start"] = helper_process_start
     _write_json(status_path, status)
     _write_json(
         lock_path,
         {
             "helper_pid": process.pid,
+            "helper_process_start": helper_process_start,
             "owner_pid": os.getpid(),
+            "owner_process_start": parent_process_start,
+            "owner_token": shutdown_owner_token,
+            "data_dir": str(root),
             "updated_at_epoch": time.time(),
             "status_file": str(status_path),
         },
@@ -7068,7 +8628,7 @@ def _schedule_sidebar_history_reset_shutdown(root: Path, payload: dict[str, Any]
     }
 
 
-def _try_acquire_sidebar_history_reset_shutdown_lock(lock_path: Path) -> bool:
+def _try_acquire_sidebar_history_reset_shutdown_lock(lock_path: Path, *, owner_token: str = "") -> bool:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -7079,6 +8639,8 @@ def _try_acquire_sidebar_history_reset_shutdown_lock(lock_path: Path) -> bool:
             {
                 "helper_pid": 0,
                 "owner_pid": os.getpid(),
+                "owner_process_start": process_start_marker(os.getpid()),
+                "owner_token": str(owner_token or uuid4().hex),
                 "updated_at_epoch": time.time(),
             },
             handle,
@@ -7099,8 +8661,29 @@ def _active_sidebar_history_reset_shutdown(runtime_dir: Path) -> dict[str, Any] 
         0,
     )
     lock_age = _shutdown_lock_age_seconds(lock if isinstance(lock, dict) else {})
+    helper_process_start = str((lock.get("helper_process_start") if isinstance(lock, dict) else "") or "")
     if helper_pid > 0 and _pid_exists(helper_pid):
-        return _deduped_sidebar_history_reset_shutdown(lock_path, status if isinstance(status, dict) else {}, helper_pid=helper_pid)
+        if not helper_process_start:
+            return _deduped_sidebar_history_reset_shutdown(
+                lock_path,
+                status if isinstance(status, dict) else {},
+                helper_pid=helper_pid,
+                outcome_unknown=True,
+            )
+        current_process_start = process_start_marker(helper_pid)
+        if not current_process_start:
+            return _deduped_sidebar_history_reset_shutdown(
+                lock_path,
+                status if isinstance(status, dict) else {},
+                helper_pid=helper_pid,
+                outcome_unknown=True,
+            )
+        if current_process_start == helper_process_start:
+            return _deduped_sidebar_history_reset_shutdown(
+                lock_path,
+                status if isinstance(status, dict) else {},
+                helper_pid=helper_pid,
+            )
     if helper_pid <= 0 and lock_age <= 20.0:
         return _deduped_sidebar_history_reset_shutdown(lock_path, status if isinstance(status, dict) else {}, helper_pid=0)
     _remove_sidebar_history_reset_shutdown_lock(lock_path)
@@ -7112,11 +8695,17 @@ def _deduped_sidebar_history_reset_shutdown(
     status: dict[str, Any],
     *,
     helper_pid: int = 0,
+    outcome_unknown: bool = False,
 ) -> dict[str, Any]:
     return {
         "status": "shutdown_scheduled",
-        "message": "Sidebar and WeFlow shutdown/cleanup is already in progress.",
+        "message": (
+            "History reset state cannot be verified; do not retry or continue writing until it is reconciled."
+            if outcome_unknown
+            else "Sidebar and WeFlow shutdown/cleanup is already in progress."
+        ),
         "deduplicated": True,
+        "outcome_unknown": bool(outcome_unknown),
         "helper_pid": helper_pid or _int_value(status.get("helper_pid") if isinstance(status, dict) else 0, 0),
         "parent_pid": _int_value(status.get("parent_pid") if isinstance(status, dict) else 0, 0),
         "weflow_pid": _int_value(status.get("weflow_pid") if isinstance(status, dict) else 0, 0),

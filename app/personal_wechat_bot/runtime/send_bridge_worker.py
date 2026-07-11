@@ -33,6 +33,7 @@ from typing import Any, Callable
 
 from app.personal_wechat_bot.config.loader import load_config
 from app.personal_wechat_bot.control.send_commands import sync_bridge_ack_to_send_state
+from app.personal_wechat_bot.runtime.history_fence import history_writer_fence, history_writer_lease_if_owned
 from app.personal_wechat_bot.runtime.process_lock import (
     ProcessLock,
     ProcessLockError,
@@ -44,6 +45,7 @@ from app.personal_wechat_bot.wechat_driver.bridge_send import (
     BridgeAckState,
     BridgeOutboxStore,
     _receiver_authorization_blocker,
+    bridge_ack_history_reset_frozen,
     bridge_sync_fingerprint,
     effective_bridge_ack_states,
     is_terminal_bridge_ack_status,
@@ -862,10 +864,14 @@ class BridgeWorker:
             if ack_state is None or ack_state.status != BridgeAckStatus.ACCEPTED:
                 continue
             ack = ack_state.ack
+            if bridge_ack_history_reset_frozen(ack):
+                continue
             payload = ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
             if payload.get("delivery_verified") is True:
                 continue
             item_marker = marker.get(bridge_id, {})
+            if item_marker.get("history_reset_frozen") is True:
+                continue
             attempts = _safe_nonnegative_int(item_marker.get("attempts"))
             if attempts >= _ACCEPTED_REVERIFY_MAX_ATTEMPTS:
                 continue
@@ -931,6 +937,9 @@ class BridgeWorker:
             fingerprint = bridge_sync_fingerprint(ack, outbox_by_id.get(bridge_id))
             if synced.get(bridge_id) == fingerprint:
                 continue
+            if bridge_ack_history_reset_frozen(ack):
+                self._mark_synced(bridge_id, fingerprint)
+                continue
             try:
                 sync_result = sync_bridge_ack_to_send_state(
                     self.data_dir,
@@ -950,6 +959,29 @@ class BridgeWorker:
 
 
 def run_bridge_worker(
+    data_dir: str | Path,
+    *,
+    poll_interval_seconds: float = 2.0,
+    once: bool = False,
+    lock_enabled: bool = True,
+    max_iterations: int | None = None,
+    stop_event: Any = None,
+) -> BridgeWorkerStats:
+    with history_writer_lease_if_owned(
+        data_dir,
+        label="send_bridge_worker_loop",
+    ):
+        return _run_bridge_worker_leased(
+            data_dir,
+            poll_interval_seconds=poll_interval_seconds,
+            once=once,
+            lock_enabled=lock_enabled,
+            max_iterations=max_iterations,
+            stop_event=stop_event,
+        )
+
+
+def _run_bridge_worker_leased(
     data_dir: str | Path,
     *,
     poll_interval_seconds: float = 2.0,
@@ -1006,7 +1038,8 @@ def run_bridge_worker(
                 worker.stats.record("skipped", runtime_blocker)
                 logger.warning("send bridge worker stopped by runtime config: %s", runtime_blocker)
                 break
-            worker.run_once()
+            with history_writer_fence(data_dir, label="send_bridge_worker"):
+                worker.run_once()
             if lock is not None:
                 lock.heartbeat()
             iterations += 1

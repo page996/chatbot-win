@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 from app.personal_wechat_bot.bootstrap import BotRuntime
 from app.personal_wechat_bot.processor.message_processor import MessageProcessor
+from app.personal_wechat_bot.runtime.history_fence import (
+    HistoryWriterLease,
+    HistoryWriterLeaseGroup,
+    history_writer_fence,
+    register_history_writer_lease_if_owned,
+)
 from app.personal_wechat_bot.runtime.conversation_scheduler import ConversationScheduler
 from app.personal_wechat_bot.runtime.resource_scheduler import ResourceSchedule
 from app.personal_wechat_bot.wechat_driver.base import WeChatDriver
@@ -33,6 +40,13 @@ class PollingRunner:
         )
 
     def run_once(self) -> dict[str, Any]:
+        with history_writer_fence(
+            Path(self.runtime.config.data_dir),
+            label="polling_runner",
+        ):
+            return self._run_once_fenced()
+
+    def _run_once_fenced(self) -> dict[str, Any]:
         if not self.driver.health_check():
             return {"status": "driver_unhealthy", "processed": []}
 
@@ -49,7 +63,23 @@ class PollingRunner:
             "resource_schedule": schedule.to_dict(),
         }
 
-    def run_forever(self, max_loops: int | None = None) -> dict[str, Any]:
+    def run_forever(
+        self,
+        max_loops: int | None = None,
+        *,
+        history_lease: HistoryWriterLease | HistoryWriterLeaseGroup | None = None,
+    ) -> dict[str, Any]:
+        lease = history_lease or register_history_writer_lease_if_owned(
+            Path(self.runtime.config.data_dir),
+            label="polling_runner_loop",
+        )
+        try:
+            return self._run_forever_leased(max_loops=max_loops)
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _run_forever_leased(self, max_loops: int | None = None) -> dict[str, Any]:
         loops = 0
         processed_count = 0
         processed: list[dict[str, Any]] = []
