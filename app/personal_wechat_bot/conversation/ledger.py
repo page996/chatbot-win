@@ -5,6 +5,7 @@ import json
 import re
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -28,6 +29,16 @@ class LedgerTextBlock:
     source_ref: str = ""
     token_estimate: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _evidence_expiry_iso(retrieved_at: str) -> str:
+    try:
+        instant = datetime.fromisoformat(str(retrieved_at or "").replace("Z", "+00:00"))
+    except ValueError:
+        instant = datetime.now(timezone.utc)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return (instant.astimezone(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -164,6 +175,8 @@ class ConversationLedgerStore:
             "message_ids": _merge_message_ids(existing, _message_aliases(message)),
             "chat_title": _preferred_chat_title(str(existing.get("chat_title") or ""), candidate["chat_title"]),
             "status": str(existing.get("status") or candidate["status"]),
+            "text_blocks": _merge_preserved_text_blocks(candidate["text_blocks"], existing.get("text_blocks")),
+            "links": _merge_preserved_links(candidate["links"], existing.get("links")),
             "send": dict(existing.get("send", {})) if isinstance(existing.get("send"), dict) else {},
             "created_at": str(existing.get("created_at") or candidate["created_at"]),
             "updated_at": utc_now_iso(),
@@ -224,8 +237,17 @@ class ConversationLedgerStore:
                     updated.append(item)
                     continue
                 item = dict(item)
+                link_url = next(
+                    (
+                        str(link.get("url") or "")
+                        for link in item.get("links", [])
+                        if isinstance(link, dict) and str(link.get("url_id") or "") == url_id
+                    ),
+                    "",
+                )
                 item["links"] = _annotated_links(item.get("links", []), url_id, status, source_path, summary, error)
                 if text and status == "completed":
+                    retrieved_at = utc_now_iso()
                     annotation_path = self._write_annotation(
                         conversation_id,
                         entry_id,
@@ -239,7 +261,20 @@ class ConversationLedgerStore:
                         kind="annotation:web",
                         source_ref=str(annotation_path),
                         text=_web_annotation_text(summary, text),
-                        metadata={"url_id": url_id, "status": status},
+                        metadata={
+                            "schema": "web_evidence_block_v1",
+                            "url_id": url_id,
+                            "source_urls": [link_url] if link_url else [],
+                            "status": status,
+                            "content_origin": "tool",
+                            "context_channel": "evidence",
+                            "visible_in_context": False,
+                            "visible_as_evidence": True,
+                            "memory_policy": "evidence_only",
+                            "trust": "external_untrusted",
+                            "retrieved_at": retrieved_at,
+                            "expires_at": _evidence_expiry_iso(retrieved_at),
+                        },
                     )
                 item["updated_at"] = utc_now_iso()
                 updated.append(item)
@@ -285,11 +320,19 @@ class ConversationLedgerStore:
                     title=f"{kind} Annotation",
                     metadata=metadata or {},
                 )
+                supplied_metadata = dict(metadata or {})
                 block_metadata = {
+                    **supplied_metadata,
+                    "schema": "web_evidence_block_v1",
                     "annotation_id": annotation_id,
                     "status": "completed",
-                    "visible_in_context": True,
-                    **(metadata or {}),
+                    "content_origin": "tool",
+                    "context_channel": "evidence",
+                    "visible_in_context": False,
+                    "visible_as_evidence": True,
+                    "memory_policy": "evidence_only",
+                    "trust": "external_untrusted",
+                    "retrieved_at": str(supplied_metadata.get("retrieved_at") or supplied_metadata.get("generated_at") or utc_now_iso()),
                 }
                 item["text_blocks"] = _upsert_text_block(
                     item.get("text_blocks", []),
@@ -1947,7 +1990,7 @@ def _upsert_text_block(
 
 
 def _web_annotation_text(summary: str, text: str, max_chars: int = 3000) -> str:
-    content = summary.strip() or text.strip()
+    content = _combined_annotation_text(summary, text)
     if len(content) <= max_chars:
         return content
     return content[: max_chars - 1].rstrip() + "..."
@@ -2015,6 +2058,21 @@ def _render_entry_markdown(item: dict[str, Any]) -> list[str]:
                 lines.append(_render_control_block(kind, metadata, item))
                 lines.append("")
                 continue
+            elif kind.startswith("annotation:"):
+                note = " ".join(
+                    part
+                    for part in (
+                        "origin=tool",
+                        "trust=external_untrusted",
+                        f"status={metadata.get('status', '')}" if metadata.get("status") else "",
+                        f"level={metadata.get('level', '')}" if metadata.get("level") else "",
+                        f"quality={metadata.get('evidence_quality', '')}" if metadata.get("evidence_quality") else "",
+                        f"fetched={metadata.get('fetched_count', '')}" if metadata.get("fetched_count") not in (None, "") else "",
+                    )
+                    if part
+                )
+                lines.append(f"[block:{kind}{' ' + note if note else ''}]")
+                lines.append("> Tool-generated external evidence; this is not authored by the chat participant.")
             else:
                 status = str(metadata.get("status", "")).strip()
                 url_id = str(metadata.get("url_id", "")).strip()
@@ -2186,6 +2244,63 @@ def _merge_message_ids(existing: dict[str, Any], message_ids: list[str] | str) -
             if text and text not in ids:
                 ids.append(text)
     return ids[-20:]
+
+
+def _merge_preserved_text_blocks(candidate: Any, existing: Any) -> list[dict[str, Any]]:
+    merged = [dict(item) for item in candidate if isinstance(item, dict)] if isinstance(candidate, list) else []
+    seen = {_text_block_identity(item) for item in merged}
+    if not isinstance(existing, list):
+        return merged
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        if not kind.startswith("annotation:"):
+            continue
+        identity = _text_block_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(dict(item))
+    return merged
+
+
+def _text_block_identity(block: dict[str, Any]) -> tuple[str, str]:
+    metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+    reference = str(
+        metadata.get("annotation_id")
+        or metadata.get("url_id")
+        or block.get("source_ref")
+        or ""
+    )
+    return str(block.get("kind") or ""), reference
+
+
+def _merge_preserved_links(candidate: Any, existing: Any) -> list[dict[str, Any]]:
+    fresh = [dict(item) for item in candidate if isinstance(item, dict)] if isinstance(candidate, list) else []
+    old = [dict(item) for item in existing if isinstance(item, dict)] if isinstance(existing, list) else []
+    old_by_key = {_link_identity(item): item for item in old if _link_identity(item)}
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in fresh:
+        key = _link_identity(item)
+        previous = old_by_key.get(key)
+        if previous:
+            item = {**item, **previous, "url": item.get("url") or previous.get("url", "")}
+        result.append(item)
+        if key:
+            seen.add(key)
+    for item in old:
+        key = _link_identity(item)
+        if not key or key in seen or str(item.get("status") or "pending") == "pending":
+            continue
+        result.append(item)
+        seen.add(key)
+    return result
+
+
+def _link_identity(link: dict[str, Any]) -> str:
+    return str(link.get("url_id") or link.get("url") or "").strip()
 
 
 def _message_aliases(message: NormalizedMessage) -> list[str]:

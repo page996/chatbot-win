@@ -14,11 +14,16 @@ from app.personal_wechat_bot.memory.file_index import FileIndex
 from app.personal_wechat_bot.tools.base import ToolManifest
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
 from app.personal_wechat_bot.tools.web.http_safety import (
+    HttpContentEncodingError,
     PublicHttpUrlError,
+    decode_http_content,
     guarded_urlopen,
     read_response_with_deadline,
 )
-from app.personal_wechat_bot.tools.web.search import fetched_text_block_reason
+from app.personal_wechat_bot.tools.web.search import (
+    _neutralize_conflicting_live_state,
+    fetched_text_block_reason,
+)
 
 
 class WebFetchTool:
@@ -64,7 +69,13 @@ class WebFetchTool:
             )
 
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "wechat-agent-local/0.1"})
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "wechat-agent-local/0.1",
+                    "Accept": "text/html,text/plain,application/xhtml+xml,application/json,application/pdf",
+                },
+            )
             deadline = time.monotonic() + max(0.2, float(self.timeout_seconds))
             with guarded_urlopen(
                 req,
@@ -78,12 +89,28 @@ class WebFetchTool:
                     truncate=True,
                 )
                 content_type = response.headers.get("content-type", "")
+                content_encoding = response.headers.get("content-encoding", "")
+            wire_truncated = len(raw) > self.max_bytes
+            raw, decoded_truncated = decode_http_content(
+                raw,
+                content_encoding=content_encoding,
+                max_bytes=self.max_bytes,
+            )
+            truncated = wire_truncated or decoded_truncated
         except PublicHttpUrlError as exc:
             return ToolCallResult(
                 call_id=request.call_id,
                 tool_name=self.manifest.name,
                 status="blocked",
                 summary="web.fetch only allows public HTTP(S) URLs",
+                error=str(exc),
+            )
+        except HttpContentEncodingError as exc:
+            return ToolCallResult(
+                call_id=request.call_id,
+                tool_name=self.manifest.name,
+                status="blocked",
+                summary="web.fetch blocked an unreadable compressed response",
                 error=str(exc),
             )
         except Exception as exc:
@@ -95,8 +122,6 @@ class WebFetchTool:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-        truncated = len(raw) > self.max_bytes
-        raw = raw[: self.max_bytes]
         url_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
         content_kind = _content_kind(url, content_type, raw)
         task = str(request.arguments.get("task") or "").strip()
@@ -132,6 +157,7 @@ class WebFetchTool:
             text = _html_to_text(text)
         else:
             text = _normalize_text(text)
+        text, extraction_warnings = _neutralize_conflicting_live_state(text)
         block_reason = fetched_text_block_reason(text)
         if block_reason:
             return ToolCallResult(
@@ -151,7 +177,8 @@ class WebFetchTool:
 
         output = self.output_dir / f"{url_id}.md"
         output.write_text(
-            f"# Web Fetch\n\nurl: {url}\ncontent_type: {content_type}\ntruncated: {str(truncated).lower()}\n\n{text}\n",
+            f"# Web Fetch\n\nurl: {url}\ncontent_type: {content_type}\ntruncated: {str(truncated).lower()}\n"
+            f"warnings: {', '.join(extraction_warnings) or 'none'}\n\n{text}\n",
             encoding="utf-8",
         )
         file_id = self.file_index.add(output, source=self.manifest.name, original_name=output.name)
@@ -169,6 +196,7 @@ class WebFetchTool:
                 "content_type": content_type,
                 "content_kind": content_kind,
                 "truncated": truncated,
+                "warnings": extraction_warnings,
                 "text": note,
             },
         )
@@ -283,13 +311,13 @@ class _TextExtractor(HTMLParser):
         self.skip_depth = 0
 
     def handle_starttag(self, tag: str, attrs):
-        if tag.lower() in {"script", "style", "noscript"}:
+        if tag.lower() in {"script", "style", "noscript", "svg", "iframe", "template", "form", "nav", "footer"}:
             self.skip_depth += 1
         if tag.lower() in {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str):
-        if tag.lower() in {"script", "style", "noscript"} and self.skip_depth:
+        if tag.lower() in {"script", "style", "noscript", "svg", "iframe", "template", "form", "nav", "footer"} and self.skip_depth:
             self.skip_depth -= 1
         if tag.lower() in {"p", "div", "li", "tr"}:
             self.parts.append("\n")

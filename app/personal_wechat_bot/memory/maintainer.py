@@ -12,6 +12,12 @@ from typing import Any
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.conversation.ledger_context import as_payload, memory_dir_for_conversation
 from app.personal_wechat_bot.conversation.session_store import DEFAULT_SESSION_ID
+from app.personal_wechat_bot.conversation.text_blocks import (
+    block_text,
+    evidence_metadata,
+    is_authored_block,
+    is_evidence_block,
+)
 from app.personal_wechat_bot.domain.models import utc_now_iso
 from app.personal_wechat_bot.runtime.history_fence import (
     HistoryWriterLease,
@@ -21,6 +27,7 @@ from app.personal_wechat_bot.runtime.history_fence import (
 
 
 _MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-maintainer")
+MEMORY_DERIVATION_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,7 @@ class MemoryMaintenanceResult:
     preferences_path: str
     entities_path: str
     state_path: str
+    evidence_path: str = ""
     status: str = "ok"
 
 
@@ -43,6 +51,7 @@ class MemoryDraft:
     file_lines: list[str] = field(default_factory=list)
     preferences: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     entities: dict[str, Any] = field(default_factory=dict)
+    web_evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 class MemoryMaintainer:
@@ -86,7 +95,12 @@ class MemoryMaintainer:
         ]
         active_signature = _active_signature(entries)
         new_entries = [item for item in entries if int(item.get("sequence", 0) or 0) > last_sequence]
-        if not new_entries and state.get("active_signature") == active_signature and memory_dir.exists():
+        if (
+            not new_entries
+            and state.get("active_signature") == active_signature
+            and int(state.get("derivation_version", 0) or 0) == MEMORY_DERIVATION_VERSION
+            and memory_dir.exists()
+        ):
             return MemoryMaintenanceResult(
                 conversation_id=conversation_id,
                 session_id=session_id,
@@ -97,6 +111,7 @@ class MemoryMaintainer:
                 preferences_path=str(memory_dir / "preferences.json"),
                 entities_path=str(memory_dir / "entities.json"),
                 state_path=str(memory_dir / "maintenance_state.json"),
+                evidence_path=str(memory_dir / "web_evidence.json"),
                 status="unchanged",
             )
 
@@ -112,6 +127,7 @@ class MemoryMaintainer:
                 "session_id": session_id,
                 "last_sequence": max_seen_sequence,
                 "active_signature": active_signature,
+                "derivation_version": MEMORY_DERIVATION_VERSION,
                 "processed_count": len(entries),
                 "updated_at": utc_now_iso(),
             },
@@ -152,6 +168,7 @@ class MemoryMaintainer:
             preferences_path=str(memory_dir / "preferences.json"),
             entities_path=str(memory_dir / "entities.json"),
             state_path=str(memory_dir / "maintenance_state.json"),
+            evidence_path=str(memory_dir / "web_evidence.json"),
         )
 
     def maintain_all(self) -> list[MemoryMaintenanceResult]:
@@ -198,12 +215,13 @@ class MemoryMaintainer:
             sender = str(entry.get("sender_name") or ("self" if entry.get("is_self") else "unknown"))
             sender_counts[sender] = sender_counts.get(sender, 0) + 1
             text = _entry_text(entry)
-            if text:
+            if text and str(entry.get("role") or "user") != "assistant":
                 line = _summary_line(entry, text, self.max_text_chars_per_entry)
                 draft.summary_lines.append(line)
                 recent_topics.extend(_topic_candidates(text))
                 _collect_preferences(draft.preferences, entry, text)
                 hashtags.update(_HASHTAG_RE.findall(text))
+            draft.web_evidence.extend(_entry_web_evidence(entry))
             files.extend(_entry_files(entry))
             urls.extend(_entry_urls(entry))
 
@@ -240,6 +258,17 @@ class MemoryMaintainer:
         _write_text_atomic(memory_dir / "summary.md", summary)
         _write_json_atomic(memory_dir / "preferences.json", draft.preferences)
         _write_json_atomic(memory_dir / "entities.json", draft.entities)
+        _write_json_atomic(
+            memory_dir / "web_evidence.json",
+            {
+                "schema": "web_evidence_memory_v1",
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "derivation_version": MEMORY_DERIVATION_VERSION,
+                "updated_at": utc_now_iso(),
+                "items": draft.web_evidence[-40:],
+            },
+        )
         _write_json_atomic(memory_dir / "maintenance_state.json", state)
 
     def _write_llm_memory(
@@ -335,13 +364,42 @@ def _entry_text(entry: dict[str, Any]) -> str:
     for block in entry.get("text_blocks", []):
         if not isinstance(block, dict):
             continue
-        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-        if metadata.get("visible_in_context") is False:
+        if not is_authored_block(block):
             continue
-        text = str(block.get("text", "")).strip()
+        text = block_text(block)
         if text:
             blocks.append(text)
     return "\n".join(blocks).strip()
+
+
+def _entry_web_evidence(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for block in entry.get("text_blocks", []):
+        if not is_evidence_block(block):
+            continue
+        metadata = evidence_metadata(block)
+        sources = metadata.get("source_urls") or metadata.get("sources") or []
+        if isinstance(sources, str):
+            sources = [sources]
+        evidence.append(
+            {
+                "entry_id": str(entry.get("entry_id") or ""),
+                "sequence": int(entry.get("sequence", 0) or 0),
+                "kind": str(metadata.get("kind") or "annotation:web"),
+                "annotation_id": str(metadata.get("annotation_id") or metadata.get("url_id") or ""),
+                "query": str(metadata.get("query") or ""),
+                "level": str(metadata.get("level") or ""),
+                "status": str(metadata.get("status") or "completed"),
+                "evidence_quality": str(metadata.get("evidence_quality") or ""),
+                "retrieved_at": str(metadata.get("retrieved_at") or metadata.get("generated_at") or ""),
+                "expires_at": str(metadata.get("expires_at") or ""),
+                "source_ref": str(metadata.get("source_ref") or ""),
+                "source_urls": [str(item) for item in sources if str(item).strip()][:12],
+                "text_excerpt": _compact(block_text(block), 1400),
+                "trust": "external_untrusted",
+            }
+        )
+    return evidence
 
 
 def _summary_line(entry: dict[str, Any], text: str, max_chars: int) -> str:
@@ -353,7 +411,7 @@ def _summary_line(entry: dict[str, Any], text: str, max_chars: int) -> str:
 
 
 def _collect_preferences(preferences: dict[str, list[dict[str, Any]]], entry: dict[str, Any], text: str) -> None:
-    if entry.get("is_self"):
+    if entry.get("is_self") or str(entry.get("role") or "user") != "user":
         return
     for pattern, key in _PREFERENCE_PATTERNS:
         for match in pattern.finditer(text):
@@ -510,13 +568,15 @@ def _render_summary(conversation_id: str, session_id: str, lines: list[str], fil
 def _memory_prompt(conversation_id: str, session_id: str, entries: list[dict[str, Any]]) -> str:
     compact_entries = []
     for entry in entries[-120:]:
+        stored_role = str(entry.get("role") or "user")
+        role = "assistant" if stored_role == "assistant" else ("self" if entry.get("is_self") else stored_role)
         compact_entries.append(
             {
                 "sequence": int(entry.get("sequence", 0) or 0),
                 "sender": entry.get("sender_name", ""),
-                "role": "self" if entry.get("is_self") else entry.get("role", "user"),
+                "role": role,
                 "time": entry.get("received_at", ""),
-                "text": _compact(_entry_text(entry), 900),
+                "text": "" if role == "assistant" else _compact(_entry_text(entry), 900),
                 "files": _entry_files(entry),
                 "urls": _entry_urls(entry),
             }
@@ -524,6 +584,7 @@ def _memory_prompt(conversation_id: str, session_id: str, entries: list[dict[str
     return (
         "你是一个长期记忆维护器。请从下面的会话 ledger 中提炼对后续真实对话有帮助的记忆，"
         "不要逐条复述。关注：稳定偏好/指令、仍在进行的任务、已完成结论、重要实体、文件引用、用户当前主题。"
+        "网页证据由独立的 web_evidence.json 保存，不会进入长期摘要；不要从链接本身推断网页事实。"
         "如果某条用户指令已被后续消息废止，请不要把它作为偏好。只返回 JSON：\n"
         '{"summary": {"conversation_review": "...", "active_tasks": ["..."], "resolved": ["..."], "current_topics": ["..."]}, '
         '"preferences": {"instructions": [{"value": "...", "confidence": 0.0, "source_sequence": 1}], "avoid": [], "likes": [], "needs": []}, '

@@ -589,11 +589,12 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertEqual(updated.links[0]["status"], "completed")
             self.assertEqual(updated.links[0]["annotation_path"], "tool_outputs/web_fetch/a.md")
             self.assertEqual(updated.text_blocks[-1]["kind"], "annotation:web")
+            self.assertTrue(updated.text_blocks[-1]["metadata"]["expires_at"].endswith("Z"))
             self.assertIn("summary text", updated.text_blocks[-1]["text"])
             self.assertIn("[block:annotation:web", markdown)
             self.assertTrue((store.annotations_dir("conv1") / f"{entry.entry_id}_{url_id}.md").exists())
 
-    def test_annotate_entry_adds_visible_tool_annotation_without_new_message(self) -> None:
+    def test_annotate_entry_adds_isolated_tool_evidence_without_new_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ConversationLedgerStore(Path(tmp))
             entry = store.append_message(_message("m1", "what changed in this library today?"))
@@ -606,7 +607,12 @@ class ConversationLedgerStoreTest(unittest.TestCase):
                 summary="Search found the current release note.",
                 text="Search evidence:\n- Official docs say version 2 is current.",
                 source_path="tool_outputs/web_search/search-m1.md",
-                metadata={"level": "standard", "result_count": 1},
+                metadata={
+                    "level": "standard",
+                    "result_count": 1,
+                    "retrieved_at": "2099-01-01T00:00:00Z",
+                    "expires_at": "2099-01-02T00:00:00Z",
+                },
             )
             entries = store.read_entries("conv1")
             markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
@@ -617,10 +623,115 @@ class ConversationLedgerStoreTest(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0].text_blocks[-1]["kind"], "annotation:websearch")
-            self.assertTrue(entries[0].text_blocks[-1]["metadata"]["visible_in_context"])
+            self.assertFalse(entries[0].text_blocks[-1]["metadata"]["visible_in_context"])
+            self.assertEqual(entries[0].text_blocks[-1]["metadata"]["context_channel"], "evidence")
             self.assertIn("[block:annotation:websearch", markdown)
             self.assertIn("Search found the current release note.", rendered)
+            self.assertIn("external untrusted data", rendered)
+            self.assertNotIn(
+                "role=user(other_party): what changed in this library today? Search found the current release note.",
+                rendered,
+            )
             self.assertTrue((store.annotations_dir("conv1") / f"{entry.entry_id}_search-m1.md").exists())
+
+    def test_expired_web_annotation_stays_on_disk_but_leaves_prompt_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            entry = store.append_message(_message("m-expired-web", "check an old fact"))
+            store.annotate_entry(
+                "conv1",
+                entry.entry_id,
+                kind="annotation:websearch",
+                annotation_id="search-expired",
+                text="Expired external fact must not be recalled.",
+                metadata={
+                    "query": "old fact",
+                    "retrieved_at": "1999-01-01T00:00:00Z",
+                    "expires_at": "2000-01-01T00:00:00Z",
+                },
+            )
+
+            markdown = store.conversation_markdown_path("conv1").read_text(encoding="utf-8")
+            rendered = LedgerContextAssembler(store, max_recent_entries=5).build_snapshot(
+                _message("m-after-expiry", "check again")
+            ).render_for_prompt()
+
+            self.assertIn("Expired external fact", markdown)
+            self.assertNotIn("Expired external fact", rendered)
+
+    def test_newest_fetch_evidence_wins_when_same_url_was_refetched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            older = store.append_message(_message("m-old-fetch", "read https://example.com/status"))
+            newer = store.append_message(_message("m-new-fetch", "read https://example.com/status"))
+            url_id = older.links[0]["url_id"]
+            store.annotate_link(
+                "conv1",
+                older.entry_id,
+                url_id,
+                status="completed",
+                summary="old fetch",
+                text="Old page state must be replaced.",
+            )
+            store.annotate_link(
+                "conv1",
+                newer.entry_id,
+                url_id,
+                status="completed",
+                summary="new fetch",
+                text="Newest page state is authoritative for this context.",
+            )
+
+            rendered = LedgerContextAssembler(store, max_recent_entries=5).build_snapshot(
+                _message("m-after-refetch", "what is current?")
+            ).render_for_prompt()
+
+            self.assertIn("Newest page state", rendered)
+            self.assertNotIn("Old page state", rendered)
+
+    def test_enriched_message_upsert_preserves_web_annotations_and_link_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationLedgerStore(Path(tmp))
+            first = _message(
+                "raw-a",
+                "read https://example.com/report",
+                metadata={"dedupe_key": "stable-message"},
+            )
+            entry = store.append_message(first)
+            url_id = entry.links[0]["url_id"]
+            store.annotate_link(
+                "conv1",
+                entry.entry_id,
+                url_id,
+                status="completed",
+                summary="Fetched report",
+                text="External report evidence",
+                source_path="tool_outputs/web_fetch/report.md",
+            )
+            store.annotate_entry(
+                "conv1",
+                entry.entry_id,
+                kind="annotation:websearch",
+                annotation_id="search-report",
+                text="Independent search evidence",
+                metadata={"query": "example report", "level": "standard"},
+            )
+
+            result = store.append_message_result(
+                _message(
+                    "raw-b",
+                    "read https://example.com/report",
+                    metadata={"dedupe_key": "stable-message", "source": "enriched_backend"},
+                )
+            )
+            updated = store.read_entries("conv1")[0]
+
+            self.assertEqual(result.status, "updated")
+            self.assertEqual(updated.links[0]["status"], "completed")
+            self.assertEqual(
+                [block["kind"] for block in updated.text_blocks],
+                ["text", "annotation:web", "annotation:websearch"],
+            )
 
     def test_append_reply_uses_conversation_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

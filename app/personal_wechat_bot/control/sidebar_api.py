@@ -41,6 +41,7 @@ from app.personal_wechat_bot.conversation.channel_state_store import (
     merge_channel_state_projection,
 )
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
+from app.personal_wechat_bot.conversation.text_blocks import is_prompt_visible_block
 from app.personal_wechat_bot.config.loader import (
     config_update_lock,
     ensure_config,
@@ -9675,16 +9676,7 @@ def _agent_entry_text(entry: dict[str, Any]) -> str:
 
 
 def _agent_visible_text_block(block: Any) -> bool:
-    if not isinstance(block, dict):
-        return False
-    text = str(block.get("text") or "").strip()
-    if not text:
-        return False
-    kind = str(block.get("kind") or "")
-    if kind.startswith("control:") or kind.startswith("attachment:"):
-        return False
-    metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-    return metadata.get("visible_in_context") is not False
+    return is_prompt_visible_block(block)
 
 
 def _agent_entry_is_control_event(entry: dict[str, Any]) -> bool:

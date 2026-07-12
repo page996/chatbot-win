@@ -79,6 +79,39 @@ class WebFetchToolTest(unittest.TestCase):
             self.assertEqual(result.error, "login_or_paywall_detected")
             self.assertEqual(result.payload["content_kind"], "text")
 
+    def test_conflicting_dynamic_open_state_is_returned_as_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "status.html").write_text(
+                "<html><body>The museum is now open. The museum is now closed. Opening hours.</body></html>",
+                encoding="utf-8",
+            )
+            server = _LocalServer(root)
+            server.start()
+            try:
+                tool = WebFetchTool(
+                    root / "outputs",
+                    FileIndex(root / "files.sqlite"),
+                    allow_private_network=True,
+                )
+                result = tool.run(
+                    ToolCallRequest(
+                        tool_name="web.fetch",
+                        call_id="call-conflicting-state",
+                        conversation_id="conv1",
+                        requested_by="test",
+                        arguments={"url": server.url("/status.html")},
+                    )
+                )
+            finally:
+                server.stop()
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.payload["warnings"], ["live_state_conflict"])
+            self.assertIn("live_state_conflict", result.payload["text"])
+            self.assertNotIn("now open", result.payload["text"].lower())
+            self.assertNotIn("now closed", result.payload["text"].lower())
+
     def test_file_url_enters_local_file_workspace_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

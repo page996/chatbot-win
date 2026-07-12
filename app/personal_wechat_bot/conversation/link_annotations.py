@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any
 
 from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore, LedgerEntry
+from app.personal_wechat_bot.conversation.text_blocks import is_authored_block
 from app.personal_wechat_bot.domain.models import ToolCallRequest
 from app.personal_wechat_bot.tools.runtime import ToolRuntime
 
@@ -30,6 +32,12 @@ class LinkAnnotationService:
             url = str(link.get("url", "")).strip()
             url_id = str(link.get("url_id", "")).strip()
             if not url or not url_id:
+                continue
+            if (
+                str(link.get("status") or "") == "completed"
+                and str(link.get("annotation_path") or "").strip()
+                and _has_fresh_link_evidence(target_entry, url_id)
+            ):
                 continue
             request = ToolCallRequest(
                 tool_name="web.fetch",
@@ -67,8 +75,11 @@ class LinkAnnotationService:
         if not quote:
             return []
         quote_context = self.ledger_store.lookup_quote_context(entry.conversation_id, quote)
+        matched_entry_id = str(quote_context.get("matched_entry_id") or "") if isinstance(quote_context, dict) else ""
         results: list[tuple[LedgerEntry, dict[str, Any]]] = []
         for payload in quote_context.get("entries", []) if isinstance(quote_context, dict) else []:
+            if matched_entry_id and str(payload.get("entry_id") or "") != matched_entry_id:
+                continue
             target = _entry_from_payload(payload)
             if target is None:
                 continue
@@ -80,6 +91,27 @@ class LinkAnnotationService:
 
 def _call_id(entry_id: str, url_id: str) -> str:
     return hashlib.sha256(f"{entry_id}:web.fetch:{url_id}".encode("utf-8")).hexdigest()[:24]
+
+
+def _has_fresh_link_evidence(entry: LedgerEntry, url_id: str) -> bool:
+    for block in entry.text_blocks:
+        if not isinstance(block, dict) or str(block.get("kind") or "") != "annotation:web":
+            continue
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        if str(metadata.get("url_id") or "") != url_id or str(metadata.get("status") or "") != "completed":
+            continue
+        expires_at = str(metadata.get("expires_at") or "").strip()
+        if not expires_at or not str(block.get("text") or "").strip():
+            continue
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry.astimezone(timezone.utc) > datetime.now(timezone.utc):
+            return True
+    return False
 
 
 def _explicit_link_read_request(entry: LedgerEntry) -> bool:
@@ -104,9 +136,7 @@ def _entry_text(entry: LedgerEntry) -> str:
     for block in entry.text_blocks:
         if not isinstance(block, dict):
             continue
-        kind = str(block.get("kind", ""))
-        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-        if kind.startswith("attachment:") or metadata.get("visible_in_context") is False:
+        if not is_authored_block(block):
             continue
         text = str(block.get("text", "")).strip()
         if text:

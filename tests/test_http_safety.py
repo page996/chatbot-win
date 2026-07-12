@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import unittest
+import gzip
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
@@ -11,6 +12,7 @@ from urllib.error import URLError
 from urllib.request import Request
 
 from app.personal_wechat_bot.tools.web.http_safety import (
+    HttpContentEncodingError,
     HttpResponseLimitError,
     LocalHttpUrlError,
     PublicHttpUrlError,
@@ -19,6 +21,7 @@ from app.personal_wechat_bot.tools.web.http_safety import (
     _ResolvedEndpoint,
     _SameAuthorityRedirectHandler,
     _open_pinned_socket,
+    decode_http_content,
     guarded_urlopen,
     guarded_local_urlopen,
     guarded_same_authority_urlopen,
@@ -296,6 +299,22 @@ class HttpSafetyTest(unittest.TestCase):
         )
 
         self.assertEqual(body, b"12345678")
+
+    def test_http_content_decoding_is_bounded_after_gzip_expansion(self) -> None:
+        compressed = gzip.compress(b"a" * 10000)
+
+        decoded, truncated = decode_http_content(
+            compressed,
+            content_encoding="gzip",
+            max_bytes=128,
+        )
+
+        self.assertEqual(decoded, b"a" * 128)
+        self.assertTrue(truncated)
+
+    def test_http_content_decoding_rejects_unknown_encoding(self) -> None:
+        with self.assertRaisesRegex(HttpContentEncodingError, "unsupported_content_encoding"):
+            decode_http_content(b"body", content_encoding="br", max_bytes=1024)
 
     def test_blocks_loopback_private_link_local_and_credentials(self) -> None:
         urls = (

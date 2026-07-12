@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -23,6 +24,10 @@ class LocalHttpUrlError(ValueError):
 
 class HttpResponseLimitError(ValueError):
     """Raised when a web response exceeds its declared or observed byte limit."""
+
+
+class HttpContentEncodingError(ValueError):
+    """Raised when a response uses an unsupported or malformed content encoding."""
 
 
 @dataclass(frozen=True)
@@ -250,6 +255,50 @@ def read_response_with_deadline(
     if deadline_expired.is_set() or time.monotonic() >= deadline:
         raise TimeoutError("http_response_deadline_exceeded")
     return b"".join(chunks)
+
+
+def decode_http_content(
+    raw: bytes,
+    *,
+    content_encoding: str,
+    max_bytes: int,
+) -> tuple[bytes, bool]:
+    """Decode HTTP content encodings while bounding the expanded representation."""
+
+    data = bytes(raw)
+    limit = max(0, int(max_bytes))
+    truncated = False
+    encodings = [item.strip().lower() for item in str(content_encoding or "").split(",") if item.strip()]
+    for encoding in reversed(encodings):
+        if encoding in {"", "identity"}:
+            continue
+        if encoding in {"gzip", "x-gzip"}:
+            data, was_truncated = _bounded_zlib_decompress(data, limit, wbits=16 + zlib.MAX_WBITS)
+        elif encoding == "deflate":
+            try:
+                data, was_truncated = _bounded_zlib_decompress(data, limit, wbits=zlib.MAX_WBITS)
+            except HttpContentEncodingError:
+                data, was_truncated = _bounded_zlib_decompress(data, limit, wbits=-zlib.MAX_WBITS)
+        else:
+            raise HttpContentEncodingError(f"unsupported_content_encoding:{encoding}")
+        truncated = truncated or was_truncated
+    if len(data) > limit:
+        truncated = True
+        data = data[:limit]
+    return data, truncated
+
+
+def _bounded_zlib_decompress(data: bytes, limit: int, *, wbits: int) -> tuple[bytes, bool]:
+    try:
+        decoder = zlib.decompressobj(wbits)
+        output = decoder.decompress(data, limit + 1)
+        truncated = len(output) > limit or bool(decoder.unconsumed_tail)
+        if not truncated:
+            output += decoder.flush(max(1, limit + 1 - len(output)))
+            truncated = len(output) > limit or not decoder.eof
+    except zlib.error as exc:
+        raise HttpContentEncodingError("malformed_compressed_response") from exc
+    return output[:limit], truncated
 
 
 def _deadline_remaining(deadline: float, *, error: str = "http_response_deadline_exceeded") -> float:

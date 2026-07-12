@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.personal_wechat_bot.config.loader import accept_contact, accept_group, create_default_config, load_config
+from app.personal_wechat_bot.conversation.ledger import ConversationLedgerStore
 from app.personal_wechat_bot.domain.models import ToolCallResult
 from app.personal_wechat_bot.replay.runner import ReplayRunner
 
@@ -97,7 +98,7 @@ class MinimumClosedLoopTest(unittest.TestCase):
         status = json.loads((tasks[0] / "status.json").read_text(encoding="utf-8"))
         self.assertEqual(status["status"], "completed")
 
-    def test_external_search_returns_url_summary_and_source_reference(self) -> None:
+    def test_external_search_is_annotated_then_synthesized(self) -> None:
         output = self.data_dir / "tool_outputs" / "web_search" / "minimum-closed-loop.md"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("https://arxiv.org/abs/1234.5678\nResearch evidence.", encoding="utf-8")
@@ -107,18 +108,38 @@ class MinimumClosedLoopTest(unittest.TestCase):
             status="completed",
             summary="web.search usable result: https://arxiv.org/abs/1234.5678",
             output_refs=[str(output)],
-            payload={"result_count": 1, "filtered": [{"title": "Unrelated shopping"}]},
+            payload={
+                "query": "transformer interpretability",
+                "level": "standard",
+                "result_count": 1,
+                "fetched_count": 1,
+                "annotation_text": "Fetched evidence: https://arxiv.org/abs/1234.5678\nResearch evidence.",
+                "generated_at": "2026-07-12T00:00:00Z",
+                "evidence": {
+                    "quality": "strong",
+                    "independent_domain_count": 1,
+                    "authoritative_source_count": 1,
+                    "source_urls": ["https://arxiv.org/abs/1234.5678"],
+                },
+                "filtered": [{"title": "Unrelated shopping"}],
+            },
         )
         with mock.patch(
-            "app.personal_wechat_bot.agent.tool_orchestrator.ToolTaskOrchestrator.execute",
+            "app.personal_wechat_bot.tools.runtime.ToolRuntime.execute",
             return_value=tool_result,
         ):
             result = self.replay("tool_external_search.json")
-        tool = result["processed"][0]["reply"]["tool_result"]
-        self.assertEqual(tool["status"], "completed")
-        self.assertIn("https://arxiv.org/abs/1234.5678", tool["summary"])
-        self.assertNotIn("Unrelated shopping", tool["summary"])
-        self.assertTrue(tool["output_refs"][0].endswith(".md"))
+        reply = result["processed"][0]["reply"]
+        conversation_id = result["processed"][0]["message"]["conversation_id"]
+        entry = ConversationLedgerStore(self.data_dir).read_entries(conversation_id)[0]
+        annotation = entry.text_blocks[-1]
+
+        self.assertIsNone(reply["tool_result"])
+        self.assertEqual(reply["send_metadata"]["web_search"]["status"], "completed")
+        self.assertEqual(annotation["kind"], "annotation:websearch")
+        self.assertIn("https://arxiv.org/abs/1234.5678", annotation["text"])
+        self.assertNotIn("Unrelated shopping", annotation["text"])
+        self.assertTrue(annotation["source_ref"].endswith(".md"))
 
 
 if __name__ == "__main__":

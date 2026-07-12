@@ -169,8 +169,9 @@ def build_preflight_report(
             },
             "web_fetch": {
                 "name": "web.fetch",
-                "scope": "http_text_only",
+                "scope": "public_http_text_and_file_workflow",
                 "available": True,
+                "network_status": "checked_per_request",
             },
             "web_search": {
                 "name": "web.search",
@@ -178,6 +179,9 @@ def build_preflight_report(
                 "available": True,
                 "levels": ["light", "standard", "deep"],
                 "uses_browser": False,
+                "providers": ["bing_rss", "duckduckgo_html_fallback"],
+                "completed_requires_readable_page": True,
+                "network_status": "checked_per_request",
             },
             "asr": {
                 "name": "voice.local_asr",
